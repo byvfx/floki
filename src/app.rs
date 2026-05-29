@@ -128,6 +128,88 @@ impl eframe::App for ExrApp {
                                 }
                             }
                         });
+                        
+                        ui.separator();
+                        ui.heading("Color Sampler");
+                        
+                        if !self.viewer.swatches.is_empty() {
+                            ui.horizontal(|ui| {
+                                ui.label(format!("{} saved", self.viewer.swatches.len()));
+                                if ui.button("Clear All").clicked() {
+                                    self.viewer.swatches.clear();
+                                }
+                            });
+                            ui.add_space(5.0);
+                            
+                            egui::ScrollArea::vertical().id_salt("swatches_scroll").show(ui, |ui| {
+                                let mut to_remove = None;
+                                for (i, swatch) in self.viewer.swatches.iter().enumerate() {
+                                    ui.horizontal(|ui| {
+                                        let [r, g, b, _a] = *swatch;
+                                        
+                                        // Preview color patch using current sRGB mode and exposure/gamma
+                                        let mut disp_r = r * self.viewer.exposure.exp2();
+                                        let mut disp_g = g * self.viewer.exposure.exp2();
+                                        let mut disp_b = b * self.viewer.exposure.exp2();
+                                        
+                                        if self.viewer.gamma != 1.0 {
+                                            let inv_gamma = 1.0 / self.viewer.gamma;
+                                            disp_r = if disp_r > 0.0 { disp_r.powf(inv_gamma) } else { 0.0 };
+                                            disp_g = if disp_g > 0.0 { disp_g.powf(inv_gamma) } else { 0.0 };
+                                            disp_b = if disp_b > 0.0 { disp_b.powf(inv_gamma) } else { 0.0 };
+                                        }
+                                        
+                                        if self.viewer.srgb {
+                                            disp_r = self.viewer.linear_to_srgb(disp_r);
+                                            disp_g = self.viewer.linear_to_srgb(disp_g);
+                                            disp_b = self.viewer.linear_to_srgb(disp_b);
+                                        }
+                                        
+                                        let r_u8 = (disp_r.clamp(0.0, 1.0) * 255.0) as u8;
+                                        let g_u8 = (disp_g.clamp(0.0, 1.0) * 255.0) as u8;
+                                        let b_u8 = (disp_b.clamp(0.0, 1.0) * 255.0) as u8;
+                                        
+                                        let color = egui::Color32::from_rgb(r_u8, g_u8, b_u8);
+                                        let (rect, _resp) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::hover());
+                                        ui.painter().rect_filled(rect, 2.0, color);
+                                        
+                                        // Display values
+                                        ui.vertical(|ui| {
+                                            ui.label(format!("Float: {:.4}, {:.4}, {:.4}", r, g, b));
+                                            ui.label(format!("8-bit: {}, {}, {}", r_u8, g_u8, b_u8));
+                                            // HSV mapping
+                                            let max = r.max(g).max(b);
+                                            let min = r.min(g).min(b);
+                                            let c = max - min;
+                                            let h = if c == 0.0 {
+                                                0.0
+                                            } else if max == r {
+                                                60.0 * (((g - b) / c) % 6.0)
+                                            } else if max == g {
+                                                60.0 * (((b - r) / c) + 2.0)
+                                            } else {
+                                                60.0 * (((r - g) / c) + 4.0)
+                                            };
+                                            let h = if h < 0.0 { h + 360.0 } else { h };
+                                            let s = if max == 0.0 { 0.0 } else { c / max };
+                                            let v = max;
+                                            ui.label(format!("HSV: {:.1}°, {:.2}, {:.2}", h, s, v));
+                                        });
+                                        
+                                        if ui.button("X").clicked() {
+                                            to_remove = Some(i);
+                                        }
+                                    });
+                                    ui.separator();
+                                }
+                                if let Some(i) = to_remove {
+                                    self.viewer.swatches.remove(i);
+                                }
+                            });
+                        } else {
+                            ui.label("Shift+Click on the image to save a swatch.");
+                        }
+
                     }
                 } else {
                     ui.label("No file loaded.");

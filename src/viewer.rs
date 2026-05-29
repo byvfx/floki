@@ -25,6 +25,7 @@ pub struct ExrViewer {
     pub channel_mode: ChannelMode,
     pub active_layer: usize,
     pub show_contact_sheet: bool,
+    pub swatches: Vec<[f32; 4]>,
 
     // View transform
     pub scale: f32,
@@ -42,6 +43,7 @@ impl Default for ExrViewer {
             channel_mode: ChannelMode::RGB,
             active_layer: 0,
             show_contact_sheet: false,
+            swatches: Vec::new(),
             scale: 1.0,
             translation: egui::Vec2::ZERO,
             first_frame: true,
@@ -205,7 +207,7 @@ impl ExrViewer {
                 let tex_size = texture.size_vec2();
 
                 let (rect, response) =
-                    ui.allocate_exact_size(ui.available_size(), egui::Sense::drag());
+                    ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
                 
                 if self.first_frame {
                     let scale_x = rect.width() / tex_size.x;
@@ -247,24 +249,35 @@ impl ExrViewer {
                     egui::Color32::WHITE,
                 );
 
-                // Pixel sampling
-                if response.hovered()
-                    && let Some(pos) = response.hover_pos() {
-                        let image_local_pos = pos - image_rect.min;
-                        let x = (image_local_pos.x / self.scale) as usize;
-                        let y = (image_local_pos.y / self.scale) as usize;
+                // Pixel Sampling & Swatches
+                if let Some(pos) = response.hover_pos() {
+                    let image_local_pos = pos - image_rect.min;
+                    let x = (image_local_pos.x / self.scale) as usize;
+                    let y = (image_local_pos.y / self.scale) as usize;
 
-                        // Check if inside image
-                        if x < tex_size.x as usize
-                            && y < tex_size.y as usize
-                            && image_local_pos.x >= 0.0
-                            && image_local_pos.y >= 0.0
-                            && let Some(val) = self.sample_pixel(exr_data, self.active_layer, x, y)
-                            {
-                                response
-                                    .on_hover_text(format!("x: {}, y: {}\nVal: {:?}", x, y, val));
+                    // Check if inside image
+                    if x < tex_size.x as usize
+                        && y < tex_size.y as usize
+                        && image_local_pos.x >= 0.0
+                        && image_local_pos.y >= 0.0
+                    {
+                        if let Some(val) = self.sample_pixel(exr_data, self.active_layer, x, y) {
+                            egui::Window::new("Pixel Tooltip")
+                                .fixed_pos(pos + egui::vec2(15.0, 15.0))
+                                .title_bar(false)
+                                .resizable(false)
+                                .collapsible(false)
+                                .show(ui.ctx(), |ui| {
+                                    ui.label(format!("x: {}, y: {}\nVal: {:.4}, {:.4}, {:.4}, {:.4}", x, y, val[0], val[1], val[2], val[3]));
+                                });
+                            
+                            // Shift+Click to add a persistent swatch
+                            if ui.input(|i| i.modifiers.shift) && response.clicked() {
+                                self.swatches.push(val);
                             }
+                        }
                     }
+                }
             }
         }
     }
@@ -434,7 +447,7 @@ impl ExrViewer {
         (r_chan, g_chan, b_chan, a_chan)
     }
 
-    fn linear_to_srgb(&self, l: f32) -> f32 {
+    pub fn linear_to_srgb(&self, l: f32) -> f32 {
         if l <= 0.0031308 {
             l * 12.92
         } else {
