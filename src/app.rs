@@ -79,24 +79,32 @@ impl eframe::App for ExrApp {
                     if let Some(exr_data) = &self.exr_data {
                         ui.separator();
                         egui::ScrollArea::vertical().show(ui, |ui| {
-                            ui.heading("Image Metadata");
-                            let attrs = &exr_data.image.attributes;
-                            ui.label(format!("Display Window: {}x{} at {},{}", 
-                                attrs.display_window.size.x(), attrs.display_window.size.y(),
-                                attrs.display_window.position.x(), attrs.display_window.position.y()
-                            ));
-                            ui.label(format!("Pixel Aspect: {}", attrs.pixel_aspect));
-                            
-                            if !attrs.other.is_empty() {
-                                ui.add_space(5.0);
-                                ui.label("Custom Attributes:");
-                                for (name, val) in attrs.other.iter() {
-                                    ui.horizontal_wrapped(|ui| {
-                                        ui.strong(format!("{}: ", name));
-                                        ui.label(format!("{:?}", val));
-                                    });
-                                }
-                            }
+                            egui::CollapsingHeader::new("Image Metadata")
+                                .id_salt("image_metadata_header")
+                                .default_open(false)
+                                .show(ui, |ui| {
+                                    let attrs = &exr_data.image.attributes;
+                                    ui.label(format!("Display Window: {}x{} at {},{}", 
+                                        attrs.display_window.size.x(), attrs.display_window.size.y(),
+                                        attrs.display_window.position.x(), attrs.display_window.position.y()
+                                    ));
+                                    ui.label(format!("Pixel Aspect: {}", attrs.pixel_aspect));
+                                    
+                                    if !attrs.other.is_empty() {
+                                        ui.add_space(5.0);
+                                        egui::CollapsingHeader::new("Custom Attributes")
+                                            .id_salt("image_custom_attrs_header")
+                                            .default_open(false)
+                                            .show(ui, |ui| {
+                                                for (name, val) in attrs.other.iter() {
+                                                    ui.horizontal_wrapped(|ui| {
+                                                        ui.strong(format!("{}: ", name));
+                                                        ui.label(format!("{:?}", val));
+                                                    });
+                                                }
+                                            });
+                                    }
+                                });
 
                             ui.separator();
                             ui.heading("Layers");
@@ -116,13 +124,17 @@ impl eframe::App for ExrApp {
                                         
                                         if !layer.attributes.other.is_empty() {
                                             ui.add_space(5.0);
-                                            ui.label("Layer Attributes:");
-                                            for (name, val) in layer.attributes.other.iter() {
-                                                ui.horizontal_wrapped(|ui| {
-                                                    ui.strong(format!("{}: ", name));
-                                                    ui.label(format!("{:?}", val));
+                                            egui::CollapsingHeader::new("Layer Attributes")
+                                                .id_salt(format!("layer_attrs_header_{}", i))
+                                                .default_open(false)
+                                                .show(ui, |ui| {
+                                                    for (name, val) in layer.attributes.other.iter() {
+                                                        ui.horizontal_wrapped(|ui| {
+                                                            ui.strong(format!("{}: ", name));
+                                                            ui.label(format!("{:?}", val));
+                                                        });
+                                                    }
                                                 });
-                                            }
                                         }
                                     });
                                 }
@@ -208,6 +220,41 @@ impl eframe::App for ExrApp {
                             });
                         } else {
                             ui.label("Shift+Click on the image to save a swatch.");
+                        }
+
+                        ui.separator();
+                        ui.heading("Histogram");
+                        ui.horizontal(|ui| {
+                            if ui.checkbox(&mut self.viewer.log_histogram, "Log Scale (-10 to +10 EV)").changed() {
+                                self.viewer.histogram_layer = None;
+                            }
+                        });
+                        
+                        self.viewer.calculate_histogram(exr_data);
+                        
+                        if let Some(bins) = &self.viewer.histogram {
+                            let (rect, _resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 80.0), egui::Sense::hover());
+                            let max_val = *bins.iter().max().unwrap_or(&1) as f32;
+                            let max_val = max_val.max(1.0);
+                            
+                            let mut shapes = vec![];
+                            let bar_width = rect.width() / 256.0;
+                            
+                            for (i, &count) in bins.iter().enumerate() {
+                                let h = (count as f32 / max_val).powf(0.5) * rect.height(); // sqrt curve so small spikes are visible
+                                let x = rect.min.x + i as f32 * bar_width;
+                                let y = rect.max.y - h;
+                                
+                                shapes.push(egui::Shape::rect_filled(
+                                    egui::Rect::from_min_max(
+                                        egui::pos2(x, y),
+                                        egui::pos2(x + bar_width.max(1.0), rect.max.y)
+                                    ),
+                                    0.0,
+                                    egui::Color32::from_gray(180)
+                                ));
+                            }
+                            ui.painter().extend(shapes);
                         }
 
                     }

@@ -26,6 +26,9 @@ pub struct ExrViewer {
     pub active_layer: usize,
     pub show_contact_sheet: bool,
     pub swatches: Vec<[f32; 4]>,
+    pub histogram: Option<[u32; 256]>,
+    pub histogram_layer: Option<usize>,
+    pub log_histogram: bool,
 
     // View transform
     pub scale: f32,
@@ -44,6 +47,9 @@ impl Default for ExrViewer {
             active_layer: 0,
             show_contact_sheet: false,
             swatches: Vec::new(),
+            histogram: None,
+            histogram_layer: None,
+            log_histogram: true,
             scale: 1.0,
             translation: egui::Vec2::ZERO,
             first_frame: true,
@@ -453,5 +459,57 @@ impl ExrViewer {
         } else {
             1.055 * l.powf(1.0 / 2.4) - 0.055
         }
+    }
+
+    pub fn calculate_histogram(&mut self, exr_data: &ExrData) {
+        if self.histogram_layer == Some(self.active_layer) {
+            return;
+        }
+
+        let mut bins = [0u32; 256];
+        if let Some(layer) = exr_data.image.layer_data.get(self.active_layer) {
+            let width = layer.size.0;
+            let height = layer.size.1;
+
+            let (r_chan, g_chan, b_chan, _) = Self::find_rgba_channels(layer);
+
+            let get_val = |chan: Option<&exr::image::AnyChannel<exr::image::FlatSamples>>, x: usize, y: usize| -> f32 {
+                if let Some(c) = chan {
+                    let index = y * width + x;
+                    match &c.sample_data {
+                        exr::image::FlatSamples::F16(s) => s[index].to_f32(),
+                        exr::image::FlatSamples::F32(s) => s[index],
+                        exr::image::FlatSamples::U32(s) => s[index] as f32 / u32::MAX as f32,
+                    }
+                } else {
+                    0.0
+                }
+            };
+
+            for y in 0..height {
+                for x in 0..width {
+                    let r = get_val(r_chan, x, y);
+                    let g = get_val(g_chan, x, y);
+                    let b = get_val(b_chan, x, y);
+
+                    // Luminance
+                    let lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+
+                    let bin = if self.log_histogram {
+                        let ev = if lum <= 0.0 { -10.0 } else { lum.log2().clamp(-10.0, 10.0) };
+                        ((ev + 10.0) / 20.0 * 255.0) as usize
+                    } else {
+                        (lum.clamp(0.0, 1.0) * 255.0) as usize
+                    };
+
+                    if bin < 256 {
+                        bins[bin] += 1;
+                    }
+                }
+            }
+        }
+
+        self.histogram = Some(bins);
+        self.histogram_layer = Some(self.active_layer);
     }
 }
