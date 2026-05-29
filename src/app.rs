@@ -76,21 +76,58 @@ impl eframe::App for ExrApp {
                         path.file_name().unwrap_or_default().to_string_lossy()
                     ));
 
-                    if let Some(data) = &self.exr_data {
+                    if let Some(exr_data) = &self.exr_data {
                         ui.separator();
-                        let num_layers = data.image.layer_data.len();
-                        ui.label(format!("Layers: {}", num_layers));
-                        for (i, layer) in data.image.layer_data.iter().enumerate() {
-                            let name = layer
-                                .attributes
-                                .layer_name
-                                .as_ref()
-                                .map(|t| t.to_string())
-                                .unwrap_or_else(|| "Unnamed".to_string());
-                            let size = layer.size;
-                            ui.label(format!("Layer {}: {} ({}x{})", i, name, size.0, size.1));
-                            ui.label(format!("  Channels: {}", layer.channel_data.list.len()));
-                        }
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            ui.heading("Image Metadata");
+                            let attrs = &exr_data.image.attributes;
+                            ui.label(format!("Display Window: {}x{} at {},{}", 
+                                attrs.display_window.size.x(), attrs.display_window.size.y(),
+                                attrs.display_window.position.x(), attrs.display_window.position.y()
+                            ));
+                            ui.label(format!("Pixel Aspect: {}", attrs.pixel_aspect));
+                            
+                            if !attrs.other.is_empty() {
+                                ui.add_space(5.0);
+                                ui.label("Custom Attributes:");
+                                for (name, val) in attrs.other.iter() {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.strong(format!("{}: ", name));
+                                        ui.label(format!("{:?}", val));
+                                    });
+                                }
+                            }
+
+                            ui.separator();
+                            ui.heading("Layers");
+                            
+                            for (i, layer) in exr_data.image.layer_data.iter().enumerate() {
+                                let is_selected = self.viewer.active_layer == i;
+                                let layer_name = layer.attributes.layer_name.as_ref().map(|n| n.to_string()).unwrap_or_else(|| "Unnamed Layer".to_string());
+                                
+                                if ui.selectable_label(is_selected, &layer_name).clicked() {
+                                    self.viewer.active_layer = i;
+                                }
+                                
+                                if is_selected {
+                                    ui.indent("layer_details", |ui| {
+                                        ui.label(format!("Resolution: {}x{}", layer.size.0, layer.size.1));
+                                        ui.label(format!("Channels: {}", layer.channel_data.list.len()));
+                                        
+                                        if !layer.attributes.other.is_empty() {
+                                            ui.add_space(5.0);
+                                            ui.label("Layer Attributes:");
+                                            for (name, val) in layer.attributes.other.iter() {
+                                                ui.horizontal_wrapped(|ui| {
+                                                    ui.strong(format!("{}: ", name));
+                                                    ui.label(format!("{:?}", val));
+                                                });
+                                            }
+                                        }
+                                    });
+                                }
+                            }
+                        });
                     }
                 } else {
                     ui.label("No file loaded.");
