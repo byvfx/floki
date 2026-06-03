@@ -432,7 +432,7 @@ impl ExrViewer {
 
                 let painter = ui.painter().with_clip_rect(rect);
 
-                if let Some(rs) = render_state {
+                if let Some(_rs) = render_state {
                     // GPU RENDER PATH
                     use eframe::egui_wgpu::wgpu::util::DeviceExt;
                     let uniform_data = crate::gpu::Uniforms {
