@@ -27,6 +27,9 @@ pub struct ExrApp {
     #[serde(skip)]
     show_settings: bool,
     
+    #[serde(skip)]
+    pub render_state: Option<eframe::egui_wgpu::RenderState>,
+    
     ocio_path: String,
     lut_path: String,
 }
@@ -43,6 +46,7 @@ impl Default for ExrApp {
             recent_files: Vec::new(),
             show_help: false,
             show_settings: false,
+            render_state: None,
             ocio_path: String::new(),
             lut_path: String::new(),
         }
@@ -51,10 +55,20 @@ impl Default for ExrApp {
 
 impl ExrApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        if let Some(storage) = cc.storage {
-            return eframe::get_value(storage, eframe::APP_KEY).unwrap_or_default();
+        let mut app: Self = if let Some(storage) = cc.storage {
+            eframe::get_value(storage, eframe::APP_KEY).unwrap_or_default()
+        } else {
+            Self::default()
+        };
+        
+        app.render_state = cc.wgpu_render_state.clone();
+        
+        if let Some(rs) = &app.render_state {
+            let gpu_state = crate::gpu::GpuState::new(&rs.device, rs.target_format);
+            rs.renderer.write().callback_resources.insert(gpu_state);
         }
-        Self::default()
+        
+        app
     }
 
     fn open_file(&mut self, path: PathBuf, is_b: bool) {
@@ -423,7 +437,7 @@ impl eframe::App for ExrApp {
         egui::CentralPanel::default().show_inside(ui, |ui| {
             if self.loaded_file.is_some() {
                 if let Some(data) = &self.exr_data {
-                    self.viewer.ui(ui, data, self.exr_data_b.as_ref());
+                    self.viewer.ui(ui, data, self.exr_data_b.as_ref(), self.render_state.as_ref());
                 }
             } else {
                 ui.centered_and_justified(|ui| {

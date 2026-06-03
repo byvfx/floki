@@ -1,0 +1,71 @@
+   Compiling serde_core v1.0.228
+   Compiling serde_derive v1.0.228
+   Compiling enumn v0.1.14
+   Compiling typeid v1.0.3
+   Compiling home v0.5.12
+   Compiling bitflags v2.11.1
+   Compiling uuid v1.23.1
+   Compiling serde v1.0.228
+   Compiling spirv v0.4.0+sdk-1.4.341.0
+   Compiling wgpu-types v29.0.3
+   Compiling gpu-descriptor-types v0.2.0
+   Compiling png v0.18.1
+   Compiling winit v0.30.13
+   Compiling gpu-descriptor v0.3.2
+   Compiling smallvec v1.15.1
+   Compiling accesskit v0.24.0
+   Compiling font-types v0.11.3
+   Compiling emath v0.34.3
+   Compiling ahash v0.8.12
+   Compiling ron v0.12.1
+   Compiling parking_lot_core v0.9.12
+   Compiling kurbo v0.13.1
+   Compiling icu_normalizer v2.2.0
+   Compiling kurbo v0.11.3
+   Compiling exr v1.74.0
+   Compiling image v0.25.10
+   Compiling read-fonts v0.37.0
+   Compiling ecolor v0.34.3
+   Compiling naga v29.0.3
+   Compiling parking_lot v0.12.5
+   Compiling svgtypes v0.15.3
+   Compiling accesskit_consumer v0.35.0
+   Compiling peniko v0.6.1
+   Compiling idna_adapter v1.2.2
+   Compiling vello_common v0.0.6
+   Compiling usvg v0.45.1
+   Compiling idna v1.1.0
+   Compiling accesskit_windows v0.32.1
+   Compiling arboard v3.6.1
+   Compiling url v2.5.8
+   Compiling vello_cpu v0.0.6
+   Compiling webbrowser v1.2.1
+   Compiling resvg v0.45.1
+   Compiling accesskit_winit v0.32.2
+   Compiling skrifa v0.40.0
+   Compiling epaint v0.34.3
+   Compiling wgpu-naga-bridge v29.0.3
+   Compiling egui v0.34.3
+   Compiling wgpu-hal v29.0.3
+   Compiling wgpu-core-deps-windows-linux-android v29.0.3
+   Compiling wgpu-core v29.0.3
+   Compiling egui-winit v0.34.3
+   Compiling egui_extras v0.34.3
+   Compiling wgpu v29.0.3
+   Compiling egui-wgpu v0.34.3
+   Compiling eframe v0.34.3
+   Compiling exr-analyzer v0.1.0 (G:\__projects\_programming\rust\exr-analyzer)
+warning: use of deprecated type alias `eframe::egui::TopBottomPanel`: Use Panel::top or Panel::bottom instead
+   --> src\viewer.rs:109:15
+    |
+109 |         egui::TopBottomPanel::top("viewer_controls").show_inside(ui, |ui| {
+    |               ^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: `exr-analyzer` (bin "exr-analyzer") generated 1 warning
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 40.62s
+     Running `C:/Users/brandon/.cargo-target\debug\exr-analyzer.exe`
+[2026-06-03T03:05:56Z ERROR wgpu_hal::vulkan::instance] GENERAL [Loader Message (0x0)]
+    	loader_get_json: Failed to open JSON file C:\Program Files\Rockstar Games\Social Club\SocialClubVulkanLayer.json
+[2026-06-03T03:05:56Z ERROR wgpu_hal::vulkan::instance] 	objects: (type: INSTANCE, hndl: 0x1b0592f63b0, name: ?)
