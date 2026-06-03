@@ -4,33 +4,85 @@ use eframe::egui;
 use rfd::FileDialog;
 use std::path::PathBuf;
 
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(default)]
 pub struct ExrApp {
+    #[serde(skip)]
     loaded_file: Option<PathBuf>,
+    #[serde(skip)]
+    loaded_file_b: Option<PathBuf>,
+    #[serde(skip)]
     exr_data: Option<ExrData>,
+    #[serde(skip)]
+    exr_data_b: Option<ExrData>,
+    #[serde(skip)]
     error_msg: Option<String>,
+    #[serde(skip)]
     viewer: ExrViewer,
+    
+    recent_files: Vec<PathBuf>,
+    
+    #[serde(skip)]
+    show_help: bool,
+    #[serde(skip)]
+    show_settings: bool,
+    
+    ocio_path: String,
+    lut_path: String,
+}
+
+impl Default for ExrApp {
+    fn default() -> Self {
+        Self {
+            loaded_file: None,
+            loaded_file_b: None,
+            exr_data: None,
+            exr_data_b: None,
+            error_msg: None,
+            viewer: ExrViewer::default(),
+            recent_files: Vec::new(),
+            show_help: false,
+            show_settings: false,
+            ocio_path: String::new(),
+            lut_path: String::new(),
+        }
+    }
 }
 
 impl ExrApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        Self {
-            loaded_file: None,
-            exr_data: None,
-            error_msg: None,
-            viewer: ExrViewer::default(),
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        if let Some(storage) = cc.storage {
+            return eframe::get_value(storage, eframe::APP_KEY).unwrap_or_default();
         }
+        Self::default()
     }
 
-    fn open_file(&mut self, path: PathBuf) {
-        self.loaded_file = Some(path.clone());
+    fn open_file(&mut self, path: PathBuf, is_b: bool) {
+        if !is_b {
+            self.recent_files.retain(|p| p != &path);
+            self.recent_files.insert(0, path.clone());
+            self.recent_files.truncate(10);
+            self.loaded_file = Some(path.clone());
+        } else {
+            self.loaded_file_b = Some(path.clone());
+        }
+        
         match ExrData::load(&path) {
             Ok(data) => {
-                self.exr_data = Some(data);
+                if is_b {
+                    self.exr_data_b = Some(data);
+                } else {
+                    self.exr_data = Some(data);
+                    self.exr_data_b = None; // Reset B when A changes
+                    self.loaded_file_b = None;
+                    self.viewer = ExrViewer::default(); // Reset viewer state
+                }
                 self.error_msg = None;
-                self.viewer = ExrViewer::default(); // Reset viewer state
             }
             Err(e) => {
-                self.exr_data = None;
+                if !is_b {
+                    self.exr_data = None;
+                }
                 self.error_msg = Some(e.to_string());
             }
         }
@@ -38,7 +90,49 @@ impl ExrApp {
 }
 
 impl eframe::App for ExrApp {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, eframe::APP_KEY, self);
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if self.show_help {
+            egui::Window::new("Help & Shortcuts").open(&mut self.show_help).show(ui.ctx(), |ui| {
+                ui.heading("Keyboard Shortcuts");
+                ui.label("R / G / B / A - Isolate specific channel");
+                ui.label("C - Return to full color composite");
+                ui.label("F - Frame image to fit the window");
+                ui.label("Shift + Click - Sample pixel color and save to swatches");
+                
+                ui.add_space(10.0);
+                ui.heading("About");
+                ui.label("EXR Analyzer - A professional tool for inspecting OpenEXR files.");
+            });
+        }
+        
+        if self.show_settings {
+            egui::Window::new("Color Management").open(&mut self.show_settings).show(ui.ctx(), |ui| {
+                ui.heading("Settings");
+                ui.add_space(5.0);
+                
+                ui.label("OCIO Environment / Config Path:");
+                ui.horizontal(|ui| {
+                    ui.text_edit_singleline(&mut self.ocio_path);
+                    if ui.button("Browse").clicked() {}
+                });
+                
+                ui.add_space(10.0);
+                
+                ui.label("Custom LUT Path (.cube, .3dl):");
+                ui.horizontal(|ui| {
+                    ui.text_edit_singleline(&mut self.lut_path);
+                    if ui.button("Browse").clicked() {}
+                });
+                
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new("Note: OCIO and custom LUTs are penciled in for future GPU rendering phases and are not currently active.").italics());
+            });
+        }
+
         egui::Panel::top("top_panel").show_inside(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
@@ -47,13 +141,56 @@ impl eframe::App for ExrApp {
                             .add_filter("EXR Image", &["exr"])
                             .pick_file()
                         {
-                            self.open_file(path);
+                            self.open_file(path, false);
                         }
                         ui.close();
                     }
+                    if ui.button("Open Reference (Image B)...").clicked() {
+                        if let Some(path) = FileDialog::new()
+                            .add_filter("EXR Image", &["exr"])
+                            .pick_file()
+                        {
+                            self.open_file(path, true);
+                        }
+                        ui.close();
+                    }
+                    ui.menu_button("Open Recent", |ui| {
+                        if self.recent_files.is_empty() {
+                            ui.label("No recent files");
+                        } else {
+                            let mut clicked_path = None;
+                            for path in &self.recent_files {
+                                if ui.button(path.file_name().unwrap_or_default().to_string_lossy()).clicked() {
+                                    clicked_path = Some(path.clone());
+                                }
+                            }
+                            if let Some(path) = clicked_path {
+                                self.open_file(path, false);
+                                ui.close();
+                            }
+                        }
+                    });
                     ui.separator();
                     if ui.button("Quit").clicked() {
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+                
+                ui.menu_button("View", |ui| {
+                    ui.checkbox(&mut self.viewer.show_contact_sheet, "Contact Sheet");
+                });
+                
+                ui.menu_button("Settings", |ui| {
+                    if ui.button("Color Management...").clicked() {
+                        self.show_settings = true;
+                        ui.close();
+                    }
+                });
+                
+                ui.menu_button("Help", |ui| {
+                    if ui.button("Keyboard Shortcuts").clicked() {
+                        self.show_help = true;
+                        ui.close();
                     }
                 });
             });
@@ -230,18 +367,21 @@ impl eframe::App for ExrApp {
                             }
                         });
                         
-                        self.viewer.calculate_histogram(exr_data);
+                        self.viewer.calculate_histogram(exr_data, self.exr_data_b.as_ref());
                         
                         if let Some(bins) = &self.viewer.histogram {
                             let (rect, _resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 80.0), egui::Sense::hover());
-                            let max_val = *bins.iter().max().unwrap_or(&1) as f32;
+                            let mut max_val = *bins.iter().max().unwrap_or(&1) as f32;
+                            if let Some(bins_b) = &self.viewer.histogram_b {
+                                max_val = max_val.max(*bins_b.iter().max().unwrap_or(&1) as f32);
+                            }
                             let max_val = max_val.max(1.0);
                             
                             let mut shapes = vec![];
                             let bar_width = rect.width() / 256.0;
                             
                             for (i, &count) in bins.iter().enumerate() {
-                                let h = (count as f32 / max_val).powf(0.5) * rect.height(); // sqrt curve so small spikes are visible
+                                let h = (count as f32 / max_val).powf(0.5) * rect.height();
                                 let x = rect.min.x + i as f32 * bar_width;
                                 let y = rect.max.y - h;
                                 
@@ -251,8 +391,25 @@ impl eframe::App for ExrApp {
                                         egui::pos2(x + bar_width.max(1.0), rect.max.y)
                                     ),
                                     0.0,
-                                    egui::Color32::from_gray(180)
+                                    egui::Color32::from_white_alpha(150) // White for A
                                 ));
+                            }
+
+                            if let Some(bins_b) = &self.viewer.histogram_b {
+                                for (i, &count) in bins_b.iter().enumerate() {
+                                    let h = (count as f32 / max_val).powf(0.5) * rect.height();
+                                    let x = rect.min.x + i as f32 * bar_width;
+                                    let y = rect.max.y - h;
+                                    
+                                    shapes.push(egui::Shape::rect_filled(
+                                        egui::Rect::from_min_max(
+                                            egui::pos2(x, y),
+                                            egui::pos2(x + bar_width.max(1.0), rect.max.y)
+                                        ),
+                                        0.0,
+                                        egui::Color32::from_rgba_unmultiplied(255, 50, 50, 150) // Red for B
+                                    ));
+                                }
                             }
                             ui.painter().extend(shapes);
                         }
@@ -266,7 +423,7 @@ impl eframe::App for ExrApp {
         egui::CentralPanel::default().show_inside(ui, |ui| {
             if self.loaded_file.is_some() {
                 if let Some(data) = &self.exr_data {
-                    self.viewer.ui(ui, data);
+                    self.viewer.ui(ui, data, self.exr_data_b.as_ref());
                 }
             } else {
                 ui.centered_and_justified(|ui| {
