@@ -129,6 +129,8 @@ impl eframe::App for ExrApp {
                     ui.add_space(10.0);
                     ui.heading("About");
                     ui.label("EXR Analyzer - A professional tool for inspecting OpenEXR files.");
+                    ui.add_space(5.0);
+                    ui.hyperlink("https://github.com/byvfx/exr-analyzer");
                 });
         }
 
