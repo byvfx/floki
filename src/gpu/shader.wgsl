@@ -13,7 +13,7 @@ struct Uniforms {
     channel_mode: u32,
     is_diff_mode: u32,
     srgb: u32,
-    pad1: u32,
+    enable_lut: u32,
     pad2: u32,
     pad3: u32,
     pad4: u32,
@@ -26,6 +26,9 @@ struct Uniforms {
 @group(1) @binding(1) var samp_b: sampler;
 
 @group(2) @binding(0) var<uniform> uniforms: Uniforms;
+
+@group(3) @binding(0) var lut_tex: texture_3d<f32>;
+@group(3) @binding(1) var lut_samp: sampler;
 
 @vertex
 fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
@@ -122,6 +125,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     // sRGB
+    if uniforms.enable_lut == 1u {
+        let l_color = textureSample(lut_tex, lut_samp, clamp(vec3<f32>(r, g, b), vec3<f32>(0.0), vec3<f32>(1.0)));
+        r = l_color.r;
+        g = l_color.g;
+        b = l_color.b;
+    }
+
     if uniforms.srgb == 1u {
         r = linear_to_srgb(r);
         g = linear_to_srgb(g);
