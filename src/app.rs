@@ -270,17 +270,29 @@ impl eframe::App for ExrApp {
                     ui.separator();
                 }
 
-                if let Some(path) = &self.loaded_file {
-                    ui.label(format!(
-                        "File: {}",
-                        path.file_name().unwrap_or_default().to_string_lossy()
-                    ));
+                let mut files_to_show = vec![];
+                if let (Some(path), Some(data)) = (&self.loaded_file, &self.exr_data) {
+                    files_to_show.push(("Image A", path, data));
+                }
+                if let (Some(path), Some(data)) = (&self.loaded_file_b, &self.exr_data_b) {
+                    files_to_show.push(("Image B", path, data));
+                }
 
-                    if let Some(exr_data) = &self.exr_data {
-                        ui.separator();
-                        egui::ScrollArea::vertical().show(ui, |ui| {
+                if !files_to_show.is_empty() {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        for (idx, (label, path, exr_data)) in files_to_show.iter().enumerate() {
+                            if idx > 0 {
+                                ui.separator();
+                                ui.add_space(10.0);
+                            }
+                            ui.heading(format!(
+                                "{}: {}", label,
+                                path.file_name().unwrap_or_default().to_string_lossy()
+                            ));
+                            ui.add_space(5.0);
+
                             egui::CollapsingHeader::new("Image Metadata")
-                                .id_salt("image_metadata_header")
+                                .id_salt(format!("image_metadata_header_{}", idx))
                                 .default_open(false)
                                 .show(ui, |ui| {
                                     let attrs = &exr_data.image.attributes;
@@ -296,7 +308,7 @@ impl eframe::App for ExrApp {
                                     if !attrs.other.is_empty() {
                                         ui.add_space(5.0);
                                         egui::CollapsingHeader::new("Custom Attributes")
-                                            .id_salt("image_custom_attrs_header")
+                                            .id_salt(format!("image_custom_attrs_header_{}", idx))
                                             .default_open(false)
                                             .show(ui, |ui| {
                                                 for (name, val) in attrs.other.iter() {
@@ -339,7 +351,7 @@ impl eframe::App for ExrApp {
                                         if !layer.attributes.other.is_empty() {
                                             ui.add_space(5.0);
                                             egui::CollapsingHeader::new("Layer Attributes")
-                                                .id_salt(format!("layer_attrs_header_{}", i))
+                                                .id_salt(format!("layer_attrs_header_{}_{}", idx, i))
                                                 .default_open(false)
                                                 .show(ui, |ui| {
                                                     for (name, val) in layer.attributes.other.iter()
@@ -354,8 +366,9 @@ impl eframe::App for ExrApp {
                                     });
                                 }
                             }
-                        });
-
+                        }
+                    });
+                }
                         ui.separator();
                         ui.heading("Color Sampler");
 
