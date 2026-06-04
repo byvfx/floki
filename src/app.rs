@@ -49,6 +49,8 @@ pub struct ExrApp {
     conversion_status: String,
     #[serde(skip)]
     conversion_receiver: Option<std::sync::mpsc::Receiver<(usize, usize, String)>>,
+    #[serde(skip)]
+    conversion_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Default for ExrApp {
@@ -75,6 +77,7 @@ impl Default for ExrApp {
             conversion_progress: None,
             conversion_status: String::new(),
             conversion_receiver: None,
+            conversion_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 }
@@ -173,7 +176,7 @@ impl eframe::App for ExrApp {
                         }
                     }
                 });
-                ui.text_edit_singleline(&mut self.tools_input_dir);
+                ui.add(egui::TextEdit::singleline(&mut self.tools_input_dir).desired_width(f32::INFINITY));
 
                 ui.add_space(5.0);
                 
@@ -185,7 +188,7 @@ impl eframe::App for ExrApp {
                         }
                     }
                 });
-                ui.text_edit_singleline(&mut self.tools_output_dir);
+                ui.add(egui::TextEdit::singleline(&mut self.tools_output_dir).desired_width(f32::INFINITY));
 
                 ui.add_space(10.0);
 
@@ -195,17 +198,26 @@ impl eframe::App for ExrApp {
                         self.conversion_receiver = Some(receiver);
                         self.conversion_status = "Starting...".to_string();
                         self.conversion_progress = Some((0, 0));
+                        
+                        self.conversion_cancel.store(false, std::sync::atomic::Ordering::SeqCst);
+                        let cancel_flag = self.conversion_cancel.clone();
 
                         let in_dir = std::path::PathBuf::from(self.tools_input_dir.clone());
                         let out_dir = std::path::PathBuf::from(self.tools_output_dir.clone());
                         
                         std::thread::spawn(move || {
-                            crate::tools::run_conversion_task(in_dir, out_dir, sender);
+                            crate::tools::run_conversion_task(in_dir, out_dir, sender, cancel_flag);
                         });
                     }
                 } else {
-                    ui.add_enabled_ui(false, |ui| {
-                        let _ = ui.button("Start Conversion");
+                    ui.horizontal(|ui| {
+                        ui.add_enabled_ui(false, |ui| {
+                            let _ = ui.button("Start Conversion");
+                        });
+                        if ui.button("Cancel").clicked() {
+                            self.conversion_cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+                            self.conversion_status = "Cancelling...".to_string();
+                        }
                     });
                 }
 
