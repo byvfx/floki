@@ -245,57 +245,85 @@ impl ExrViewer {
         }
 
         if self.show_contact_sheet {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing = egui::vec2(16.0, 16.0); // Add some spacing between thumbnails
-                    for i in 0..layer_count {
-                        if self.textures[i].is_none() {
-                            self.textures[i] = self.generate_texture(ui.ctx(), exr_data, i);
-                        }
+            let draw_sheet = |viewer: &mut ExrViewer, ui: &mut egui::Ui, data: &crate::exr_loader::ExrData, is_a: bool| {
+                let l_count = data.image.layer_data.len();
+                egui::ScrollArea::vertical()
+                    .id_salt(if is_a { "sheet_a" } else { "sheet_b" })
+                    .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(16.0, 16.0);
+                        for i in 0..l_count {
+                            let tex_opt = if is_a {
+                                if viewer.textures[i].is_none() {
+                                    viewer.textures[i] = viewer.generate_texture(ui.ctx(), data, i);
+                                }
+                                viewer.textures[i].as_ref()
+                            } else {
+                                if viewer.textures_b[i].is_none() {
+                                    viewer.textures_b[i] = viewer.generate_texture(ui.ctx(), data, i);
+                                }
+                                viewer.textures_b[i].as_ref()
+                            };
 
-                        if let Some(texture) = &self.textures[i] {
-                            let thumb_width = 256.0;
-                            let thumb_height =
-                                thumb_width * (texture.size_vec2().y / texture.size_vec2().x);
+                            if let Some(texture) = tex_opt {
+                                let thumb_width = 256.0;
+                                let thumb_height = thumb_width * (texture.size_vec2().y / texture.size_vec2().x);
 
-                            // Allocate fixed width container for wrapping to work properly
-                            ui.allocate_ui(egui::vec2(thumb_width, thumb_height + 30.0), |ui| {
-                                ui.vertical(|ui| {
-                                    let name = exr_data.image.layer_data[i]
-                                        .attributes
-                                        .layer_name
-                                        .as_ref()
-                                        .map(|t| t.to_string())
-                                        .unwrap_or_else(|| "Unnamed".to_string());
-                                    // Let text wrap if it's too long
-                                    ui.label(
-                                        egui::RichText::new(format!("Layer {}: {}", i, name))
-                                            .strong(),
-                                    );
+                                ui.allocate_ui(egui::vec2(thumb_width, thumb_height + 30.0), |ui| {
+                                    ui.vertical(|ui| {
+                                        let name = data.image.layer_data[i]
+                                            .attributes
+                                            .layer_name
+                                            .as_ref()
+                                            .map(|t| t.to_string())
+                                            .unwrap_or_else(|| "Unnamed".to_string());
+                                        ui.label(egui::RichText::new(format!("Layer {}: {}", i, name)).strong());
 
-                                    // Thumbnail
-                                    let response =
-                                        ui.add(egui::Image::new(texture).fit_to_exact_size(
-                                            egui::vec2(thumb_width, thumb_height),
-                                        ));
+                                        let response = ui.add(egui::Image::new(texture).fit_to_exact_size(egui::vec2(thumb_width, thumb_height)));
 
-                                    if response.clicked() {
-                                        self.active_layer = i;
-                                        self.show_contact_sheet = false;
-                                        self.first_frame = true;
-                                    }
-                                    if response.hovered() {
-                                        response
-                                            .clone()
-                                            .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                            .on_hover_text("Click to view layer");
-                                    }
+                                        if response.clicked() {
+                                            viewer.active_layer = i;
+                                            viewer.show_contact_sheet = false;
+                                            viewer.first_frame = true;
+                                            if !is_a {
+                                                viewer.compare_mode = CompareMode::SingleB;
+                                            } else {
+                                                if viewer.compare_mode == CompareMode::SingleB {
+                                                    viewer.compare_mode = CompareMode::SingleA;
+                                                }
+                                            }
+                                        }
+                                        if response.hovered() {
+                                            response.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Click to view layer");
+                                        }
+                                    });
                                 });
-                            });
+                            }
                         }
-                    }
+                    });
                 });
-            });
+            };
+
+            if let CompareMode::SideBySide | CompareMode::Wipe | CompareMode::DiffMatte = self.compare_mode {
+                if let Some(exr_b) = exr_data_b {
+                    ui.columns(2, |cols| {
+                        cols[0].heading("Image A");
+                        draw_sheet(self, &mut cols[0], exr_data, true);
+                        cols[1].heading("Image B");
+                        draw_sheet(self, &mut cols[1], exr_b, false);
+                    });
+                } else {
+                    draw_sheet(self, ui, exr_data, true);
+                }
+            } else if self.compare_mode == CompareMode::SingleB {
+                if let Some(exr_b) = exr_data_b {
+                    draw_sheet(self, ui, exr_b, false);
+                } else {
+                    ui.label("Image B not loaded.");
+                }
+            } else {
+                draw_sheet(self, ui, exr_data, true);
+            }
         } else {
             // Handle Keyboard "F" to frame and Channel hotkeys
             ui.input(|i| {
