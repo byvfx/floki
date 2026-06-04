@@ -439,8 +439,8 @@ impl ExrViewer {
                         rect_min: [image_rect.min.x, image_rect.min.y],
                         rect_max: [image_rect.max.x, image_rect.max.y],
                         screen_size: [
-                            ui.ctx().content_rect().width(),
-                            ui.ctx().content_rect().height(),
+                            ui.ctx().screen_rect().width(),
+                            ui.ctx().screen_rect().height(),
                         ],
                         exposure: self.exposure,
                         gamma: self.gamma,
