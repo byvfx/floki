@@ -127,6 +127,11 @@ impl eframe::App for ExrApp {
                     ui.label("Shift + Click - Sample pixel color and save to swatches");
 
                     ui.add_space(10.0);
+                    ui.heading("Features");
+                    ui.label("• Dual Contact Sheets: Enable 'Contact Sheet' and use Compare Modes (A, B, A|B) to view side-by-side contact sheets.");
+                    ui.label("• Metadata Explorer: When two images are loaded, EXR Info automatically displays metadata and layers for both Image A and Image B.");
+
+                    ui.add_space(10.0);
                     ui.heading("About");
                     ui.label("EXR Analyzer - A professional tool for inspecting OpenEXR files.");
                     ui.add_space(5.0);
@@ -369,6 +374,9 @@ impl eframe::App for ExrApp {
                         }
                     });
                 }
+
+                if let Some(path) = &self.loaded_file {
+                    if let Some(exr_data) = &self.exr_data {
                         ui.separator();
                         ui.heading("Color Sampler");
 

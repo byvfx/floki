@@ -20,8 +20,8 @@ Powered by `egui`, `wgpu`, and the pure-Rust `exr` crate, it allows you to insta
 ### Deep Inspection
 * **Precision Pixel Sampling:** Hover over any pixel to reveal exact floating-point values (R, G, B, A) regardless of bit-depth (F16, F32, U32).
 * **Persistent Swatches:** `Shift + Click` on the image to drop a permanent color swatch into your toolbelt for cross-referencing.
-* **Metadata Explorer:** Cleanly displays embedded EXR attributes (like V-Ray/Arnold custom tags) and bounding box data in collapsible, organized panels.
-* **Contact Sheet Generation:** Instantly view all AOVs (Arbitrary Output Variables) and layers as a scrollable grid of thumbnails.
+* **Metadata Explorer:** Cleanly displays embedded EXR attributes (like V-Ray/Arnold custom tags), layers, and bounding box data in collapsible panels for both Image A and Image B simultaneously.
+* **Dual Contact Sheets:** Instantly view all AOVs (Arbitrary Output Variables) and layers as a scrollable grid of thumbnails. If a second image is loaded, view dual synchronized contact sheets side-by-side or seamlessly toggle between them.
 
 ### Advanced A/B Comparison
 Load a Reference Image (Image B) to unlock advanced visual diffing:
