@@ -1,7 +1,9 @@
 use exr::prelude::*;
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::Arc;
 
 pub fn run_conversion_task(
     input_dir: PathBuf,
@@ -37,28 +39,47 @@ pub fn run_conversion_task(
         return;
     }
 
-    std::fs::create_dir_all(&output_dir).unwrap_or_default();
+    if let Err(e) = std::fs::create_dir_all(&output_dir) {
+        let _ = sender.send((0, 0, format!("Failed to create output directory: {}", e)));
+        return;
+    }
 
-    // Use a multi-producer, single-consumer channel within the rayon pool to gather progress,
-    // or just let each thread send directly using the cloned sender.
-    files_to_process.into_par_iter().enumerate().for_each_with(sender, |s, (i, path)| {
-        if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
-            return;
-        }
-        let file_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-        let _ = s.send((i, total, format!("Processing: {}", file_name)));
+    // Shared monotonic counter: files convert in parallel and finish out of
+    // order, but progress must only ever move forward. Each file emits exactly
+    // one message (on completion) carrying the cumulative completed count.
+    let completed = Arc::new(AtomicUsize::new(0));
 
-        let out_path = output_dir.join(&file_name);
-        
-        match convert_exr(&path, &out_path) {
-            Ok(_) => {
-                let _ = s.send((i + 1, total, format!("Finished: {}", file_name)));
+    files_to_process
+        .into_par_iter()
+        .for_each_with(sender.clone(), |s, path| {
+            if cancel_flag.load(Ordering::Relaxed) {
+                return;
             }
-            Err(e) => {
-                let _ = s.send((i + 1, total, format!("Error on {}: {}", file_name, e)));
-            }
-        }
-    });
+            let file_name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            let out_path = output_dir.join(&file_name);
+
+            let msg = match convert_exr(&path, &out_path) {
+                Ok(_) => format!("Converted: {}", file_name),
+                Err(e) => format!("Error on {}: {}", file_name, e),
+            };
+            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+            let _ = s.send((done, total, msg));
+        });
+
+    // Terminal message, then `sender` drops and the channel disconnects — the UI
+    // uses that disconnect to detect completion (also covers cancellation).
+    let done = completed.load(Ordering::Relaxed);
+    let cancelled = cancel_flag.load(Ordering::Relaxed);
+    let (count, final_msg) = if cancelled {
+        (done, format!("Cancelled — {}/{} files processed", done, total))
+    } else {
+        (total, format!("Complete — {} file(s) converted", done))
+    };
+    let _ = sender.send((count, total, final_msg));
 }
 
 fn convert_exr(in_path: &Path, out_path: &Path) -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -66,7 +87,9 @@ fn convert_exr(in_path: &Path, out_path: &Path) -> std::result::Result<(), Box<d
     use std::fs::File;
     use exr::block::writer::ChunksWriter;
 
-    let file = BufReader::new(File::open(in_path)?);
+    // 1 MiB buffers: EXR chunks are large, so the default 8 KiB buffer turns a
+    // sequential copy into many syscalls. Bigger buffers cut that dramatically.
+    let file = BufReader::with_capacity(1 << 20, File::open(in_path)?);
     let reader = exr::block::read(file, false)?;
     let mut meta = reader.meta_data().clone();
 
@@ -110,8 +133,8 @@ fn convert_exr(in_path: &Path, out_path: &Path) -> std::result::Result<(), Box<d
         block_indices.push(map);
     }
 
-    let out_file = BufWriter::new(File::create(out_path)?);
-    exr::block::writer::write_chunks_with(out_file, meta.headers.clone(), false, |_, mut chunk_writer| {
+    let out_file = BufWriter::with_capacity(1 << 20, File::create(out_path)?);
+    exr::block::writer::write_chunks_with(out_file, meta.headers.clone(), false, |_, chunk_writer| {
         let chunks_reader = reader.all_chunks(false)?;
         for chunk_result in chunks_reader {
             let chunk = chunk_result?;

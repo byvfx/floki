@@ -222,23 +222,47 @@ impl eframe::App for ExrApp {
                 }
 
                 if let Some(rx) = &self.conversion_receiver {
-                    while let Ok((done, total, msg)) = rx.try_recv() {
-                        self.conversion_status = msg;
-                        self.conversion_progress = Some((done, total));
+                    let mut finished = false;
+                    loop {
+                        match rx.try_recv() {
+                            Ok((done, total, msg)) => {
+                                self.conversion_status = msg;
+                                self.conversion_progress = Some((done, total));
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                // Worker thread exited (completed or cancelled).
+                                finished = true;
+                                break;
+                            }
+                        }
                     }
-                    
+
                     if let Some((done, total)) = self.conversion_progress {
                         if total > 0 {
-                            ui.add(egui::ProgressBar::new(done as f32 / total as f32).text(format!("{}/{}", done, total)));
-                        }
-                        if done == total && total > 0 {
-                            self.conversion_receiver = None; // Finished
+                            let frac = (done as f32 / total as f32).clamp(0.0, 1.0);
+                            ui.add(
+                                egui::ProgressBar::new(frac)
+                                    .text(format!("{}/{}", done, total)),
+                            );
                         }
                     }
                     ui.label(&self.conversion_status);
-                } else if self.conversion_progress.map(|(d, t)| d == t && t > 0).unwrap_or(false) {
-                     ui.add(egui::ProgressBar::new(1.0).text("Finished"));
-                     ui.label("Conversion Complete!");
+
+                    if finished {
+                        self.conversion_receiver = None;
+                    } else {
+                        // egui is reactive: without this the progress bar would
+                        // freeze until the next input event. Poll ~20x/sec.
+                        ui.ctx()
+                            .request_repaint_after(std::time::Duration::from_millis(50));
+                    }
+                } else if let Some((done, total)) = self.conversion_progress {
+                    if total > 0 {
+                        let frac = (done as f32 / total as f32).clamp(0.0, 1.0);
+                        ui.add(egui::ProgressBar::new(frac).text(format!("{}/{}", done, total)));
+                        ui.label(&self.conversion_status);
+                    }
                 }
             });
         }
