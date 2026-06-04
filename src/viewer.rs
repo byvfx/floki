@@ -847,7 +847,7 @@ impl ExrViewer {
                         && image_local_pos.y >= 0.0
                     {
                         let val_a_opt = self.sample_pixel(exr_data, self.active_layer, x, y);
-                        let val_b_opt = if let Some(exr_b) = &self.exr_data_b {
+                        let val_b_opt = if let Some(exr_b) = exr_data_b {
                             self.sample_pixel(exr_b, self.active_layer, x, y)
                         } else {
                             None
