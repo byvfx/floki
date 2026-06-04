@@ -533,9 +533,9 @@ impl eframe::App for ExrApp {
                                             }
 
                                             if self.viewer.srgb {
-                                                disp_r = self.viewer.linear_to_srgb(disp_r);
-                                                disp_g = self.viewer.linear_to_srgb(disp_g);
-                                                disp_b = self.viewer.linear_to_srgb(disp_b);
+                                                disp_r = crate::viewer::ExrViewer::linear_to_srgb(disp_r);
+                                                disp_g = crate::viewer::ExrViewer::linear_to_srgb(disp_g);
+                                                disp_b = crate::viewer::ExrViewer::linear_to_srgb(disp_b);
                                             }
 
                                             let r_u8 = (disp_r.clamp(0.0, 1.0) * 255.0) as u8;

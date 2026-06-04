@@ -1,5 +1,6 @@
 use crate::exr_loader::ExrData;
 use eframe::egui;
+use rayon::prelude::*;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ChannelMode {
@@ -488,80 +489,6 @@ impl ExrViewer {
                         pad4: 0,
                     };
 
-                    let default_lut = render_state
-                        .as_ref()
-                        .unwrap()
-                        .renderer
-                        .read()
-                        .callback_resources
-                        .get::<crate::gpu::GpuState>()
-                        .unwrap()
-                        .default_lut_bind_group
-                        .clone();
-                    let active_lut_bg = lut_bg_opt.clone().unwrap_or(default_lut);
-                    let _draw_gpu = |painter: &egui::Painter,
-                                     bg_a: std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>,
-                                     bg_b_opt: Option<
-                        std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>,
-                    >,
-                                     clip_rect: egui::Rect,
-                                     target_rect: egui::Rect,
-                                     is_diff: bool| {
-                        let mut u = uniform_data.clone();
-                        u.rect_min = [target_rect.min.x, target_rect.min.y];
-                        u.rect_max = [target_rect.max.x, target_rect.max.y];
-                        u.is_diff_mode = if is_diff { 1 } else { 0 };
-
-                        let device = &render_state.as_ref().unwrap().device;
-                        let renderer_guard = render_state.as_ref().unwrap().renderer.read();
-                        let gpu_state = renderer_guard
-                            .callback_resources
-                            .get::<crate::gpu::GpuState>()
-                            .unwrap();
-
-                        let uniform_buffer = device.create_buffer_init(
-                            &eframe::egui_wgpu::wgpu::util::BufferInitDescriptor {
-                                label: Some("Exr Uniform Buffer"),
-                                contents: bytemuck::bytes_of(&u),
-                                usage: eframe::egui_wgpu::wgpu::BufferUsages::UNIFORM
-                                    | eframe::egui_wgpu::wgpu::BufferUsages::COPY_DST,
-                            },
-                        );
-
-                        let uniform_bg = device.create_bind_group(
-                            &eframe::egui_wgpu::wgpu::BindGroupDescriptor {
-                                label: Some("Exr Uniform Bind Group"),
-                                layout: &gpu_state.bind_group_layout_uniform,
-                                entries: &[eframe::egui_wgpu::wgpu::BindGroupEntry {
-                                    binding: 0,
-                                    resource: uniform_buffer.as_entire_binding(),
-                                }],
-                            },
-                        );
-
-                        // We must clone the underlying wgpu::BindGroup or return a reference to it.
-                        // wait, our default_tex_bind_group is wgpu::BindGroup, not Arc.
-                        // So we can't easily pass it to Arc without creating one, but gpu_state is &GpuState.
-                        // Actually, ExrCallback needs an Arc? Wait! ExrCallback in egui_wgpu only lives for the frame.
-                        // It can just hold Arc<BindGroup>. But `default_tex_bind_group` is just `wgpu::BindGroup`.
-                        // We will need to change default_tex_bind_group to Arc<wgpu::BindGroup> in GpuState!
-
-                        let bg_b =
-                            bg_b_opt.unwrap_or_else(|| gpu_state.default_tex_bind_group.clone());
-
-                        let callback = crate::gpu::ExrCallback {
-                            bg_a,
-                            bg_b,
-                            uniform_bg,
-                            lut_bg: active_lut_bg.clone(),
-                        };
-
-                        painter.with_clip_rect(clip_rect).add(
-                            eframe::egui_wgpu::Callback::new_paint_callback(clip_rect, callback),
-                        );
-
-                        // Let's just pass `std::sync::Arc::new(callback)`
-                    };
                     let default_lut = render_state
                         .as_ref()
                         .unwrap()
@@ -1068,78 +995,86 @@ impl ExrViewer {
             }
         };
 
+        // Hoist all loop-invariant scalars out of the per-pixel work.
         let exp_mult = 2.0_f32.powf(self.exposure);
+        let inv_gamma = 1.0 / self.gamma;
+        let apply_gamma = self.gamma != 1.0;
+        let apply_srgb = self.srgb;
+        let channel_mode = self.channel_mode;
 
-        for y in 0..height {
-            for x in 0..width {
-                let mut r = get_val(r_chan, x, y);
-                let mut g = get_val(g_chan, x, y);
-                let mut b = get_val(b_chan, x, y);
-                let mut a = get_val(a_chan, x, y);
+        // Process rows in parallel; each row is an independent, contiguous slice.
+        pixels
+            .par_chunks_mut(width)
+            .enumerate()
+            .for_each(|(y, row)| {
+                for x in 0..width {
+                    let mut r = get_val(r_chan, x, y);
+                    let mut g = get_val(g_chan, x, y);
+                    let mut b = get_val(b_chan, x, y);
+                    let mut a = get_val(a_chan, x, y);
 
-                if a_chan.is_none() {
-                    a = 1.0;
-                }
-
-                match self.channel_mode {
-                    ChannelMode::R => {
-                        g = r;
-                        b = r;
+                    if a_chan.is_none() {
                         a = 1.0;
                     }
-                    ChannelMode::G => {
-                        r = g;
-                        b = g;
-                        a = 1.0;
+
+                    match channel_mode {
+                        ChannelMode::R => {
+                            g = r;
+                            b = r;
+                            a = 1.0;
+                        }
+                        ChannelMode::G => {
+                            r = g;
+                            b = g;
+                            a = 1.0;
+                        }
+                        ChannelMode::B => {
+                            r = b;
+                            g = b;
+                            a = 1.0;
+                        }
+                        ChannelMode::A => {
+                            r = a;
+                            g = a;
+                            b = a;
+                            a = 1.0;
+                        }
+                        ChannelMode::RGB => {}
                     }
-                    ChannelMode::B => {
-                        r = b;
-                        g = b;
-                        a = 1.0;
+
+                    let is_dark = ((x / 16) + (y / 16)) % 2 == 0;
+                    let bg_linear = if is_dark { 0.1 } else { 0.2 };
+
+                    // Apply exposure
+                    r *= exp_mult;
+                    g *= exp_mult;
+                    b *= exp_mult;
+
+                    // Composite over checkerboard (assuming EXR is pre-multiplied)
+                    let a_clamp = a.clamp(0.0, 1.0);
+                    r = r + bg_linear * (1.0 - a_clamp);
+                    g = g + bg_linear * (1.0 - a_clamp);
+                    b = b + bg_linear * (1.0 - a_clamp);
+
+                    if apply_gamma {
+                        r = if r > 0.0 { r.powf(inv_gamma) } else { 0.0 };
+                        g = if g > 0.0 { g.powf(inv_gamma) } else { 0.0 };
+                        b = if b > 0.0 { b.powf(inv_gamma) } else { 0.0 };
                     }
-                    ChannelMode::A => {
-                        r = a;
-                        g = a;
-                        b = a;
-                        a = 1.0;
+
+                    if apply_srgb {
+                        r = Self::linear_to_srgb(r);
+                        g = Self::linear_to_srgb(g);
+                        b = Self::linear_to_srgb(b);
                     }
-                    ChannelMode::RGB => {}
+
+                    let r_u8 = (r.clamp(0.0, 1.0) * 255.0) as u8;
+                    let g_u8 = (g.clamp(0.0, 1.0) * 255.0) as u8;
+                    let b_u8 = (b.clamp(0.0, 1.0) * 255.0) as u8;
+
+                    row[x] = egui::Color32::from_rgb(r_u8, g_u8, b_u8);
                 }
-
-                let is_dark = ((x / 16) + (y / 16)) % 2 == 0;
-                let bg_linear = if is_dark { 0.1 } else { 0.2 };
-
-                // Apply exposure
-                r *= exp_mult;
-                g *= exp_mult;
-                b *= exp_mult;
-
-                // Composite over checkerboard (assuming EXR is pre-multiplied)
-                let a_clamp = a.clamp(0.0, 1.0);
-                r = r + bg_linear * (1.0 - a_clamp);
-                g = g + bg_linear * (1.0 - a_clamp);
-                b = b + bg_linear * (1.0 - a_clamp);
-
-                if self.gamma != 1.0 {
-                    let inv_gamma = 1.0 / self.gamma;
-                    r = if r > 0.0 { r.powf(inv_gamma) } else { 0.0 };
-                    g = if g > 0.0 { g.powf(inv_gamma) } else { 0.0 };
-                    b = if b > 0.0 { b.powf(inv_gamma) } else { 0.0 };
-                }
-
-                if self.srgb {
-                    r = self.linear_to_srgb(r);
-                    g = self.linear_to_srgb(g);
-                    b = self.linear_to_srgb(b);
-                }
-
-                let r_u8 = (r.clamp(0.0, 1.0) * 255.0) as u8;
-                let g_u8 = (g.clamp(0.0, 1.0) * 255.0) as u8;
-                let b_u8 = (b.clamp(0.0, 1.0) * 255.0) as u8;
-
-                pixels[y * width + x] = egui::Color32::from_rgb(r_u8, g_u8, b_u8);
-            }
-        }
+            });
 
         let color_image = egui::ColorImage {
             size: [width, height],
@@ -1190,59 +1125,57 @@ impl ExrViewer {
             }
         };
 
-        for y in 0..height {
-            for x in 0..width {
-                let r_a = get_val(r_chan_a, x, y, layer_a.size.0, layer_a.size.1);
-                let g_a = get_val(g_chan_a, x, y, layer_a.size.0, layer_a.size.1);
-                let b_a = get_val(b_chan_a, x, y, layer_a.size.0, layer_a.size.1);
+        // Hoist all loop-invariant scalars out of the per-pixel work.
+        let exp_mult = 2.0_f32.powf(self.exposure);
+        let inv_gamma = 1.0 / self.gamma;
+        let apply_gamma = self.gamma != 1.0;
+        let apply_srgb = self.srgb;
+        let diff_multiplier = self.diff_multiplier;
+        let (aw, ah) = (layer_a.size.0, layer_a.size.1);
+        let (bw, bh) = (layer_b.size.0, layer_b.size.1);
 
-                let r_b = get_val(r_chan_b, x, y, layer_b.size.0, layer_b.size.1);
-                let g_b = get_val(g_chan_b, x, y, layer_b.size.0, layer_b.size.1);
-                let b_b = get_val(b_chan_b, x, y, layer_b.size.0, layer_b.size.1);
+        pixels
+            .par_chunks_mut(width)
+            .enumerate()
+            .for_each(|(y, row)| {
+                for x in 0..width {
+                    let r_a = get_val(r_chan_a, x, y, aw, ah);
+                    let g_a = get_val(g_chan_a, x, y, aw, ah);
+                    let b_a = get_val(b_chan_a, x, y, aw, ah);
 
-                // Difference calculation
-                let mut diff_r = (r_a - r_b).abs() * self.diff_multiplier;
-                let mut diff_g = (g_a - g_b).abs() * self.diff_multiplier;
-                let mut diff_b = (b_a - b_b).abs() * self.diff_multiplier;
+                    let r_b = get_val(r_chan_b, x, y, bw, bh);
+                    let g_b = get_val(g_chan_b, x, y, bw, bh);
+                    let b_b = get_val(b_chan_b, x, y, bw, bh);
 
-                // Tone mapping logic for the diff to be visible
-                let exp_mult = 2.0_f32.powf(self.exposure);
-                diff_r *= exp_mult;
-                diff_g *= exp_mult;
-                diff_b *= exp_mult;
+                    // Difference calculation
+                    let mut diff_r = (r_a - r_b).abs() * diff_multiplier;
+                    let mut diff_g = (g_a - g_b).abs() * diff_multiplier;
+                    let mut diff_b = (b_a - b_b).abs() * diff_multiplier;
 
-                if self.gamma != 1.0 {
-                    let inv_gamma = 1.0 / self.gamma;
-                    diff_r = if diff_r > 0.0 {
-                        diff_r.powf(inv_gamma)
-                    } else {
-                        0.0
-                    };
-                    diff_g = if diff_g > 0.0 {
-                        diff_g.powf(inv_gamma)
-                    } else {
-                        0.0
-                    };
-                    diff_b = if diff_b > 0.0 {
-                        diff_b.powf(inv_gamma)
-                    } else {
-                        0.0
-                    };
+                    // Tone mapping logic for the diff to be visible
+                    diff_r *= exp_mult;
+                    diff_g *= exp_mult;
+                    diff_b *= exp_mult;
+
+                    if apply_gamma {
+                        diff_r = if diff_r > 0.0 { diff_r.powf(inv_gamma) } else { 0.0 };
+                        diff_g = if diff_g > 0.0 { diff_g.powf(inv_gamma) } else { 0.0 };
+                        diff_b = if diff_b > 0.0 { diff_b.powf(inv_gamma) } else { 0.0 };
+                    }
+
+                    if apply_srgb {
+                        diff_r = Self::linear_to_srgb(diff_r);
+                        diff_g = Self::linear_to_srgb(diff_g);
+                        diff_b = Self::linear_to_srgb(diff_b);
+                    }
+
+                    let r_u8 = (diff_r.clamp(0.0, 1.0) * 255.0) as u8;
+                    let g_u8 = (diff_g.clamp(0.0, 1.0) * 255.0) as u8;
+                    let b_u8 = (diff_b.clamp(0.0, 1.0) * 255.0) as u8;
+
+                    row[x] = egui::Color32::from_rgb(r_u8, g_u8, b_u8);
                 }
-
-                if self.srgb {
-                    diff_r = self.linear_to_srgb(diff_r);
-                    diff_g = self.linear_to_srgb(diff_g);
-                    diff_b = self.linear_to_srgb(diff_b);
-                }
-
-                let r_u8 = (diff_r.clamp(0.0, 1.0) * 255.0) as u8;
-                let g_u8 = (diff_g.clamp(0.0, 1.0) * 255.0) as u8;
-                let b_u8 = (diff_b.clamp(0.0, 1.0) * 255.0) as u8;
-
-                pixels[y * width + x] = egui::Color32::from_rgb(r_u8, g_u8, b_u8);
-            }
-        }
+            });
 
         let color_image = egui::ColorImage {
             size: [width, height],
@@ -1312,27 +1245,17 @@ impl ExrViewer {
         let mut a_chan = None;
 
         for c in &layer.channel_data.list {
+            // The channel name may be qualified (e.g. "diffuse.R"); match the
+            // last dotted component, case-insensitively, without extra allocations.
             let n = c.name.to_string();
-            let upper = n.to_uppercase();
-            if upper == "R" || upper == "RED" || upper.ends_with(".R") || upper.ends_with(".RED") {
+            let suffix = n.rsplit('.').next().unwrap_or(n.as_str());
+            if suffix.eq_ignore_ascii_case("R") || suffix.eq_ignore_ascii_case("RED") {
                 r_chan = Some(c);
-            } else if upper == "G"
-                || upper == "GREEN"
-                || upper.ends_with(".G")
-                || upper.ends_with(".GREEN")
-            {
+            } else if suffix.eq_ignore_ascii_case("G") || suffix.eq_ignore_ascii_case("GREEN") {
                 g_chan = Some(c);
-            } else if upper == "B"
-                || upper == "BLUE"
-                || upper.ends_with(".B")
-                || upper.ends_with(".BLUE")
-            {
+            } else if suffix.eq_ignore_ascii_case("B") || suffix.eq_ignore_ascii_case("BLUE") {
                 b_chan = Some(c);
-            } else if upper == "A"
-                || upper == "ALPHA"
-                || upper.ends_with(".A")
-                || upper.ends_with(".ALPHA")
-            {
+            } else if suffix.eq_ignore_ascii_case("A") || suffix.eq_ignore_ascii_case("ALPHA") {
                 a_chan = Some(c);
             }
         }
@@ -1349,7 +1272,7 @@ impl ExrViewer {
         (r_chan, g_chan, b_chan, a_chan)
     }
 
-    pub fn linear_to_srgb(&self, l: f32) -> f32 {
+    pub fn linear_to_srgb(l: f32) -> f32 {
         if l <= 0.0031308 {
             l * 12.92
         } else {
