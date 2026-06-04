@@ -28,6 +28,7 @@ pub fn run_conversion_task(
             }
         }
         Err(e) => {
+            log::error!("Failed to read input directory {:?}: {}", input_dir, e);
             let _ = sender.send((0, 0, format!("Failed to read directory: {}", e)));
             return;
         }
@@ -35,14 +36,23 @@ pub fn run_conversion_task(
 
     let total = files_to_process.len();
     if total == 0 {
+        log::warn!("No EXR files found in {:?}", input_dir);
         let _ = sender.send((0, 0, "No EXR files found in directory.".to_string()));
         return;
     }
 
     if let Err(e) = std::fs::create_dir_all(&output_dir) {
+        log::error!("Failed to create output directory {:?}: {}", output_dir, e);
         let _ = sender.send((0, 0, format!("Failed to create output directory: {}", e)));
         return;
     }
+
+    log::info!(
+        "EXR convert: {} file(s) from {:?} -> {:?}",
+        total,
+        input_dir,
+        output_dir
+    );
 
     // Shared monotonic counter: files convert in parallel and finish out of
     // order, but progress must only ever move forward. Each file emits exactly
@@ -64,9 +74,13 @@ pub fn run_conversion_task(
             let out_path = output_dir.join(&file_name);
 
             let msg = match convert_exr(&path, &out_path) {
-                Ok(_) => format!("Converted: {}", file_name),
+                Ok(_) => {
+                    log::debug!("converted {}", file_name);
+                    format!("Converted: {}", file_name)
+                }
                 Err(e) => {
                     errors.fetch_add(1, Ordering::Relaxed);
+                    log::error!("convert failed for {}: {}", file_name, e);
                     format!("Error on {}: {}", file_name, e)
                 }
             };
@@ -89,6 +103,7 @@ pub fn run_conversion_task(
     if failed > 0 {
         final_msg.push_str(&format!(" ({} failed)", failed));
     }
+    log::info!("EXR convert finished: {}", final_msg);
     let count = if cancelled { done } else { total };
     let _ = sender.send((count, total, final_msg));
 }
@@ -161,6 +176,12 @@ fn convert_exr(in_path: &Path, out_path: &Path) -> std::result::Result<(), Box<d
             for (channel, new_name) in layer.channels.list.iter_mut().zip(proposed.iter()) {
                 channel.name = Text::from(new_name.as_str());
             }
+        } else {
+            log::debug!(
+                "{:?}: layer {} left unchanged (renaming would reorder channels)",
+                in_path,
+                layer_idx
+            );
         }
     }
 
