@@ -202,8 +202,8 @@ impl eframe::App for ExrApp {
                         self.conversion_cancel.store(false, std::sync::atomic::Ordering::SeqCst);
                         let cancel_flag = self.conversion_cancel.clone();
 
-                        let in_dir = std::path::PathBuf::from(self.tools_input_dir.clone());
-                        let out_dir = std::path::PathBuf::from(self.tools_output_dir.clone());
+                        let in_dir = std::path::PathBuf::from(self.tools_input_dir.trim().trim_matches(|c| c == '"' || c == '\''));
+                        let out_dir = std::path::PathBuf::from(self.tools_output_dir.trim().trim_matches(|c| c == '"' || c == '\''));
                         
                         std::thread::spawn(move || {
                             crate::tools::run_conversion_task(in_dir, out_dir, sender, cancel_flag);

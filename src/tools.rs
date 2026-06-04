@@ -12,22 +12,28 @@ pub fn run_conversion_task(
     let mut files_to_process = Vec::new();
     
     // Read all .exr files in the input directory
-    if let Ok(entries) = std::fs::read_dir(&input_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_file() {
-                if let Some(ext) = path.extension() {
-                    if ext.to_ascii_lowercase() == "exr" {
-                        files_to_process.push(path);
+    match std::fs::read_dir(&input_dir) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    if let Some(ext) = path.extension() {
+                        if ext.to_ascii_lowercase() == "exr" {
+                            files_to_process.push(path);
+                        }
                     }
                 }
             }
+        }
+        Err(e) => {
+            let _ = sender.send((0, 0, format!("Failed to read directory: {}", e)));
+            return;
         }
     }
 
     let total = files_to_process.len();
     if total == 0 {
-        let _ = sender.send((0, 0, "No EXR files found.".to_string()));
+        let _ = sender.send((0, 0, "No EXR files found in directory.".to_string()));
         return;
     }
 
