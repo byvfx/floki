@@ -36,6 +36,19 @@ pub struct ExrApp {
     #[serde(skip)]
     pub lut_bg: Option<std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>>,
     pub lut_error: Option<String>,
+
+    #[serde(skip)]
+    show_tools_window: bool,
+    #[serde(skip)]
+    tools_input_dir: String,
+    #[serde(skip)]
+    tools_output_dir: String,
+    #[serde(skip)]
+    conversion_progress: Option<(usize, usize)>,
+    #[serde(skip)]
+    conversion_status: String,
+    #[serde(skip)]
+    conversion_receiver: Option<std::sync::mpsc::Receiver<(usize, usize, String)>>,
 }
 
 impl Default for ExrApp {
@@ -56,6 +69,12 @@ impl Default for ExrApp {
             enable_lut: false,
             lut_bg: None,
             lut_error: None,
+            show_tools_window: false,
+            tools_input_dir: String::new(),
+            tools_output_dir: String::new(),
+            conversion_progress: None,
+            conversion_status: String::new(),
+            conversion_receiver: None,
         }
     }
 }
@@ -137,6 +156,79 @@ impl eframe::App for ExrApp {
                     ui.add_space(5.0);
                     ui.hyperlink("https://github.com/byvfx/exr-analyzer");
                 });
+        }
+
+        if self.show_tools_window {
+            egui::Window::new("EXR Header Converter").open(&mut self.show_tools_window).show(ui.ctx(), |ui| {
+                ui.heading("Batch Convert EXR Headers");
+                ui.label("This tool processes all EXR files in a directory and renames their channels to standard RGBA format.");
+                ui.add_space(10.0);
+
+                ui.horizontal(|ui| {
+                    ui.label("Input Directory:");
+                    if ui.button("Browse...").clicked() {
+                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                            self.tools_input_dir = path.to_string_lossy().to_string();
+                            self.tools_output_dir = path.join("converted").to_string_lossy().to_string();
+                        }
+                    }
+                });
+                ui.text_edit_singleline(&mut self.tools_input_dir);
+
+                ui.add_space(5.0);
+                
+                ui.horizontal(|ui| {
+                    ui.label("Output Directory:");
+                    if ui.button("Browse...").clicked() {
+                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                            self.tools_output_dir = path.to_string_lossy().to_string();
+                        }
+                    }
+                });
+                ui.text_edit_singleline(&mut self.tools_output_dir);
+
+                ui.add_space(10.0);
+
+                if self.conversion_receiver.is_none() {
+                    if ui.button("Start Conversion").clicked() && !self.tools_input_dir.is_empty() && !self.tools_output_dir.is_empty() {
+                        let (sender, receiver) = std::sync::mpsc::channel();
+                        self.conversion_receiver = Some(receiver);
+                        self.conversion_status = "Starting...".to_string();
+                        self.conversion_progress = Some((0, 0));
+
+                        let in_dir = std::path::PathBuf::from(self.tools_input_dir.clone());
+                        let out_dir = std::path::PathBuf::from(self.tools_output_dir.clone());
+                        
+                        std::thread::spawn(move || {
+                            crate::tools::run_conversion_task(in_dir, out_dir, sender);
+                        });
+                    }
+                } else {
+                    ui.add_enabled_ui(false, |ui| {
+                        let _ = ui.button("Start Conversion");
+                    });
+                }
+
+                if let Some(rx) = &self.conversion_receiver {
+                    while let Ok((done, total, msg)) = rx.try_recv() {
+                        self.conversion_status = msg;
+                        self.conversion_progress = Some((done, total));
+                    }
+                    
+                    if let Some((done, total)) = self.conversion_progress {
+                        if total > 0 {
+                            ui.add(egui::ProgressBar::new(done as f32 / total as f32).text(format!("{}/{}", done, total)));
+                        }
+                        if done == total && total > 0 {
+                            self.conversion_receiver = None; // Finished
+                        }
+                    }
+                    ui.label(&self.conversion_status);
+                } else if self.conversion_progress.map(|(d, t)| d == t && t > 0).unwrap_or(false) {
+                     ui.add(egui::ProgressBar::new(1.0).text("Finished"));
+                     ui.label("Conversion Complete!");
+                }
+            });
         }
 
         if self.show_settings {
@@ -251,6 +343,13 @@ impl eframe::App for ExrApp {
                 ui.menu_button("Settings", |ui| {
                     if ui.button("Color Management...").clicked() {
                         self.show_settings = true;
+                        ui.close();
+                    }
+                });
+
+                ui.menu_button("Tools", |ui| {
+                    if ui.button("EXR Header Converter").clicked() {
+                        self.show_tools_window = true;
                         ui.close();
                     }
                 });
@@ -375,7 +474,7 @@ impl eframe::App for ExrApp {
                     });
                 }
 
-                if let Some(path) = &self.loaded_file {
+                if let Some(_path) = &self.loaded_file {
                     if let Some(exr_data) = &self.exr_data {
                         ui.separator();
                         ui.heading("Color Sampler");

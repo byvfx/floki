@@ -2,6 +2,7 @@ mod app;
 mod color;
 mod exr_loader;
 mod gpu;
+mod tools;
 mod viewer;
 
 use eframe::egui;

@@ -14,3 +14,4 @@ log = "0.4.30"
 rfd = "0.17.2"
 smallvec = "1.15.1"
 bytemuck = { version = "1.16", features = ["derive"] }
+rayon = "1.12.0"
