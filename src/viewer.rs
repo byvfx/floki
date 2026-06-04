@@ -846,22 +846,50 @@ impl ExrViewer {
                         && image_local_pos.x >= 0.0
                         && image_local_pos.y >= 0.0
                     {
-                        if let Some(val) = self.sample_pixel(exr_data, self.active_layer, x, y) {
+                        let val_a_opt = self.sample_pixel(exr_data, self.active_layer, x, y);
+                        let val_b_opt = if let Some(exr_b) = &self.exr_data_b {
+                            self.sample_pixel(exr_b, self.active_layer, x, y)
+                        } else {
+                            None
+                        };
+
+                        if val_a_opt.is_some() || val_b_opt.is_some() {
                             egui::Window::new("Pixel Tooltip")
                                 .fixed_pos(pos + egui::vec2(15.0, 15.0))
                                 .title_bar(false)
                                 .resizable(false)
                                 .collapsible(false)
                                 .show(ui.ctx(), |ui| {
-                                    ui.label(format!(
-                                        "x: {}, y: {}\nVal: {:.4}, {:.4}, {:.4}, {:.4}",
-                                        x, y, val[0], val[1], val[2], val[3]
-                                    ));
+                                    ui.label(format!("x: {}, y: {}", x, y));
+                                    
+                                    if let Some(val_a) = val_a_opt {
+                                        if val_b_opt.is_some() {
+                                            ui.label(format!("A: {:.4}, {:.4}, {:.4}, {:.4}", val_a[0], val_a[1], val_a[2], val_a[3]));
+                                        } else {
+                                            ui.label(format!("Val: {:.4}, {:.4}, {:.4}, {:.4}", val_a[0], val_a[1], val_a[2], val_a[3]));
+                                        }
+                                    }
+                                    
+                                    if let Some(val_b) = val_b_opt {
+                                        ui.label(format!("B: {:.4}, {:.4}, {:.4}, {:.4}", val_b[0], val_b[1], val_b[2], val_b[3]));
+                                    }
+                                    
+                                    if let (Some(val_a), Some(val_b)) = (val_a_opt, val_b_opt) {
+                                        ui.label(format!(
+                                            "Diff: {:.4}, {:.4}, {:.4}, {:.4}",
+                                            (val_b[0] - val_a[0]).abs(),
+                                            (val_b[1] - val_a[1]).abs(),
+                                            (val_b[2] - val_a[2]).abs(),
+                                            (val_b[3] - val_a[3]).abs()
+                                        ));
+                                    }
                                 });
 
                             // Shift+Click to add a persistent swatch
                             if ui.input(|i| i.modifiers.shift) && response.clicked() {
-                                self.swatches.push(val);
+                                if let Some(v) = val_a_opt.or(val_b_opt) {
+                                    self.swatches.push(v);
+                                }
                             }
                         }
                     }
