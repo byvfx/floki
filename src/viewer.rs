@@ -624,14 +624,11 @@ impl ExrViewer {
                             CompareMode::Wipe => {
                                 let wipe_x =
                                     image_rect.min.x + image_rect.width() * self.wipe_position;
-                                let rect_a = egui::Rect::from_min_max(
-                                    rect.min,
-                                    egui::pos2(wipe_x, rect.max.y),
-                                );
-                                let rect_b = egui::Rect::from_min_max(
-                                    egui::pos2(wipe_x, rect.min.y),
-                                    rect.max,
-                                );
+                                let clamped_wipe_x = wipe_x.clamp(rect.min.x, rect.max.x);
+                                let mut rect_a = rect;
+                                rect_a.max.x = clamped_wipe_x;
+                                let mut rect_b = rect;
+                                rect_b.min.x = clamped_wipe_x;
 
                                 draw_gpu(&painter, bg_a.clone(), None, rect_a, image_rect, false);
                                 if let Some(bg_b) = exr_data_b.and_then(|d| {
@@ -755,10 +752,11 @@ impl ExrViewer {
                         }
                         CompareMode::Wipe => {
                             let wipe_x = image_rect.min.x + image_rect.width() * self.wipe_position;
-                            let rect_a =
-                                egui::Rect::from_min_max(rect.min, egui::pos2(wipe_x, rect.max.y));
-                            let rect_b =
-                                egui::Rect::from_min_max(egui::pos2(wipe_x, rect.min.y), rect.max);
+                            let clamped_wipe_x = wipe_x.clamp(rect.min.x, rect.max.x);
+                            let mut rect_a = rect;
+                            rect_a.max.x = clamped_wipe_x;
+                            let mut rect_b = rect;
+                            rect_b.min.x = clamped_wipe_x;
 
                             draw_image(&painter, texture.as_ref().unwrap(), rect_a, image_rect);
                             if let Some(tex_b) = exr_data_b.and_then(|d| {
