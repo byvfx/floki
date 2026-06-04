@@ -48,6 +48,7 @@ pub fn run_conversion_task(
     // order, but progress must only ever move forward. Each file emits exactly
     // one message (on completion) carrying the cumulative completed count.
     let completed = Arc::new(AtomicUsize::new(0));
+    let errors = Arc::new(AtomicUsize::new(0));
 
     files_to_process
         .into_par_iter()
@@ -64,7 +65,10 @@ pub fn run_conversion_task(
 
             let msg = match convert_exr(&path, &out_path) {
                 Ok(_) => format!("Converted: {}", file_name),
-                Err(e) => format!("Error on {}: {}", file_name, e),
+                Err(e) => {
+                    errors.fetch_add(1, Ordering::Relaxed);
+                    format!("Error on {}: {}", file_name, e)
+                }
             };
             let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
             let _ = s.send((done, total, msg));
@@ -73,12 +77,19 @@ pub fn run_conversion_task(
     // Terminal message, then `sender` drops and the channel disconnects — the UI
     // uses that disconnect to detect completion (also covers cancellation).
     let done = completed.load(Ordering::Relaxed);
+    let failed = errors.load(Ordering::Relaxed);
+    let converted = done - failed;
     let cancelled = cancel_flag.load(Ordering::Relaxed);
-    let (count, final_msg) = if cancelled {
-        (done, format!("Cancelled — {}/{} files processed", done, total))
+
+    let mut final_msg = if cancelled {
+        format!("Cancelled — {} of {} files converted", converted, total)
     } else {
-        (total, format!("Complete — {} file(s) converted", done))
+        format!("Complete — {} of {} files converted", converted, total)
     };
+    if failed > 0 {
+        final_msg.push_str(&format!(" ({} failed)", failed));
+    }
+    let count = if cancelled { done } else { total };
     let _ = sender.send((count, total, final_msg));
 }
 
