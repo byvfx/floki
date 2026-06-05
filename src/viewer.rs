@@ -177,7 +177,7 @@ impl ExrViewer {
                     self.diff_texture = None;
                 }
 
-                let layer_count = exr_data.image.layer_data.len();
+                let layer_count = exr_data.logical_layers.len();
                 if layer_count > 1 {
                     ui.toggle_value(&mut self.show_contact_sheet, "Contact Sheet");
                 }
@@ -200,25 +200,20 @@ impl ExrViewer {
                         self.first_frame = true;
                     }
 
-                    // Layer selection
+                    // Layer (pass) selection
                     if layer_count > 1 {
                         ui.label("Layer:");
+                        let selected_name = exr_data
+                            .logical_layers
+                            .get(self.active_layer)
+                            .map(|l| l.name.as_str())
+                            .unwrap_or("Unnamed");
                         egui::ComboBox::from_id_salt("layer_select")
-                            .selected_text(format!("Layer {}", self.active_layer))
+                            .selected_text(selected_name)
                             .show_ui(ui, |ui| {
-                                for i in 0..layer_count {
-                                    let name = exr_data.image.layer_data[i]
-                                        .attributes
-                                        .layer_name
-                                        .as_ref()
-                                        .map(|t| t.to_string())
-                                        .unwrap_or_else(|| "Unnamed".to_string());
+                                for (i, ll) in exr_data.logical_layers.iter().enumerate() {
                                     if ui
-                                        .selectable_value(
-                                            &mut self.active_layer,
-                                            i,
-                                            format!("{} - {}", i, name),
-                                        )
+                                        .selectable_value(&mut self.active_layer, i, &ll.name)
                                         .clicked()
                                     {
                                         self.first_frame = true;
@@ -230,14 +225,14 @@ impl ExrViewer {
             });
         });
 
-        let layer_count = exr_data.image.layer_data.len();
+        let layer_count = exr_data.logical_layers.len();
         if self.textures.len() != layer_count {
             self.textures.clear();
             self.textures.resize(layer_count, None);
             self.gpu_textures.clear();
             self.gpu_textures.resize(layer_count, None);
         }
-        let layer_count_b = exr_data_b.map(|d| d.image.layer_data.len()).unwrap_or(0);
+        let layer_count_b = exr_data_b.map(|d| d.logical_layers.len()).unwrap_or(0);
         if self.textures_b.len() != layer_count_b {
             self.textures_b.clear();
             self.textures_b.resize(layer_count_b, None);
@@ -247,7 +242,7 @@ impl ExrViewer {
 
         if self.show_contact_sheet {
             let draw_sheet = |viewer: &mut ExrViewer, ui: &mut egui::Ui, data: &crate::exr_loader::ExrData, is_a: bool| {
-                let l_count = data.image.layer_data.len();
+                let l_count = data.logical_layers.len();
                 egui::ScrollArea::vertical()
                     .id_salt(if is_a { "sheet_a" } else { "sheet_b" })
                     .show(ui, |ui| {
@@ -272,13 +267,12 @@ impl ExrViewer {
 
                                 ui.allocate_ui(egui::vec2(thumb_width, thumb_height + 30.0), |ui| {
                                     ui.vertical(|ui| {
-                                        let name = data.image.layer_data[i]
-                                            .attributes
-                                            .layer_name
-                                            .as_ref()
-                                            .map(|t| t.to_string())
-                                            .unwrap_or_else(|| "Unnamed".to_string());
-                                        ui.label(egui::RichText::new(format!("Layer {}: {}", i, name)).strong());
+                                        let name = data
+                                            .logical_layers
+                                            .get(i)
+                                            .map(|l| l.name.as_str())
+                                            .unwrap_or("Unnamed");
+                                        ui.label(egui::RichText::new(format!("{}: {}", i, name)).strong());
 
                                         let response = ui.add(egui::Image::new(texture).fit_to_exact_size(egui::vec2(thumb_width, thumb_height)));
 
@@ -355,19 +349,16 @@ impl ExrViewer {
                 }
             });
 
-            let tex_size = egui::vec2(
-                exr_data.image.layer_data[self.active_layer].size.0 as f32,
-                exr_data.image.layer_data[self.active_layer].size.1 as f32,
-            );
+            let (tw, th) = exr_data.logical_size(self.active_layer).unwrap_or((1, 1));
+            let tex_size = egui::vec2(tw as f32, th as f32);
             let mut tex_size_b = None;
             if let Some(data_b) = exr_data_b {
                 let layer_b = self
                     .active_layer
-                    .min(data_b.image.layer_data.len().saturating_sub(1));
-                tex_size_b = Some(egui::vec2(
-                    data_b.image.layer_data[layer_b].size.0 as f32,
-                    data_b.image.layer_data[layer_b].size.1 as f32,
-                ));
+                    .min(data_b.logical_layers.len().saturating_sub(1));
+                if let Some((bw, bh)) = data_b.logical_size(layer_b) {
+                    tex_size_b = Some(egui::vec2(bw as f32, bh as f32));
+                }
             }
 
             if let Some(rs) = render_state {
@@ -378,7 +369,7 @@ impl ExrViewer {
                 if let Some(data_b) = exr_data_b {
                     let layer_b = self
                         .active_layer
-                        .min(data_b.image.layer_data.len().saturating_sub(1));
+                        .min(data_b.logical_layers.len().saturating_sub(1));
                     if self.gpu_textures_b[layer_b].is_none() {
                         self.gpu_textures_b[layer_b] =
                             self.generate_gpu_texture(rs, data_b, layer_b);
@@ -392,7 +383,7 @@ impl ExrViewer {
                 if let Some(data_b) = exr_data_b {
                     let layer_b = self
                         .active_layer
-                        .min(data_b.image.layer_data.len().saturating_sub(1));
+                        .min(data_b.logical_layers.len().saturating_sub(1));
                     if self.textures_b[layer_b].is_none() {
                         self.textures_b[layer_b] = self.generate_texture(ui.ctx(), data_b, layer_b);
                     }
@@ -403,7 +394,7 @@ impl ExrViewer {
                     {
                         let layer_b = self
                             .active_layer
-                            .min(exr_data_b.unwrap().image.layer_data.len().saturating_sub(1));
+                            .min(exr_data_b.unwrap().logical_layers.len().saturating_sub(1));
                         self.diff_texture = self.generate_diff_texture(
                             ui.ctx(),
                             exr_data,
@@ -570,7 +561,7 @@ impl ExrViewer {
                                 if let Some(bg_b) = exr_data_b.and_then(|d| {
                                     self.gpu_textures_b[self
                                         .active_layer
-                                        .min(d.image.layer_data.len().saturating_sub(1))]
+                                        .min(d.logical_layers.len().saturating_sub(1))]
                                     .clone()
                                 }) {
                                     draw_gpu(&painter, bg_b, None, rect, image_rect, false);
@@ -589,7 +580,7 @@ impl ExrViewer {
                                 if let Some(bg_b) = exr_data_b.and_then(|d| {
                                     self.gpu_textures_b[self
                                         .active_layer
-                                        .min(d.image.layer_data.len().saturating_sub(1))]
+                                        .min(d.logical_layers.len().saturating_sub(1))]
                                     .clone()
                                 }) {
                                     draw_gpu(&painter, bg_b, None, rect_b, image_rect, false);
@@ -606,7 +597,7 @@ impl ExrViewer {
                                 let bg_b_opt = exr_data_b.and_then(|d| {
                                     self.gpu_textures_b[self
                                         .active_layer
-                                        .min(d.image.layer_data.len().saturating_sub(1))]
+                                        .min(d.logical_layers.len().saturating_sub(1))]
                                     .clone()
                                 });
                                 if let Some(bg_b) = bg_b_opt {
@@ -659,7 +650,7 @@ impl ExrViewer {
                                 let bg_b_opt = exr_data_b.and_then(|d| {
                                     self.gpu_textures_b[self
                                         .active_layer
-                                        .min(d.image.layer_data.len().saturating_sub(1))]
+                                        .min(d.logical_layers.len().saturating_sub(1))]
                                     .clone()
                                 });
                                 if let Some(bg_b) = bg_b_opt {
@@ -699,7 +690,7 @@ impl ExrViewer {
                             if let Some(tex_b) = exr_data_b.and_then(|d| {
                                 self.textures_b[self
                                     .active_layer
-                                    .min(d.image.layer_data.len().saturating_sub(1))]
+                                    .min(d.logical_layers.len().saturating_sub(1))]
                                 .as_ref()
                             }) {
                                 draw_image(&painter, tex_b, rect, image_rect);
@@ -717,7 +708,7 @@ impl ExrViewer {
                             if let Some(tex_b) = exr_data_b.and_then(|d| {
                                 self.textures_b[self
                                     .active_layer
-                                    .min(d.image.layer_data.len().saturating_sub(1))]
+                                    .min(d.logical_layers.len().saturating_sub(1))]
                                 .as_ref()
                             }) {
                                 draw_image(&painter, tex_b, rect_b, image_rect);
@@ -735,7 +726,7 @@ impl ExrViewer {
                             let tex_b_opt = exr_data_b.and_then(|d| {
                                 self.textures_b[self
                                     .active_layer
-                                    .min(d.image.layer_data.len().saturating_sub(1))]
+                                    .min(d.logical_layers.len().saturating_sub(1))]
                                 .as_ref()
                             });
                             if let Some(tex_b) = tex_b_opt {
@@ -859,11 +850,9 @@ impl ExrViewer {
         exr_data: &ExrData,
         layer_index: usize,
     ) -> Option<std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>> {
-        let layer = exr_data.image.layer_data.get(layer_index)?;
+        let (layer, r_chan, g_chan, b_chan, a_chan) = exr_data.logical_channels(layer_index)?;
         let width = layer.size.0;
         let height = layer.size.1;
-
-        let (r_chan, g_chan, b_chan, a_chan) = Self::find_rgba_channels(layer);
 
         // Pack into Rgba32Float
         let mut pixels = vec![0.0f32; width * height * 4];
@@ -969,14 +958,11 @@ impl ExrViewer {
         exr_data: &ExrData,
         layer_index: usize,
     ) -> Option<egui::TextureHandle> {
-        let layer = exr_data.image.layer_data.get(layer_index)?;
+        let (layer, r_chan, g_chan, b_chan, a_chan) = exr_data.logical_channels(layer_index)?;
         let width = layer.size.0;
         let height = layer.size.1;
 
         let mut pixels = vec![egui::Color32::BLACK; width * height];
-
-        // Find R, G, B, A channels with robust matching
-        let (r_chan, g_chan, b_chan, a_chan) = Self::find_rgba_channels(layer);
 
         // Helper to get a pixel value from a channel
         let get_val = |chan: Option<&exr::image::AnyChannel<exr::image::FlatSamples>>,
@@ -1093,16 +1079,13 @@ impl ExrViewer {
         layer_a_idx: usize,
         layer_b_idx: usize,
     ) -> Option<egui::TextureHandle> {
-        let layer_a = data_a.image.layer_data.get(layer_a_idx)?;
-        let layer_b = data_b.image.layer_data.get(layer_b_idx)?;
+        let (layer_a, r_chan_a, g_chan_a, b_chan_a, _) = data_a.logical_channels(layer_a_idx)?;
+        let (layer_b, r_chan_b, g_chan_b, b_chan_b, _) = data_b.logical_channels(layer_b_idx)?;
 
         let width = layer_a.size.0.max(layer_b.size.0);
         let height = layer_a.size.1.max(layer_b.size.1);
 
         let mut pixels = vec![egui::Color32::BLACK; width * height];
-
-        let (r_chan_a, g_chan_a, b_chan_a, _) = Self::find_rgba_channels(layer_a);
-        let (r_chan_b, g_chan_b, b_chan_b, _) = Self::find_rgba_channels(layer_b);
 
         let get_val = |chan: Option<&exr::image::AnyChannel<exr::image::FlatSamples>>,
                        x: usize,
@@ -1193,15 +1176,13 @@ impl ExrViewer {
         x: usize,
         y: usize,
     ) -> Option<[f32; 4]> {
-        let layer = exr_data.image.layer_data.get(layer_index)?;
+        let (layer, r_chan, g_chan, b_chan, a_chan) = exr_data.logical_channels(layer_index)?;
         let width = layer.size.0;
         let height = layer.size.1;
 
         if x >= width || y >= height {
             return None;
         }
-
-        let (r_chan, g_chan, b_chan, a_chan) = Self::find_rgba_channels(layer);
 
         let get_val = |chan: Option<&exr::image::AnyChannel<exr::image::FlatSamples>>,
                        x: usize,
@@ -1231,47 +1212,6 @@ impl ExrViewer {
         Some([r, g, b, a])
     }
 
-    fn find_rgba_channels<'a>(
-        layer: &'a exr::image::Layer<exr::image::AnyChannels<exr::image::FlatSamples>>,
-    ) -> (
-        Option<&'a exr::image::AnyChannel<exr::image::FlatSamples>>,
-        Option<&'a exr::image::AnyChannel<exr::image::FlatSamples>>,
-        Option<&'a exr::image::AnyChannel<exr::image::FlatSamples>>,
-        Option<&'a exr::image::AnyChannel<exr::image::FlatSamples>>,
-    ) {
-        let mut r_chan = None;
-        let mut g_chan = None;
-        let mut b_chan = None;
-        let mut a_chan = None;
-
-        for c in &layer.channel_data.list {
-            // The channel name may be qualified (e.g. "diffuse.R"); match the
-            // last dotted component, case-insensitively, without extra allocations.
-            let n = c.name.to_string();
-            let suffix = n.rsplit('.').next().unwrap_or(n.as_str());
-            if suffix.eq_ignore_ascii_case("R") || suffix.eq_ignore_ascii_case("RED") {
-                r_chan = Some(c);
-            } else if suffix.eq_ignore_ascii_case("G") || suffix.eq_ignore_ascii_case("GREEN") {
-                g_chan = Some(c);
-            } else if suffix.eq_ignore_ascii_case("B") || suffix.eq_ignore_ascii_case("BLUE") {
-                b_chan = Some(c);
-            } else if suffix.eq_ignore_ascii_case("A") || suffix.eq_ignore_ascii_case("ALPHA") {
-                a_chan = Some(c);
-            }
-        }
-
-        // Fallback for single-channel or non-standard layers (e.g., Z-depth, Alpha, luminance)
-        if r_chan.is_none() && g_chan.is_none() && b_chan.is_none() {
-            if let Some(first) = layer.channel_data.list.first() {
-                r_chan = Some(first);
-                g_chan = Some(first);
-                b_chan = Some(first);
-            }
-        }
-
-        (r_chan, g_chan, b_chan, a_chan)
-    }
-
     pub fn linear_to_srgb(l: f32) -> f32 {
         if l <= 0.0031308 {
             l * 12.92
@@ -1287,11 +1227,9 @@ impl ExrViewer {
 
         let calc_bins = |data: &ExrData, layer_idx: usize| -> Option<[u32; 256]> {
             let mut bins = [0u32; 256];
-            let layer = data.image.layer_data.get(layer_idx)?;
+            let (layer, r_chan, g_chan, b_chan, _) = data.logical_channels(layer_idx)?;
             let width = layer.size.0;
             let height = layer.size.1;
-
-            let (r_chan, g_chan, b_chan, _) = Self::find_rgba_channels(layer);
 
             let get_val = |chan: Option<&exr::image::AnyChannel<exr::image::FlatSamples>>,
                            x: usize,
@@ -1342,7 +1280,7 @@ impl ExrViewer {
             calc_bins(
                 d,
                 self.active_layer
-                    .min(d.image.layer_data.len().saturating_sub(1)),
+                    .min(d.logical_layers.len().saturating_sub(1)),
             )
         });
         self.histogram_layer = Some(self.active_layer);

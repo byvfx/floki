@@ -3,6 +3,34 @@ use std::path::Path;
 
 pub struct ExrData {
     pub image: Image<smallvec::SmallVec<[Layer<AnyChannels<FlatSamples>>; 2]>>,
+    /// Displayable passes derived by grouping channels by their dotted name
+    /// prefix. See [`LogicalLayer`].
+    pub logical_layers: Vec<LogicalLayer>,
+}
+
+/// A displayable "layer" (render pass) derived from grouping a physical EXR
+/// layer's channels by their dotted name prefix.
+///
+/// OpenEXR stores a layer's channels as a flat list; the convention is that a
+/// channel name like `diffuse.R` means channel `R` of layer `diffuse`. Blender
+/// in particular writes a *single* EXR part whose channels encode every render
+/// pass as a prefix (`ViewLayer.Combined.R`, `ViewLayer.Normal.X`, ...). The
+/// `exr` crate exposes that as one unnamed `Layer`, so without regrouping the
+/// passes are invisible. This type is that regrouping: one entry per pass.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LogicalLayer {
+    /// Smart display name, e.g. `Combined`, `Normal`, or `RGBA` for root channels.
+    pub name: String,
+    /// Full group key (the channel-name prefix, plus any physical layer name),
+    /// e.g. `ViewLayer.Combined`; empty for unprefixed root channels.
+    pub group_key: String,
+    /// Index into [`ExrData::image`]`.layer_data`.
+    pub physical_index: usize,
+    /// Indices into the physical layer's `channel_data.list` for each slot.
+    pub r: Option<usize>,
+    pub g: Option<usize>,
+    pub b: Option<usize>,
+    pub a: Option<usize>,
 }
 
 impl ExrData {
@@ -14,9 +42,15 @@ impl ExrData {
             .all_channels()
             .all_layers()
             .all_attributes()
-            .from_file(path_ref) 
+            .from_file(path_ref)
         {
-            Ok(image) => Ok(Self { image }),
+            Ok(image) => {
+                let logical_layers = build_logical_layers(&image);
+                Ok(Self {
+                    image,
+                    logical_layers,
+                })
+            }
             Err(e) => {
                 let err_str = e.to_string();
                 if err_str.contains("file identifier missing") {
@@ -39,5 +73,314 @@ impl ExrData {
                 }
             }
         }
+    }
+
+    /// `(width, height)` of the physical layer backing the given logical layer.
+    pub fn logical_size(&self, idx: usize) -> Option<(usize, usize)> {
+        let ll = self.logical_layers.get(idx)?;
+        let layer = self.image.layer_data.get(ll.physical_index)?;
+        Some((layer.size.0, layer.size.1))
+    }
+
+    /// Resolve a logical layer to its physical layer plus the `(r, g, b, a)`
+    /// channels it maps to. Channels are looked up by the indices recorded at
+    /// load time, so no per-call name matching is needed.
+    #[allow(clippy::type_complexity)]
+    pub fn logical_channels(
+        &self,
+        idx: usize,
+    ) -> Option<(
+        &Layer<AnyChannels<FlatSamples>>,
+        Option<&exr::image::AnyChannel<FlatSamples>>,
+        Option<&exr::image::AnyChannel<FlatSamples>>,
+        Option<&exr::image::AnyChannel<FlatSamples>>,
+        Option<&exr::image::AnyChannel<FlatSamples>>,
+    )> {
+        let ll = self.logical_layers.get(idx)?;
+        let layer = self.image.layer_data.get(ll.physical_index)?;
+        let list = &layer.channel_data.list;
+        let get = |o: Option<usize>| o.and_then(|i| list.get(i));
+        Some((layer, get(ll.r), get(ll.g), get(ll.b), get(ll.a)))
+    }
+}
+
+/// Build the logical-layer list for a loaded image by grouping each physical
+/// layer's channels on their dotted prefix, then applying smart display names.
+fn build_logical_layers(
+    image: &Image<smallvec::SmallVec<[Layer<AnyChannels<FlatSamples>>; 2]>>,
+) -> Vec<LogicalLayer> {
+    let mut result = Vec::new();
+    for (physical_index, layer) in image.layer_data.iter().enumerate() {
+        let phys_name = layer.attributes.layer_name.as_ref().map(|t| t.to_string());
+        let names: Vec<String> = layer
+            .channel_data
+            .list
+            .iter()
+            .map(|c| c.name.to_string())
+            .collect();
+        for raw in group_channels(&names) {
+            result.push(LogicalLayer {
+                name: String::new(),
+                group_key: combine_key(phys_name.as_deref(), &raw.group_key),
+                physical_index,
+                r: raw.r,
+                g: raw.g,
+                b: raw.b,
+                a: raw.a,
+            });
+        }
+    }
+    apply_smart_names(&mut result);
+    result
+}
+
+/// A channel group before display naming: the prefix and the resolved slots.
+struct RawGroup {
+    group_key: String,
+    r: Option<usize>,
+    g: Option<usize>,
+    b: Option<usize>,
+    a: Option<usize>,
+}
+
+/// Split a channel name into `(prefix, component_token)` on the last `.`.
+/// `"ViewLayer.Combined.R"` -> `("ViewLayer.Combined", "R")`; `"R"` -> `("", "R")`.
+fn split_channel_name(name: &str) -> (&str, &str) {
+    match name.rsplit_once('.') {
+        Some((prefix, token)) => (prefix, token),
+        None => ("", name),
+    }
+}
+
+/// Map a component token to an RGBA slot (`0=r, 1=g, 2=b, 3=a`), or `None` if it
+/// is not a recognized color/vector component. Vector passes map `X->r, Y->g, Z->b`.
+fn component_slot(token: &str) -> Option<usize> {
+    let eq = |s: &str| token.eq_ignore_ascii_case(s);
+    if eq("R") || eq("red") || eq("X") {
+        Some(0)
+    } else if eq("G") || eq("green") || eq("Y") {
+        Some(1)
+    } else if eq("B") || eq("blue") || eq("Z") {
+        Some(2)
+    } else if eq("A") || eq("alpha") {
+        Some(3)
+    } else {
+        None
+    }
+}
+
+/// Group channel names by prefix, preserving first-seen order, and assign each
+/// group's channels to r/g/b/a slots. A single-channel group renders as
+/// grayscale (r=g=b); a multi-channel group with no recognizable color
+/// component falls back to replicating its first channel.
+fn group_channels(names: &[String]) -> Vec<RawGroup> {
+    let mut order: Vec<String> = Vec::new();
+    let mut members: Vec<Vec<(usize, String)>> = Vec::new();
+
+    for (idx, name) in names.iter().enumerate() {
+        let (prefix, token) = split_channel_name(name);
+        let pos = match order.iter().position(|k| k == prefix) {
+            Some(p) => p,
+            None => {
+                order.push(prefix.to_string());
+                members.push(Vec::new());
+                order.len() - 1
+            }
+        };
+        members[pos].push((idx, token.to_string()));
+    }
+
+    order
+        .into_iter()
+        .zip(members)
+        .map(|(group_key, mem)| {
+            let (mut r, mut g, mut b, mut a) = (None, None, None, None);
+            if mem.len() == 1 {
+                // Single-channel pass (Z-depth, mist, a mask): show as grayscale.
+                let only = mem[0].0;
+                r = Some(only);
+                g = Some(only);
+                b = Some(only);
+            } else {
+                for (ci, token) in &mem {
+                    match component_slot(token) {
+                        Some(0) => r = Some(*ci),
+                        Some(1) => g = Some(*ci),
+                        Some(2) => b = Some(*ci),
+                        Some(3) => a = Some(*ci),
+                        _ => {}
+                    }
+                }
+                if r.is_none() && g.is_none() && b.is_none() {
+                    let first = mem[0].0;
+                    r = Some(first);
+                    g = Some(first);
+                    b = Some(first);
+                }
+            }
+            RawGroup {
+                group_key,
+                r,
+                g,
+                b,
+                a,
+            }
+        })
+        .collect()
+}
+
+/// Combine a physical layer name with a channel-prefix into one full group key.
+fn combine_key(phys: Option<&str>, group_key: &str) -> String {
+    match (phys, group_key.is_empty()) {
+        (Some(p), false) => format!("{}.{}", p, group_key),
+        (Some(p), true) => p.to_string(),
+        (None, false) => group_key.to_string(),
+        (None, true) => String::new(),
+    }
+}
+
+/// Fill in each layer's display `name`: strip a leading dotted prefix shared by
+/// every keyed layer (e.g. the Blender view-layer name), keep the remainder,
+/// and label unprefixed root channels `RGBA`.
+fn apply_smart_names(layers: &mut [LogicalLayer]) {
+    let keys: Vec<&str> = layers
+        .iter()
+        .map(|l| l.group_key.as_str())
+        .filter(|k| !k.is_empty())
+        .collect();
+    let prefix = longest_common_dotted_prefix(&keys);
+
+    for l in layers.iter_mut() {
+        l.name = if l.group_key.is_empty() {
+            "RGBA".to_string()
+        } else if !prefix.is_empty() && l.group_key.len() > prefix.len() {
+            l.group_key[prefix.len()..].to_string()
+        } else {
+            l.group_key.clone()
+        };
+    }
+}
+
+/// Longest prefix of whole dotted segments shared by all keys, including the
+/// trailing dot, never consuming a key's final segment. Empty if fewer than two
+/// keys or nothing is shared. `["ViewLayer.Combined", "ViewLayer.Normal"]` ->
+/// `"ViewLayer."`.
+fn longest_common_dotted_prefix(keys: &[&str]) -> String {
+    if keys.len() < 2 {
+        return String::new();
+    }
+    let split: Vec<Vec<&str>> = keys.iter().map(|k| k.split('.').collect()).collect();
+    let min_segs = split.iter().map(|s| s.len()).min().unwrap_or(0);
+    let max_take = min_segs.saturating_sub(1); // keep at least one segment as the name
+    let mut k = 0;
+    while k < max_take {
+        let seg = split[0][k];
+        if split.iter().all(|s| s[k] == seg) {
+            k += 1;
+        } else {
+            break;
+        }
+    }
+    if k == 0 {
+        String::new()
+    } else {
+        format!("{}.", split[0][..k].join("."))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn splits_dotted_and_bare_names() {
+        assert_eq!(
+            split_channel_name("ViewLayer.Combined.R"),
+            ("ViewLayer.Combined", "R")
+        );
+        assert_eq!(split_channel_name("R"), ("", "R"));
+        assert_eq!(split_channel_name("Depth.Z"), ("Depth", "Z"));
+    }
+
+    #[test]
+    fn maps_color_and_vector_components() {
+        assert_eq!(component_slot("R"), Some(0));
+        assert_eq!(component_slot("g"), Some(1));
+        assert_eq!(component_slot("BLUE"), Some(2));
+        assert_eq!(component_slot("A"), Some(3));
+        assert_eq!(component_slot("X"), Some(0));
+        assert_eq!(component_slot("Y"), Some(1));
+        assert_eq!(component_slot("Z"), Some(2));
+        assert_eq!(component_slot("mask"), None);
+    }
+
+    #[test]
+    fn groups_blender_passes_regardless_of_channel_order() {
+        // Blender commonly stores channels in B,G,R,A order.
+        let g = group_channels(&names(&[
+            "ViewLayer.Combined.B",
+            "ViewLayer.Combined.G",
+            "ViewLayer.Combined.R",
+            "ViewLayer.Combined.A",
+            "ViewLayer.Depth.Z",
+            "ViewLayer.Normal.X",
+            "ViewLayer.Normal.Y",
+            "ViewLayer.Normal.Z",
+        ]));
+        assert_eq!(g.len(), 3);
+
+        let combined = &g[0];
+        assert_eq!(combined.group_key, "ViewLayer.Combined");
+        assert_eq!((combined.r, combined.g, combined.b, combined.a), (Some(2), Some(1), Some(0), Some(3)));
+
+        let depth = &g[1];
+        assert_eq!(depth.group_key, "ViewLayer.Depth");
+        // Single channel -> grayscale, no alpha.
+        assert_eq!((depth.r, depth.g, depth.b, depth.a), (Some(4), Some(4), Some(4), None));
+
+        let normal = &g[2];
+        assert_eq!(normal.group_key, "ViewLayer.Normal");
+        assert_eq!((normal.r, normal.g, normal.b, normal.a), (Some(5), Some(6), Some(7), None));
+    }
+
+    #[test]
+    fn groups_unprefixed_root_channels() {
+        let g = group_channels(&names(&["R", "G", "B", "A"]));
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].group_key, "");
+        assert_eq!((g[0].r, g[0].g, g[0].b, g[0].a), (Some(0), Some(1), Some(2), Some(3)));
+    }
+
+    #[test]
+    fn finds_common_view_layer_prefix() {
+        assert_eq!(
+            longest_common_dotted_prefix(&["ViewLayer.Combined", "ViewLayer.Normal"]),
+            "ViewLayer."
+        );
+        // No shared leading segment.
+        assert_eq!(longest_common_dotted_prefix(&["A.R", "B.R"]), "");
+        // Fewer than two keys.
+        assert_eq!(longest_common_dotted_prefix(&["ViewLayer.Combined"]), "");
+    }
+
+    #[test]
+    fn smart_names_strip_shared_prefix_and_label_root() {
+        let mut layers = vec![
+            LogicalLayer { name: String::new(), group_key: "ViewLayer.Combined".into(), physical_index: 0, r: None, g: None, b: None, a: None },
+            LogicalLayer { name: String::new(), group_key: "ViewLayer.Normal".into(), physical_index: 0, r: None, g: None, b: None, a: None },
+        ];
+        apply_smart_names(&mut layers);
+        assert_eq!(layers[0].name, "Combined");
+        assert_eq!(layers[1].name, "Normal");
+
+        let mut root = vec![LogicalLayer {
+            name: String::new(), group_key: String::new(), physical_index: 0, r: Some(0), g: Some(1), b: Some(2), a: Some(3),
+        }];
+        apply_smart_names(&mut root);
+        assert_eq!(root[0].name, "RGBA");
     }
 }

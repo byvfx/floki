@@ -464,46 +464,56 @@ impl eframe::App for ExrApp {
                             ui.separator();
                             ui.heading("Layers");
 
-                            for (i, layer) in exr_data.image.layer_data.iter().enumerate() {
+                            for (i, ll) in exr_data.logical_layers.iter().enumerate() {
                                 let is_selected = self.viewer.active_layer == i;
-                                let layer_name = layer
-                                    .attributes
-                                    .layer_name
-                                    .as_ref()
-                                    .map(|n| n.to_string())
-                                    .unwrap_or_else(|| "Unnamed Layer".to_string());
 
-                                if ui.selectable_label(is_selected, &layer_name).clicked() {
+                                if ui.selectable_label(is_selected, &ll.name).clicked() {
                                     self.viewer.active_layer = i;
                                 }
 
                                 if is_selected {
-                                    ui.indent("layer_details", |ui| {
-                                        ui.label(format!(
-                                            "Resolution: {}x{}",
-                                            layer.size.0, layer.size.1
-                                        ));
-                                        ui.label(format!(
-                                            "Channels: {}",
-                                            layer.channel_data.list.len()
-                                        ));
+                                    if let Some(layer) =
+                                        exr_data.image.layer_data.get(ll.physical_index)
+                                    {
+                                        ui.indent("layer_details", |ui| {
+                                            ui.label(format!(
+                                                "Resolution: {}x{}",
+                                                layer.size.0, layer.size.1
+                                            ));
+                                            let chan_name = |idx: Option<usize>| {
+                                                idx.and_then(|j| layer.channel_data.list.get(j))
+                                                    .map(|c| c.name.to_string())
+                                                    .unwrap_or_else(|| "-".to_string())
+                                            };
+                                            ui.label(format!(
+                                                "Channels: R={} G={} B={} A={}",
+                                                chan_name(ll.r),
+                                                chan_name(ll.g),
+                                                chan_name(ll.b),
+                                                chan_name(ll.a),
+                                            ));
 
-                                        if !layer.attributes.other.is_empty() {
-                                            ui.add_space(5.0);
-                                            egui::CollapsingHeader::new("Layer Attributes")
-                                                .id_salt(format!("layer_attrs_header_{}_{}", idx, i))
-                                                .default_open(false)
-                                                .show(ui, |ui| {
-                                                    for (name, val) in layer.attributes.other.iter()
-                                                    {
-                                                        ui.horizontal_wrapped(|ui| {
-                                                            ui.strong(format!("{}: ", name));
-                                                            ui.label(format!("{:?}", val));
-                                                        });
-                                                    }
-                                                });
-                                        }
-                                    });
+                                            if !layer.attributes.other.is_empty() {
+                                                ui.add_space(5.0);
+                                                egui::CollapsingHeader::new("Layer Attributes")
+                                                    .id_salt(format!(
+                                                        "layer_attrs_header_{}_{}",
+                                                        idx, i
+                                                    ))
+                                                    .default_open(false)
+                                                    .show(ui, |ui| {
+                                                        for (name, val) in
+                                                            layer.attributes.other.iter()
+                                                        {
+                                                            ui.horizontal_wrapped(|ui| {
+                                                                ui.strong(format!("{}: ", name));
+                                                                ui.label(format!("{:?}", val));
+                                                            });
+                                                        }
+                                                    });
+                                            }
+                                        });
+                                    }
                                 }
                             }
                         }
