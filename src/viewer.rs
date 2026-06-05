@@ -45,6 +45,7 @@ pub struct ExrViewer {
     pub diff_multiplier: f32,
     pub active_layer: usize,
     pub show_contact_sheet: bool,
+    pub normalize_side_by_side: bool,
     pub swatches: Vec<[f32; 4]>,
     pub histogram: Option<[u32; 256]>,
     pub histogram_b: Option<[u32; 256]>,
@@ -77,6 +78,7 @@ impl Default for ExrViewer {
             diff_multiplier: 1.0,
             active_layer: 0,
             show_contact_sheet: false,
+            normalize_side_by_side: true,
             swatches: Vec::new(),
             histogram: None,
             histogram_b: None,
@@ -126,13 +128,18 @@ impl ExrViewer {
                     ui.label("Compare:");
                     ui.selectable_value(&mut self.compare_mode, CompareMode::SingleA, "A");
                     ui.selectable_value(&mut self.compare_mode, CompareMode::SingleB, "B");
-                    ui.selectable_value(&mut self.compare_mode, CompareMode::Wipe, "Wipe");
+                    
+                    ui.add_enabled_ui(!self.show_contact_sheet, |ui| {
+                        ui.selectable_value(&mut self.compare_mode, CompareMode::Wipe, "Wipe");
+                    });
                     ui.selectable_value(
                         &mut self.compare_mode,
                         CompareMode::SideBySide,
                         "Side-by-Side",
                     );
-                    ui.selectable_value(&mut self.compare_mode, CompareMode::DiffMatte, "Diff");
+                    ui.add_enabled_ui(!self.show_contact_sheet, |ui| {
+                        ui.selectable_value(&mut self.compare_mode, CompareMode::DiffMatte, "Diff");
+                    });
                     if ui
                         .toggle_value(&mut self.blink_state, "Blink (Spc)")
                         .clicked()
@@ -149,6 +156,8 @@ impl ExrViewer {
                             egui::Slider::new(&mut self.diff_multiplier, 1.0..=100.0)
                                 .text("Diff Multiplier"),
                         );
+                    } else if self.compare_mode == CompareMode::SideBySide {
+                        ui.checkbox(&mut self.normalize_side_by_side, "Normalize Size");
                     }
                     ui.separator();
                 }
@@ -179,7 +188,13 @@ impl ExrViewer {
 
                 let layer_count = exr_data.logical_layers.len();
                 if layer_count > 1 {
-                    ui.toggle_value(&mut self.show_contact_sheet, "Contact Sheet");
+                    if ui.toggle_value(&mut self.show_contact_sheet, "Contact Sheet").changed() {
+                        if self.show_contact_sheet {
+                            if self.compare_mode == CompareMode::Wipe || self.compare_mode == CompareMode::DiffMatte {
+                                self.compare_mode = CompareMode::SideBySide;
+                            }
+                        }
+                    }
                 }
 
                 ui.separator();
@@ -274,7 +289,7 @@ impl ExrViewer {
                                             .unwrap_or("Unnamed");
                                         ui.label(egui::RichText::new(format!("{}: {}", i, name)).strong());
 
-                                        let response = ui.add(egui::Image::new(texture).fit_to_exact_size(egui::vec2(thumb_width, thumb_height)));
+                                        let response = ui.add(egui::Image::new(texture).fit_to_exact_size(egui::vec2(thumb_width, thumb_height)).sense(egui::Sense::click()));
 
                                         if response.clicked() {
                                             viewer.active_layer = i;
@@ -601,7 +616,11 @@ impl ExrViewer {
                                     .clone()
                                 });
                                 if let Some(bg_b) = bg_b_opt {
-                                    let image_size_b = tex_size_b.unwrap() * self.scale;
+                                    let mut image_size_b = tex_size_b.unwrap() * self.scale;
+                                    if self.normalize_side_by_side {
+                                        let scale_b = (tex_size.y * self.scale) / tex_size_b.unwrap().y;
+                                        image_size_b = tex_size_b.unwrap() * scale_b;
+                                    }
                                     let combined_width = image_size.x + image_size_b.x;
                                     let combined_height = image_size.y.max(image_size_b.y);
                                     let combined_rect = egui::Rect::from_center_size(
@@ -730,7 +749,11 @@ impl ExrViewer {
                                 .as_ref()
                             });
                             if let Some(tex_b) = tex_b_opt {
-                                let image_size_b = tex_size_b.unwrap() * self.scale;
+                                let mut image_size_b = tex_size_b.unwrap() * self.scale;
+                                if self.normalize_side_by_side {
+                                    let scale_b = (tex_size.y * self.scale) / tex_size_b.unwrap().y;
+                                    image_size_b = tex_size_b.unwrap() * scale_b;
+                                }
                                 let combined_width = image_size.x + image_size_b.x;
                                 let combined_height = image_size.y.max(image_size_b.y);
 
