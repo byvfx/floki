@@ -40,6 +40,7 @@ pub struct ExrViewer {
     pub gamma: f32,
     pub srgb: bool,
     pub enable_lut: bool,
+    pub show_tooltip: bool,
     pub channel_mode: ChannelMode,
     pub compare_mode: CompareMode,
     pub wipe_position: f32,
@@ -77,6 +78,7 @@ impl Default for ExrViewer {
             gamma: 1.0,
             srgb: true,
             enable_lut: false,
+            show_tooltip: true,
             channel_mode: ChannelMode::RGB,
             compare_mode: CompareMode::SingleA,
             wipe_position: 0.5,
@@ -196,6 +198,8 @@ impl ExrViewer {
                     self.textures_b.fill(None);
                     self.diff_texture = None;
                 }
+                
+                ui.checkbox(&mut self.show_tooltip, "Show Pixel Tooltip");
 
                 let layer_count = exr_data.logical_layers.len();
                 if layer_count > 1 {
@@ -949,7 +953,7 @@ impl ExrViewer {
                         self.last_sampled_val_a = val_a_opt;
                         self.last_sampled_val_b = val_b_opt;
 
-                        if val_a_opt.is_some() || val_b_opt.is_some() {
+                        if self.show_tooltip && (val_a_opt.is_some() || val_b_opt.is_some()) {
                             egui::Window::new("Pixel Tooltip")
                                 .fixed_pos(pos + egui::vec2(15.0, 15.0))
                                 .title_bar(false)
@@ -959,13 +963,31 @@ impl ExrViewer {
                                     ui.label(format!("x={} y={}", x, y));
                                     
                                     if let Some(val_a) = val_a_opt {
-                                        colored_rgba_label(ui, if val_b_opt.is_some() { "A:" } else { "" }, val_a);
+                                        ui.horizontal(|ui| {
+                                            colored_rgba_label(ui, if val_b_opt.is_some() { "A:" } else { "" }, val_a);
+                                            let (r, g, b) = (
+                                                (val_a[0].clamp(0.0, 1.0) * 255.0) as u8,
+                                                (val_a[1].clamp(0.0, 1.0) * 255.0) as u8,
+                                                (val_a[2].clamp(0.0, 1.0) * 255.0) as u8,
+                                            );
+                                            let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                                            ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgb(r, g, b));
+                                        });
                                         let (h, s, v, l) = rgb_to_hsvl(val_a[0], val_a[1], val_a[2]);
                                         ui.label(egui::RichText::new(format!("H:{:.0} S:{:.2} V:{:.2} L:{:.5}", h, s, v, l)).color(egui::Color32::LIGHT_GRAY));
                                     }
                                     
                                     if let Some(val_b) = val_b_opt {
-                                        colored_rgba_label(ui, "B:", val_b);
+                                        ui.horizontal(|ui| {
+                                            colored_rgba_label(ui, "B:", val_b);
+                                            let (r, g, b) = (
+                                                (val_b[0].clamp(0.0, 1.0) * 255.0) as u8,
+                                                (val_b[1].clamp(0.0, 1.0) * 255.0) as u8,
+                                                (val_b[2].clamp(0.0, 1.0) * 255.0) as u8,
+                                            );
+                                            let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                                            ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgb(r, g, b));
+                                        });
                                         let (h, s, v, l) = rgb_to_hsvl(val_b[0], val_b[1], val_b[2]);
                                         ui.label(egui::RichText::new(format!("H:{:.0} S:{:.2} V:{:.2} L:{:.5}", h, s, v, l)).color(egui::Color32::LIGHT_GRAY));
                                     }
