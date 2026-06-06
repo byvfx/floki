@@ -706,8 +706,9 @@ impl eframe::App for ExrApp {
 
         
         egui::TopBottomPanel::bottom("status_bar").show_inside(ui, |ui| {
-            ui.horizontal(|ui| {
-                if let Some((x, y)) = self.viewer.last_hover_pos_img {
+            egui::ScrollArea::horizontal().show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if let Some((x, y)) = self.viewer.last_hover_pos_img {
                     let layer_name = self.exr_data.as_ref()
                         .and_then(|d| d.logical_layers.get(self.viewer.active_layer))
                         .map(|l| l.name.as_str())
@@ -812,6 +813,7 @@ impl eframe::App for ExrApp {
                 } else {
                     ui.label(egui::RichText::new("x=-- y=--").color(egui::Color32::DARK_GRAY));
                 }
+                });
             });
         });
 
