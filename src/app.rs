@@ -146,7 +146,7 @@ impl eframe::App for ExrApp {
                     ui.label("R / G / B / A - Isolate specific channel");
                     ui.label("C - Return to full color composite");
                     ui.label("F - Frame image to fit the window");
-                    
+
                     ui.add_space(5.0);
                     ui.heading("Mouse Controls");
                     ui.label("Left Click + Drag - Pan image");
@@ -174,24 +174,22 @@ impl eframe::App for ExrApp {
 
                 ui.horizontal(|ui| {
                     ui.label("Input Directory:");
-                    if ui.button("Browse...").clicked() {
-                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                    if ui.button("Browse...").clicked()
+                        && let Some(path) = rfd::FileDialog::new().pick_folder() {
                             self.tools_input_dir = path.to_string_lossy().to_string();
                             self.tools_output_dir = path.join("converted").to_string_lossy().to_string();
                         }
-                    }
                 });
                 ui.add(egui::TextEdit::singleline(&mut self.tools_input_dir).desired_width(f32::INFINITY));
 
                 ui.add_space(5.0);
-                
+
                 ui.horizontal(|ui| {
                     ui.label("Output Directory:");
-                    if ui.button("Browse...").clicked() {
-                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                    if ui.button("Browse...").clicked()
+                        && let Some(path) = rfd::FileDialog::new().pick_folder() {
                             self.tools_output_dir = path.to_string_lossy().to_string();
                         }
-                    }
                 });
                 ui.add(egui::TextEdit::singleline(&mut self.tools_output_dir).desired_width(f32::INFINITY));
 
@@ -203,13 +201,13 @@ impl eframe::App for ExrApp {
                         self.conversion_receiver = Some(receiver);
                         self.conversion_status = "Starting...".to_string();
                         self.conversion_progress = Some((0, 0));
-                        
+
                         self.conversion_cancel.store(false, std::sync::atomic::Ordering::SeqCst);
                         let cancel_flag = self.conversion_cancel.clone();
 
                         let in_dir = std::path::PathBuf::from(self.tools_input_dir.trim().trim_matches(|c| c == '"' || c == '\''));
                         let out_dir = std::path::PathBuf::from(self.tools_output_dir.trim().trim_matches(|c| c == '"' || c == '\''));
-                        
+
                         std::thread::spawn(move || {
                             crate::tools::run_conversion_task(in_dir, out_dir, sender, cancel_flag);
                         });
@@ -243,15 +241,14 @@ impl eframe::App for ExrApp {
                         }
                     }
 
-                    if let Some((done, total)) = self.conversion_progress {
-                        if total > 0 {
+                    if let Some((done, total)) = self.conversion_progress
+                        && total > 0 {
                             let frac = (done as f32 / total as f32).clamp(0.0, 1.0);
                             ui.add(
                                 egui::ProgressBar::new(frac)
                                     .text(format!("{}/{}", done, total)),
                             );
                         }
-                    }
                     ui.label(&self.conversion_status);
 
                     if finished {
@@ -262,13 +259,12 @@ impl eframe::App for ExrApp {
                         ui.ctx()
                             .request_repaint_after(std::time::Duration::from_millis(50));
                     }
-                } else if let Some((done, total)) = self.conversion_progress {
-                    if total > 0 {
+                } else if let Some((done, total)) = self.conversion_progress
+                    && total > 0 {
                         let frac = (done as f32 / total as f32).clamp(0.0, 1.0);
                         ui.add(egui::ProgressBar::new(frac).text(format!("{}/{}", done, total)));
                         ui.label(&self.conversion_status);
                     }
-                }
             });
         }
 
@@ -276,22 +272,22 @@ impl eframe::App for ExrApp {
             egui::Window::new("Color Management").open(&mut self.show_settings).show(ui.ctx(), |ui| {
                 ui.heading("Settings");
                 ui.add_space(5.0);
-                
+
                 ui.label("OCIO Environment / Config Path:");
                 ui.horizontal(|ui| {
                     ui.text_edit_singleline(&mut self.ocio_path);
                     if ui.button("Browse").clicked() {}
                 });
-                
+
                 ui.add_space(10.0);
-                
+
                 ui.label("Custom LUT Path (.cube, .3dl):");
                 ui.horizontal(|ui| {
                     ui.text_edit_singleline(&mut self.lut_path);
-                    if ui.button("Browse").clicked() {
-                        if let Some(path) = rfd::FileDialog::new()
+                    if ui.button("Browse").clicked()
+                        && let Some(path) = rfd::FileDialog::new()
                             .add_filter("LUT", &["cube"])
-                            .pick_file() 
+                            .pick_file()
                         {
                             self.lut_path = path.to_string_lossy().to_string();
                             match crate::color::cube::CubeLut::load(&path) {
@@ -316,7 +312,6 @@ impl eframe::App for ExrApp {
                                 }
                             }
                         }
-                    }
                 });
                 ui.checkbox(&mut self.enable_lut, "Enable Custom LUT");
                 if let Some(err) = &self.lut_error {
@@ -325,7 +320,7 @@ impl eframe::App for ExrApp {
                 if self.lut_bg.is_some() {
                     ui.label(egui::RichText::new("LUT loaded and active!").color(egui::Color32::GREEN));
                 }
-                
+
                 ui.add_space(10.0);
                 ui.label(egui::RichText::new("Note: OCIO is penciled in for future GPU rendering phases and is not currently active.").italics());
             });
@@ -404,6 +399,199 @@ impl eframe::App for ExrApp {
             });
         });
 
+        // Status bar must be added BEFORE the side panel. egui allocates panel space
+        // in call order; if the side panel (whose content can grow taller than the
+        // window when Image B is loaded) is added first, it expands the parent UI's
+        // bottom edge past the window and the bottom panel anchors off-screen.
+        egui::Panel::bottom("status_bar").show_inside(ui, |ui| {
+            ui.vertical(|ui| {
+                let draw_nuke_status_line =
+                    |ui: &mut egui::Ui,
+                     prefix: &str,
+                     data: Option<&ExrData>,
+                     hover_pos: Option<(usize, usize)>,
+                     val: Option<[f32; 4]>,
+                     layer_name: &str| {
+                        if let Some(d) = data {
+                            // Scroll each row horizontally on its own. Wrapping the whole
+                            // vertical stack in one ScrollArea hides the stacked row
+                            // height from the auto-sizing bottom panel, collapsing it.
+                            egui::ScrollArea::horizontal()
+                                .id_salt(prefix)
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        let disp_w = d.image.attributes.display_window.size.x();
+                                        let disp_h = d.image.attributes.display_window.size.y();
+
+                                        // Resolve the *physical* layer backing this logical
+                                        // layer. `physical_index` maps into `image.layer_data`;
+                                        // never index it with a logical-layer position.
+                                        let phys_idx = d
+                                            .logical_layers
+                                            .iter()
+                                            .find(|l| l.name == layer_name)
+                                            .map(|l| l.physical_index)
+                                            .unwrap_or(0);
+
+                                        let channels: Vec<_> = d
+                                            .logical_layers
+                                            .iter()
+                                            .map(|l| l.name.as_str())
+                                            .collect();
+                                        let mut channels_str = channels.join(",");
+                                        if channels_str.len() > 50 {
+                                            channels_str.truncate(50);
+                                            channels_str.push_str("...");
+                                        }
+
+                                        if let Some(layer) = d.image.layer_data.get(phys_idx) {
+                                            let data_window_min = layer.attributes.layer_position;
+                                            let data_w = layer.size.0;
+                                            let data_h = layer.size.1;
+
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "{}: {}x{} bbox: {} {} {} {} channels: {}",
+                                                    prefix,
+                                                    disp_w,
+                                                    disp_h,
+                                                    data_window_min.x(),
+                                                    data_window_min.y(),
+                                                    data_w,
+                                                    data_h,
+                                                    channels_str
+                                                ))
+                                                .color(egui::Color32::DARK_GRAY),
+                                            );
+                                        }
+
+                                        ui.add_space(10.0);
+
+                                        if let (Some((x, y)), Some(v)) = (hover_pos, val) {
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "x={} y={} {}",
+                                                    x, y, layer_name
+                                                ))
+                                                .strong()
+                                                .color(egui::Color32::WHITE),
+                                            );
+                                            ui.spacing_mut().item_spacing.x = 4.0;
+                                            ui.label(
+                                                egui::RichText::new(format!("{:.5}", v[0]))
+                                                    .color(egui::Color32::from_rgb(255, 80, 80)),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new(format!("{:.5}", v[1]))
+                                                    .color(egui::Color32::from_rgb(80, 255, 80)),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new(format!("{:.5}", v[2]))
+                                                    .color(egui::Color32::from_rgb(100, 150, 255)),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new(format!("{:.5}", v[3]))
+                                                    .color(egui::Color32::LIGHT_GRAY),
+                                            );
+
+                                            // Swatch
+                                            let (r, g, b) = (
+                                                (v[0].clamp(0.0, 1.0) * 255.0) as u8,
+                                                (v[1].clamp(0.0, 1.0) * 255.0) as u8,
+                                                (v[2].clamp(0.0, 1.0) * 255.0) as u8,
+                                            );
+                                            let (rect, _response) = ui.allocate_exact_size(
+                                                egui::vec2(20.0, 14.0),
+                                                egui::Sense::hover(),
+                                            );
+                                            ui.painter().rect_filled(
+                                                rect,
+                                                0.0,
+                                                egui::Color32::from_rgb(r, g, b),
+                                            );
+
+                                            // HSVL
+                                            ui.add_space(10.0);
+                                            let max = v[0].max(v[1]).max(v[2]);
+                                            let min = v[0].min(v[1]).min(v[2]);
+                                            let delta = max - min;
+                                            let mut h = 0.0;
+                                            if delta > 0.0 {
+                                                if max == v[0] {
+                                                    h = 60.0 * (((v[1] - v[2]) / delta) % 6.0);
+                                                } else if max == v[1] {
+                                                    h = 60.0 * (((v[2] - v[0]) / delta) + 2.0);
+                                                } else if max == v[2] {
+                                                    h = 60.0 * (((v[0] - v[1]) / delta) + 4.0);
+                                                }
+                                            }
+                                            if h < 0.0 {
+                                                h += 360.0;
+                                            }
+                                            let s = if max > 0.0 { delta / max } else { 0.0 };
+                                            let val_v = max;
+                                            let l = 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2];
+
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "H:{:.0} S:{:.2} V:{:.2} L:{:.5}",
+                                                    h, s, val_v, l
+                                                ))
+                                                .color(egui::Color32::LIGHT_GRAY),
+                                            );
+                                        } else {
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "x=-- y=-- {}",
+                                                    layer_name
+                                                ))
+                                                .color(egui::Color32::DARK_GRAY),
+                                            );
+                                        }
+                                    });
+                                });
+                        }
+                    };
+
+                let layer_name_a = self
+                    .exr_data
+                    .as_ref()
+                    .and_then(|d| d.logical_layers.get(self.viewer.active_layer))
+                    .map(|l| l.name.as_str())
+                    .unwrap_or("");
+
+                draw_nuke_status_line(
+                    ui,
+                    "A",
+                    self.exr_data.as_ref(),
+                    self.viewer.last_hover_pos_img,
+                    self.viewer.last_sampled_val_a,
+                    layer_name_a,
+                );
+
+                if let Some(exr_b) = &self.exr_data_b {
+                    let layer_name_b = exr_b
+                        .logical_layers
+                        .get(
+                            self.viewer
+                                .active_layer
+                                .min(exr_b.logical_layers.len().saturating_sub(1)),
+                        )
+                        .map(|l| l.name.as_str())
+                        .unwrap_or("");
+
+                    draw_nuke_status_line(
+                        ui,
+                        "B",
+                        Some(exr_b),
+                        self.viewer.last_hover_pos_img,
+                        self.viewer.last_sampled_val_b,
+                        layer_name_b,
+                    );
+                }
+            });
+        });
+
         egui::Panel::left("side_panel")
             .resizable(true)
             .min_size(200.0)
@@ -431,7 +619,8 @@ impl eframe::App for ExrApp {
                                 ui.add_space(10.0);
                             }
                             ui.heading(format!(
-                                "{}: {}", label,
+                                "{}: {}",
+                                label,
                                 path.file_name().unwrap_or_default().to_string_lossy()
                             ));
                             ui.add_space(5.0);
@@ -476,49 +665,47 @@ impl eframe::App for ExrApp {
                                     self.viewer.active_layer = i;
                                 }
 
-                                if is_selected {
-                                    if let Some(layer) =
+                                if is_selected
+                                    && let Some(layer) =
                                         exr_data.image.layer_data.get(ll.physical_index)
-                                    {
-                                        ui.indent("layer_details", |ui| {
-                                            ui.label(format!(
-                                                "Resolution: {}x{}",
-                                                layer.size.0, layer.size.1
-                                            ));
-                                            let chan_name = |idx: Option<usize>| {
-                                                idx.and_then(|j| layer.channel_data.list.get(j))
-                                                    .map(|c| c.name.to_string())
-                                                    .unwrap_or_else(|| "-".to_string())
-                                            };
-                                            ui.label(format!(
-                                                "Channels: R={} G={} B={} A={}",
-                                                chan_name(ll.r),
-                                                chan_name(ll.g),
-                                                chan_name(ll.b),
-                                                chan_name(ll.a),
-                                            ));
+                                {
+                                    ui.indent("layer_details", |ui| {
+                                        ui.label(format!(
+                                            "Resolution: {}x{}",
+                                            layer.size.0, layer.size.1
+                                        ));
+                                        let chan_name = |idx: Option<usize>| {
+                                            idx.and_then(|j| layer.channel_data.list.get(j))
+                                                .map(|c| c.name.to_string())
+                                                .unwrap_or_else(|| "-".to_string())
+                                        };
+                                        ui.label(format!(
+                                            "Channels: R={} G={} B={} A={}",
+                                            chan_name(ll.r),
+                                            chan_name(ll.g),
+                                            chan_name(ll.b),
+                                            chan_name(ll.a),
+                                        ));
 
-                                            if !layer.attributes.other.is_empty() {
-                                                ui.add_space(5.0);
-                                                egui::CollapsingHeader::new("Layer Attributes")
-                                                    .id_salt(format!(
-                                                        "layer_attrs_header_{}_{}",
-                                                        idx, i
-                                                    ))
-                                                    .default_open(false)
-                                                    .show(ui, |ui| {
-                                                        for (name, val) in
-                                                            layer.attributes.other.iter()
-                                                        {
-                                                            ui.horizontal_wrapped(|ui| {
-                                                                ui.strong(format!("{}: ", name));
-                                                                ui.label(format!("{:?}", val));
-                                                            });
-                                                        }
-                                                    });
-                                            }
-                                        });
-                                    }
+                                        if !layer.attributes.other.is_empty() {
+                                            ui.add_space(5.0);
+                                            egui::CollapsingHeader::new("Layer Attributes")
+                                                .id_salt(format!(
+                                                    "layer_attrs_header_{}_{}",
+                                                    idx, i
+                                                ))
+                                                .default_open(false)
+                                                .show(ui, |ui| {
+                                                    for (name, val) in layer.attributes.other.iter()
+                                                    {
+                                                        ui.horizontal_wrapped(|ui| {
+                                                            ui.strong(format!("{}: ", name));
+                                                            ui.label(format!("{:?}", val));
+                                                        });
+                                                    }
+                                                });
+                                        }
+                                    });
                                 }
                             }
                         }
@@ -572,9 +759,15 @@ impl eframe::App for ExrApp {
                                             }
 
                                             if self.viewer.srgb {
-                                                disp_r = crate::viewer::ExrViewer::linear_to_srgb(disp_r);
-                                                disp_g = crate::viewer::ExrViewer::linear_to_srgb(disp_g);
-                                                disp_b = crate::viewer::ExrViewer::linear_to_srgb(disp_b);
+                                                disp_r = crate::viewer::ExrViewer::linear_to_srgb(
+                                                    disp_r,
+                                                );
+                                                disp_g = crate::viewer::ExrViewer::linear_to_srgb(
+                                                    disp_g,
+                                                );
+                                                disp_b = crate::viewer::ExrViewer::linear_to_srgb(
+                                                    disp_b,
+                                                );
                                             }
 
                                             let r_u8 = (disp_r.clamp(0.0, 1.0) * 255.0) as u8;
@@ -703,114 +896,6 @@ impl eframe::App for ExrApp {
                     ui.label("No file loaded.");
                 }
             });
-
-             egui::Panel::bottom("status_bar").show_inside(ui, |ui| {
-            egui::ScrollArea::horizontal().show(ui, |ui| {
-                ui.vertical(|ui| {
-                    let draw_nuke_status_line = |ui: &mut egui::Ui, prefix: &str, data: Option<&ExrData>, hover_pos: Option<(usize, usize)>, val: Option<[f32; 4]>, layer_name: &str| {
-                        if let Some(d) = data {
-                            ui.horizontal(|ui| {
-                                let disp_w = d.image.attributes.display_window.size.x();
-                                let disp_h = d.image.attributes.display_window.size.y();
-                                
-                                let phys_idx = d.logical_layers.iter().position(|l| l.name == layer_name).unwrap_or(0);
-                                let data_window_min = d.image.layer_data[phys_idx].attributes.layer_position;
-                                let data_w = d.image.layer_data[phys_idx].size.0;
-                                let data_h = d.image.layer_data[phys_idx].size.1;
-                                
-                                let channels: Vec<_> = d.logical_layers.iter().map(|l| l.name.as_str()).collect();
-                                let mut channels_str = channels.join(",");
-                                if channels_str.len() > 50 {
-                                    channels_str.truncate(50);
-                                    channels_str.push_str("...");
-                                }
-
-                                ui.label(egui::RichText::new(format!("{}: {}x{} bbox: {} {} {} {} channels: {}", 
-                                    prefix, 
-                                    disp_w, disp_h, 
-                                    data_window_min.x(), data_window_min.y(), data_w, data_h,
-                                    channels_str
-                                )).color(egui::Color32::DARK_GRAY));
-                                
-                                ui.add_space(10.0);
-                                
-                                if let (Some((x, y)), Some(v)) = (hover_pos, val) {
-                                    ui.label(egui::RichText::new(format!("x={} y={} {}", x, y, layer_name)).strong().color(egui::Color32::WHITE));
-                                    ui.spacing_mut().item_spacing.x = 4.0;
-                                    ui.label(egui::RichText::new(format!("{:.5}", v[0])).color(egui::Color32::from_rgb(255, 80, 80)));
-                                    ui.label(egui::RichText::new(format!("{:.5}", v[1])).color(egui::Color32::from_rgb(80, 255, 80)));
-                                    ui.label(egui::RichText::new(format!("{:.5}", v[2])).color(egui::Color32::from_rgb(100, 150, 255)));
-                                    ui.label(egui::RichText::new(format!("{:.5}", v[3])).color(egui::Color32::LIGHT_GRAY));
-                                    
-                                    // Swatch
-                                    let (r, g, b) = (
-                                        (v[0].clamp(0.0, 1.0) * 255.0) as u8,
-                                        (v[1].clamp(0.0, 1.0) * 255.0) as u8,
-                                        (v[2].clamp(0.0, 1.0) * 255.0) as u8,
-                                    );
-                                    let (rect, _response) = ui.allocate_exact_size(egui::vec2(20.0, 14.0), egui::Sense::hover());
-                                    ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgb(r, g, b));
-                                    
-                                    // HSVL
-                                    ui.add_space(10.0);
-                                    let max = v[0].max(v[1]).max(v[2]);
-                                    let min = v[0].min(v[1]).min(v[2]);
-                                    let delta = max - min;
-                                    let mut h = 0.0;
-                                    if delta > 0.0 {
-                                        if max == v[0] {
-                                            h = 60.0 * (((v[1] - v[2]) / delta) % 6.0);
-                                        } else if max == v[1] {
-                                            h = 60.0 * (((v[2] - v[0]) / delta) + 2.0);
-                                        } else if max == v[2] {
-                                            h = 60.0 * (((v[0] - v[1]) / delta) + 4.0);
-                                        }
-                                    }
-                                    if h < 0.0 { h += 360.0; }
-                                    let s = if max > 0.0 { delta / max } else { 0.0 };
-                                    let val_v = max;
-                                    let l = 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2];
-                                    
-                                    ui.label(egui::RichText::new(format!("H:{:.0} S:{:.2} V:{:.2} L:{:.5}", h, s, val_v, l)).color(egui::Color32::LIGHT_GRAY));
-                                } else {
-                                    ui.label(egui::RichText::new(format!("x=-- y=-- {}", layer_name)).color(egui::Color32::DARK_GRAY));
-                                }
-                            });
-                        }
-                    };
-
-                    let layer_name_a = self.exr_data.as_ref()
-                        .and_then(|d| d.logical_layers.get(self.viewer.active_layer))
-                        .map(|l| l.name.as_str())
-                        .unwrap_or("");
-                        
-                    draw_nuke_status_line(
-                        ui, 
-                        "A", 
-                        self.exr_data.as_ref(), 
-                        self.viewer.last_hover_pos_img, 
-                        self.viewer.last_sampled_val_a, 
-                        layer_name_a
-                    );
-
-                    if let Some(exr_b) = &self.exr_data_b {
-                        let layer_name_b = exr_b
-                            .logical_layers.get(self.viewer.active_layer.min(exr_b.logical_layers.len().saturating_sub(1)))
-                            .map(|l| l.name.as_str())
-                            .unwrap_or("");
-                            
-                        draw_nuke_status_line(
-                            ui, 
-                            "B", 
-                            Some(exr_b), 
-                            self.viewer.last_hover_pos_img, 
-                            self.viewer.last_sampled_val_b, 
-                            layer_name_b
-                        );
-                    }
-                });
-            });
-        });
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
             if self.loaded_file.is_some() {

@@ -54,14 +54,14 @@ impl CubeLut {
                 }
                 _ => {
                     // Must be a data row
-                    if parts.len() >= 3 {
-                        if let (Ok(r), Ok(g), Ok(b)) = (
+                    if parts.len() >= 3
+                        && let (Ok(r), Ok(g), Ok(b)) = (
                             parts[0].parse::<f32>(),
                             parts[1].parse::<f32>(),
                             parts[2].parse::<f32>(),
-                        ) {
-                            data.push([r, g, b, 1.0]); // Alpha is 1.0
-                        }
+                        )
+                    {
+                        data.push([r, g, b, 1.0]); // Alpha is 1.0
                     }
                 }
             }

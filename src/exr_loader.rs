@@ -59,8 +59,20 @@ impl ExrData {
                         use std::io::Read;
                         let mut buf = [0u8; 4];
                         if f.read_exact(&mut buf).is_ok() {
-                            let hex_str = format!("{:02X} {:02X} {:02X} {:02X}", buf[0], buf[1], buf[2], buf[3]);
-                            let ascii_str: String = buf.iter().map(|&b| if b >= 32 && b <= 126 { b as char } else { '.' }).collect();
+                            let hex_str = format!(
+                                "{:02X} {:02X} {:02X} {:02X}",
+                                buf[0], buf[1], buf[2], buf[3]
+                            );
+                            let ascii_str: String = buf
+                                .iter()
+                                .map(|&b| {
+                                    if (32..=126).contains(&b) {
+                                        b as char
+                                    } else {
+                                        '.'
+                                    }
+                                })
+                                .collect();
                             return Err(format!(
                                 "Not a valid EXR file (magic number missing).\nFirst 4 bytes: [{}] ('{}')\nMake sure this is actually an OpenEXR file and not a renamed PNG, JPG, or corrupted file.",
                                 hex_str, ascii_str
@@ -261,12 +273,12 @@ fn apply_smart_names(layers: &mut [LogicalLayer]) {
 
         // If the resulting name is exactly `part.part` (like `combineddiffuse.combineddiffuse`),
         // deduplicate it to just `part` to match standard Nuke formatting.
-        if let Some((left, right)) = name.split_once('.') {
-            if left == right {
-                name = left.to_string();
-            }
+        if let Some((left, right)) = name.split_once('.')
+            && left == right
+        {
+            name = left.to_string();
         }
-        
+
         l.name = name;
     }
 }
@@ -345,16 +357,25 @@ mod tests {
 
         let combined = &g[0];
         assert_eq!(combined.group_key, "ViewLayer.Combined");
-        assert_eq!((combined.r, combined.g, combined.b, combined.a), (Some(2), Some(1), Some(0), Some(3)));
+        assert_eq!(
+            (combined.r, combined.g, combined.b, combined.a),
+            (Some(2), Some(1), Some(0), Some(3))
+        );
 
         let depth = &g[1];
         assert_eq!(depth.group_key, "ViewLayer.Depth");
         // Single channel -> grayscale, no alpha.
-        assert_eq!((depth.r, depth.g, depth.b, depth.a), (Some(4), Some(4), Some(4), None));
+        assert_eq!(
+            (depth.r, depth.g, depth.b, depth.a),
+            (Some(4), Some(4), Some(4), None)
+        );
 
         let normal = &g[2];
         assert_eq!(normal.group_key, "ViewLayer.Normal");
-        assert_eq!((normal.r, normal.g, normal.b, normal.a), (Some(5), Some(6), Some(7), None));
+        assert_eq!(
+            (normal.r, normal.g, normal.b, normal.a),
+            (Some(5), Some(6), Some(7), None)
+        );
     }
 
     #[test]
@@ -362,7 +383,10 @@ mod tests {
         let g = group_channels(&names(&["R", "G", "B", "A"]));
         assert_eq!(g.len(), 1);
         assert_eq!(g[0].group_key, "");
-        assert_eq!((g[0].r, g[0].g, g[0].b, g[0].a), (Some(0), Some(1), Some(2), Some(3)));
+        assert_eq!(
+            (g[0].r, g[0].g, g[0].b, g[0].a),
+            (Some(0), Some(1), Some(2), Some(3))
+        );
     }
 
     #[test]
@@ -380,15 +404,37 @@ mod tests {
     #[test]
     fn smart_names_strip_shared_prefix_and_label_root() {
         let mut layers = vec![
-            LogicalLayer { name: String::new(), group_key: "ViewLayer.Combined".into(), physical_index: 0, r: None, g: None, b: None, a: None },
-            LogicalLayer { name: String::new(), group_key: "ViewLayer.Normal".into(), physical_index: 0, r: None, g: None, b: None, a: None },
+            LogicalLayer {
+                name: String::new(),
+                group_key: "ViewLayer.Combined".into(),
+                physical_index: 0,
+                r: None,
+                g: None,
+                b: None,
+                a: None,
+            },
+            LogicalLayer {
+                name: String::new(),
+                group_key: "ViewLayer.Normal".into(),
+                physical_index: 0,
+                r: None,
+                g: None,
+                b: None,
+                a: None,
+            },
         ];
         apply_smart_names(&mut layers);
         assert_eq!(layers[0].name, "Combined");
         assert_eq!(layers[1].name, "Normal");
 
         let mut root = vec![LogicalLayer {
-            name: String::new(), group_key: String::new(), physical_index: 0, r: Some(0), g: Some(1), b: Some(2), a: Some(3),
+            name: String::new(),
+            group_key: String::new(),
+            physical_index: 0,
+            r: Some(0),
+            g: Some(1),
+            b: Some(2),
+            a: Some(3),
         }];
         apply_smart_names(&mut root);
         assert_eq!(root[0].name, "RGBA");

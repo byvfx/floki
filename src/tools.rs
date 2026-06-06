@@ -1,9 +1,9 @@
 use exr::prelude::*;
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::Arc;
 
 pub fn run_conversion_task(
     input_dir: PathBuf,
@@ -12,18 +12,17 @@ pub fn run_conversion_task(
     cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     let mut files_to_process = Vec::new();
-    
+
     // Read all .exr files in the input directory
     match std::fs::read_dir(&input_dir) {
         Ok(entries) => {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.is_file() {
-                    if let Some(ext) = path.extension() {
-                        if ext.to_ascii_lowercase() == "exr" {
-                            files_to_process.push(path);
-                        }
-                    }
+                if path.is_file()
+                    && let Some(ext) = path.extension()
+                    && ext.eq_ignore_ascii_case("exr")
+                {
+                    files_to_process.push(path);
                 }
             }
         }
@@ -124,10 +123,13 @@ fn canonical_rgba(suffix: &str) -> Option<&'static str> {
     }
 }
 
-fn convert_exr(in_path: &Path, out_path: &Path) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    use std::io::{BufReader, BufWriter};
-    use std::fs::File;
+fn convert_exr(
+    in_path: &Path,
+    out_path: &Path,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     use exr::block::writer::ChunksWriter;
+    use std::fs::File;
+    use std::io::{BufReader, BufWriter};
 
     // 1 MiB buffers: EXR chunks are large, so the default 8 KiB buffer turns a
     // sequential copy into many syscalls. Bigger buffers cut that dramatically.
@@ -195,19 +197,24 @@ fn convert_exr(in_path: &Path, out_path: &Path) -> std::result::Result<(), Box<d
     }
 
     let out_file = BufWriter::with_capacity(1 << 20, File::create(out_path)?);
-    exr::block::writer::write_chunks_with(out_file, meta.headers.clone(), false, |_, chunk_writer| {
-        let chunks_reader = reader.all_chunks(false)?;
-        for chunk_result in chunks_reader {
-            let chunk = chunk_result?;
-            let layer_idx = chunk.layer_index;
-            let header = &meta.headers[layer_idx];
-            
-            let location = header.get_block_data_indices(&chunk.compressed_block)?;
-            let index_in_header = block_indices[layer_idx][&location];
-            chunk_writer.write_chunk(index_in_header, chunk)?;
-        }
-        Ok(())
-    })?;
+    exr::block::writer::write_chunks_with(
+        out_file,
+        meta.headers.clone(),
+        false,
+        |_, chunk_writer| {
+            let chunks_reader = reader.all_chunks(false)?;
+            for chunk_result in chunks_reader {
+                let chunk = chunk_result?;
+                let layer_idx = chunk.layer_index;
+                let header = &meta.headers[layer_idx];
+
+                let location = header.get_block_data_indices(&chunk.compressed_block)?;
+                let index_in_header = block_indices[layer_idx][&location];
+                chunk_writer.write_chunk(index_in_header, chunk)?;
+            }
+            Ok(())
+        },
+    )?;
 
     Ok(())
 }
@@ -298,7 +305,8 @@ mod tests {
         assert_eq!(out.get("y"), Some(&20.0), "y must keep its name and data");
         assert_eq!(out.get("z"), Some(&30.0), "z must keep its name and data");
         assert!(
-            !out.keys().any(|k| k.ends_with(".R") || k.ends_with(".G") || k.ends_with(".B")),
+            !out.keys()
+                .any(|k| k.ends_with(".R") || k.ends_with(".G") || k.ends_with(".B")),
             "no x/y/z channel should have been renamed to a colour channel: {:?}",
             out.keys().collect::<Vec<_>>()
         );

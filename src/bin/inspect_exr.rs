@@ -8,8 +8,19 @@ fn inspect_file(path: &str) {
                 println!("  Header {}:", i);
                 println!("    Layer Name: {:?}", header.own_attributes.layer_name);
                 println!("    Data Window: {:?}", header.data_window());
-                println!("    Display Window: {:?}", header.shared_attributes.display_window);
-                println!("    Channels: {:?}", header.channels.list.iter().map(|c| &c.name).collect::<Vec<_>>());
+                println!(
+                    "    Display Window: {:?}",
+                    header.shared_attributes.display_window
+                );
+                println!(
+                    "    Channels: {:?}",
+                    header
+                        .channels
+                        .list
+                        .iter()
+                        .map(|c| &c.name)
+                        .collect::<Vec<_>>()
+                );
             }
         }
         Err(e) => {
