@@ -521,28 +521,34 @@ impl ExrViewer {
                     image_size,
                 );
 
-                let painter = ui.painter().with_clip_rect(rect);
+                let unclipped_painter = ui.painter().with_clip_rect(rect);
+                let painter = ui.painter().with_clip_rect(rect.intersect(disp_rect));
                 
                 // Draw display window bounding box
-                draw_dashed_rect(&painter, disp_rect, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 100), 5.0, 5.0);
+                draw_dashed_rect(&unclipped_painter, disp_rect, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 100), 5.0, 5.0);
                 
                 // Labels for display window
-                painter.text(
-                    disp_rect.left_bottom() + egui::vec2(0.0, 5.0),
-                    egui::Align2::LEFT_TOP,
-                    format!("{},{}", disp_window.position.x(), disp_window.position.y()),
-                    egui::FontId::proportional(12.0),
-                    egui::Color32::GRAY,
-                );
-                let top_right_x = disp_window.position.x() + disp_window.size.x() as i32;
-                let top_right_y = disp_window.position.y() + disp_window.size.y() as i32;
-                painter.text(
-                    disp_rect.right_top() - egui::vec2(0.0, 5.0),
-                    egui::Align2::RIGHT_BOTTOM,
-                    format!("{},{}", top_right_x, top_right_y),
-                    egui::FontId::proportional(12.0),
-                    egui::Color32::GRAY,
-                );
+                let is_overscanned = image_rect.min.x < disp_rect.min.x || image_rect.min.y < disp_rect.min.y || image_rect.max.x > disp_rect.max.x || image_rect.max.y > disp_rect.max.y;
+                let is_cropped = image_rect.min.x > disp_rect.min.x || image_rect.min.y > disp_rect.min.y || image_rect.max.x < disp_rect.max.x || image_rect.max.y < disp_rect.max.y;
+                
+                if is_overscanned || is_cropped {
+                    unclipped_painter.text(
+                        disp_rect.left_bottom() + egui::vec2(0.0, 5.0),
+                        egui::Align2::LEFT_TOP,
+                        format!("{},{}", disp_window.position.x(), disp_window.position.y()),
+                        egui::FontId::proportional(12.0),
+                        egui::Color32::GRAY,
+                    );
+                    let top_right_x = disp_window.position.x() + disp_window.size.x() as i32;
+                    let top_right_y = disp_window.position.y() + disp_window.size.y() as i32;
+                    unclipped_painter.text(
+                        disp_rect.right_top() - egui::vec2(0.0, 5.0),
+                        egui::Align2::RIGHT_BOTTOM,
+                        format!("{},{}", top_right_x, top_right_y),
+                        egui::FontId::proportional(12.0),
+                        egui::Color32::GRAY,
+                    );
+                }
 
 
                 if let Some(_rs) = render_state {
@@ -634,8 +640,9 @@ impl ExrViewer {
                             lut_bg: active_lut_bg.clone(),
                         };
 
-                        painter.with_clip_rect(clip_rect).add(
-                            eframe::egui_wgpu::Callback::new_paint_callback(clip_rect, callback),
+                        let final_clip_rect = painter.clip_rect().intersect(clip_rect);
+                        painter.with_clip_rect(final_clip_rect).add(
+                            eframe::egui_wgpu::Callback::new_paint_callback(final_clip_rect, callback),
                         );
                     };
 
@@ -768,7 +775,8 @@ impl ExrViewer {
                             } else {
                                 1.0
                             };
-                            painter.with_clip_rect(clip_rect).image(
+                            let final_clip_rect = painter.clip_rect().intersect(clip_rect);
+                            painter.with_clip_rect(final_clip_rect).image(
                                 tex.id(),
                                 target_rect,
                                 egui::Rect::from_min_max(
@@ -882,14 +890,17 @@ impl ExrViewer {
                 }
 
                 // Draw data window bounding box over the image
-                draw_dashed_rect(&painter, image_rect, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 150), 3.0, 3.0);
-                painter.text(
-                    image_rect.right_bottom() + egui::vec2(5.0, 5.0),
-                    egui::Align2::LEFT_TOP,
-                    format!("({}x{})", tex_size.x, tex_size.y),
-                    egui::FontId::proportional(12.0),
-                    egui::Color32::GRAY,
-                );
+                if is_overscanned || is_cropped {
+                    draw_dashed_rect(&unclipped_painter, image_rect, egui::Color32::from_rgba_unmultiplied(255, 200, 100, 180), 4.0, 4.0);
+                    
+                    unclipped_painter.text(
+                        image_rect.right_bottom() + egui::vec2(5.0, 5.0),
+                        egui::Align2::LEFT_TOP,
+                        format!("Overscan: {}x{} (pos: {}, {})", tex_size.x, tex_size.y, data_window_min.0, data_window_min.1),
+                        egui::FontId::proportional(12.0),
+                        egui::Color32::from_rgb(255, 200, 100),
+                    );
+                }
 
                 // Pixel Sampling & Swatches
                 let mut hovered_pixel = None;
