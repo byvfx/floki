@@ -14,7 +14,7 @@ struct Uniforms {
     is_diff_mode: u32,
     srgb: u32,
     enable_lut: u32,
-    pad2: u32,
+    opacity: f32,
     pad3: u32,
     pad4: u32,
 };
@@ -138,5 +138,5 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         b = linear_to_srgb(b);
     }
 
-    return vec4<f32>(r, g, b, 1.0);
+    return vec4<f32>(r, g, b, uniforms.opacity);
 }

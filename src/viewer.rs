@@ -36,6 +36,7 @@ pub struct ExrViewer {
     pub blink_state: bool,
     // Add viewing options like exposure, gamma, srgb toggle
     pub exposure: f32,
+    pub overscan_opacity: f32,
     pub gamma: f32,
     pub srgb: bool,
     pub enable_lut: bool,
@@ -72,6 +73,7 @@ impl Default for ExrViewer {
             last_diff_params: (0, 0.0),
             blink_state: false,
             exposure: 0.0,
+            overscan_opacity: 0.2,
             gamma: 1.0,
             srgb: true,
             enable_lut: false,
@@ -177,6 +179,9 @@ impl ExrViewer {
                     self.textures_b.fill(None);
                     self.diff_texture = None;
                 }
+
+                ui.label("Overscan Opacity:");
+                ui.add(egui::Slider::new(&mut self.overscan_opacity, 0.0..=1.0));
                 ui.label("Gamma:");
                 if ui
                     .add(egui::Slider::new(&mut self.gamma, 0.1..=5.0))
@@ -574,7 +579,7 @@ impl ExrViewer {
                         is_diff_mode: 0,
                         srgb: if self.srgb { 1 } else { 0 },
                         enable_lut: if self.enable_lut { 1 } else { 0 },
-                        pad2: 0,
+                        opacity: 1.0,
                         pad3: 0,
                         pad4: 0,
                     };
@@ -597,11 +602,13 @@ impl ExrViewer {
                     >,
                                     clip_rect: egui::Rect,
                                     target_rect: egui::Rect,
-                                    is_diff: bool| {
+                                    is_diff: bool,
+                                    opacity: f32| {
                         let mut u = uniform_data.clone();
                         u.rect_min = [target_rect.min.x, target_rect.min.y];
                         u.rect_max = [target_rect.max.x, target_rect.max.y];
                         u.is_diff_mode = if is_diff { 1 } else { 0 };
+                        u.opacity = opacity;
 
                         let device = &render_state.as_ref().unwrap().device;
                         let renderer_guard = render_state.as_ref().unwrap().renderer.read();
@@ -653,9 +660,10 @@ impl ExrViewer {
                         } else {
                             self.compare_mode
                         };
-                        match comp_mode {
+                        let mut draw_all = |p: &egui::Painter, opac: f32| {
+                            match comp_mode {
                             CompareMode::SingleA => {
-                                draw_gpu(&painter, bg_a, None, rect, image_rect, false);
+                                draw_gpu(p, bg_a.clone(), None, rect, image_rect, false, opac);
                             }
                             CompareMode::SingleB => {
                                 if let Some(bg_b) = exr_data_b.and_then(|d| {
@@ -664,7 +672,7 @@ impl ExrViewer {
                                         .min(d.logical_layers.len().saturating_sub(1))]
                                     .clone()
                                 }) {
-                                    draw_gpu(&painter, bg_b, None, rect, image_rect, false);
+                                    draw_gpu(p, bg_b.clone(), None, rect, image_rect, false, opac);
                                 }
                             }
                             CompareMode::Wipe => {
@@ -676,14 +684,14 @@ impl ExrViewer {
                                 let mut rect_b = rect;
                                 rect_b.min.x = clamped_wipe_x;
 
-                                draw_gpu(&painter, bg_a.clone(), None, rect_a, image_rect, false);
+                                draw_gpu(p, bg_a.clone(), None, rect_a, image_rect, false, opac);
                                 if let Some(bg_b) = exr_data_b.and_then(|d| {
                                     self.gpu_textures_b[self
                                         .active_layer
                                         .min(d.logical_layers.len().saturating_sub(1))]
                                     .clone()
                                 }) {
-                                    draw_gpu(&painter, bg_b, None, rect_b, image_rect, false);
+                                    draw_gpu(p, bg_b, None, rect_b, image_rect, false, opac);
                                 }
                                 painter.line_segment(
                                     [
@@ -731,14 +739,15 @@ impl ExrViewer {
                                     ));
 
                                     draw_gpu(
-                                        &painter,
+                                        p,
                                         bg_a.clone(),
                                         None,
                                         rect,
                                         image_rect_a,
                                         false,
+                                        opac,
                                     );
-                                    draw_gpu(&painter, bg_b, None, rect, image_rect_b, false);
+                                    draw_gpu(p, bg_b.clone(), None, rect, image_rect_b, false, opac);
                                     painter.line_segment(
                                         [
                                             egui::pos2(image_rect_b.min.x, combined_rect.min.y),
@@ -747,7 +756,7 @@ impl ExrViewer {
                                         (2.0, egui::Color32::GRAY),
                                     );
                                 } else {
-                                    draw_gpu(&painter, bg_a, None, rect, image_rect, false);
+                                    draw_gpu(p, bg_a.clone(), None, rect, image_rect, false, opac);
                                 }
                             }
                             CompareMode::DiffMatte => {
@@ -758,22 +767,28 @@ impl ExrViewer {
                                     .clone()
                                 });
                                 if let Some(bg_b) = bg_b_opt {
-                                    draw_gpu(&painter, bg_a, Some(bg_b), rect, image_rect, true);
+                                    draw_gpu(p, bg_a.clone(), Some(bg_b.clone()), rect, image_rect, true, opac);
                                 }
                             }
                         }
+                        };
+                        
+                        if self.overscan_opacity > 0.0 {
+                            draw_all(&unclipped_painter, self.overscan_opacity);
+                        }
+                        draw_all(&painter, 1.0);
                     }
                 } else {
                     let texture = &self.textures[self.active_layer];
-                    let draw_image =
-                        |painter: &egui::Painter,
-                         tex: &egui::TextureHandle,
-                         clip_rect: egui::Rect,
-                         target_rect: egui::Rect| {
+                    let mut draw_image = |painter: &egui::Painter,
+                                          tex: &egui::TextureHandle,
+                                          clip_rect: egui::Rect,
+                                          target_rect: egui::Rect,
+                                          opacity: f32| {
                             let alpha = if self.blink_state && (ui.input(|i| i.time) % 1.0 > 0.5) {
                                 0.0
                             } else {
-                                1.0
+                                opacity
                             };
                             let final_clip_rect = painter.clip_rect().intersect(clip_rect);
                             painter.with_clip_rect(final_clip_rect).image(
@@ -787,9 +802,10 @@ impl ExrViewer {
                             );
                         };
 
-                    match self.compare_mode {
+                    let mut draw_all_cpu = |p: &egui::Painter, opac: f32| {
+                        match self.compare_mode {
                         CompareMode::SingleA => {
-                            draw_image(&painter, texture.as_ref().unwrap(), rect, image_rect);
+                            draw_image(p, texture.as_ref().unwrap(), rect, image_rect, opac);
                         }
                         CompareMode::SingleB => {
                             if let Some(tex_b) = exr_data_b.and_then(|d| {
@@ -798,7 +814,7 @@ impl ExrViewer {
                                     .min(d.logical_layers.len().saturating_sub(1))]
                                 .as_ref()
                             }) {
-                                draw_image(&painter, tex_b, rect, image_rect);
+                                draw_image(p, tex_b, rect, image_rect, opac);
                             }
                         }
                         CompareMode::Wipe => {
@@ -809,14 +825,14 @@ impl ExrViewer {
                             let mut rect_b = rect;
                             rect_b.min.x = clamped_wipe_x;
 
-                            draw_image(&painter, texture.as_ref().unwrap(), rect_a, image_rect);
+                            draw_image(p, texture.as_ref().unwrap(), rect_a, image_rect, opac);
                             if let Some(tex_b) = exr_data_b.and_then(|d| {
                                 self.textures_b[self
                                     .active_layer
                                     .min(d.logical_layers.len().saturating_sub(1))]
                                 .as_ref()
                             }) {
-                                draw_image(&painter, tex_b, rect_b, image_rect);
+                                draw_image(p, tex_b, rect_b, image_rect, opac);
                             }
 
                             painter.line_segment(
@@ -867,8 +883,8 @@ impl ExrViewer {
                                     combined_rect.center().y,
                                 ));
 
-                                draw_image(&painter, texture.as_ref().unwrap(), rect, image_rect_a);
-                                draw_image(&painter, tex_b, rect, image_rect_b);
+                                draw_image(p, texture.as_ref().unwrap(), rect, image_rect_a, opac);
+                                draw_image(p, tex_b, rect, image_rect_b, opac);
 
                                 painter.line_segment(
                                     [
@@ -878,15 +894,21 @@ impl ExrViewer {
                                     (2.0, egui::Color32::GRAY),
                                 );
                             } else {
-                                draw_image(&painter, texture.as_ref().unwrap(), rect, image_rect);
+                                draw_image(p, texture.as_ref().unwrap(), rect, image_rect, opac);
                             }
                         }
                         CompareMode::DiffMatte => {
                             if let Some(diff) = &self.diff_texture {
-                                draw_image(&painter, diff, rect, image_rect);
+                                draw_image(p, diff, rect, image_rect, opac);
                             }
                         }
                     }
+                    };
+                    
+                    if self.overscan_opacity > 0.0 {
+                        draw_all_cpu(&unclipped_painter, self.overscan_opacity);
+                    }
+                    draw_all_cpu(&painter, 1.0);
                 }
 
                 // Draw data window bounding box over the image

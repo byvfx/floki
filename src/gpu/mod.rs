@@ -15,7 +15,7 @@ pub struct Uniforms {
     pub is_diff_mode: u32,
     pub srgb: u32,
     pub enable_lut: u32,
-    pub pad2: u32,
+    pub opacity: f32,
     pub pad3: u32,
     pub pad4: u32,
 }
