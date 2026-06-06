@@ -933,6 +933,7 @@ impl ExrViewer {
                 if let Some(pos) = response.hover_pos() {
                     let mut hover_x = None;
                     let mut hover_y = None;
+                    let mut hovered_b = false;
 
                     if self.compare_mode == CompareMode::SideBySide && exr_data_b.is_some() {
                         let tex_b_opt = exr_data_b.and_then(|d| self.textures_b[self.active_layer.min(d.logical_layers.len().saturating_sub(1))].as_ref());
@@ -968,6 +969,7 @@ impl ExrViewer {
                                 let scale_b = if self.normalize_side_by_side { (tex_size.y * self.scale) / tex_size_b.unwrap().y } else { self.scale };
                                 hover_x = Some((local.x / scale_b) as usize);
                                 hover_y = Some((local.y / scale_b) as usize);
+                                hovered_b = true;
                             }
                         }
                     } else {
@@ -979,13 +981,32 @@ impl ExrViewer {
                     }
                     let mut val_a_opt = None;
                     let mut val_b_opt = None;
+                    let mut x_final = None;
+                    let mut y_final = None;
 
                     if let (Some(x), Some(y)) = (hover_x, hover_y) {
-                        if x < tex_size.x as usize && y < tex_size.y as usize {
+                        // Check if within bounds of the hovered image
+                        let mut valid = false;
+                        if hovered_b {
+                            if let Some(s) = tex_size_b {
+                                if x < s.x as usize && y < s.y as usize {
+                                    valid = true;
+                                }
+                            }
+                        } else {
+                            if x < tex_size.x as usize && y < tex_size.y as usize {
+                                valid = true;
+                            }
+                        }
+
+                        if valid {
                             hovered_pixel = Some((x, y));
+                            x_final = Some(x);
+                            y_final = Some(y);
                             val_a_opt = self.sample_pixel(exr_data, self.active_layer, x, y);
                             val_b_opt = if let Some(exr_b) = exr_data_b {
-                                self.sample_pixel(exr_b, self.active_layer, x, y)
+                                let layer_b = self.active_layer.min(exr_b.logical_layers.len().saturating_sub(1));
+                                self.sample_pixel(exr_b, layer_b, x, y)
                             } else {
                                 None
                             };
@@ -997,7 +1018,7 @@ impl ExrViewer {
                     }
 
                     if self.show_tooltip && (val_a_opt.is_some() || val_b_opt.is_some()) {
-                        if let Some((x, y)) = hovered_pixel {
+                        if let (Some(x), Some(y)) = (x_final, y_final) {
                             egui::Window::new("Pixel Tooltip")
                                 .fixed_pos(pos + egui::vec2(15.0, 15.0))
                                 .title_bar(false)
