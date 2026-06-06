@@ -764,11 +764,50 @@ impl eframe::App for ExrApp {
                             ui.separator();
                             ui.add_space(10.0);
                         }
-                        ui.label("B:");
+                        
+                        let layer_name_b = self.exr_data_b.as_ref()
+                            .and_then(|d| d.logical_layers.get(self.viewer.active_layer.min(d.logical_layers.len().saturating_sub(1))))
+                            .map(|l| l.name.as_str())
+                            .unwrap_or("");
+                        ui.label(egui::RichText::new(format!("B: {}", layer_name_b)).strong().color(egui::Color32::WHITE));
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        
                         ui.label(egui::RichText::new(format!("{:.5}", val_b[0])).color(egui::Color32::from_rgb(255, 80, 80)));
                         ui.label(egui::RichText::new(format!("{:.5}", val_b[1])).color(egui::Color32::from_rgb(80, 255, 80)));
                         ui.label(egui::RichText::new(format!("{:.5}", val_b[2])).color(egui::Color32::from_rgb(100, 150, 255)));
                         ui.label(egui::RichText::new(format!("{:.5}", val_b[3])).color(egui::Color32::LIGHT_GRAY));
+                        
+                        // Swatch B
+                        let (r, g, b) = (
+                            (val_b[0].clamp(0.0, 1.0) * 255.0) as u8,
+                            (val_b[1].clamp(0.0, 1.0) * 255.0) as u8,
+                            (val_b[2].clamp(0.0, 1.0) * 255.0) as u8,
+                        );
+                        let (rect, _response) = ui.allocate_exact_size(egui::vec2(20.0, 14.0), egui::Sense::hover());
+                        ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgb(r, g, b));
+                        
+                        // HSVL B
+                        ui.add_space(10.0);
+                        let max = val_b[0].max(val_b[1]).max(val_b[2]);
+                        let min = val_b[0].min(val_b[1]).min(val_b[2]);
+                        let delta = max - min;
+                        
+                        let mut h = 0.0;
+                        if delta > 0.0 {
+                            if max == val_b[0] {
+                                h = 60.0 * (((val_b[1] - val_b[2]) / delta) % 6.0);
+                            } else if max == val_b[1] {
+                                h = 60.0 * (((val_b[2] - val_b[0]) / delta) + 2.0);
+                            } else if max == val_b[2] {
+                                h = 60.0 * (((val_b[0] - val_b[1]) / delta) + 4.0);
+                            }
+                        }
+                        if h < 0.0 { h += 360.0; }
+                        let s = if max > 0.0 { delta / max } else { 0.0 };
+                        let v = max;
+                        let l = 0.2126 * val_b[0] + 0.7152 * val_b[1] + 0.0722 * val_b[2];
+                        
+                        ui.label(egui::RichText::new(format!("H:{:.0} S:{:.2} V:{:.2} L:{:.5}", h, s, v, l)).color(egui::Color32::LIGHT_GRAY));
                     }
                 } else {
                     ui.label(egui::RichText::new("x=-- y=--").color(egui::Color32::DARK_GRAY));
