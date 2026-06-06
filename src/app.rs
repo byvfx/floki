@@ -705,7 +705,7 @@ impl eframe::App for ExrApp {
             });
 
         
-        egui::TopBottomPanel::bottom("status_bar").show_inside(ui, |ui| {
+        egui::Panel::bottom("status_bar").show_inside(ui, |ui| {
             egui::ScrollArea::horizontal().show(ui, |ui| {
                 ui.horizontal(|ui| {
                     if let Some((x, y)) = self.viewer.last_hover_pos_img {

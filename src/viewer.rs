@@ -664,7 +664,7 @@ impl ExrViewer {
                         } else {
                             self.compare_mode
                         };
-                        let mut draw_all = |p: &egui::Painter, opac: f32| {
+                        let draw_all = |p: &egui::Painter, opac: f32| {
                             match comp_mode {
                             CompareMode::SingleA => {
                                 draw_gpu(p, bg_a.clone(), None, rect, image_rect, false, opac);
@@ -784,7 +784,7 @@ impl ExrViewer {
                     }
                 } else {
                     let texture = &self.textures[self.active_layer];
-                    let mut draw_image = |painter: &egui::Painter,
+                    let draw_image = |painter: &egui::Painter,
                                           tex: &egui::TextureHandle,
                                           clip_rect: egui::Rect,
                                           target_rect: egui::Rect,
@@ -806,7 +806,7 @@ impl ExrViewer {
                             );
                         };
 
-                    let mut draw_all_cpu = |p: &egui::Painter, opac: f32| {
+                    let draw_all_cpu = |p: &egui::Painter, opac: f32| {
                         match self.compare_mode {
                         CompareMode::SingleA => {
                             draw_image(p, texture.as_ref().unwrap(), rect, image_rect, opac);
@@ -937,7 +937,7 @@ impl ExrViewer {
 
                     if self.compare_mode == CompareMode::SideBySide && exr_data_b.is_some() {
                         let tex_b_opt = exr_data_b.and_then(|d| self.textures_b[self.active_layer.min(d.logical_layers.len().saturating_sub(1))].as_ref());
-                        if let Some(tex_b) = tex_b_opt {
+                        if tex_b_opt.is_some() {
                             let mut image_size_b = tex_size_b.unwrap() * self.scale;
                             if self.normalize_side_by_side {
                                 let scale_b = (tex_size.y * self.scale) / tex_size_b.unwrap().y;
