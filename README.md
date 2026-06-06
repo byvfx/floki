@@ -35,6 +35,12 @@ Load a Reference Image (Image B) to unlock advanced visual diffing:
 * **Dual Histogram Mode:** When comparing two images, the histogram overlays a translucent Red graph (Image B) on top of the White graph (Image A) so you can visually align black levels.
 * **Channel Isolation:** Quickly isolate `R`, `G`, `B`, `A`, or view `RGB` composite with single-key shortcuts.
 
+### Color Management
+* **3D LUT Support:** Load Adobe `.cube` 3D LUTs and apply them in real time on the GPU as a display transform, alongside the built-in Exposure/Gamma/sRGB controls (OCIO config path is also configurable).
+
+### Batch Tooling
+* **EXR Header Converter:** Bulk-rename channels across an entire directory to standard RGBA — available both as an in-app Tools window and a headless `convert_dir` CLI, parallelized across CPU cores via `rayon` with live progress and cancellation.
+
 ### High-Performance UI
 * **Immediate-Mode UI:** Built on `egui` for a responsive, minimal-overhead interface.
 * **Persistent State:** Remembers your UI layout, recent files list, and preferences across sessions.
@@ -67,7 +73,7 @@ Make sure you have [Rust and Cargo](https://rustup.rs/) installed on your system
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/exr-analyzer.git
+git clone https://github.com/byvfx/exr-analyzer.git
 cd exr-analyzer
 
 # Build and run the app in release mode (Highly recommended for EXR parsing speed)
