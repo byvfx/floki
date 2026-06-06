@@ -36,14 +36,30 @@ pub struct LogicalLayer {
 impl ExrData {
     pub fn load(path: impl AsRef<Path>) -> std::result::Result<Self, String> {
         let path_ref = path.as_ref();
-        match read()
-            .no_deep_data()
-            .largest_resolution_level()
-            .all_channels()
-            .all_layers()
-            .all_attributes()
-            .from_file(path_ref)
-        {
+
+        // Block decompression can panic inside the `exr` crate's `zune-inflate`
+        // backend on some files. Read non-parallel so any panic happens on this
+        // thread instead of a detached rayon worker (whose panic would
+        // `process::abort()` the entire app, uncatchable), and catch it so a bad
+        // file surfaces as an error message instead of crashing.
+        let read_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            read()
+                .no_deep_data()
+                .largest_resolution_level()
+                .all_channels()
+                .all_layers()
+                .all_attributes()
+                .non_parallel()
+                .from_file(path_ref)
+        }))
+        .map_err(|_| {
+            "Failed to decode EXR: the decompressor panicked. The file may use an \
+             unsupported compression variant or trigger a known decoder bug in the \
+             exr/zune-inflate dependency."
+                .to_string()
+        })?;
+
+        match read_result {
             Ok(image) => {
                 let logical_layers = build_logical_layers(&image);
                 Ok(Self {
