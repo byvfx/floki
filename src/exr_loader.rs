@@ -251,13 +251,23 @@ fn apply_smart_names(layers: &mut [LogicalLayer]) {
     let prefix = longest_common_dotted_prefix(&keys);
 
     for l in layers.iter_mut() {
-        l.name = if l.group_key.is_empty() {
+        let mut name = if l.group_key.is_empty() {
             "RGBA".to_string()
         } else if !prefix.is_empty() && l.group_key.len() > prefix.len() {
             l.group_key[prefix.len()..].to_string()
         } else {
             l.group_key.clone()
         };
+
+        // If the resulting name is exactly `part.part` (like `combineddiffuse.combineddiffuse`),
+        // deduplicate it to just `part` to match standard Nuke formatting.
+        if let Some((left, right)) = name.split_once('.') {
+            if left == right {
+                name = left.to_string();
+            }
+        }
+        
+        l.name = name;
     }
 }
 

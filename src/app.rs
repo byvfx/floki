@@ -704,6 +704,74 @@ impl eframe::App for ExrApp {
                 }
             });
 
+        
+        egui::TopBottomPanel::bottom("status_bar").show_inside(ui, |ui| {
+            ui.horizontal(|ui| {
+                if let Some((x, y)) = self.viewer.last_hover_pos_img {
+                    ui.label(egui::RichText::new(format!("x={} y={}", x, y)).strong().color(egui::Color32::WHITE));
+                    
+                    let mut has_data = false;
+                    
+                    if let Some(val_a) = self.viewer.last_sampled_val_a {
+                        has_data = true;
+                        ui.add_space(10.0);
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        ui.label(egui::RichText::new(format!("{:.5}", val_a[0])).color(egui::Color32::from_rgb(255, 80, 80)));
+                        ui.label(egui::RichText::new(format!("{:.5}", val_a[1])).color(egui::Color32::from_rgb(80, 255, 80)));
+                        ui.label(egui::RichText::new(format!("{:.5}", val_a[2])).color(egui::Color32::from_rgb(100, 150, 255)));
+                        ui.label(egui::RichText::new(format!("{:.5}", val_a[3])).color(egui::Color32::LIGHT_GRAY));
+                        
+                        // Swatch
+                        let (r, g, b) = (
+                            (val_a[0].clamp(0.0, 1.0) * 255.0) as u8,
+                            (val_a[1].clamp(0.0, 1.0) * 255.0) as u8,
+                            (val_a[2].clamp(0.0, 1.0) * 255.0) as u8,
+                        );
+                        let (rect, _response) = ui.allocate_exact_size(egui::vec2(20.0, 14.0), egui::Sense::hover());
+                        ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgb(r, g, b));
+                        
+                        // HSVL
+                        ui.add_space(10.0);
+                        let max = val_a[0].max(val_a[1]).max(val_a[2]);
+                        let min = val_a[0].min(val_a[1]).min(val_a[2]);
+                        let delta = max - min;
+                        
+                        let mut h = 0.0;
+                        if delta > 0.0 {
+                            if max == val_a[0] {
+                                h = 60.0 * (((val_a[1] - val_a[2]) / delta) % 6.0);
+                            } else if max == val_a[1] {
+                                h = 60.0 * (((val_a[2] - val_a[0]) / delta) + 2.0);
+                            } else if max == val_a[2] {
+                                h = 60.0 * (((val_a[0] - val_a[1]) / delta) + 4.0);
+                            }
+                        }
+                        if h < 0.0 { h += 360.0; }
+                        let s = if max > 0.0 { delta / max } else { 0.0 };
+                        let v = max;
+                        let l = 0.2126 * val_a[0] + 0.7152 * val_a[1] + 0.0722 * val_a[2];
+                        
+                        ui.label(egui::RichText::new(format!("H:{:.0} S:{:.2} V:{:.2} L:{:.5}", h, s, v, l)).color(egui::Color32::LIGHT_GRAY));
+                    }
+                    
+                    if let Some(val_b) = self.viewer.last_sampled_val_b {
+                        if has_data {
+                            ui.add_space(20.0);
+                            ui.separator();
+                            ui.add_space(10.0);
+                        }
+                        ui.label("B:");
+                        ui.label(egui::RichText::new(format!("{:.5}", val_b[0])).color(egui::Color32::from_rgb(255, 80, 80)));
+                        ui.label(egui::RichText::new(format!("{:.5}", val_b[1])).color(egui::Color32::from_rgb(80, 255, 80)));
+                        ui.label(egui::RichText::new(format!("{:.5}", val_b[2])).color(egui::Color32::from_rgb(100, 150, 255)));
+                        ui.label(egui::RichText::new(format!("{:.5}", val_b[3])).color(egui::Color32::LIGHT_GRAY));
+                    }
+                } else {
+                    ui.label(egui::RichText::new("x=-- y=--").color(egui::Color32::DARK_GRAY));
+                }
+            });
+        });
+
         egui::CentralPanel::default().show_inside(ui, |ui| {
             if self.loaded_file.is_some() {
                 if let Some(data) = &self.exr_data {

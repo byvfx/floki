@@ -56,6 +56,9 @@ pub struct ExrViewer {
     pub scale: f32,
     pub translation: egui::Vec2,
     pub first_frame: bool,
+    pub last_hover_pos_img: Option<(usize, usize)>,
+    pub last_sampled_val_a: Option<[f32; 4]>,
+    pub last_sampled_val_b: Option<[f32; 4]>,
 }
 
 impl Default for ExrViewer {
@@ -87,6 +90,9 @@ impl Default for ExrViewer {
             scale: 1.0,
             translation: egui::Vec2::ZERO,
             first_frame: true,
+            last_hover_pos_img: None,
+            last_sampled_val_a: None,
+            last_sampled_val_b: None,
         }
     }
 }
@@ -277,37 +283,70 @@ impl ExrViewer {
                             };
 
                             if let Some(texture) = tex_opt {
+                                // Reserve an EXACTLY uniform cell, then position the image and
+                                // label by absolute geometry. Auto-layout (allocate_ui /
+                                // vertical_centered) let cell heights vary by a few px (inherited
+                                // item-spacing + variable label line count), and horizontal_wrapped
+                                // then center-aligned those unequal cells by different amounts —
+                                // producing the slight vertical "staircase". Fixed rects + paint_at
+                                // remove that degree of freedom entirely.
                                 let thumb_width = 256.0;
-                                let thumb_height = thumb_width * (texture.size_vec2().y / texture.size_vec2().x);
+                                let thumb_box = 256.0;
+                                let label_height = 30.0;
+                                let tex_size = texture.size_vec2();
+                                let aspect = if tex_size.y > 0.0 {
+                                    tex_size.x / tex_size.y
+                                } else {
+                                    1.0
+                                };
+                                let (fit_w, fit_h) = if aspect >= 1.0 {
+                                    (thumb_box, thumb_box / aspect)
+                                } else {
+                                    (thumb_box * aspect, thumb_box)
+                                };
+                                let name = data
+                                    .logical_layers
+                                    .get(i)
+                                    .map(|l| l.name.as_str())
+                                    .unwrap_or("Unnamed");
 
-                                ui.allocate_ui(egui::vec2(thumb_width, thumb_height + 30.0), |ui| {
-                                    ui.vertical(|ui| {
-                                        let name = data
-                                            .logical_layers
-                                            .get(i)
-                                            .map(|l| l.name.as_str())
-                                            .unwrap_or("Unnamed");
-                                        
-                                        let response = ui.add(egui::Image::new(texture).fit_to_exact_size(egui::vec2(thumb_width, thumb_height)).sense(egui::Sense::click()));
-                                        ui.label(egui::RichText::new(format!("{}: {}", i, name)).strong());
+                                let (cell_rect, response) = ui.allocate_exact_size(
+                                    egui::vec2(thumb_width, thumb_box + label_height),
+                                    egui::Sense::click(),
+                                );
 
-                                        if response.clicked() {
-                                            viewer.active_layer = i;
-                                            viewer.show_contact_sheet = false;
-                                            viewer.first_frame = true;
-                                            if !is_a {
-                                                viewer.compare_mode = CompareMode::SingleB;
-                                            } else {
-                                                if viewer.compare_mode == CompareMode::SingleB {
-                                                    viewer.compare_mode = CompareMode::SingleA;
-                                                }
-                                            }
-                                        }
-                                        if response.hovered() {
-                                            response.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Click to view layer");
-                                        }
-                                    });
-                                });
+                                // Image: centered horizontally, centered within the top square box.
+                                let img_rect = egui::Rect::from_center_size(
+                                    egui::pos2(cell_rect.center().x, cell_rect.top() + thumb_box * 0.5),
+                                    egui::vec2(fit_w, fit_h),
+                                );
+                                egui::Image::new(texture).paint_at(ui, img_rect);
+
+                                // Label: centered in the strip beneath the box.
+                                ui.painter().text(
+                                    egui::pos2(
+                                        cell_rect.center().x,
+                                        cell_rect.top() + thumb_box + label_height * 0.5,
+                                    ),
+                                    egui::Align2::CENTER_CENTER,
+                                    format!("{}: {}", i, name),
+                                    egui::FontId::proportional(14.0),
+                                    ui.visuals().strong_text_color(),
+                                );
+
+                                if response.clicked() {
+                                    viewer.active_layer = i;
+                                    viewer.show_contact_sheet = false;
+                                    viewer.first_frame = true;
+                                    if !is_a {
+                                        viewer.compare_mode = CompareMode::SingleB;
+                                    } else if viewer.compare_mode == CompareMode::SingleB {
+                                        viewer.compare_mode = CompareMode::SingleA;
+                                    }
+                                }
+                                if response.hovered() {
+                                    response.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Click to view layer");
+                                }
                             }
                         }
                     });
@@ -440,16 +479,20 @@ impl ExrViewer {
                     self.first_frame = false;
                 }
 
-                // Handle Zoom
+                // Handle Zoom: pinch / ctrl+scroll via zoom_delta(), plus the plain
+                // mouse wheel via smooth_scroll_delta (which zoom_delta() does NOT report).
                 if response.hovered() {
-                    let zoom_delta = ui.input(|i| i.zoom_delta());
-                    if zoom_delta != 1.0
+                    let (zoom_delta, scroll_y) =
+                        ui.input(|i| (i.zoom_delta(), i.smooth_scroll_delta.y));
+                    let wheel_zoom = (scroll_y * 0.004).exp();
+                    let total_zoom = zoom_delta * wheel_zoom;
+                    if total_zoom != 1.0
                         && let Some(pos) = response.hover_pos()
                     {
                         // Zoom around the cursor
                         let offset = pos - rect.center() - self.translation;
-                        self.translation -= offset * (zoom_delta - 1.0);
-                        self.scale *= zoom_delta;
+                        self.translation -= offset * (total_zoom - 1.0);
+                        self.scale = (self.scale * total_zoom).clamp(0.01, 100.0);
                     }
                 }
 
@@ -460,12 +503,47 @@ impl ExrViewer {
 
                 // Render Image
                 let image_size = tex_size * self.scale;
+                
+                let disp_window = exr_data.image.attributes.display_window;
+                let phys_idx = exr_data.logical_layers[self.active_layer].physical_index;
+                let data_window_min = exr_data.image.layer_data[phys_idx].attributes.layer_position;
+                
+                let disp_size = egui::vec2(disp_window.size.x() as f32, disp_window.size.y() as f32) * self.scale;
+                let disp_rect = egui::Rect::from_min_size(
+                    rect.center() + self.translation - disp_size / 2.0,
+                    disp_size,
+                );
+
+                let data_offset = egui::vec2((data_window_min.0 - disp_window.position.x()) as f32, (data_window_min.1 - disp_window.position.y()) as f32) * self.scale;
+
                 let image_rect = egui::Rect::from_min_size(
-                    rect.center() + self.translation - image_size / 2.0,
+                    disp_rect.min + data_offset,
                     image_size,
                 );
 
                 let painter = ui.painter().with_clip_rect(rect);
+                
+                // Draw display window bounding box
+                draw_dashed_rect(&painter, disp_rect, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 100), 5.0, 5.0);
+                
+                // Labels for display window
+                painter.text(
+                    disp_rect.left_bottom() + egui::vec2(0.0, 5.0),
+                    egui::Align2::LEFT_TOP,
+                    format!("{},{}", disp_window.position.x(), disp_window.position.y()),
+                    egui::FontId::proportional(12.0),
+                    egui::Color32::GRAY,
+                );
+                let top_right_x = disp_window.position.x() + disp_window.size.x() as i32;
+                let top_right_y = disp_window.position.y() + disp_window.size.y() as i32;
+                painter.text(
+                    disp_rect.right_top() - egui::vec2(0.0, 5.0),
+                    egui::Align2::RIGHT_BOTTOM,
+                    format!("{},{}", top_right_x, top_right_y),
+                    egui::FontId::proportional(12.0),
+                    egui::Color32::GRAY,
+                );
+
 
                 if let Some(_rs) = render_state {
                     // GPU RENDER PATH
@@ -803,7 +881,18 @@ impl ExrViewer {
                     }
                 }
 
+                // Draw data window bounding box over the image
+                draw_dashed_rect(&painter, image_rect, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 150), 3.0, 3.0);
+                painter.text(
+                    image_rect.right_bottom() + egui::vec2(5.0, 5.0),
+                    egui::Align2::LEFT_TOP,
+                    format!("({}x{})", tex_size.x, tex_size.y),
+                    egui::FontId::proportional(12.0),
+                    egui::Color32::GRAY,
+                );
+
                 // Pixel Sampling & Swatches
+                let mut hovered_pixel = None;
                 if let Some(pos) = response.hover_pos() {
                     let image_local_pos = pos - image_rect.min;
                     let x = (image_local_pos.x / self.scale) as usize;
@@ -815,12 +904,17 @@ impl ExrViewer {
                         && image_local_pos.x >= 0.0
                         && image_local_pos.y >= 0.0
                     {
+                        hovered_pixel = Some((x, y));
                         let val_a_opt = self.sample_pixel(exr_data, self.active_layer, x, y);
                         let val_b_opt = if let Some(exr_b) = exr_data_b {
                             self.sample_pixel(exr_b, self.active_layer, x, y)
                         } else {
                             None
                         };
+
+                        self.last_hover_pos_img = Some((x, y));
+                        self.last_sampled_val_a = val_a_opt;
+                        self.last_sampled_val_b = val_b_opt;
 
                         if val_a_opt.is_some() || val_b_opt.is_some() {
                             egui::Window::new("Pixel Tooltip")
@@ -829,28 +923,28 @@ impl ExrViewer {
                                 .resizable(false)
                                 .collapsible(false)
                                 .show(ui.ctx(), |ui| {
-                                    ui.label(format!("x: {}, y: {}", x, y));
+                                    ui.label(format!("x={} y={}", x, y));
                                     
                                     if let Some(val_a) = val_a_opt {
-                                        if val_b_opt.is_some() {
-                                            ui.label(format!("A: {:.4}, {:.4}, {:.4}, {:.4}", val_a[0], val_a[1], val_a[2], val_a[3]));
-                                        } else {
-                                            ui.label(format!("Val: {:.4}, {:.4}, {:.4}, {:.4}", val_a[0], val_a[1], val_a[2], val_a[3]));
-                                        }
+                                        colored_rgba_label(ui, if val_b_opt.is_some() { "A:" } else { "" }, val_a);
+                                        let (h, s, v, l) = rgb_to_hsvl(val_a[0], val_a[1], val_a[2]);
+                                        ui.label(egui::RichText::new(format!("H:{:.0} S:{:.2} V:{:.2} L:{:.5}", h, s, v, l)).color(egui::Color32::LIGHT_GRAY));
                                     }
                                     
                                     if let Some(val_b) = val_b_opt {
-                                        ui.label(format!("B: {:.4}, {:.4}, {:.4}, {:.4}", val_b[0], val_b[1], val_b[2], val_b[3]));
+                                        colored_rgba_label(ui, "B:", val_b);
+                                        let (h, s, v, l) = rgb_to_hsvl(val_b[0], val_b[1], val_b[2]);
+                                        ui.label(egui::RichText::new(format!("H:{:.0} S:{:.2} V:{:.2} L:{:.5}", h, s, v, l)).color(egui::Color32::LIGHT_GRAY));
                                     }
                                     
                                     if let (Some(val_a), Some(val_b)) = (val_a_opt, val_b_opt) {
-                                        ui.label(format!(
-                                            "Diff: {:.4}, {:.4}, {:.4}, {:.4}",
+                                        let diff = [
                                             (val_b[0] - val_a[0]).abs(),
                                             (val_b[1] - val_a[1]).abs(),
                                             (val_b[2] - val_a[2]).abs(),
                                             (val_b[3] - val_a[3]).abs()
-                                        ));
+                                        ];
+                                        colored_rgba_label(ui, "Diff:", diff);
                                     }
                                 });
 
@@ -862,6 +956,12 @@ impl ExrViewer {
                             }
                         }
                     }
+                }
+                
+                if hovered_pixel.is_none() {
+                    self.last_hover_pos_img = None;
+                    self.last_sampled_val_a = None;
+                    self.last_sampled_val_b = None;
                 }
             }
         }
@@ -1308,4 +1408,66 @@ impl ExrViewer {
         });
         self.histogram_layer = Some(self.active_layer);
     }
+}
+
+
+fn rgb_to_hsvl(r: f32, g: f32, b: f32) -> (f32, f32, f32, f32) {
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let delta = max - min;
+    
+    let mut h = 0.0;
+    if delta > 0.0 {
+        if max == r {
+            h = 60.0 * (((g - b) / delta) % 6.0);
+        } else if max == g {
+            h = 60.0 * (((b - r) / delta) + 2.0);
+        } else if max == b {
+            h = 60.0 * (((r - g) / delta) + 4.0);
+        }
+    }
+    if h < 0.0 {
+        h += 360.0;
+    }
+    
+    let s = if max > 0.0 { delta / max } else { 0.0 };
+    let v = max;
+    let l = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    
+    (h, s, v, l)
+}
+
+fn colored_rgba_label(ui: &mut egui::Ui, prefix: &str, val: [f32; 4]) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        if !prefix.is_empty() {
+            ui.label(prefix);
+        }
+        ui.label(egui::RichText::new(format!("{:.5}", val[0])).color(egui::Color32::from_rgb(255, 80, 80)));
+        ui.label(egui::RichText::new(format!("{:.5}", val[1])).color(egui::Color32::from_rgb(80, 255, 80)));
+        ui.label(egui::RichText::new(format!("{:.5}", val[2])).color(egui::Color32::from_rgb(100, 150, 255)));
+        ui.label(egui::RichText::new(format!("{:.5}", val[3])).color(egui::Color32::LIGHT_GRAY));
+    });
+}
+
+fn draw_dashed_rect(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32, dash_length: f32, gap_length: f32) {
+    let draw_line = |start: egui::Pos2, end: egui::Pos2| {
+        let dir = end - start;
+        let len = dir.length();
+        let dir_norm = dir / len;
+        let mut t = 0.0;
+        while t < len {
+            let t_end = (t + dash_length).min(len);
+            painter.line_segment(
+                [start + dir_norm * t, start + dir_norm * t_end],
+                (1.0, color),
+            );
+            t += dash_length + gap_length;
+        }
+    };
+    
+    draw_line(rect.left_top(), rect.right_top());
+    draw_line(rect.right_top(), rect.right_bottom());
+    draw_line(rect.right_bottom(), rect.left_bottom());
+    draw_line(rect.left_bottom(), rect.left_top());
 }
