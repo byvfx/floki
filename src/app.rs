@@ -596,108 +596,62 @@ impl eframe::App for ExrApp {
             .resizable(true)
             .min_size(200.0)
             .show_inside(ui, |ui| {
-                ui.heading("EXR Info");
-                ui.separator();
-                if let Some(err) = &self.error_msg {
-                    ui.colored_label(egui::Color32::RED, format!("Error: {}", err));
+                // Whole sidebar scrolls as one column so Color Sampler / Histogram
+                // are never pushed below the window when Image B doubles the content.
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.heading("EXR Info");
                     ui.separator();
-                }
+                    if let Some(err) = &self.error_msg {
+                        ui.colored_label(egui::Color32::RED, format!("Error: {}", err));
+                        ui.separator();
+                    }
 
-                let mut files_to_show = vec![];
-                if let (Some(path), Some(data)) = (&self.loaded_file, &self.exr_data) {
-                    files_to_show.push(("Image A", path, data));
-                }
-                if let (Some(path), Some(data)) = (&self.loaded_file_b, &self.exr_data_b) {
-                    files_to_show.push(("Image B", path, data));
-                }
+                    let mut files_to_show = vec![];
+                    if let (Some(path), Some(data)) = (&self.loaded_file, &self.exr_data) {
+                        files_to_show.push(("Image A", path, data));
+                    }
+                    if let (Some(path), Some(data)) = (&self.loaded_file_b, &self.exr_data_b) {
+                        files_to_show.push(("Image B", path, data));
+                    }
 
-                if !files_to_show.is_empty() {
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        for (idx, (label, path, exr_data)) in files_to_show.iter().enumerate() {
-                            if idx > 0 {
-                                ui.separator();
-                                ui.add_space(10.0);
-                            }
-                            ui.heading(format!(
-                                "{}: {}",
-                                label,
-                                path.file_name().unwrap_or_default().to_string_lossy()
-                            ));
-                            ui.add_space(5.0);
-
-                            egui::CollapsingHeader::new("Image Metadata")
-                                .id_salt(format!("image_metadata_header_{}", idx))
-                                .default_open(false)
-                                .show(ui, |ui| {
-                                    let attrs = &exr_data.image.attributes;
-                                    ui.label(format!(
-                                        "Display Window: {}x{} at {},{}",
-                                        attrs.display_window.size.x(),
-                                        attrs.display_window.size.y(),
-                                        attrs.display_window.position.x(),
-                                        attrs.display_window.position.y()
-                                    ));
-                                    ui.label(format!("Pixel Aspect: {}", attrs.pixel_aspect));
-
-                                    if !attrs.other.is_empty() {
-                                        ui.add_space(5.0);
-                                        egui::CollapsingHeader::new("Custom Attributes")
-                                            .id_salt(format!("image_custom_attrs_header_{}", idx))
-                                            .default_open(false)
-                                            .show(ui, |ui| {
-                                                for (name, val) in attrs.other.iter() {
-                                                    ui.horizontal_wrapped(|ui| {
-                                                        ui.strong(format!("{}: ", name));
-                                                        ui.label(format!("{:?}", val));
-                                                    });
-                                                }
-                                            });
-                                    }
-                                });
-
-                            ui.separator();
-                            ui.heading("Layers");
-
-                            for (i, ll) in exr_data.logical_layers.iter().enumerate() {
-                                let is_selected = self.viewer.active_layer == i;
-
-                                if ui.selectable_label(is_selected, &ll.name).clicked() {
-                                    self.viewer.active_layer = i;
+                    if !files_to_show.is_empty() {
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            for (idx, (label, path, exr_data)) in files_to_show.iter().enumerate() {
+                                if idx > 0 {
+                                    ui.separator();
+                                    ui.add_space(10.0);
                                 }
+                                ui.heading(format!(
+                                    "{}: {}",
+                                    label,
+                                    path.file_name().unwrap_or_default().to_string_lossy()
+                                ));
+                                ui.add_space(5.0);
 
-                                if is_selected
-                                    && let Some(layer) =
-                                        exr_data.image.layer_data.get(ll.physical_index)
-                                {
-                                    ui.indent("layer_details", |ui| {
+                                egui::CollapsingHeader::new("Image Metadata")
+                                    .id_salt(format!("image_metadata_header_{}", idx))
+                                    .default_open(false)
+                                    .show(ui, |ui| {
+                                        let attrs = &exr_data.image.attributes;
                                         ui.label(format!(
-                                            "Resolution: {}x{}",
-                                            layer.size.0, layer.size.1
+                                            "Display Window: {}x{} at {},{}",
+                                            attrs.display_window.size.x(),
+                                            attrs.display_window.size.y(),
+                                            attrs.display_window.position.x(),
+                                            attrs.display_window.position.y()
                                         ));
-                                        let chan_name = |idx: Option<usize>| {
-                                            idx.and_then(|j| layer.channel_data.list.get(j))
-                                                .map(|c| c.name.to_string())
-                                                .unwrap_or_else(|| "-".to_string())
-                                        };
-                                        ui.label(format!(
-                                            "Channels: R={} G={} B={} A={}",
-                                            chan_name(ll.r),
-                                            chan_name(ll.g),
-                                            chan_name(ll.b),
-                                            chan_name(ll.a),
-                                        ));
+                                        ui.label(format!("Pixel Aspect: {}", attrs.pixel_aspect));
 
-                                        if !layer.attributes.other.is_empty() {
+                                        if !attrs.other.is_empty() {
                                             ui.add_space(5.0);
-                                            egui::CollapsingHeader::new("Layer Attributes")
+                                            egui::CollapsingHeader::new("Custom Attributes")
                                                 .id_salt(format!(
-                                                    "layer_attrs_header_{}_{}",
-                                                    idx, i
+                                                    "image_custom_attrs_header_{}",
+                                                    idx
                                                 ))
                                                 .default_open(false)
                                                 .show(ui, |ui| {
-                                                    for (name, val) in layer.attributes.other.iter()
-                                                    {
+                                                    for (name, val) in attrs.other.iter() {
                                                         ui.horizontal_wrapped(|ui| {
                                                             ui.strong(format!("{}: ", name));
                                                             ui.label(format!("{:?}", val));
@@ -706,175 +660,217 @@ impl eframe::App for ExrApp {
                                                 });
                                         }
                                     });
-                                }
-                            }
-                        }
-                    });
-                }
 
-                if let Some(_path) = &self.loaded_file {
-                    if let Some(exr_data) = &self.exr_data {
-                        ui.separator();
-                        ui.heading("Color Sampler");
+                                ui.separator();
+                                ui.heading("Layers");
 
-                        if !self.viewer.swatches.is_empty() {
-                            ui.horizontal(|ui| {
-                                ui.label(format!("{} saved", self.viewer.swatches.len()));
-                                if ui.button("Clear All").clicked() {
-                                    self.viewer.swatches.clear();
-                                }
-                            });
-                            ui.add_space(5.0);
+                                for (i, ll) in exr_data.logical_layers.iter().enumerate() {
+                                    let is_selected = self.viewer.active_layer == i;
 
-                            egui::ScrollArea::vertical()
-                                .id_salt("swatches_scroll")
-                                .show(ui, |ui| {
-                                    let mut to_remove = None;
-                                    for (i, swatch) in self.viewer.swatches.iter().enumerate() {
-                                        ui.horizontal(|ui| {
-                                            let [r, g, b, _a] = *swatch;
+                                    if ui.selectable_label(is_selected, &ll.name).clicked() {
+                                        self.viewer.active_layer = i;
+                                    }
 
-                                            // Preview color patch using current sRGB mode and exposure/gamma
-                                            let mut disp_r = r * self.viewer.exposure.exp2();
-                                            let mut disp_g = g * self.viewer.exposure.exp2();
-                                            let mut disp_b = b * self.viewer.exposure.exp2();
+                                    if is_selected
+                                        && let Some(layer) =
+                                            exr_data.image.layer_data.get(ll.physical_index)
+                                    {
+                                        ui.indent("layer_details", |ui| {
+                                            ui.label(format!(
+                                                "Resolution: {}x{}",
+                                                layer.size.0, layer.size.1
+                                            ));
+                                            let chan_name = |idx: Option<usize>| {
+                                                idx.and_then(|j| layer.channel_data.list.get(j))
+                                                    .map(|c| c.name.to_string())
+                                                    .unwrap_or_else(|| "-".to_string())
+                                            };
+                                            ui.label(format!(
+                                                "Channels: R={} G={} B={} A={}",
+                                                chan_name(ll.r),
+                                                chan_name(ll.g),
+                                                chan_name(ll.b),
+                                                chan_name(ll.a),
+                                            ));
 
-                                            if self.viewer.gamma != 1.0 {
-                                                let inv_gamma = 1.0 / self.viewer.gamma;
-                                                disp_r = if disp_r > 0.0 {
-                                                    disp_r.powf(inv_gamma)
-                                                } else {
-                                                    0.0
-                                                };
-                                                disp_g = if disp_g > 0.0 {
-                                                    disp_g.powf(inv_gamma)
-                                                } else {
-                                                    0.0
-                                                };
-                                                disp_b = if disp_b > 0.0 {
-                                                    disp_b.powf(inv_gamma)
-                                                } else {
-                                                    0.0
-                                                };
-                                            }
-
-                                            if self.viewer.srgb {
-                                                disp_r = crate::viewer::ExrViewer::linear_to_srgb(
-                                                    disp_r,
-                                                );
-                                                disp_g = crate::viewer::ExrViewer::linear_to_srgb(
-                                                    disp_g,
-                                                );
-                                                disp_b = crate::viewer::ExrViewer::linear_to_srgb(
-                                                    disp_b,
-                                                );
-                                            }
-
-                                            let r_u8 = (disp_r.clamp(0.0, 1.0) * 255.0) as u8;
-                                            let g_u8 = (disp_g.clamp(0.0, 1.0) * 255.0) as u8;
-                                            let b_u8 = (disp_b.clamp(0.0, 1.0) * 255.0) as u8;
-
-                                            let color = egui::Color32::from_rgb(r_u8, g_u8, b_u8);
-                                            let (rect, _resp) = ui.allocate_exact_size(
-                                                egui::vec2(20.0, 20.0),
-                                                egui::Sense::hover(),
-                                            );
-                                            ui.painter().rect_filled(rect, 2.0, color);
-
-                                            // Display values
-                                            ui.vertical(|ui| {
-                                                ui.label(format!(
-                                                    "Float: {:.4}, {:.4}, {:.4}",
-                                                    r, g, b
-                                                ));
-                                                ui.label(format!(
-                                                    "8-bit: {}, {}, {}",
-                                                    r_u8, g_u8, b_u8
-                                                ));
-                                                // HSV mapping
-                                                let max = r.max(g).max(b);
-                                                let min = r.min(g).min(b);
-                                                let c = max - min;
-                                                let h = if c == 0.0 {
-                                                    0.0
-                                                } else if max == r {
-                                                    60.0 * (((g - b) / c) % 6.0)
-                                                } else if max == g {
-                                                    60.0 * (((b - r) / c) + 2.0)
-                                                } else {
-                                                    60.0 * (((r - g) / c) + 4.0)
-                                                };
-                                                let h = if h < 0.0 { h + 360.0 } else { h };
-                                                let s = if max == 0.0 { 0.0 } else { c / max };
-                                                let v = max;
-                                                ui.label(format!(
-                                                    "HSV: {:.1}°, {:.2}, {:.2}",
-                                                    h, s, v
-                                                ));
-                                            });
-
-                                            if ui.button("X").clicked() {
-                                                to_remove = Some(i);
+                                            if !layer.attributes.other.is_empty() {
+                                                ui.add_space(5.0);
+                                                egui::CollapsingHeader::new("Layer Attributes")
+                                                    .id_salt(format!(
+                                                        "layer_attrs_header_{}_{}",
+                                                        idx, i
+                                                    ))
+                                                    .default_open(false)
+                                                    .show(ui, |ui| {
+                                                        for (name, val) in
+                                                            layer.attributes.other.iter()
+                                                        {
+                                                            ui.horizontal_wrapped(|ui| {
+                                                                ui.strong(format!("{}: ", name));
+                                                                ui.label(format!("{:?}", val));
+                                                            });
+                                                        }
+                                                    });
                                             }
                                         });
-                                        ui.separator();
                                     }
-                                    if let Some(i) = to_remove {
-                                        self.viewer.swatches.remove(i);
-                                    }
-                                });
-                        } else {
-                            ui.label("Shift+Click on the image to save a swatch.");
-                        }
-
-                        ui.separator();
-                        ui.heading("Histogram");
-                        ui.horizontal(|ui| {
-                            if ui
-                                .checkbox(
-                                    &mut self.viewer.log_histogram,
-                                    "Log Scale (-10 to +10 EV)",
-                                )
-                                .changed()
-                            {
-                                self.viewer.histogram_layer = None;
+                                }
                             }
                         });
+                    }
 
-                        self.viewer
-                            .calculate_histogram(exr_data, self.exr_data_b.as_ref());
+                    if let Some(_path) = &self.loaded_file {
+                        if let Some(exr_data) = &self.exr_data {
+                            ui.separator();
+                            ui.heading("Color Sampler");
 
-                        if let Some(bins) = &self.viewer.histogram {
-                            let (rect, _resp) = ui.allocate_exact_size(
-                                egui::vec2(ui.available_width(), 80.0),
-                                egui::Sense::hover(),
-                            );
-                            let mut max_val = *bins.iter().max().unwrap_or(&1) as f32;
-                            if let Some(bins_b) = &self.viewer.histogram_b {
-                                max_val = max_val.max(*bins_b.iter().max().unwrap_or(&1) as f32);
+                            if !self.viewer.swatches.is_empty() {
+                                ui.horizontal(|ui| {
+                                    ui.label(format!("{} saved", self.viewer.swatches.len()));
+                                    if ui.button("Clear All").clicked() {
+                                        self.viewer.swatches.clear();
+                                    }
+                                });
+                                ui.add_space(5.0);
+
+                                egui::ScrollArea::vertical()
+                                    .id_salt("swatches_scroll")
+                                    .show(ui, |ui| {
+                                        let mut to_remove = None;
+                                        for (i, swatch) in self.viewer.swatches.iter().enumerate() {
+                                            ui.horizontal(|ui| {
+                                                let [r, g, b, _a] = *swatch;
+
+                                                // Preview color patch using current sRGB mode and exposure/gamma
+                                                let mut disp_r = r * self.viewer.exposure.exp2();
+                                                let mut disp_g = g * self.viewer.exposure.exp2();
+                                                let mut disp_b = b * self.viewer.exposure.exp2();
+
+                                                if self.viewer.gamma != 1.0 {
+                                                    let inv_gamma = 1.0 / self.viewer.gamma;
+                                                    disp_r = if disp_r > 0.0 {
+                                                        disp_r.powf(inv_gamma)
+                                                    } else {
+                                                        0.0
+                                                    };
+                                                    disp_g = if disp_g > 0.0 {
+                                                        disp_g.powf(inv_gamma)
+                                                    } else {
+                                                        0.0
+                                                    };
+                                                    disp_b = if disp_b > 0.0 {
+                                                        disp_b.powf(inv_gamma)
+                                                    } else {
+                                                        0.0
+                                                    };
+                                                }
+
+                                                if self.viewer.srgb {
+                                                    disp_r =
+                                                        crate::viewer::ExrViewer::linear_to_srgb(
+                                                            disp_r,
+                                                        );
+                                                    disp_g =
+                                                        crate::viewer::ExrViewer::linear_to_srgb(
+                                                            disp_g,
+                                                        );
+                                                    disp_b =
+                                                        crate::viewer::ExrViewer::linear_to_srgb(
+                                                            disp_b,
+                                                        );
+                                                }
+
+                                                let r_u8 = (disp_r.clamp(0.0, 1.0) * 255.0) as u8;
+                                                let g_u8 = (disp_g.clamp(0.0, 1.0) * 255.0) as u8;
+                                                let b_u8 = (disp_b.clamp(0.0, 1.0) * 255.0) as u8;
+
+                                                let color =
+                                                    egui::Color32::from_rgb(r_u8, g_u8, b_u8);
+                                                let (rect, _resp) = ui.allocate_exact_size(
+                                                    egui::vec2(20.0, 20.0),
+                                                    egui::Sense::hover(),
+                                                );
+                                                ui.painter().rect_filled(rect, 2.0, color);
+
+                                                // Display values
+                                                ui.vertical(|ui| {
+                                                    ui.label(format!(
+                                                        "Float: {:.4}, {:.4}, {:.4}",
+                                                        r, g, b
+                                                    ));
+                                                    ui.label(format!(
+                                                        "8-bit: {}, {}, {}",
+                                                        r_u8, g_u8, b_u8
+                                                    ));
+                                                    // HSV mapping
+                                                    let max = r.max(g).max(b);
+                                                    let min = r.min(g).min(b);
+                                                    let c = max - min;
+                                                    let h = if c == 0.0 {
+                                                        0.0
+                                                    } else if max == r {
+                                                        60.0 * (((g - b) / c) % 6.0)
+                                                    } else if max == g {
+                                                        60.0 * (((b - r) / c) + 2.0)
+                                                    } else {
+                                                        60.0 * (((r - g) / c) + 4.0)
+                                                    };
+                                                    let h = if h < 0.0 { h + 360.0 } else { h };
+                                                    let s = if max == 0.0 { 0.0 } else { c / max };
+                                                    let v = max;
+                                                    ui.label(format!(
+                                                        "HSV: {:.1}°, {:.2}, {:.2}",
+                                                        h, s, v
+                                                    ));
+                                                });
+
+                                                if ui.button("X").clicked() {
+                                                    to_remove = Some(i);
+                                                }
+                                            });
+                                            ui.separator();
+                                        }
+                                        if let Some(i) = to_remove {
+                                            self.viewer.swatches.remove(i);
+                                        }
+                                    });
+                            } else {
+                                ui.label("Shift+Click on the image to save a swatch.");
                             }
-                            let max_val = max_val.max(1.0);
 
-                            let mut shapes = vec![];
-                            let bar_width = rect.width() / 256.0;
+                            ui.separator();
+                            ui.heading("Histogram");
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .checkbox(
+                                        &mut self.viewer.log_histogram,
+                                        "Log Scale (-10 to +10 EV)",
+                                    )
+                                    .changed()
+                                {
+                                    self.viewer.histogram_layer = None;
+                                }
+                            });
 
-                            for (i, &count) in bins.iter().enumerate() {
-                                let h = (count as f32 / max_val).powf(0.5) * rect.height();
-                                let x = rect.min.x + i as f32 * bar_width;
-                                let y = rect.max.y - h;
+                            self.viewer
+                                .calculate_histogram(exr_data, self.exr_data_b.as_ref());
 
-                                shapes.push(egui::Shape::rect_filled(
-                                    egui::Rect::from_min_max(
-                                        egui::pos2(x, y),
-                                        egui::pos2(x + bar_width.max(1.0), rect.max.y),
-                                    ),
-                                    0.0,
-                                    egui::Color32::from_white_alpha(150), // White for A
-                                ));
-                            }
+                            if let Some(bins) = &self.viewer.histogram {
+                                let (rect, _resp) = ui.allocate_exact_size(
+                                    egui::vec2(ui.available_width(), 80.0),
+                                    egui::Sense::hover(),
+                                );
+                                let mut max_val = *bins.iter().max().unwrap_or(&1) as f32;
+                                if let Some(bins_b) = &self.viewer.histogram_b {
+                                    max_val =
+                                        max_val.max(*bins_b.iter().max().unwrap_or(&1) as f32);
+                                }
+                                let max_val = max_val.max(1.0);
 
-                            if let Some(bins_b) = &self.viewer.histogram_b {
-                                for (i, &count) in bins_b.iter().enumerate() {
+                                let mut shapes = vec![];
+                                let bar_width = rect.width() / 256.0;
+
+                                for (i, &count) in bins.iter().enumerate() {
                                     let h = (count as f32 / max_val).powf(0.5) * rect.height();
                                     let x = rect.min.x + i as f32 * bar_width;
                                     let y = rect.max.y - h;
@@ -885,16 +881,33 @@ impl eframe::App for ExrApp {
                                             egui::pos2(x + bar_width.max(1.0), rect.max.y),
                                         ),
                                         0.0,
-                                        egui::Color32::from_rgba_unmultiplied(255, 50, 50, 150), // Red for B
+                                        egui::Color32::from_white_alpha(150), // White for A
                                     ));
                                 }
+
+                                if let Some(bins_b) = &self.viewer.histogram_b {
+                                    for (i, &count) in bins_b.iter().enumerate() {
+                                        let h = (count as f32 / max_val).powf(0.5) * rect.height();
+                                        let x = rect.min.x + i as f32 * bar_width;
+                                        let y = rect.max.y - h;
+
+                                        shapes.push(egui::Shape::rect_filled(
+                                            egui::Rect::from_min_max(
+                                                egui::pos2(x, y),
+                                                egui::pos2(x + bar_width.max(1.0), rect.max.y),
+                                            ),
+                                            0.0,
+                                            egui::Color32::from_rgba_unmultiplied(255, 50, 50, 150), // Red for B
+                                        ));
+                                    }
+                                }
+                                ui.painter().extend(shapes);
                             }
-                            ui.painter().extend(shapes);
                         }
+                    } else {
+                        ui.label("No file loaded.");
                     }
-                } else {
-                    ui.label("No file loaded.");
-                }
+                });
             });
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
