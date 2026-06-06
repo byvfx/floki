@@ -37,11 +37,12 @@ impl ExrData {
     pub fn load(path: impl AsRef<Path>) -> std::result::Result<Self, String> {
         let path_ref = path.as_ref();
 
-        // Block decompression can panic inside the `exr` crate's `zune-inflate`
-        // backend on some files. Read non-parallel so any panic happens on this
-        // thread instead of a detached rayon worker (whose panic would
-        // `process::abort()` the entire app, uncatchable), and catch it so a bad
-        // file surfaces as an error message instead of crashing.
+        // The patched `exr` (see [patch.crates-io] in Cargo.toml) decompresses via
+        // miniz_oxide, which returns an error instead of panicking on bad data, so
+        // parallel decompression is safe again. catch_unwind is kept as cheap
+        // insurance against panics in the synchronous (calling-thread) parsing
+        // path; it can't catch a rayon-worker panic, but miniz_oxide removes the
+        // one decompression panic that used to abort the app.
         let read_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             read()
                 .no_deep_data()
@@ -49,7 +50,6 @@ impl ExrData {
                 .all_channels()
                 .all_layers()
                 .all_attributes()
-                .non_parallel()
                 .from_file(path_ref)
         }))
         .map_err(|_| {

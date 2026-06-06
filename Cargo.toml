@@ -15,3 +15,9 @@ rfd = "0.17.2"
 smallvec = "1.15.1"
 bytemuck = { version = "1.16", features = ["derive"] }
 rayon = "1.12.0"
+
+# Patched exr: decompresses ZIP/PXR24 via miniz_oxide instead of zune-inflate,
+# which panics (and aborts the app via a rayon worker) on some valid files.
+# See https://github.com/byvfx/exrs/tree/miniz-inflate
+[patch.crates-io]
+exr = { git = "https://github.com/byvfx/exrs", branch = "miniz-inflate" }

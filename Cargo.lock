@@ -1233,8 +1233,7 @@ dependencies = [
 [[package]]
 name = "exr"
 version = "1.74.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4300e043a56aa2cb633c01af81ca8f699a321879a7854d3896a0ba89056363be"
+source = "git+https://github.com/byvfx/exrs?branch=miniz-inflate#912016cce348fcd4441928f15225e5628f51c41d"
 dependencies = [
  "bit_field",
  "half",
@@ -1242,7 +1241,6 @@ dependencies = [
  "miniz_oxide",
  "rayon-core",
  "smallvec",
- "zune-inflate",
 ]
 
 [[package]]
@@ -5170,15 +5168,6 @@ name = "zune-core"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb8a0807f7c01457d0379ba880ba6322660448ddebc890ce29bb64da71fb40f9"
-
-[[package]]
-name = "zune-inflate"
-version = "0.2.54"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "73ab332fe2f6680068f3582b16a24f90ad7096d5d39b974d1c0aff0125116f02"
-dependencies = [
- "simd-adler32",
-]
 
 [[package]]
 name = "zune-jpeg"
