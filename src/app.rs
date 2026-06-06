@@ -146,7 +146,12 @@ impl eframe::App for ExrApp {
                     ui.label("R / G / B / A - Isolate specific channel");
                     ui.label("C - Return to full color composite");
                     ui.label("F - Frame image to fit the window");
-                    ui.label("Shift + Click - Sample pixel color and save to swatches");
+                    
+                    ui.add_space(5.0);
+                    ui.heading("Mouse Controls");
+                    ui.label("Left Click + Drag - Pan image");
+                    ui.label("Scroll Wheel - Zoom in and out");
+                    ui.label("Shift + Left Click - Sample pixel color and save to swatches");
 
                     ui.add_space(10.0);
                     ui.heading("Features");
