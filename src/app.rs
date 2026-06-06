@@ -704,115 +704,110 @@ impl eframe::App for ExrApp {
                 }
             });
 
-        
-        egui::Panel::bottom("status_bar").show_inside(ui, |ui| {
+             egui::Panel::bottom("status_bar").show_inside(ui, |ui| {
             egui::ScrollArea::horizontal().show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    if let Some((x, y)) = self.viewer.last_hover_pos_img {
-                    let layer_name = self.exr_data.as_ref()
+                ui.vertical(|ui| {
+                    let draw_nuke_status_line = |ui: &mut egui::Ui, prefix: &str, data: Option<&ExrData>, hover_pos: Option<(usize, usize)>, val: Option<[f32; 4]>, layer_name: &str| {
+                        if let Some(d) = data {
+                            ui.horizontal(|ui| {
+                                let disp_w = d.image.attributes.display_window.size.x();
+                                let disp_h = d.image.attributes.display_window.size.y();
+                                
+                                let phys_idx = d.logical_layers.iter().position(|l| l.name == layer_name).unwrap_or(0);
+                                let data_window_min = d.image.layer_data[phys_idx].attributes.layer_position;
+                                let data_w = d.image.layer_data[phys_idx].size.0;
+                                let data_h = d.image.layer_data[phys_idx].size.1;
+                                
+                                let channels: Vec<_> = d.logical_layers.iter().map(|l| l.name.as_str()).collect();
+                                let mut channels_str = channels.join(",");
+                                if channels_str.len() > 50 {
+                                    channels_str.truncate(50);
+                                    channels_str.push_str("...");
+                                }
+
+                                ui.label(egui::RichText::new(format!("{}: {}x{} bbox: {} {} {} {} channels: {}", 
+                                    prefix, 
+                                    disp_w, disp_h, 
+                                    data_window_min.x(), data_window_min.y(), data_w, data_h,
+                                    channels_str
+                                )).color(egui::Color32::DARK_GRAY));
+                                
+                                ui.add_space(10.0);
+                                
+                                if let (Some((x, y)), Some(v)) = (hover_pos, val) {
+                                    ui.label(egui::RichText::new(format!("x={} y={} {}", x, y, layer_name)).strong().color(egui::Color32::WHITE));
+                                    ui.spacing_mut().item_spacing.x = 4.0;
+                                    ui.label(egui::RichText::new(format!("{:.5}", v[0])).color(egui::Color32::from_rgb(255, 80, 80)));
+                                    ui.label(egui::RichText::new(format!("{:.5}", v[1])).color(egui::Color32::from_rgb(80, 255, 80)));
+                                    ui.label(egui::RichText::new(format!("{:.5}", v[2])).color(egui::Color32::from_rgb(100, 150, 255)));
+                                    ui.label(egui::RichText::new(format!("{:.5}", v[3])).color(egui::Color32::LIGHT_GRAY));
+                                    
+                                    // Swatch
+                                    let (r, g, b) = (
+                                        (v[0].clamp(0.0, 1.0) * 255.0) as u8,
+                                        (v[1].clamp(0.0, 1.0) * 255.0) as u8,
+                                        (v[2].clamp(0.0, 1.0) * 255.0) as u8,
+                                    );
+                                    let (rect, _response) = ui.allocate_exact_size(egui::vec2(20.0, 14.0), egui::Sense::hover());
+                                    ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgb(r, g, b));
+                                    
+                                    // HSVL
+                                    ui.add_space(10.0);
+                                    let max = v[0].max(v[1]).max(v[2]);
+                                    let min = v[0].min(v[1]).min(v[2]);
+                                    let delta = max - min;
+                                    let mut h = 0.0;
+                                    if delta > 0.0 {
+                                        if max == v[0] {
+                                            h = 60.0 * (((v[1] - v[2]) / delta) % 6.0);
+                                        } else if max == v[1] {
+                                            h = 60.0 * (((v[2] - v[0]) / delta) + 2.0);
+                                        } else if max == v[2] {
+                                            h = 60.0 * (((v[0] - v[1]) / delta) + 4.0);
+                                        }
+                                    }
+                                    if h < 0.0 { h += 360.0; }
+                                    let s = if max > 0.0 { delta / max } else { 0.0 };
+                                    let val_v = max;
+                                    let l = 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2];
+                                    
+                                    ui.label(egui::RichText::new(format!("H:{:.0} S:{:.2} V:{:.2} L:{:.5}", h, s, val_v, l)).color(egui::Color32::LIGHT_GRAY));
+                                } else {
+                                    ui.label(egui::RichText::new(format!("x=-- y=-- {}", layer_name)).color(egui::Color32::DARK_GRAY));
+                                }
+                            });
+                        }
+                    };
+
+                    let layer_name_a = self.exr_data.as_ref()
                         .and_then(|d| d.logical_layers.get(self.viewer.active_layer))
                         .map(|l| l.name.as_str())
                         .unwrap_or("");
-                    ui.label(egui::RichText::new(format!("x={} y={} {}", x, y, layer_name)).strong().color(egui::Color32::WHITE));
-                    
-                    let mut has_data = false;
-                    
-                    if let Some(val_a) = self.viewer.last_sampled_val_a {
-                        has_data = true;
-                        ui.add_space(10.0);
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        ui.label(egui::RichText::new(format!("{:.5}", val_a[0])).color(egui::Color32::from_rgb(255, 80, 80)));
-                        ui.label(egui::RichText::new(format!("{:.5}", val_a[1])).color(egui::Color32::from_rgb(80, 255, 80)));
-                        ui.label(egui::RichText::new(format!("{:.5}", val_a[2])).color(egui::Color32::from_rgb(100, 150, 255)));
-                        ui.label(egui::RichText::new(format!("{:.5}", val_a[3])).color(egui::Color32::LIGHT_GRAY));
                         
-                        // Swatch
-                        let (r, g, b) = (
-                            (val_a[0].clamp(0.0, 1.0) * 255.0) as u8,
-                            (val_a[1].clamp(0.0, 1.0) * 255.0) as u8,
-                            (val_a[2].clamp(0.0, 1.0) * 255.0) as u8,
-                        );
-                        let (rect, _response) = ui.allocate_exact_size(egui::vec2(20.0, 14.0), egui::Sense::hover());
-                        ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgb(r, g, b));
-                        
-                        // HSVL
-                        ui.add_space(10.0);
-                        let max = val_a[0].max(val_a[1]).max(val_a[2]);
-                        let min = val_a[0].min(val_a[1]).min(val_a[2]);
-                        let delta = max - min;
-                        
-                        let mut h = 0.0;
-                        if delta > 0.0 {
-                            if max == val_a[0] {
-                                h = 60.0 * (((val_a[1] - val_a[2]) / delta) % 6.0);
-                            } else if max == val_a[1] {
-                                h = 60.0 * (((val_a[2] - val_a[0]) / delta) + 2.0);
-                            } else if max == val_a[2] {
-                                h = 60.0 * (((val_a[0] - val_a[1]) / delta) + 4.0);
-                            }
-                        }
-                        if h < 0.0 { h += 360.0; }
-                        let s = if max > 0.0 { delta / max } else { 0.0 };
-                        let v = max;
-                        let l = 0.2126 * val_a[0] + 0.7152 * val_a[1] + 0.0722 * val_a[2];
-                        
-                        ui.label(egui::RichText::new(format!("H:{:.0} S:{:.2} V:{:.2} L:{:.5}", h, s, v, l)).color(egui::Color32::LIGHT_GRAY));
-                    }
-                    
-                    if let Some(val_b) = self.viewer.last_sampled_val_b {
-                        if has_data {
-                            ui.add_space(20.0);
-                            ui.separator();
-                            ui.add_space(10.0);
-                        }
-                        
-                        let layer_name_b = self.exr_data_b.as_ref()
-                            .and_then(|d| d.logical_layers.get(self.viewer.active_layer.min(d.logical_layers.len().saturating_sub(1))))
+                    draw_nuke_status_line(
+                        ui, 
+                        "A", 
+                        self.exr_data.as_ref(), 
+                        self.viewer.last_hover_pos_img, 
+                        self.viewer.last_sampled_val_a, 
+                        layer_name_a
+                    );
+
+                    if let Some(exr_b) = &self.exr_data_b {
+                        let layer_name_b = exr_b
+                            .logical_layers.get(self.viewer.active_layer.min(exr_b.logical_layers.len().saturating_sub(1)))
                             .map(|l| l.name.as_str())
                             .unwrap_or("");
-                        ui.label(egui::RichText::new(format!("B: {}", layer_name_b)).strong().color(egui::Color32::WHITE));
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        
-                        ui.label(egui::RichText::new(format!("{:.5}", val_b[0])).color(egui::Color32::from_rgb(255, 80, 80)));
-                        ui.label(egui::RichText::new(format!("{:.5}", val_b[1])).color(egui::Color32::from_rgb(80, 255, 80)));
-                        ui.label(egui::RichText::new(format!("{:.5}", val_b[2])).color(egui::Color32::from_rgb(100, 150, 255)));
-                        ui.label(egui::RichText::new(format!("{:.5}", val_b[3])).color(egui::Color32::LIGHT_GRAY));
-                        
-                        // Swatch B
-                        let (r, g, b) = (
-                            (val_b[0].clamp(0.0, 1.0) * 255.0) as u8,
-                            (val_b[1].clamp(0.0, 1.0) * 255.0) as u8,
-                            (val_b[2].clamp(0.0, 1.0) * 255.0) as u8,
+                            
+                        draw_nuke_status_line(
+                            ui, 
+                            "B", 
+                            Some(exr_b), 
+                            self.viewer.last_hover_pos_img, 
+                            self.viewer.last_sampled_val_b, 
+                            layer_name_b
                         );
-                        let (rect, _response) = ui.allocate_exact_size(egui::vec2(20.0, 14.0), egui::Sense::hover());
-                        ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgb(r, g, b));
-                        
-                        // HSVL B
-                        ui.add_space(10.0);
-                        let max = val_b[0].max(val_b[1]).max(val_b[2]);
-                        let min = val_b[0].min(val_b[1]).min(val_b[2]);
-                        let delta = max - min;
-                        
-                        let mut h = 0.0;
-                        if delta > 0.0 {
-                            if max == val_b[0] {
-                                h = 60.0 * (((val_b[1] - val_b[2]) / delta) % 6.0);
-                            } else if max == val_b[1] {
-                                h = 60.0 * (((val_b[2] - val_b[0]) / delta) + 2.0);
-                            } else if max == val_b[2] {
-                                h = 60.0 * (((val_b[0] - val_b[1]) / delta) + 4.0);
-                            }
-                        }
-                        if h < 0.0 { h += 360.0; }
-                        let s = if max > 0.0 { delta / max } else { 0.0 };
-                        let v = max;
-                        let l = 0.2126 * val_b[0] + 0.7152 * val_b[1] + 0.0722 * val_b[2];
-                        
-                        ui.label(egui::RichText::new(format!("H:{:.0} S:{:.2} V:{:.2} L:{:.5}", h, s, v, l)).color(egui::Color32::LIGHT_GRAY));
                     }
-                } else {
-                    ui.label(egui::RichText::new("x=-- y=--").color(egui::Color32::DARK_GRAY));
-                }
                 });
             });
         });
