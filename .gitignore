@@ -2,3 +2,6 @@
 
 # EXR test assets / renders (large binaries)
 *.exr
+
+# Local agent guidance (not versioned)
+CLAUDE.md
