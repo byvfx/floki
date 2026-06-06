@@ -708,7 +708,11 @@ impl eframe::App for ExrApp {
         egui::TopBottomPanel::bottom("status_bar").show_inside(ui, |ui| {
             ui.horizontal(|ui| {
                 if let Some((x, y)) = self.viewer.last_hover_pos_img {
-                    ui.label(egui::RichText::new(format!("x={} y={}", x, y)).strong().color(egui::Color32::WHITE));
+                    let layer_name = self.exr_data.as_ref()
+                        .and_then(|d| d.logical_layers.get(self.viewer.active_layer))
+                        .map(|l| l.name.as_str())
+                        .unwrap_or("");
+                    ui.label(egui::RichText::new(format!("x={} y={} {}", x, y, layer_name)).strong().color(egui::Color32::WHITE));
                     
                     let mut has_data = false;
                     
