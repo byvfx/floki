@@ -287,9 +287,9 @@ impl ExrViewer {
                                             .get(i)
                                             .map(|l| l.name.as_str())
                                             .unwrap_or("Unnamed");
-                                        ui.label(egui::RichText::new(format!("{}: {}", i, name)).strong());
-
+                                        
                                         let response = ui.add(egui::Image::new(texture).fit_to_exact_size(egui::vec2(thumb_width, thumb_height)).sense(egui::Sense::click()));
+                                        ui.label(egui::RichText::new(format!("{}: {}", i, name)).strong());
 
                                         if response.clicked() {
                                             viewer.active_layer = i;
