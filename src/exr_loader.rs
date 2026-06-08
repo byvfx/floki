@@ -455,4 +455,109 @@ mod tests {
         apply_smart_names(&mut root);
         assert_eq!(root[0].name, "RGBA");
     }
+
+    // --- End-to-end `ExrData::load` integration tests -----------------------
+    // These generate tiny EXRs in a temp dir (no committed binaries) and drive
+    // the full parse + regrouping path, complementing the pure-helper tests above.
+
+    use std::collections::HashMap;
+
+    /// Write a Blender-style single-part EXR: one unnamed physical layer whose
+    /// channel names encode multiple passes by dotted prefix.
+    fn write_blender_exr(path: &Path) {
+        const W: usize = 2;
+        const H: usize = 2;
+        let mut list = smallvec::SmallVec::new();
+        for name in [
+            "ViewLayer.Combined.R",
+            "ViewLayer.Combined.G",
+            "ViewLayer.Combined.B",
+            "ViewLayer.Combined.A",
+            "ViewLayer.Depth.Z",
+        ] {
+            list.push(AnyChannel::new(
+                Text::from(name),
+                FlatSamples::F32(vec![0.5; W * H]),
+            ));
+        }
+        let layer = Layer::new(
+            (W, H),
+            LayerAttributes::default(),
+            Encoding::FAST_LOSSLESS,
+            AnyChannels::sort(list),
+        );
+        Image::from_layer(layer)
+            .write()
+            .to_file(path)
+            .expect("write blender-style exr");
+    }
+
+    #[test]
+    fn load_regroups_blender_passes_into_logical_layers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blender.exr");
+        write_blender_exr(&path);
+
+        let data = ExrData::load(&path).expect("load generated exr");
+
+        // Two passes recovered from the single physical layer: Combined + Depth.
+        assert_eq!(data.logical_layers.len(), 2, "expected Combined + Depth");
+        let by_name: HashMap<&str, &LogicalLayer> = data
+            .logical_layers
+            .iter()
+            .map(|l| (l.name.as_str(), l))
+            .collect();
+
+        let combined = by_name.get("Combined").expect("Combined pass present");
+        assert!(
+            combined.r.is_some()
+                && combined.g.is_some()
+                && combined.b.is_some()
+                && combined.a.is_some(),
+            "Combined must resolve all four RGBA slots"
+        );
+
+        let depth = by_name.get("Depth").expect("Depth pass present");
+        // Single channel renders as grayscale (r=g=b) with no alpha.
+        assert_eq!(depth.r, depth.g);
+        assert_eq!(depth.g, depth.b);
+        assert_eq!(depth.a, None);
+    }
+
+    #[test]
+    fn logical_size_and_channels_resolve() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blender.exr");
+        write_blender_exr(&path);
+        let data = ExrData::load(&path).unwrap();
+
+        // Layer 0 is the Combined (RGBA) pass.
+        assert_eq!(data.logical_size(0), Some((2, 2)));
+        let (_layer, r, g, b, a) = data.logical_channels(0).expect("channels for layer 0");
+        assert!(r.is_some() && g.is_some() && b.is_some() && a.is_some());
+
+        // Out-of-range indices are handled gracefully.
+        assert!(data.logical_size(99).is_none());
+        assert!(data.logical_channels(99).is_none());
+    }
+
+    #[test]
+    fn load_rejects_non_exr_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not_an.exr");
+        std::fs::write(&path, b"this is plainly not an exr file").unwrap();
+
+        // `ExrData` isn't `Debug`, so match rather than `expect_err`.
+        let err = match ExrData::load(&path) {
+            Ok(_) => panic!("garbage must not parse as EXR"),
+            Err(e) => e,
+        };
+        let lower = err.to_lowercase();
+        assert!(
+            lower.contains("magic number")
+                || lower.contains("valid exr")
+                || lower.contains("identifier"),
+            "error should explain the bad EXR, got: {err}"
+        );
+    }
 }

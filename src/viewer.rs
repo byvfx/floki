@@ -2,7 +2,7 @@ use crate::exr_loader::ExrData;
 use eframe::egui;
 use rayon::prelude::*;
 
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 #[allow(clippy::upper_case_acronyms)] // RGB matches the documented channel_mode mapping
 pub enum ChannelMode {
     #[default]
@@ -13,7 +13,23 @@ pub enum ChannelMode {
     A,
 }
 
-#[derive(PartialEq, Clone, Copy)]
+impl ChannelMode {
+    /// Integer encoding shared with the GPU. This is the **single source of
+    /// truth** for the `channel_mode` mapping; the `switch` in
+    /// `gpu/shader.wgsl` must use these same values (RGB=0, R=1, G=2, B=3, A=4).
+    /// Changing a value here requires the matching change in the shader.
+    pub fn as_u32(self) -> u32 {
+        match self {
+            ChannelMode::RGB => 0,
+            ChannelMode::R => 1,
+            ChannelMode::G => 2,
+            ChannelMode::B => 3,
+            ChannelMode::A => 4,
+        }
+    }
+}
+
+#[derive(PartialEq, Clone, Copy, Debug)]
 pub enum CompareMode {
     SingleA,
     SingleB,
@@ -98,6 +114,57 @@ impl Default for ExrViewer {
 }
 
 impl ExrViewer {
+    /// Apply keyboard shortcuts that only mutate view state — compare-mode
+    /// selection (1/2/Space) and channel isolation (R/G/B/A/C/F). Extracted
+    /// from [`Self::ui`] as a rendering-free seam so the input handling can be
+    /// driven headlessly in tests (no wgpu device required).
+    ///
+    /// `has_b` is whether a reference image (B) is loaded; the B-only shortcuts
+    /// are inert without it. Channel shortcuts apply only in the single-view
+    /// layout (not the contact sheet), matching the original inline behavior.
+    pub fn handle_hotkeys(&mut self, ui: &egui::Ui, has_b: bool) {
+        ui.input(|i| {
+            if i.key_pressed(egui::Key::Num1) {
+                self.compare_mode = CompareMode::SingleA;
+                self.blink_state = false;
+            }
+            if has_b && i.key_pressed(egui::Key::Num2) {
+                self.compare_mode = CompareMode::SingleB;
+                self.blink_state = false;
+            }
+            if has_b && i.key_pressed(egui::Key::Space) {
+                self.blink_state = !self.blink_state;
+            }
+
+            if !self.show_contact_sheet {
+                if i.key_pressed(egui::Key::F) {
+                    self.first_frame = true;
+                }
+                let prev_mode = self.channel_mode;
+                if i.key_pressed(egui::Key::R) {
+                    self.channel_mode = ChannelMode::R;
+                }
+                if i.key_pressed(egui::Key::G) {
+                    self.channel_mode = ChannelMode::G;
+                }
+                if i.key_pressed(egui::Key::B) {
+                    self.channel_mode = ChannelMode::B;
+                }
+                if i.key_pressed(egui::Key::A) {
+                    self.channel_mode = ChannelMode::A;
+                }
+                if i.key_pressed(egui::Key::C) {
+                    self.channel_mode = ChannelMode::RGB;
+                }
+                if self.channel_mode != prev_mode {
+                    self.textures.fill(None);
+                    self.textures_b.fill(None);
+                    self.diff_texture = None;
+                }
+            }
+        });
+    }
+
     pub fn ui(
         &mut self,
         ui: &mut egui::Ui,
@@ -106,17 +173,7 @@ impl ExrViewer {
         render_state: Option<&eframe::egui_wgpu::RenderState>,
         lut_bg_opt: Option<std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>>,
     ) {
-        if ui.input(|i| i.key_pressed(egui::Key::Num1)) {
-            self.compare_mode = CompareMode::SingleA;
-            self.blink_state = false;
-        }
-        if ui.input(|i| i.key_pressed(egui::Key::Num2)) && exr_data_b.is_some() {
-            self.compare_mode = CompareMode::SingleB;
-            self.blink_state = false;
-        }
-        if ui.input(|i| i.key_pressed(egui::Key::Space)) && exr_data_b.is_some() {
-            self.blink_state = !self.blink_state;
-        }
+        self.handle_hotkeys(ui, exr_data_b.is_some());
 
         if self.blink_state && exr_data_b.is_some() {
             ui.ctx().request_repaint();
@@ -391,35 +448,7 @@ impl ExrViewer {
                 draw_sheet(self, ui, exr_data, true);
             }
         } else {
-            // Handle Keyboard "F" to frame and Channel hotkeys
-            ui.input(|i| {
-                if i.key_pressed(egui::Key::F) {
-                    self.first_frame = true;
-                }
-
-                let prev_mode = self.channel_mode;
-                if i.key_pressed(egui::Key::R) {
-                    self.channel_mode = ChannelMode::R;
-                }
-                if i.key_pressed(egui::Key::G) {
-                    self.channel_mode = ChannelMode::G;
-                }
-                if i.key_pressed(egui::Key::B) {
-                    self.channel_mode = ChannelMode::B;
-                }
-                if i.key_pressed(egui::Key::A) {
-                    self.channel_mode = ChannelMode::A;
-                }
-                if i.key_pressed(egui::Key::C) {
-                    self.channel_mode = ChannelMode::RGB;
-                }
-                if self.channel_mode != prev_mode {
-                    self.textures.fill(None);
-                    self.textures_b.fill(None);
-                    self.diff_texture = None;
-                }
-            });
-
+            // Channel/frame hotkeys are handled up-front in `handle_hotkeys`.
             let (tw, th) = exr_data.logical_size(self.active_layer).unwrap_or((1, 1));
             let tex_size = egui::vec2(tw as f32, th as f32);
             let mut tex_size_b = None;
@@ -521,6 +550,11 @@ impl ExrViewer {
                 // Render Image
                 let image_size = tex_size * self.scale;
 
+                // Side-by-Side draws each image at its own offset position, so the
+                // single centered overscan geometry below does not apply: skip the
+                // overscan dimming pass and its annotations in that mode.
+                let is_side_by_side = matches!(self.compare_mode, CompareMode::SideBySide);
+
                 let disp_window = exr_data.image.attributes.display_window;
                 let phys_idx = exr_data.logical_layers[self.active_layer].physical_index;
                 let data_window_min = exr_data.image.layer_data[phys_idx]
@@ -546,13 +580,15 @@ impl ExrViewer {
                 let painter = ui.painter().with_clip_rect(rect.intersect(disp_rect));
 
                 // Draw display window bounding box
-                draw_dashed_rect(
-                    &unclipped_painter,
-                    disp_rect,
-                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 100),
-                    5.0,
-                    5.0,
-                );
+                if !is_side_by_side {
+                    draw_dashed_rect(
+                        &unclipped_painter,
+                        disp_rect,
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 100),
+                        5.0,
+                        5.0,
+                    );
+                }
 
                 // Labels for display window
                 let is_overscanned = image_rect.min.x < disp_rect.min.x
@@ -564,7 +600,7 @@ impl ExrViewer {
                     || image_rect.max.x < disp_rect.max.x
                     || image_rect.max.y < disp_rect.max.y;
 
-                if is_overscanned || is_cropped {
+                if (is_overscanned || is_cropped) && !is_side_by_side {
                     unclipped_painter.text(
                         disp_rect.left_bottom() + egui::vec2(0.0, 5.0),
                         egui::Align2::LEFT_TOP,
@@ -596,13 +632,7 @@ impl ExrViewer {
                         exposure: self.exposure,
                         gamma: self.gamma,
                         diff_multiplier: self.diff_multiplier,
-                        channel_mode: match self.channel_mode {
-                            ChannelMode::RGB => 0,
-                            ChannelMode::R => 1,
-                            ChannelMode::G => 2,
-                            ChannelMode::B => 3,
-                            ChannelMode::A => 4,
-                        },
+                        channel_mode: self.channel_mode.as_u32(),
                         is_diff_mode: 0,
                         srgb: if self.srgb { 1 } else { 0 },
                         enable_lut: if self.enable_lut { 1 } else { 0 },
@@ -785,7 +815,7 @@ impl ExrViewer {
                                         false,
                                         opac,
                                     );
-                                    painter.line_segment(
+                                    p.line_segment(
                                         [
                                             egui::pos2(image_rect_b.min.x, combined_rect.min.y),
                                             egui::pos2(image_rect_b.min.x, combined_rect.max.y),
@@ -817,10 +847,13 @@ impl ExrViewer {
                             }
                         };
 
-                        if self.overscan_opacity > 0.0 {
+                        let is_sbs = matches!(comp_mode, CompareMode::SideBySide);
+                        if self.overscan_opacity > 0.0 && !is_sbs {
                             draw_all(&unclipped_painter, self.overscan_opacity);
                         }
-                        draw_all(&painter, 1.0);
+                        // Side-by-Side renders at full brightness with the full-canvas
+                        // clip (no display-window clip), so overscan dimming is skipped.
+                        draw_all(if is_sbs { &unclipped_painter } else { &painter }, 1.0);
                     }
                 } else {
                     let texture = &self.textures[self.active_layer];
@@ -926,7 +959,7 @@ impl ExrViewer {
                                 draw_image(p, texture.as_ref().unwrap(), rect, image_rect_a, opac);
                                 draw_image(p, tex_b, rect, image_rect_b, opac);
 
-                                painter.line_segment(
+                                p.line_segment(
                                     [
                                         egui::pos2(image_rect_b.min.x, combined_rect.min.y),
                                         egui::pos2(image_rect_b.min.x, combined_rect.max.y),
@@ -944,14 +977,22 @@ impl ExrViewer {
                         }
                     };
 
-                    if self.overscan_opacity > 0.0 {
+                    if self.overscan_opacity > 0.0 && !is_side_by_side {
                         draw_all_cpu(&unclipped_painter, self.overscan_opacity);
                     }
-                    draw_all_cpu(&painter, 1.0);
+                    // Side-by-Side renders at full brightness with the full-canvas clip.
+                    draw_all_cpu(
+                        if is_side_by_side {
+                            &unclipped_painter
+                        } else {
+                            &painter
+                        },
+                        1.0,
+                    );
                 }
 
                 // Draw data window bounding box over the image
-                if is_overscanned || is_cropped {
+                if (is_overscanned || is_cropped) && !is_side_by_side {
                     draw_dashed_rect(
                         &unclipped_painter,
                         image_rect,
@@ -1318,8 +1359,8 @@ impl ExrViewer {
         };
 
         // Hoist all loop-invariant scalars out of the per-pixel work.
-        let exp_mult = 2.0_f32.powf(self.exposure);
-        let inv_gamma = 1.0 / self.gamma;
+        let exp_mult = crate::render_math::exposure_to_multiplier(self.exposure);
+        let gamma = self.gamma;
         let apply_gamma = self.gamma != 1.0;
         let apply_srgb = self.srgb;
         let channel_mode = self.channel_mode;
@@ -1379,9 +1420,9 @@ impl ExrViewer {
                     b += bg_linear * (1.0 - a_clamp);
 
                     if apply_gamma {
-                        r = if r > 0.0 { r.powf(inv_gamma) } else { 0.0 };
-                        g = if g > 0.0 { g.powf(inv_gamma) } else { 0.0 };
-                        b = if b > 0.0 { b.powf(inv_gamma) } else { 0.0 };
+                        r = crate::render_math::apply_gamma(r, gamma);
+                        g = crate::render_math::apply_gamma(g, gamma);
+                        b = crate::render_math::apply_gamma(b, gamma);
                     }
 
                     if apply_srgb {
@@ -1445,8 +1486,8 @@ impl ExrViewer {
         };
 
         // Hoist all loop-invariant scalars out of the per-pixel work.
-        let exp_mult = 2.0_f32.powf(self.exposure);
-        let inv_gamma = 1.0 / self.gamma;
+        let exp_mult = crate::render_math::exposure_to_multiplier(self.exposure);
+        let gamma = self.gamma;
         let apply_gamma = self.gamma != 1.0;
         let apply_srgb = self.srgb;
         let diff_multiplier = self.diff_multiplier;
@@ -1477,21 +1518,9 @@ impl ExrViewer {
                     diff_b *= exp_mult;
 
                     if apply_gamma {
-                        diff_r = if diff_r > 0.0 {
-                            diff_r.powf(inv_gamma)
-                        } else {
-                            0.0
-                        };
-                        diff_g = if diff_g > 0.0 {
-                            diff_g.powf(inv_gamma)
-                        } else {
-                            0.0
-                        };
-                        diff_b = if diff_b > 0.0 {
-                            diff_b.powf(inv_gamma)
-                        } else {
-                            0.0
-                        };
+                        diff_r = crate::render_math::apply_gamma(diff_r, gamma);
+                        diff_g = crate::render_math::apply_gamma(diff_g, gamma);
+                        diff_b = crate::render_math::apply_gamma(diff_b, gamma);
                     }
 
                     if apply_srgb {
@@ -1560,12 +1589,11 @@ impl ExrViewer {
         Some([r, g, b, a])
     }
 
+    /// Thin re-export of [`crate::render_math::linear_to_srgb`] so existing
+    /// `ExrViewer::linear_to_srgb(..)` call sites (here and in `app.rs`) keep
+    /// working while the math lives in one tested place.
     pub fn linear_to_srgb(l: f32) -> f32 {
-        if l <= 0.0031308 {
-            l * 12.92
-        } else {
-            1.055 * l.powf(1.0 / 2.4) - 0.055
-        }
+        crate::render_math::linear_to_srgb(l)
     }
 
     pub fn calculate_histogram(&mut self, exr_data: &ExrData, exr_data_b: Option<&ExrData>) {
@@ -1709,4 +1737,120 @@ fn draw_dashed_rect(
     draw_line(rect.right_top(), rect.right_bottom());
     draw_line(rect.right_bottom(), rect.left_bottom());
     draw_line(rect.left_bottom(), rect.left_top());
+}
+
+#[cfg(test)]
+mod gui_tests {
+    //! Headless GUI interaction tests. They drive the rendering-free
+    //! [`ExrViewer::handle_hotkeys`] seam through `egui_kittest`, so they run
+    //! anywhere — no wgpu device, no loaded image — yet exercise the real egui
+    //! input pipeline (events → `key_pressed` → state mutation).
+    use super::{ChannelMode, CompareMode, ExrViewer};
+    use eframe::egui;
+    use egui_kittest::Harness;
+
+    struct State {
+        viewer: ExrViewer,
+        has_b: bool,
+    }
+
+    fn harness(has_b: bool) -> Harness<'static, State> {
+        Harness::new_ui_state(
+            |ui, s: &mut State| {
+                let has_b = s.has_b;
+                s.viewer.handle_hotkeys(ui, has_b);
+            },
+            State {
+                viewer: ExrViewer::default(),
+                has_b,
+            },
+        )
+    }
+
+    #[test]
+    fn channel_keys_isolate_and_reset() {
+        let mut h = harness(false);
+
+        for (key, expected) in [
+            (egui::Key::R, ChannelMode::R),
+            (egui::Key::G, ChannelMode::G),
+            (egui::Key::B, ChannelMode::B),
+            (egui::Key::A, ChannelMode::A),
+            (egui::Key::C, ChannelMode::RGB), // C returns to full RGB
+        ] {
+            h.key_press(key);
+            h.run();
+            assert_eq!(h.state().viewer.channel_mode, expected, "key {key:?}");
+        }
+    }
+
+    #[test]
+    fn channel_keys_are_inert_in_contact_sheet() {
+        let mut h = harness(false);
+        h.state_mut().viewer.show_contact_sheet = true;
+        let before = h.state().viewer.channel_mode;
+
+        h.key_press(egui::Key::R);
+        h.run();
+        assert_eq!(
+            h.state().viewer.channel_mode,
+            before,
+            "channel hotkeys must not fire in contact-sheet mode"
+        );
+    }
+
+    #[test]
+    fn compare_keys_switch_mode_when_reference_loaded() {
+        let mut h = harness(true);
+
+        h.key_press(egui::Key::Num2);
+        h.run();
+        assert_eq!(h.state().viewer.compare_mode, CompareMode::SingleB);
+
+        h.key_press(egui::Key::Num1);
+        h.run();
+        assert_eq!(h.state().viewer.compare_mode, CompareMode::SingleA);
+    }
+
+    #[test]
+    fn reference_only_shortcuts_are_inert_without_b() {
+        let mut h = harness(false);
+        let before = h.state().viewer.compare_mode;
+
+        h.key_press(egui::Key::Num2);
+        h.run();
+        assert_eq!(
+            h.state().viewer.compare_mode,
+            before,
+            "Num2 must do nothing without a reference image"
+        );
+    }
+
+    #[test]
+    fn space_toggles_blink_only_with_reference() {
+        // With a reference image, Space toggles the blink (A/B flip) state.
+        let mut h = harness(true);
+        assert!(!h.state().viewer.blink_state);
+        h.key_press(egui::Key::Space);
+        h.run();
+        assert!(
+            h.state().viewer.blink_state,
+            "Space should enable blink with B"
+        );
+        h.key_press(egui::Key::Space);
+        h.run();
+        assert!(
+            !h.state().viewer.blink_state,
+            "Space should toggle blink back off"
+        );
+
+        // Without a reference image, Space is inert.
+        let mut h = harness(false);
+        h.key_press(egui::Key::Space);
+        h.run();
+        assert!(
+            !h.state().viewer.blink_state,
+            "Space must be inert without B"
+        );
+    }
 }

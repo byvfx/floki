@@ -332,3 +332,71 @@ impl eframe::egui_wgpu::CallbackTrait for ExrCallback {
         render_pass.draw(0..6, 0..1);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uniforms_size_is_16_byte_aligned() {
+        // WGSL uniform buffers require the struct size to be a multiple of 16
+        // bytes; the explicit `pad*` fields exist solely to guarantee that.
+        // Keep this in lockstep with the uniform struct in `shader.wgsl`.
+        let size = std::mem::size_of::<Uniforms>();
+        assert_eq!(
+            size % 16,
+            0,
+            "Uniforms size ({size}) must be a multiple of 16"
+        );
+        assert_eq!(
+            size, 64,
+            "Uniforms layout changed — update shader.wgsl to match"
+        );
+    }
+
+    #[test]
+    fn uniforms_round_trip_through_bytes() {
+        // Proves the `Pod`/`Zeroable` derives are sound: what we upload is what
+        // the shader receives, byte for byte.
+        let u = Uniforms {
+            rect_min: [1.0, 2.0],
+            rect_max: [3.0, 4.0],
+            screen_size: [800.0, 600.0],
+            exposure: 1.5,
+            gamma: 2.2,
+            diff_multiplier: 4.0,
+            channel_mode: 3,
+            is_diff_mode: 1,
+            srgb: 1,
+            enable_lut: 0,
+            opacity: 0.5,
+            pad3: 0,
+            pad4: 0,
+        };
+        let bytes = bytemuck::bytes_of(&u);
+        assert_eq!(bytes.len(), std::mem::size_of::<Uniforms>());
+
+        let back: &Uniforms = bytemuck::from_bytes(bytes);
+        assert_eq!(back.exposure, 1.5);
+        assert_eq!(back.gamma, 2.2);
+        assert_eq!(back.diff_multiplier, 4.0);
+        assert_eq!(back.channel_mode, 3);
+        assert_eq!(back.is_diff_mode, 1);
+        assert_eq!(back.srgb, 1);
+        assert_eq!(back.enable_lut, 0);
+        assert_eq!(back.opacity, 0.5);
+        assert_eq!(back.screen_size, [800.0, 600.0]);
+    }
+
+    #[test]
+    fn channel_mode_encoding_matches_shader_contract() {
+        // The single source of truth (`ChannelMode::as_u32`) must keep emitting
+        // the values the shader's `channel_mode` switch expects.
+        use crate::viewer::ChannelMode;
+        assert_eq!(ChannelMode::RGB.as_u32(), 0);
+        assert_eq!(ChannelMode::R.as_u32(), 1);
+        assert_eq!(ChannelMode::G.as_u32(), 2);
+        assert_eq!(ChannelMode::B.as_u32(), 3);
+        assert_eq!(ChannelMode::A.as_u32(), 4);
+    }
+}

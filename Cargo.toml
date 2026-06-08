@@ -1,6 +1,6 @@
 [package]
 name = "exr-analyzer"
-version = "1.2.2"
+version = "1.2.3"
 edition = "2024"
 
 [dependencies]
@@ -15,6 +15,11 @@ rfd = "0.17.2"
 smallvec = "1.15.1"
 bytemuck = { version = "1.16", features = ["derive"] }
 rayon = "1.12.0"
+
+[dev-dependencies]
+tempfile = "3"          # scoped temp dirs/files for test fixtures (auto-cleanup)
+egui_kittest = "0.34"   # headless egui interaction harness (no wgpu/snapshot feature)
+approx = "0.5"          # float-tolerant assertions for color math
 
 # Patched exr: decompresses ZIP/PXR24 via miniz_oxide instead of zune-inflate,
 # which panics (and aborts the app via a rayon worker) on some valid files.

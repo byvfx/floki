@@ -16,9 +16,11 @@ If you've noticed a bug or have a feature request, please make sure to open an i
 
 1. **Create a new branch** for your feature or bugfix (`git checkout -b feature/my-awesome-feature`).
 2. **Make your changes**. Ensure your code is well-commented and clean.
-3. **Run the tests** (`cargo test`) to ensure no existing functionality is broken.
+3. **Run the tests** (`cargo test`) to ensure no existing functionality is broken. See [TESTING.md](TESTING.md) for what the suite covers and how to add tests (generate fixtures in a temp dir; keep tests GPU-free).
 4. **Format your code** using `cargo fmt`.
 5. **Lint your code** using `cargo clippy` and fix any warnings.
+
+> CI runs `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test --all-targets`, and **blocks the build until they pass** — so run them locally first.
 6. **Commit your changes** with clear, descriptive commit messages.
 7. **Push to your fork** and submit a Pull Request.
 

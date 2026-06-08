@@ -221,7 +221,7 @@ fn convert_exr(
 
 #[cfg(test)]
 mod tests {
-    use super::convert_exr;
+    use super::{canonical_rgba, convert_exr, run_conversion_task};
     use exr::prelude::*;
     use std::path::Path;
 
@@ -310,5 +310,145 @@ mod tests {
             "no x/y/z channel should have been renamed to a colour channel: {:?}",
             out.keys().collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn canonical_rgba_maps_aliases_and_rejects_others() {
+        for s in ["R", "r", "RED", "red", "Red"] {
+            assert_eq!(canonical_rgba(s), Some("R"), "{s} -> R");
+        }
+        for s in ["G", "g", "green", "GREEN"] {
+            assert_eq!(canonical_rgba(s), Some("G"), "{s} -> G");
+        }
+        for s in ["B", "b", "blue", "BLUE"] {
+            assert_eq!(canonical_rgba(s), Some("B"), "{s} -> B");
+        }
+        for s in ["A", "a", "alpha", "ALPHA"] {
+            assert_eq!(canonical_rgba(s), Some("A"), "{s} -> A");
+        }
+        for s in ["X", "x", "y", "z", "Z", "depth", "height", "mask", ""] {
+            assert_eq!(canonical_rgba(s), None, "{s} must not be a colour channel");
+        }
+    }
+
+    #[test]
+    fn rename_skipped_when_it_would_reorder_channels() {
+        // A layer mixing a colour channel (R) with a later-sorting data channel
+        // (Z): prefixing R into "rgba.R" would push it after "Z" alphabetically,
+        // so the converter must leave the layer untouched rather than scramble
+        // the verbatim-copied pixel blocks.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("reorder_src.exr");
+        let dst = dir.path().join("reorder_dst.exr");
+        write_single_layer(&src, "C", &[("R", 7.0), ("Z", 9.0)]);
+
+        convert_exr(&src, &dst).expect("convert");
+        let out: std::collections::HashMap<String, f32> = read_back(&dst).into_iter().collect();
+
+        assert_eq!(out.get("R"), Some(&7.0), "R must keep its name and data");
+        assert_eq!(out.get("Z"), Some(&9.0), "Z must keep its name and data");
+        assert!(
+            !out.keys().any(|k| k.contains('.')),
+            "no channel should have been renamed: {:?}",
+            out.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn run_conversion_task_processes_all_files() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::mpsc::channel;
+
+        let in_dir = tempfile::tempdir().unwrap();
+        let out_dir = tempfile::tempdir().unwrap();
+        const N: usize = 4;
+        for i in 0..N {
+            write_single_layer(
+                &in_dir.path().join(format!("img_{i}.exr")),
+                "C",
+                &[("R", 1.0), ("G", 2.0), ("B", 3.0), ("A", 4.0)],
+            );
+        }
+
+        let (tx, rx) = channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        run_conversion_task(
+            in_dir.path().to_path_buf(),
+            out_dir.path().to_path_buf(),
+            tx,
+            cancel,
+        );
+
+        let msgs: Vec<(usize, usize, String)> = rx.iter().collect();
+        assert!(!msgs.is_empty(), "must emit progress");
+        assert!(
+            msgs.iter().all(|(_, total, _)| *total == N),
+            "every message reports the same total"
+        );
+        let max_done = msgs.iter().map(|(d, _, _)| *d).max().unwrap();
+        assert_eq!(max_done, N, "all {N} files must complete");
+
+        // The monotonic counter visits 1..=N exactly across per-file messages.
+        let mut dones: Vec<usize> = msgs
+            .iter()
+            .map(|(d, _, _)| *d)
+            .filter(|&d| (1..=N).contains(&d))
+            .collect();
+        dones.sort_unstable();
+        dones.dedup();
+        assert_eq!(dones, (1..=N).collect::<Vec<_>>());
+
+        // Outputs exist and were renamed to the canonical rgba.* scheme.
+        for i in 0..N {
+            assert!(
+                out_dir.path().join(format!("img_{i}.exr")).exists(),
+                "output {i} must exist"
+            );
+        }
+        let sample: std::collections::HashMap<String, f32> =
+            read_back(&out_dir.path().join("img_0.exr"))
+                .into_iter()
+                .collect();
+        assert_eq!(sample.get("rgba.R"), Some(&1.0));
+        assert_eq!(sample.get("rgba.A"), Some(&4.0));
+    }
+
+    #[test]
+    fn run_conversion_task_respects_cancellation() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::mpsc::channel;
+
+        let in_dir = tempfile::tempdir().unwrap();
+        let out_dir = tempfile::tempdir().unwrap();
+        for i in 0..3 {
+            write_single_layer(
+                &in_dir.path().join(format!("img_{i}.exr")),
+                "C",
+                &[("R", 1.0), ("G", 2.0), ("B", 3.0)],
+            );
+        }
+
+        let (tx, rx) = channel();
+        let cancel = Arc::new(AtomicBool::new(true)); // cancelled before it starts
+        run_conversion_task(
+            in_dir.path().to_path_buf(),
+            out_dir.path().to_path_buf(),
+            tx,
+            cancel,
+        );
+        let _drain: Vec<_> = rx.iter().collect();
+
+        let produced = std::fs::read_dir(out_dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .is_some_and(|x| x.eq_ignore_ascii_case("exr"))
+            })
+            .count();
+        assert_eq!(produced, 0, "cancelled run must not write outputs");
     }
 }

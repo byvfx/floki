@@ -2,6 +2,7 @@ mod app;
 mod color;
 mod exr_loader;
 mod gpu;
+mod render_math;
 mod tools;
 mod viewer;
 

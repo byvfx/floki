@@ -87,6 +87,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // Channel mode
     // 0: RGB, 1: R, 2: G, 3: B, 4: A
+    // Source of truth for this encoding: `ChannelMode::as_u32` in src/viewer.rs.
+    // Keep these branches in lockstep with that mapping.
     if uniforms.channel_mode == 1u {
         g = r; b = r; a = 1.0;
     } else if uniforms.channel_mode == 2u {
