@@ -36,6 +36,43 @@ pub enum CompareMode {
     Wipe,
     SideBySide,
     DiffMatte,
+    Composite,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub enum BlendMode {
+    #[default]
+    Over,
+    Under,
+    Add,
+    Multiply,
+    Screen,
+}
+
+impl BlendMode {
+    /// Integer encoding shared with the GPU. This is the **single source of
+    /// truth** for the `blend_mode` mapping; the `switch` in `gpu/shader.wgsl`
+    /// must use these same values (Over=0, Under=1, Add=2, Multiply=3, Screen=4).
+    /// Changing a value here requires the matching change in the shader.
+    pub fn as_u32(self) -> u32 {
+        match self {
+            BlendMode::Over => 0,
+            BlendMode::Under => 1,
+            BlendMode::Add => 2,
+            BlendMode::Multiply => 3,
+            BlendMode::Screen => 4,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BlendMode::Over => "Over",
+            BlendMode::Under => "Under",
+            BlendMode::Add => "Add",
+            BlendMode::Multiply => "Multiply",
+            BlendMode::Screen => "Screen",
+        }
+    }
 }
 
 pub struct ExrViewer {
@@ -45,7 +82,10 @@ pub struct ExrViewer {
     gpu_textures_b: Vec<Option<std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>>>,
     diff_texture: Option<egui::TextureHandle>,
     last_diff_params: (usize, f32), // (layer_index, diff_multiplier)
+    composite_texture: Option<egui::TextureHandle>,
+    last_composite_params: (usize, BlendMode), // (layer_index, blend_mode)
     pub blink_state: bool,
+    pub fullscreen: bool,
     // Add viewing options like exposure, gamma, srgb toggle
     pub exposure: f32,
     pub overscan_opacity: f32,
@@ -55,6 +95,8 @@ pub struct ExrViewer {
     pub show_tooltip: bool,
     pub channel_mode: ChannelMode,
     pub compare_mode: CompareMode,
+    pub blend_mode: BlendMode,
+    pub sample_aperture: usize,
     pub wipe_position: f32,
     pub diff_multiplier: f32,
     pub active_layer: usize,
@@ -84,7 +126,10 @@ impl Default for ExrViewer {
             gpu_textures_b: Vec::new(),
             diff_texture: None,
             last_diff_params: (0, 0.0),
+            composite_texture: None,
+            last_composite_params: (0, BlendMode::Over),
             blink_state: false,
+            fullscreen: false,
             exposure: 0.0,
             overscan_opacity: 0.2,
             gamma: 1.0,
@@ -93,6 +138,8 @@ impl Default for ExrViewer {
             show_tooltip: true,
             channel_mode: ChannelMode::RGB,
             compare_mode: CompareMode::SingleA,
+            blend_mode: BlendMode::Over,
+            sample_aperture: 1,
             wipe_position: 0.5,
             diff_multiplier: 1.0,
             active_layer: 0,
@@ -123,6 +170,10 @@ impl ExrViewer {
     /// are inert without it. Channel shortcuts apply only in the single-view
     /// layout (not the contact sheet), matching the original inline behavior.
     pub fn handle_hotkeys(&mut self, ui: &egui::Ui, has_b: bool) {
+        // Sending a viewport command requires `ui.ctx()`, which we cannot touch
+        // while the input lock is held — defer it until after the closure.
+        let mut fullscreen_changed = false;
+
         ui.input(|i| {
             if i.key_pressed(egui::Key::Num1) {
                 self.compare_mode = CompareMode::SingleA;
@@ -136,6 +187,25 @@ impl ExrViewer {
                 self.blink_state = !self.blink_state;
             }
 
+            // Full-screen toggle (F11) and ESC-to-exit work in any mode.
+            if i.key_pressed(egui::Key::F11) {
+                self.fullscreen = !self.fullscreen;
+                fullscreen_changed = true;
+            }
+            if self.fullscreen && i.key_pressed(egui::Key::Escape) {
+                self.fullscreen = false;
+                fullscreen_changed = true;
+            }
+
+            // Reset exposure (E) / gamma (Shift+G). Gamma deliberately uses
+            // Shift+G because plain `G` isolates the green channel below.
+            if i.key_pressed(egui::Key::E) {
+                self.reset_exposure();
+            }
+            if i.modifiers.shift && i.key_pressed(egui::Key::G) {
+                self.reset_gamma();
+            }
+
             if !self.show_contact_sheet {
                 if i.key_pressed(egui::Key::F) {
                     self.first_frame = true;
@@ -144,7 +214,8 @@ impl ExrViewer {
                 if i.key_pressed(egui::Key::R) {
                     self.channel_mode = ChannelMode::R;
                 }
-                if i.key_pressed(egui::Key::G) {
+                // Plain G only — Shift+G is the gamma reset handled above.
+                if i.key_pressed(egui::Key::G) && !i.modifiers.shift {
                     self.channel_mode = ChannelMode::G;
                 }
                 if i.key_pressed(egui::Key::B) {
@@ -163,6 +234,31 @@ impl ExrViewer {
                 }
             }
         });
+
+        if fullscreen_changed {
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+        }
+    }
+
+    /// Invalidate cached CPU display textures whose pixels depend on the
+    /// exposure / gamma / sRGB tone pipeline, so they regenerate next frame.
+    /// (The GPU path reads the live uniform each frame and needs no invalidation.)
+    fn invalidate_tone(&mut self) {
+        self.textures.fill(None);
+        self.textures_b.fill(None);
+        self.diff_texture = None;
+        self.composite_texture = None;
+    }
+
+    fn reset_exposure(&mut self) {
+        self.exposure = 0.0;
+        self.invalidate_tone();
+    }
+
+    fn reset_gamma(&mut self) {
+        self.gamma = 1.0;
+        self.invalidate_tone();
     }
 
     pub fn ui(
@@ -202,6 +298,7 @@ impl ExrViewer {
                     );
                     ui.add_enabled_ui(!self.show_contact_sheet, |ui| {
                         ui.selectable_value(&mut self.compare_mode, CompareMode::DiffMatte, "Diff");
+                        ui.selectable_value(&mut self.compare_mode, CompareMode::Composite, "Comp");
                     });
                     if ui
                         .toggle_value(&mut self.blink_state, "Blink (Spc)")
@@ -220,38 +317,74 @@ impl ExrViewer {
                         );
                     } else if self.compare_mode == CompareMode::SideBySide {
                         ui.checkbox(&mut self.normalize_side_by_side, "Normalize Size");
+                    } else if self.compare_mode == CompareMode::Composite {
+                        ui.label("Blend:");
+                        egui::ComboBox::from_id_salt("blend_mode_select")
+                            .selected_text(self.blend_mode.label())
+                            .show_ui(ui, |ui| {
+                                for mode in [
+                                    BlendMode::Over,
+                                    BlendMode::Under,
+                                    BlendMode::Add,
+                                    BlendMode::Multiply,
+                                    BlendMode::Screen,
+                                ] {
+                                    ui.selectable_value(&mut self.blend_mode, mode, mode.label());
+                                }
+                            });
                     }
                     ui.separator();
                 }
 
-                ui.label("Exposure:");
+                // Right-clicking the label resets that control (Nuke-style).
+                if ui
+                    .add(egui::Label::new("Exposure:").sense(egui::Sense::click()))
+                    .on_hover_text("Right-click to reset to 0.0 (key: E)")
+                    .secondary_clicked()
+                {
+                    self.reset_exposure();
+                }
                 if ui
                     .add(egui::Slider::new(&mut self.exposure, -5.0..=5.0))
                     .changed()
                 {
-                    self.textures.fill(None);
-                    self.textures_b.fill(None);
-                    self.diff_texture = None;
+                    self.invalidate_tone();
                 }
 
                 ui.label("Overscan Opacity:");
                 ui.add(egui::Slider::new(&mut self.overscan_opacity, 0.0..=1.0));
-                ui.label("Gamma:");
+                if ui
+                    .add(egui::Label::new("Gamma:").sense(egui::Sense::click()))
+                    .on_hover_text("Right-click to reset to 1.0 (key: Shift+G)")
+                    .secondary_clicked()
+                {
+                    self.reset_gamma();
+                }
                 if ui
                     .add(egui::Slider::new(&mut self.gamma, 0.1..=5.0))
                     .changed()
                 {
-                    self.textures.fill(None);
-                    self.textures_b.fill(None);
-                    self.diff_texture = None;
+                    self.invalidate_tone();
+                }
+                if ui
+                    .button("⟲")
+                    .on_hover_text("Reset exposure (0.0) & gamma (1.0)")
+                    .clicked()
+                {
+                    self.reset_exposure();
+                    self.reset_gamma();
                 }
                 if ui.checkbox(&mut self.srgb, "sRGB").changed() {
-                    self.textures.fill(None);
-                    self.textures_b.fill(None);
-                    self.diff_texture = None;
+                    self.invalidate_tone();
                 }
 
                 ui.checkbox(&mut self.show_tooltip, "Show Pixel Tooltip");
+
+                ui.separator();
+                ui.label("Sample:");
+                ui.selectable_value(&mut self.sample_aperture, 1, "1px");
+                ui.selectable_value(&mut self.sample_aperture, 3, "3×3");
+                ui.selectable_value(&mut self.sample_aperture, 9, "9×9");
 
                 let layer_count = exr_data.logical_layers.len();
                 if layer_count > 1
@@ -260,7 +393,8 @@ impl ExrViewer {
                         .changed()
                     && self.show_contact_sheet
                     && (self.compare_mode == CompareMode::Wipe
-                        || self.compare_mode == CompareMode::DiffMatte)
+                        || self.compare_mode == CompareMode::DiffMatte
+                        || self.compare_mode == CompareMode::Composite)
                 {
                     self.compare_mode = CompareMode::SideBySide;
                 }
@@ -505,6 +639,23 @@ impl ExrViewer {
                     );
                     self.last_diff_params = (self.active_layer, self.diff_multiplier);
                 }
+                if let Some(exr_b) = exr_data_b
+                    && self.compare_mode == CompareMode::Composite
+                    && (self.composite_texture.is_none()
+                        || self.last_composite_params != (self.active_layer, self.blend_mode))
+                {
+                    let layer_b = self
+                        .active_layer
+                        .min(exr_b.logical_layers.len().saturating_sub(1));
+                    self.composite_texture = self.generate_composite_texture(
+                        ui.ctx(),
+                        exr_data,
+                        exr_b,
+                        self.active_layer,
+                        layer_b,
+                    );
+                    self.last_composite_params = (self.active_layer, self.blend_mode);
+                }
             }
 
             // Draw texture
@@ -637,8 +788,8 @@ impl ExrViewer {
                         srgb: if self.srgb { 1 } else { 0 },
                         enable_lut: if self.enable_lut { 1 } else { 0 },
                         opacity: 1.0,
-                        pad3: 0,
-                        pad4: 0,
+                        is_composite: 0,
+                        blend_mode: self.blend_mode.as_u32(),
                     };
 
                     let default_lut = render_state
@@ -659,11 +810,13 @@ impl ExrViewer {
                          clip_rect: egui::Rect,
                          target_rect: egui::Rect,
                          is_diff: bool,
+                         is_composite: bool,
                          opacity: f32| {
                             let mut u = uniform_data;
                             u.rect_min = [target_rect.min.x, target_rect.min.y];
                             u.rect_max = [target_rect.max.x, target_rect.max.y];
                             u.is_diff_mode = if is_diff { 1 } else { 0 };
+                            u.is_composite = if is_composite { 1 } else { 0 };
                             u.opacity = opacity;
 
                             let device = &render_state.as_ref().unwrap().device;
@@ -721,7 +874,16 @@ impl ExrViewer {
                         };
                         let draw_all = |p: &egui::Painter, opac: f32| match comp_mode {
                             CompareMode::SingleA => {
-                                draw_gpu(p, bg_a.clone(), None, rect, image_rect, false, opac);
+                                draw_gpu(
+                                    p,
+                                    bg_a.clone(),
+                                    None,
+                                    rect,
+                                    image_rect,
+                                    false,
+                                    false,
+                                    opac,
+                                );
                             }
                             CompareMode::SingleB => {
                                 if let Some(bg_b) = exr_data_b.and_then(|d| {
@@ -730,7 +892,16 @@ impl ExrViewer {
                                         .min(d.logical_layers.len().saturating_sub(1))]
                                     .clone()
                                 }) {
-                                    draw_gpu(p, bg_b.clone(), None, rect, image_rect, false, opac);
+                                    draw_gpu(
+                                        p,
+                                        bg_b.clone(),
+                                        None,
+                                        rect,
+                                        image_rect,
+                                        false,
+                                        false,
+                                        opac,
+                                    );
                                 }
                             }
                             CompareMode::Wipe => {
@@ -742,14 +913,23 @@ impl ExrViewer {
                                 let mut rect_b = rect;
                                 rect_b.min.x = clamped_wipe_x;
 
-                                draw_gpu(p, bg_a.clone(), None, rect_a, image_rect, false, opac);
+                                draw_gpu(
+                                    p,
+                                    bg_a.clone(),
+                                    None,
+                                    rect_a,
+                                    image_rect,
+                                    false,
+                                    false,
+                                    opac,
+                                );
                                 if let Some(bg_b) = exr_data_b.and_then(|d| {
                                     self.gpu_textures_b[self
                                         .active_layer
                                         .min(d.logical_layers.len().saturating_sub(1))]
                                     .clone()
                                 }) {
-                                    draw_gpu(p, bg_b, None, rect_b, image_rect, false, opac);
+                                    draw_gpu(p, bg_b, None, rect_b, image_rect, false, false, opac);
                                 }
                                 painter.line_segment(
                                     [
@@ -804,6 +984,7 @@ impl ExrViewer {
                                         rect,
                                         image_rect_a,
                                         false,
+                                        false,
                                         opac,
                                     );
                                     draw_gpu(
@@ -812,6 +993,7 @@ impl ExrViewer {
                                         None,
                                         rect,
                                         image_rect_b,
+                                        false,
                                         false,
                                         opac,
                                     );
@@ -823,7 +1005,16 @@ impl ExrViewer {
                                         (2.0, egui::Color32::GRAY),
                                     );
                                 } else {
-                                    draw_gpu(p, bg_a.clone(), None, rect, image_rect, false, opac);
+                                    draw_gpu(
+                                        p,
+                                        bg_a.clone(),
+                                        None,
+                                        rect,
+                                        image_rect,
+                                        false,
+                                        false,
+                                        opac,
+                                    );
                                 }
                             }
                             CompareMode::DiffMatte => {
@@ -840,6 +1031,27 @@ impl ExrViewer {
                                         Some(bg_b.clone()),
                                         rect,
                                         image_rect,
+                                        true,
+                                        false,
+                                        opac,
+                                    );
+                                }
+                            }
+                            CompareMode::Composite => {
+                                let bg_b_opt = exr_data_b.and_then(|d| {
+                                    self.gpu_textures_b[self
+                                        .active_layer
+                                        .min(d.logical_layers.len().saturating_sub(1))]
+                                    .clone()
+                                });
+                                if let Some(bg_b) = bg_b_opt {
+                                    draw_gpu(
+                                        p,
+                                        bg_a.clone(),
+                                        Some(bg_b.clone()),
+                                        rect,
+                                        image_rect,
+                                        false,
                                         true,
                                         opac,
                                     );
@@ -973,6 +1185,11 @@ impl ExrViewer {
                         CompareMode::DiffMatte => {
                             if let Some(diff) = &self.diff_texture {
                                 draw_image(p, diff, rect, image_rect, opac);
+                            }
+                        }
+                        CompareMode::Composite => {
+                            if let Some(comp) = &self.composite_texture {
+                                draw_image(p, comp, rect, image_rect, opac);
                             }
                         }
                     };
@@ -1546,6 +1763,151 @@ impl ExrViewer {
         Some(ctx.load_texture("exr_viewer_diff", color_image, egui::TextureOptions::LINEAR))
     }
 
+    /// CPU-fallback parity for [`CompareMode::Composite`]. Blends A and B in
+    /// linear space (premultiplied-alpha aware) per [`BlendMode`], then runs the
+    /// same exposure → checkerboard → gamma → sRGB tone pipeline as
+    /// [`Self::generate_texture`]. Like the CPU diff path it ignores per-channel
+    /// isolation — the GPU path (the default) applies that after the blend.
+    fn generate_composite_texture(
+        &self,
+        ctx: &egui::Context,
+        data_a: &ExrData,
+        data_b: &ExrData,
+        layer_a_idx: usize,
+        layer_b_idx: usize,
+    ) -> Option<egui::TextureHandle> {
+        let (layer_a, r_chan_a, g_chan_a, b_chan_a, a_chan_a) =
+            data_a.logical_channels(layer_a_idx)?;
+        let (layer_b, r_chan_b, g_chan_b, b_chan_b, a_chan_b) =
+            data_b.logical_channels(layer_b_idx)?;
+
+        let width = layer_a.size.0.max(layer_b.size.0);
+        let height = layer_a.size.1.max(layer_b.size.1);
+
+        let mut pixels = vec![egui::Color32::BLACK; width * height];
+
+        let get_val = |chan: Option<&exr::image::AnyChannel<exr::image::FlatSamples>>,
+                       x: usize,
+                       y: usize,
+                       w: usize,
+                       h: usize|
+         -> f32 {
+            if x >= w || y >= h {
+                return 0.0;
+            }
+            if let Some(c) = chan {
+                let index = y * w + x;
+                match &c.sample_data {
+                    exr::image::FlatSamples::F16(s) => s[index].to_f32(),
+                    exr::image::FlatSamples::F32(s) => s[index],
+                    exr::image::FlatSamples::U32(s) => s[index] as f32 / u32::MAX as f32,
+                }
+            } else {
+                0.0
+            }
+        };
+
+        let exp_mult = crate::render_math::exposure_to_multiplier(self.exposure);
+        let gamma = self.gamma;
+        let apply_gamma = self.gamma != 1.0;
+        let apply_srgb = self.srgb;
+        let blend_mode = self.blend_mode;
+        let (aw, ah) = (layer_a.size.0, layer_a.size.1);
+        let (bw, bh) = (layer_b.size.0, layer_b.size.1);
+
+        pixels
+            .par_chunks_mut(width)
+            .enumerate()
+            .for_each(|(y, row)| {
+                for (x, px) in row.iter_mut().enumerate() {
+                    let ar = get_val(r_chan_a, x, y, aw, ah);
+                    let ag = get_val(g_chan_a, x, y, aw, ah);
+                    let ab = get_val(b_chan_a, x, y, aw, ah);
+                    let aa = if a_chan_a.is_some() {
+                        get_val(a_chan_a, x, y, aw, ah)
+                    } else {
+                        1.0
+                    };
+
+                    let br = get_val(r_chan_b, x, y, bw, bh);
+                    let bg = get_val(g_chan_b, x, y, bw, bh);
+                    let bb = get_val(b_chan_b, x, y, bw, bh);
+                    let ba = if a_chan_b.is_some() {
+                        get_val(a_chan_b, x, y, bw, bh)
+                    } else {
+                        1.0
+                    };
+
+                    // Premultiplied-alpha blends; keep in lockstep with the
+                    // `blend_mode` switch in gpu/shader.wgsl.
+                    let (mut r, mut g, mut b, a) = match blend_mode {
+                        BlendMode::Over => (
+                            ar + br * (1.0 - aa),
+                            ag + bg * (1.0 - aa),
+                            ab + bb * (1.0 - aa),
+                            aa + ba * (1.0 - aa),
+                        ),
+                        BlendMode::Under => (
+                            br + ar * (1.0 - ba),
+                            bg + ag * (1.0 - ba),
+                            bb + ab * (1.0 - ba),
+                            ba + aa * (1.0 - ba),
+                        ),
+                        BlendMode::Add => (ar + br, ag + bg, ab + bb, (aa + ba).min(1.0)),
+                        BlendMode::Multiply => (ar * br, ag * bg, ab * bb, aa),
+                        BlendMode::Screen => (
+                            ar + br - ar * br,
+                            ag + bg - ag * bg,
+                            ab + bb - ab * bb,
+                            aa + ba - aa * ba,
+                        ),
+                    };
+
+                    let is_dark = ((x / 16) + (y / 16)) % 2 == 0;
+                    let bg_linear = if is_dark { 0.1 } else { 0.2 };
+
+                    r *= exp_mult;
+                    g *= exp_mult;
+                    b *= exp_mult;
+
+                    let a_clamp = a.clamp(0.0, 1.0);
+                    r += bg_linear * (1.0 - a_clamp);
+                    g += bg_linear * (1.0 - a_clamp);
+                    b += bg_linear * (1.0 - a_clamp);
+
+                    if apply_gamma {
+                        r = crate::render_math::apply_gamma(r, gamma);
+                        g = crate::render_math::apply_gamma(g, gamma);
+                        b = crate::render_math::apply_gamma(b, gamma);
+                    }
+
+                    if apply_srgb {
+                        r = Self::linear_to_srgb(r);
+                        g = Self::linear_to_srgb(g);
+                        b = Self::linear_to_srgb(b);
+                    }
+
+                    let r_u8 = (r.clamp(0.0, 1.0) * 255.0) as u8;
+                    let g_u8 = (g.clamp(0.0, 1.0) * 255.0) as u8;
+                    let b_u8 = (b.clamp(0.0, 1.0) * 255.0) as u8;
+
+                    *px = egui::Color32::from_rgb(r_u8, g_u8, b_u8);
+                }
+            });
+
+        let color_image = egui::ColorImage {
+            size: [width, height],
+            source_size: egui::vec2(width as f32, height as f32),
+            pixels,
+        };
+
+        Some(ctx.load_texture(
+            "exr_viewer_composite",
+            color_image,
+            egui::TextureOptions::LINEAR,
+        ))
+    }
+
     fn sample_pixel(
         &self,
         exr_data: &ExrData,
@@ -1577,16 +1939,35 @@ impl ExrViewer {
             }
         };
 
-        let r = get_val(r_chan, x, y);
-        let g = get_val(g_chan, x, y);
-        let b = get_val(b_chan, x, y);
-        let mut a = get_val(a_chan, x, y);
-
-        if a_chan.is_none() {
-            a = 1.0;
+        // Aperture averaging: 1 (single pixel), 3 (3×3) or 9 (9×9). The window is
+        // centered on (x, y) with edge-clamped coordinates so it stays valid at
+        // the image border (replicate edge), and the average is over every sample
+        // in the window.
+        let radius = (self.sample_aperture / 2) as isize;
+        let mut sum = [0.0f32; 4];
+        let mut count = 0.0f32;
+        for dy in -radius..=radius {
+            for dx in -radius..=radius {
+                let sx = (x as isize + dx).clamp(0, width as isize - 1) as usize;
+                let sy = (y as isize + dy).clamp(0, height as isize - 1) as usize;
+                sum[0] += get_val(r_chan, sx, sy);
+                sum[1] += get_val(g_chan, sx, sy);
+                sum[2] += get_val(b_chan, sx, sy);
+                sum[3] += if a_chan.is_some() {
+                    get_val(a_chan, sx, sy)
+                } else {
+                    1.0
+                };
+                count += 1.0;
+            }
         }
 
-        Some([r, g, b, a])
+        Some([
+            sum[0] / count,
+            sum[1] / count,
+            sum[2] / count,
+            sum[3] / count,
+        ])
     }
 
     /// Thin re-export of [`crate::render_math::linear_to_srgb`] so existing
@@ -1782,6 +2163,42 @@ mod gui_tests {
             h.run();
             assert_eq!(h.state().viewer.channel_mode, expected, "key {key:?}");
         }
+    }
+
+    #[test]
+    fn reset_keys_zero_exposure_and_gamma() {
+        let mut h = harness(false);
+        h.state_mut().viewer.exposure = 2.0;
+        h.state_mut().viewer.gamma = 2.2;
+
+        h.key_press(egui::Key::E);
+        h.run();
+        assert_eq!(h.state().viewer.exposure, 0.0, "E should reset exposure");
+        // Gamma untouched by the exposure reset.
+        assert_eq!(h.state().viewer.gamma, 2.2);
+
+        h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::G);
+        h.run();
+        assert_eq!(h.state().viewer.gamma, 1.0, "Shift+G should reset gamma");
+    }
+
+    #[test]
+    fn plain_g_still_isolates_green_not_gamma_reset() {
+        let mut h = harness(false);
+        h.state_mut().viewer.gamma = 2.2;
+
+        h.key_press(egui::Key::G);
+        h.run();
+        assert_eq!(
+            h.state().viewer.channel_mode,
+            ChannelMode::G,
+            "plain G must isolate the green channel"
+        );
+        assert_eq!(
+            h.state().viewer.gamma,
+            2.2,
+            "plain G must NOT reset gamma (that's Shift+G)"
+        );
     }
 
     #[test]
