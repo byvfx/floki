@@ -16,8 +16,8 @@ pub struct Uniforms {
     pub srgb: u32,
     pub enable_lut: u32,
     pub opacity: f32,
-    pub pad3: u32,
-    pub pad4: u32,
+    pub is_composite: u32,
+    pub blend_mode: u32,
 }
 
 pub struct GpuState {
@@ -370,8 +370,8 @@ mod tests {
             srgb: 1,
             enable_lut: 0,
             opacity: 0.5,
-            pad3: 0,
-            pad4: 0,
+            is_composite: 1,
+            blend_mode: 2,
         };
         let bytes = bytemuck::bytes_of(&u);
         assert_eq!(bytes.len(), std::mem::size_of::<Uniforms>());
@@ -385,6 +385,8 @@ mod tests {
         assert_eq!(back.srgb, 1);
         assert_eq!(back.enable_lut, 0);
         assert_eq!(back.opacity, 0.5);
+        assert_eq!(back.is_composite, 1);
+        assert_eq!(back.blend_mode, 2);
         assert_eq!(back.screen_size, [800.0, 600.0]);
     }
 
@@ -398,5 +400,17 @@ mod tests {
         assert_eq!(ChannelMode::G.as_u32(), 2);
         assert_eq!(ChannelMode::B.as_u32(), 3);
         assert_eq!(ChannelMode::A.as_u32(), 4);
+    }
+
+    #[test]
+    fn blend_mode_encoding_matches_shader_contract() {
+        // The single source of truth (`BlendMode::as_u32`) must keep emitting the
+        // values the shader's `blend_mode` switch expects.
+        use crate::viewer::BlendMode;
+        assert_eq!(BlendMode::Over.as_u32(), 0);
+        assert_eq!(BlendMode::Under.as_u32(), 1);
+        assert_eq!(BlendMode::Add.as_u32(), 2);
+        assert_eq!(BlendMode::Multiply.as_u32(), 3);
+        assert_eq!(BlendMode::Screen.as_u32(), 4);
     }
 }

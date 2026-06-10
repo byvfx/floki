@@ -15,8 +15,8 @@ struct Uniforms {
     srgb: u32,
     enable_lut: u32,
     opacity: f32,
-    pad3: u32,
-    pad4: u32,
+    is_composite: u32,
+    blend_mode: u32,
 };
 
 @group(0) @binding(0) var tex_a: texture_2d<f32>;
@@ -69,20 +69,60 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     var color_a = textureSample(tex_a, samp_a, in.uv);
     var color_b = vec4<f32>(0.0);
     
-    if uniforms.is_diff_mode == 1u {
+    if uniforms.is_diff_mode == 1u || uniforms.is_composite == 1u {
         color_b = textureSample(tex_b, samp_b, in.uv);
     }
-    
+
     var r = color_a.r;
     var g = color_a.g;
     var b = color_a.b;
     var a = color_a.a;
-    
+
     if uniforms.is_diff_mode == 1u {
         r = abs(r - color_b.r) * uniforms.diff_multiplier;
         g = abs(g - color_b.g) * uniforms.diff_multiplier;
         b = abs(b - color_b.b) * uniforms.diff_multiplier;
         a = 1.0;
+    }
+
+    // Premultiplied-alpha compositing. Keep the `blend_mode` switch in lockstep
+    // with `BlendMode::as_u32` in src/viewer.rs (Over=0, Under=1, Add=2,
+    // Multiply=3, Screen=4) and the CPU `generate_composite_texture`.
+    if uniforms.is_composite == 1u {
+        let aa = color_a.a;
+        let ba = color_b.a;
+        switch uniforms.blend_mode {
+            case 1u: { // Under: B over A
+                r = color_b.r + color_a.r * (1.0 - ba);
+                g = color_b.g + color_a.g * (1.0 - ba);
+                b = color_b.b + color_a.b * (1.0 - ba);
+                a = ba + aa * (1.0 - ba);
+            }
+            case 2u: { // Add
+                r = color_a.r + color_b.r;
+                g = color_a.g + color_b.g;
+                b = color_a.b + color_b.b;
+                a = min(aa + ba, 1.0);
+            }
+            case 3u: { // Multiply
+                r = color_a.r * color_b.r;
+                g = color_a.g * color_b.g;
+                b = color_a.b * color_b.b;
+                a = aa;
+            }
+            case 4u: { // Screen
+                r = color_a.r + color_b.r - color_a.r * color_b.r;
+                g = color_a.g + color_b.g - color_a.g * color_b.g;
+                b = color_a.b + color_b.b - color_a.b * color_b.b;
+                a = aa + ba - aa * ba;
+            }
+            default: { // 0u Over: A over B
+                r = color_a.r + color_b.r * (1.0 - aa);
+                g = color_a.g + color_b.g * (1.0 - aa);
+                b = color_a.b + color_b.b * (1.0 - aa);
+                a = aa + ba * (1.0 - aa);
+            }
+        }
     }
 
     // Channel mode
