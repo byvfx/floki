@@ -165,10 +165,13 @@ impl eframe::App for ExrApp {
                 .open(&mut self.show_help)
                 .show(ui.ctx(), |ui| {
                     ui.heading("Keyboard Shortcuts");
+                    ui.label("1 - View Image A");
+                    ui.label("2 - View Image B (when reference loaded)");
+                    ui.label("Space - Toggle Blink comparison (when reference loaded)");
                     ui.label("R / G / B / A - Isolate specific channel");
                     ui.label("C - Return to full color composite");
                     ui.label("F - Frame image to fit the window");
-                    ui.label("F11 - Toggle full-screen (ESC to exit)");
+                    ui.label("F11 - Toggle full-screen (ESC or F11 to exit)");
                     ui.label("E - Reset exposure to 0.0");
                     ui.label("Shift+G - Reset gamma to 1.0");
                     ui.label("(or right-click the Exposure / Gamma labels to reset)");

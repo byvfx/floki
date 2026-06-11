@@ -85,6 +85,7 @@ pub struct ExrViewer {
     composite_texture: Option<egui::TextureHandle>,
     last_composite_params: (usize, BlendMode), // (layer_index, blend_mode)
     pub blink_state: bool,
+    pub blink_interval: f32,
     pub fullscreen: bool,
     // Add viewing options like exposure, gamma, srgb toggle
     pub exposure: f32,
@@ -129,6 +130,7 @@ impl Default for ExrViewer {
             composite_texture: None,
             last_composite_params: (0, BlendMode::Over),
             blink_state: false,
+            blink_interval: 1.0,
             fullscreen: false,
             exposure: 0.0,
             overscan_opacity: 0.2,
@@ -274,7 +276,7 @@ impl ExrViewer {
         if self.blink_state && exr_data_b.is_some() {
             ui.ctx().request_repaint();
             let time = ui.input(|i| i.time);
-            if ((time * 5.0) as usize).is_multiple_of(2) {
+            if ((time / self.blink_interval as f64) as usize).is_multiple_of(2) {
                 self.compare_mode = CompareMode::SingleA;
             } else {
                 self.compare_mode = CompareMode::SingleB;
@@ -306,6 +308,9 @@ impl ExrViewer {
                         && !self.blink_state
                     {
                         self.compare_mode = CompareMode::SingleA;
+                    }
+                    if self.blink_state {
+                        ui.add(egui::Slider::new(&mut self.blink_interval, 0.05..=5.0).suffix("s"));
                     }
 
                     if self.compare_mode == CompareMode::Wipe {
@@ -867,8 +872,14 @@ impl ExrViewer {
 
                     let bg_a_opt = self.gpu_textures[self.active_layer].clone();
                     if let Some(bg_a) = bg_a_opt {
-                        let comp_mode = if self.blink_state && (ui.input(|i| i.time) % 1.0 > 0.5) {
-                            CompareMode::SingleB
+                        let comp_mode = if self.blink_state {
+                            if ((ui.input(|i| i.time) / self.blink_interval as f64) as usize)
+                                .is_multiple_of(2)
+                            {
+                                CompareMode::SingleA
+                            } else {
+                                CompareMode::SingleB
+                            }
                         } else {
                             self.compare_mode
                         };
@@ -1074,11 +1085,7 @@ impl ExrViewer {
                                       clip_rect: egui::Rect,
                                       target_rect: egui::Rect,
                                       opacity: f32| {
-                        let alpha = if self.blink_state && (ui.input(|i| i.time) % 1.0 > 0.5) {
-                            0.0
-                        } else {
-                            opacity
-                        };
+                        let alpha = opacity;
                         let final_clip_rect = painter.clip_rect().intersect(clip_rect);
                         painter.with_clip_rect(final_clip_rect).image(
                             tex.id(),
@@ -2269,5 +2276,25 @@ mod gui_tests {
             !h.state().viewer.blink_state,
             "Space must be inert without B"
         );
+    }
+
+    #[test]
+    fn test_blink_interval_math() {
+        let blink_interval = 1.0;
+        let is_even_phase = |time: f64| ((time / blink_interval) as usize).is_multiple_of(2);
+
+        assert!(is_even_phase(0.0));
+        assert!(is_even_phase(0.5));
+        assert!(!is_even_phase(1.0));
+        assert!(!is_even_phase(1.5));
+        assert!(is_even_phase(2.0));
+
+        let blink_interval = 0.5;
+        let is_even_phase = |time: f64| ((time / blink_interval) as usize).is_multiple_of(2);
+        assert!(is_even_phase(0.0));
+        assert!(is_even_phase(0.25));
+        assert!(!is_even_phase(0.5));
+        assert!(!is_even_phase(0.75));
+        assert!(is_even_phase(1.0));
     }
 }
