@@ -1,11 +1,11 @@
-# EXR Analyzer
+# Floki
 
 [![Rust](https://img.shields.io/badge/Rust-1.70+-orange.svg)](https://www.rust-lang.org)
 [![egui](https://img.shields.io/badge/GUI-egui-blue)](https://github.com/emilk/egui)
 [![wgpu](https://img.shields.io/badge/wgpu-Native-green.svg)](https://wgpu.rs)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**EXR Analyzer** is a fast, hardware-accelerated Rust GUI application tailored for Technical Directors, Compositors, and LookDev Artists who need to deeply inspect and compare multi-layered OpenEXR files. 
+**Floki** is a fast, hardware-accelerated Rust GUI application tailored for Technical Directors, Compositors, and LookDev Artists who need to deeply inspect and compare multi-layered OpenEXR files. 
 
 Powered by `egui`, `wgpu`, and the pure-Rust `exr` crate, it allows you to instantly view dense pixel data, isolate color channels, explore unbounded floating-point histograms, and perform pixel-perfect A/B diffing natively on your GPU.
 
@@ -73,8 +73,8 @@ Make sure you have [Rust and Cargo](https://rustup.rs/) installed on your system
 
 ```bash
 # Clone the repository
-git clone https://github.com/byvfx/exr-analyzer.git
-cd exr-analyzer
+git clone https://github.com/byvfx/floki.git
+cd floki
 
 # Build and run the app in release mode (Highly recommended for EXR parsing speed)
 cargo run --release
@@ -88,23 +88,23 @@ log output (written to `stderr`) is visible.
 
 ```powershell
 # PowerShell — watch the EXR Header Converter work through a batch
-$env:RUST_LOG = "exr_analyzer=debug"
+$env:RUST_LOG = "floki=debug"
 cargo run --release
 ```
 
 ```bash
 # bash / zsh
-RUST_LOG=exr_analyzer=debug cargo run --release
+RUST_LOG=floki=debug cargo run --release
 ```
 
-Useful levels (prefix the target with `exr_analyzer=` to filter out noisy `wgpu`/`eframe` logs):
+Useful levels (prefix the target with `floki=` to filter out noisy `wgpu`/`eframe` logs):
 
 | `RUST_LOG` value | What you see |
 |------------------|--------------|
-| `exr_analyzer=info` | Conversion start line, final summary (`N of X files converted`), and any errors |
-| `exr_analyzer=debug` | The above plus a line per converted file and any layer left unchanged by the rename guard |
+| `floki=info` | Conversion start line, final summary (`N of X files converted`), and any errors |
+| `floki=debug` | The above plus a line per converted file and any layer left unchanged by the rename guard |
 | `info` | Everything at info level, including `wgpu`/`eframe` startup |
-| `exr_analyzer=info,wgpu=warn` | App info logs while silencing graphics-backend chatter |
+| `floki=info,wgpu=warn` | App info logs while silencing graphics-backend chatter |
 
 > **Note:** During batch conversion, files are processed in parallel across CPU cores, so
 > per-file log lines appear interleaved/out of order. The count in the final summary is

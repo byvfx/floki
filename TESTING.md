@@ -1,6 +1,6 @@
 # Testing
 
-EXR Analyzer ships a **GPU-free** test suite that covers parsing/import logic,
+Floki ships a **GPU-free** test suite that covers parsing/import logic,
 the batch converter, color/tone math, and headless GUI interaction. Everything
 runs on a plain CI runner — no graphics device, no committed binary fixtures.
 

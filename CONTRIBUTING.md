@@ -1,6 +1,6 @@
-# Contributing to EXR Analyzer
+# Contributing to Floki
 
-First off, thank you for considering contributing to EXR Analyzer! It's people like you that make open-source software such a great community.
+First off, thank you for considering contributing to Floki! It's people like you that make open-source software such a great community.
 
 ## Where do I go from here?
 
@@ -38,4 +38,4 @@ When filing a bug report, please include:
 - Steps to reproduce the bug.
 - If possible, a link to the specific `.exr` file that caused the crash or bug (please ensure you have the right to share the file).
 
-Thanks again for helping make EXR Analyzer better for everyone!
+Thanks again for helping make Floki better for everyone!

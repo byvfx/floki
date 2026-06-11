@@ -58,19 +58,19 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            executable: exr-analyzer
-            artifact_name: exr-analyzer-linux-x86_64
-            release_file: exr-analyzer-linux-x86_64
+            executable: floki
+            artifact_name: floki-linux-x86_64
+            release_file: floki-linux-x86_64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            executable: exr-analyzer.exe
-            artifact_name: exr-analyzer-windows-x86_64
-            release_file: exr-analyzer-windows-x86_64.exe
+            executable: floki.exe
+            artifact_name: floki-windows-x86_64
+            release_file: floki-windows-x86_64.exe
           - os: macos-latest
             target: aarch64-apple-darwin
-            executable: exr-analyzer
-            artifact_name: exr-analyzer-macos-arm64
-            release_file: exr-analyzer-macos-arm64
+            executable: floki
+            artifact_name: floki-macos-arm64
+            release_file: floki-macos-arm64
 
     steps:
       - uses: actions/checkout@v4

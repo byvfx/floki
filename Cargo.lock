@@ -1265,26 +1265,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "exr-analyzer"
-version = "1.3.0"
-dependencies = [
- "approx",
- "bytemuck",
- "eframe",
- "egui",
- "egui_extras",
- "egui_kittest",
- "env_logger",
- "exr",
- "log",
- "rayon",
- "rfd",
- "serde",
- "smallvec",
- "tempfile",
-]
-
-[[package]]
 name = "fastrand"
 version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1335,6 +1315,26 @@ name = "float-cmp"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "98de4bbd547a563b716d8dfa9aad1cb19bfab00f4fa09a6a4ed21dbcf44ce9c4"
+
+[[package]]
+name = "floki"
+version = "1.3.0"
+dependencies = [
+ "approx",
+ "bytemuck",
+ "eframe",
+ "egui",
+ "egui_extras",
+ "egui_kittest",
+ "env_logger",
+ "exr",
+ "log",
+ "rayon",
+ "rfd",
+ "serde",
+ "smallvec",
+ "tempfile",
+]
 
 [[package]]
 name = "foldhash"

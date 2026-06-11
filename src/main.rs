@@ -25,12 +25,12 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 800.0])
-            .with_title("EXR Analyzer"),
+            .with_title("Floki"),
         wgpu_options,
         ..Default::default()
     };
     eframe::run_native(
-        "EXR Analyzer",
+        "Floki",
         options,
         Box::new(|cc| {
             // This gives us image support:
