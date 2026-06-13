@@ -4,19 +4,24 @@ struct VertexOutput {
 };
 
 struct Uniforms {
+    // 8-byte aligned fields first (required by WGSL vec2<f32>)
     rect_min: vec2<f32>,
     rect_max: vec2<f32>,
     screen_size: vec2<f32>,
+    wipe_center: vec2<f32>,
+    // 4-byte aligned fields
     exposure: f32,
     gamma: f32,
     diff_multiplier: f32,
+    opacity: f32,
+    wipe_angle: f32,
     channel_mode: u32,
     is_diff_mode: u32,
     srgb: u32,
     enable_lut: u32,
-    opacity: f32,
     is_composite: u32,
     blend_mode: u32,
+    is_wipe_mode: u32,
 };
 
 @group(0) @binding(0) var tex_a: texture_2d<f32>;
@@ -69,7 +74,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     var color_a = textureSample(tex_a, samp_a, in.uv);
     var color_b = vec4<f32>(0.0);
     
-    if uniforms.is_diff_mode == 1u || uniforms.is_composite == 1u {
+    if uniforms.is_diff_mode == 1u || uniforms.is_composite == 1u || uniforms.is_wipe_mode == 1u {
         color_b = textureSample(tex_b, samp_b, in.uv);
     }
 
@@ -122,6 +127,26 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 b = color_a.b + color_b.b * (1.0 - aa);
                 a = aa + ba * (1.0 - aa);
             }
+        }
+    }
+
+    // Wipe mode: use dot product to determine which side of the line we are on.
+    // Write r/g/b/a directly — they were already copied from color_a above, so
+    // reassigning color_a here would have no effect on the output.
+    if uniforms.is_wipe_mode == 1u {
+        // Work in screen-pixel space so the split lines up with the on-screen wipe
+        // line at every angle. UV space is normalized 0..1 per-axis, so on a
+        // non-square image it distorts the angle; scaling by the rect size
+        // (rect_max - rect_min, in pixels) removes that distortion.
+        let rect_size = uniforms.rect_max - uniforms.rect_min;
+        let to_pixel = (in.uv - uniforms.wipe_center) * rect_size;
+        let normal = vec2<f32>(cos(uniforms.wipe_angle), sin(uniforms.wipe_angle));
+        let dist = dot(to_pixel, normal);
+        if dist >= 0.0 {
+            r = color_b.r;
+            g = color_b.g;
+            b = color_b.b;
+            a = color_b.a;
         }
     }
 

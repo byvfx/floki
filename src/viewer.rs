@@ -98,7 +98,9 @@ pub struct ExrViewer {
     pub compare_mode: CompareMode,
     pub blend_mode: BlendMode,
     pub sample_aperture: usize,
-    pub wipe_position: f32,
+    pub wipe_center: [f32; 2],
+    pub wipe_angle: f32,
+    pub wipe_line_opacity: f32,
     pub diff_multiplier: f32,
     pub active_layer: usize,
     pub show_contact_sheet: bool,
@@ -142,7 +144,9 @@ impl Default for ExrViewer {
             compare_mode: CompareMode::SingleA,
             blend_mode: BlendMode::Over,
             sample_aperture: 1,
-            wipe_position: 0.5,
+            wipe_center: [0.5, 0.5],
+            wipe_angle: 0.0,
+            wipe_line_opacity: 1.0,
             diff_multiplier: 1.0,
             active_layer: 0,
             show_contact_sheet: false,
@@ -314,7 +318,25 @@ impl ExrViewer {
                     }
 
                     if self.compare_mode == CompareMode::Wipe {
-                        ui.add(egui::Slider::new(&mut self.wipe_position, 0.0..=1.0).text("Wipe"));
+                        ui.label("Wipe Center:");
+                        ui.add(
+                            egui::Slider::new(&mut self.wipe_center[0], 0.0..=1.0)
+                                .suffix(" X")
+                                .show_value(false),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut self.wipe_center[1], 0.0..=1.0)
+                                .suffix(" Y")
+                                .show_value(false),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut self.wipe_angle, -180.0..=180.0)
+                                .text("Angle (°)"),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut self.wipe_line_opacity, 0.0..=1.0)
+                                .text("Line Opacity"),
+                        );
                     } else if self.compare_mode == CompareMode::DiffMatte {
                         ui.add(
                             egui::Slider::new(&mut self.diff_multiplier, 1.0..=100.0)
@@ -795,6 +817,13 @@ impl ExrViewer {
                         opacity: 1.0,
                         is_composite: 0,
                         blend_mode: self.blend_mode.as_u32(),
+                        is_wipe_mode: if self.compare_mode == CompareMode::Wipe {
+                            1
+                        } else {
+                            0
+                        },
+                        wipe_center: self.wipe_center,
+                        wipe_angle: self.wipe_angle.to_radians(),
                     };
 
                     let default_lut = render_state
@@ -883,6 +912,36 @@ impl ExrViewer {
                         } else {
                             self.compare_mode
                         };
+
+                        // Wipe interaction logic (drag to move, scroll to rotate)
+                        if self.compare_mode == CompareMode::Wipe {
+                            let center_screen = egui::pos2(
+                                image_rect.min.x + image_rect.width() * self.wipe_center[0],
+                                image_rect.min.y + image_rect.height() * self.wipe_center[1],
+                            );
+                            let handle_rect =
+                                egui::Rect::from_center_size(center_screen, egui::vec2(24.0, 24.0));
+                            let handle_id = ui.id().with("wipe_handle");
+                            let response = ui.interact(handle_rect, handle_id, egui::Sense::drag());
+
+                            if response.dragged() {
+                                let delta = response.drag_delta();
+                                self.wipe_center[0] = (self.wipe_center[0]
+                                    + delta.x / image_rect.width())
+                                .clamp(0.0, 1.0);
+                                self.wipe_center[1] = (self.wipe_center[1]
+                                    + delta.y / image_rect.height())
+                                .clamp(0.0, 1.0);
+                            }
+                            if response.hovered() {
+                                let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+                                if scroll != 0.0 {
+                                    self.wipe_angle =
+                                        (self.wipe_angle + scroll * 2.0).clamp(-180.0, 180.0);
+                                }
+                            }
+                        }
+
                         let draw_all = |p: &egui::Painter, opac: f32| match comp_mode {
                             CompareMode::SingleA => {
                                 draw_gpu(
@@ -916,39 +975,44 @@ impl ExrViewer {
                                 }
                             }
                             CompareMode::Wipe => {
-                                let wipe_x =
-                                    image_rect.min.x + image_rect.width() * self.wipe_position;
-                                let clamped_wipe_x = wipe_x.clamp(rect.min.x, rect.max.x);
-                                let mut rect_a = rect;
-                                rect_a.max.x = clamped_wipe_x;
-                                let mut rect_b = rect;
-                                rect_b.min.x = clamped_wipe_x;
-
+                                let bg_b_opt = exr_data_b.and_then(|d| {
+                                    self.gpu_textures_b[self
+                                        .active_layer
+                                        .min(d.logical_layers.len().saturating_sub(1))]
+                                    .clone()
+                                });
+                                // Single draw call: the shader handles the wipe split.
+                                // Bind the real B texture so the shader can sample it when
+                                // is_wipe_mode is set; falls back to the default texture if
+                                // no B image is loaded.
                                 draw_gpu(
                                     p,
                                     bg_a.clone(),
-                                    None,
-                                    rect_a,
+                                    bg_b_opt,
+                                    rect,
                                     image_rect,
                                     false,
                                     false,
                                     opac,
                                 );
-                                if let Some(bg_b) = exr_data_b.and_then(|d| {
-                                    self.gpu_textures_b[self
-                                        .active_layer
-                                        .min(d.logical_layers.len().saturating_sub(1))]
-                                    .clone()
-                                }) {
-                                    draw_gpu(p, bg_b, None, rect_b, image_rect, false, false, opac);
-                                }
-                                painter.line_segment(
-                                    [
-                                        egui::pos2(wipe_x, rect.min.y),
-                                        egui::pos2(wipe_x, rect.max.y),
-                                    ],
-                                    (2.0, egui::Color32::WHITE),
+
+                                // Draw the rotated wipe line and handle
+                                let center_screen = egui::pos2(
+                                    image_rect.min.x + image_rect.width() * self.wipe_center[0],
+                                    image_rect.min.y + image_rect.height() * self.wipe_center[1],
                                 );
+                                let angle_rad = self.wipe_angle.to_radians();
+                                // Line direction is perpendicular to the normal (cos, sin)
+                                let dir = egui::vec2(-angle_rad.sin(), angle_rad.cos());
+                                let max_dist = image_rect.width().hypot(image_rect.height());
+                                let p1 = center_screen + dir * max_dist;
+                                let p2 = center_screen - dir * max_dist;
+
+                                let alpha = (self.wipe_line_opacity * 255.0) as u8;
+                                let color = egui::Color32::from_white_alpha(alpha);
+
+                                p.line_segment([p1, p2], (2.0, color));
+                                p.circle_filled(center_screen, 8.0, color);
                             }
                             CompareMode::SideBySide => {
                                 let bg_b_opt = exr_data_b.and_then(|d| {
@@ -1110,7 +1174,9 @@ impl ExrViewer {
                             }
                         }
                         CompareMode::Wipe => {
-                            let wipe_x = image_rect.min.x + image_rect.width() * self.wipe_position;
+                            // CPU fallback: keep it vertical for simplicity, but use new center state
+                            let wipe_x =
+                                image_rect.min.x + image_rect.width() * self.wipe_center[0];
                             let clamped_wipe_x = wipe_x.clamp(rect.min.x, rect.max.x);
                             let mut rect_a = rect;
                             rect_a.max.x = clamped_wipe_x;
@@ -1127,12 +1193,14 @@ impl ExrViewer {
                                 draw_image(p, tex_b, rect_b, image_rect, opac);
                             }
 
-                            painter.line_segment(
+                            let alpha = (self.wipe_line_opacity * 255.0) as u8;
+                            let color = egui::Color32::from_white_alpha(alpha);
+                            p.line_segment(
                                 [
                                     egui::pos2(wipe_x, rect.min.y),
                                     egui::pos2(wipe_x, rect.max.y),
                                 ],
-                                (2.0, egui::Color32::WHITE),
+                                (2.0, color),
                             );
                         }
                         CompareMode::SideBySide => {

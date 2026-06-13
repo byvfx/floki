@@ -5,19 +5,24 @@ use std::sync::Arc;
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct Uniforms {
+    // 8-byte aligned fields first (required by WGSL vec2<f32>)
     pub rect_min: [f32; 2],
     pub rect_max: [f32; 2],
     pub screen_size: [f32; 2],
+    pub wipe_center: [f32; 2],
+    // 4-byte aligned fields
     pub exposure: f32,
     pub gamma: f32,
     pub diff_multiplier: f32,
+    pub opacity: f32,
+    pub wipe_angle: f32,
     pub channel_mode: u32,
     pub is_diff_mode: u32,
     pub srgb: u32,
     pub enable_lut: u32,
-    pub opacity: f32,
     pub is_composite: u32,
     pub blend_mode: u32,
+    pub is_wipe_mode: u32,
 }
 
 pub struct GpuState {
@@ -349,7 +354,7 @@ mod tests {
             "Uniforms size ({size}) must be a multiple of 16"
         );
         assert_eq!(
-            size, 64,
+            size, 80,
             "Uniforms layout changed — update shader.wgsl to match"
         );
     }
@@ -372,6 +377,9 @@ mod tests {
             opacity: 0.5,
             is_composite: 1,
             blend_mode: 2,
+            is_wipe_mode: 1,
+            wipe_center: [0.5, 0.5],
+            wipe_angle: 0.0,
         };
         let bytes = bytemuck::bytes_of(&u);
         assert_eq!(bytes.len(), std::mem::size_of::<Uniforms>());
