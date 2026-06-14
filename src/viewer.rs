@@ -939,17 +939,25 @@ impl ExrViewer {
                         wipe_angle: self.wipe_angle.to_radians(),
                     };
 
-                    let default_lut = render_state
-                        .as_ref()
-                        .unwrap()
-                        .renderer
-                        .read()
-                        .callback_resources
-                        .get::<crate::gpu::GpuState>()
-                        .unwrap()
-                        .default_lut_bind_group
-                        .clone();
-                    let active_lut_bg = lut_bg_opt.clone().unwrap_or(default_lut);
+                    // Acquire the renderer read-lock ONCE per frame: clone out the
+                    // cheap (Arc-backed) uniform bind-group layout and the active LUT
+                    // bind group. `draw_gpu` then builds its per-draw buffer without
+                    // re-locking or re-looking-up GpuState. A single shared uniform
+                    // buffer is NOT viable: egui defers paint callbacks, so each of the
+                    // (up to 4) draws per frame needs its own immutable uniform snapshot
+                    // alive until paint time.
+                    let (uniform_layout, active_lut_bg, default_tex_bg) = {
+                        let guard = render_state.as_ref().unwrap().renderer.read();
+                        let gpu_state = guard
+                            .callback_resources
+                            .get::<crate::gpu::GpuState>()
+                            .unwrap();
+                        let layout = gpu_state.bind_group_layout_uniform.clone();
+                        let lut = lut_bg_opt
+                            .clone()
+                            .unwrap_or_else(|| gpu_state.default_lut_bind_group.clone());
+                        (layout, lut, gpu_state.default_tex_bind_group.clone())
+                    };
                     let draw_gpu =
                         |painter: &egui::Painter,
                          bg_a: std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>,
@@ -967,11 +975,6 @@ impl ExrViewer {
                             u.opacity = opacity;
 
                             let device = &render_state.as_ref().unwrap().device;
-                            let renderer_guard = render_state.as_ref().unwrap().renderer.read();
-                            let gpu_state = renderer_guard
-                                .callback_resources
-                                .get::<crate::gpu::GpuState>()
-                                .unwrap();
 
                             let uniform_buffer = device.create_buffer_init(
                                 &eframe::egui_wgpu::wgpu::util::BufferInitDescriptor {
@@ -985,7 +988,7 @@ impl ExrViewer {
                             let uniform_bg = device.create_bind_group(
                                 &eframe::egui_wgpu::wgpu::BindGroupDescriptor {
                                     label: Some("Exr Uniform Bind Group"),
-                                    layout: &gpu_state.bind_group_layout_uniform,
+                                    layout: &uniform_layout,
                                     entries: &[eframe::egui_wgpu::wgpu::BindGroupEntry {
                                         binding: 0,
                                         resource: uniform_buffer.as_entire_binding(),
@@ -993,8 +996,7 @@ impl ExrViewer {
                                 },
                             );
 
-                            let bg_b = bg_b_opt
-                                .unwrap_or_else(|| gpu_state.default_tex_bind_group.clone());
+                            let bg_b = bg_b_opt.unwrap_or_else(|| default_tex_bg.clone());
 
                             let callback = crate::gpu::ExrCallback {
                                 bg_a,
