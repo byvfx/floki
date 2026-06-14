@@ -108,7 +108,11 @@ pub struct ExrViewer {
     pub swatches: Vec<[f32; 4]>,
     pub histogram: Option<[u32; 256]>,
     pub histogram_b: Option<[u32; 256]>,
-    pub histogram_layer: Option<usize>,
+    /// Cache key for the computed bins: `(active_layer, log_histogram)`. The bins
+    /// depend on both, so keying on the layer alone left stale bins when the log
+    /// toggle flipped. Image-B load/unload is invalidated explicitly via
+    /// [`ExrViewer::invalidate_histogram`] since B identity isn't in the key.
+    histogram_key: Option<(usize, bool)>,
     pub log_histogram: bool,
 
     // View transform
@@ -159,7 +163,7 @@ impl Default for ExrViewer {
             swatches: Vec::new(),
             histogram: None,
             histogram_b: None,
-            histogram_layer: None,
+            histogram_key: None,
             log_histogram: true,
             scale: 1.0,
             translation: egui::Vec2::ZERO,
@@ -2167,8 +2171,16 @@ impl ExrViewer {
         crate::render_math::linear_to_srgb(l)
     }
 
+    /// Invalidate the cached histogram so the next [`calculate_histogram`] call
+    /// recomputes. Call this when image B changes (load/unload) — B identity is
+    /// not part of the cache key.
+    pub fn invalidate_histogram(&mut self) {
+        self.histogram_key = None;
+    }
+
     pub fn calculate_histogram(&mut self, exr_data: &ExrData, exr_data_b: Option<&ExrData>) {
-        if self.histogram_layer == Some(self.active_layer) {
+        let key = (self.active_layer, self.log_histogram);
+        if self.histogram_key == Some(key) {
             return;
         }
 
@@ -2230,7 +2242,7 @@ impl ExrViewer {
                     .min(d.logical_layers.len().saturating_sub(1)),
             )
         });
-        self.histogram_layer = Some(self.active_layer);
+        self.histogram_key = Some(key);
     }
 }
 
