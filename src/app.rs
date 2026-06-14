@@ -181,6 +181,9 @@ impl ExrApp {
             Ok(data) => {
                 if is_b {
                     self.exr_data_b = Some(data);
+                    // B isn't part of the histogram cache key — refresh it so the
+                    // B histogram appears without waiting for a layer change.
+                    self.viewer.invalidate_histogram();
                 } else {
                     self.exr_data = Some(data);
                     self.exr_data_b = None; // Reset B when A changes
@@ -210,6 +213,8 @@ impl ExrApp {
             // B-only compare modes are meaningless without B.
             self.viewer.compare_mode = crate::viewer::CompareMode::SingleA;
             self.viewer.blink_state = false;
+            // Drop B's histogram (not part of the cache key).
+            self.viewer.invalidate_histogram();
         } else {
             self.exr_data = None;
             self.loaded_file = None;
@@ -573,15 +578,23 @@ impl eframe::App for ExrApp {
                                             .map(|l| l.physical_index)
                                             .unwrap_or(0);
 
-                                        let channels: Vec<_> = d
-                                            .logical_layers
-                                            .iter()
-                                            .map(|l| l.name.as_str())
-                                            .collect();
-                                        let mut channels_str = channels.join(",");
-                                        if channels_str.len() > 50 {
-                                            channels_str.truncate(50);
-                                            channels_str.push_str("...");
+                                        // Built fresh each frame (immediate mode),
+                                        // but stop once we pass the 50-char display
+                                        // cap so we don't allocate a Vec + join every
+                                        // layer name (Blender EXRs have 100+) only to
+                                        // truncate it away.
+                                        let mut channels_str = String::new();
+                                        for name in d.logical_layers.iter().map(|l| l.name.as_str())
+                                        {
+                                            if !channels_str.is_empty() {
+                                                channels_str.push(',');
+                                            }
+                                            channels_str.push_str(name);
+                                            if channels_str.len() > 50 {
+                                                channels_str.truncate(50);
+                                                channels_str.push_str("...");
+                                                break;
+                                            }
                                         }
 
                                         if let Some(layer) = d.image.layer_data.get(phys_idx) {
@@ -999,15 +1012,12 @@ impl eframe::App for ExrApp {
                                 ui.separator();
                                 ui.heading("Histogram");
                                 ui.horizontal(|ui| {
-                                    if ui
-                                        .checkbox(
-                                            &mut self.viewer.log_histogram,
-                                            "Log Scale (-10 to +10 EV)",
-                                        )
-                                        .changed()
-                                    {
-                                        self.viewer.histogram_layer = None;
-                                    }
+                                    // The histogram cache key includes log_histogram,
+                                    // so flipping this auto-invalidates — no manual reset.
+                                    ui.checkbox(
+                                        &mut self.viewer.log_histogram,
+                                        "Log Scale (-10 to +10 EV)",
+                                    );
                                 });
 
                                 self.viewer
