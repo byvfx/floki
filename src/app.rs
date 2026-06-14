@@ -382,7 +382,8 @@ impl eframe::App for ExrApp {
                 ui.label("OCIO Environment / Config Path:");
                 ui.horizontal(|ui| {
                     ui.text_edit_singleline(&mut self.ocio_path);
-                    if ui.button("Browse").clicked() {}
+                    ui.add_enabled(false, egui::Button::new("Browse"))
+                        .on_disabled_hover_text("Coming soon");
                 });
 
                 ui.add_space(10.0);
