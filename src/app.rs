@@ -119,7 +119,52 @@ impl ExrApp {
             rs.renderer.write().callback_resources.insert(gpu_state);
         }
 
+        // `lut_bg` is a GPU handle and can't persist, but `enable_lut`/`lut_path`
+        // do. Without rebuilding the bind group here, a restart leaves the LUT
+        // "enabled" in the UI but silently inert. Rebuild it, or clear the flag so
+        // the persisted state matches reality.
+        if app.enable_lut && !app.lut_path.is_empty() {
+            app.reload_lut();
+            if app.lut_bg.is_none() {
+                app.enable_lut = false;
+            }
+        }
+
         app
+    }
+
+    /// (Re)build the GPU LUT bind group from `self.lut_path`, updating `lut_bg`
+    /// and `lut_error` to reflect the outcome. A parse failure clears `lut_bg`
+    /// and disables the LUT. Does not force `enable_lut` on success — callers
+    /// decide whether loading should auto-enable (the Browse button does).
+    fn reload_lut(&mut self) {
+        if self.lut_path.is_empty() {
+            return;
+        }
+        let path = self.lut_path.clone();
+        match crate::color::cube::CubeLut::load(&path) {
+            Ok(lut) => {
+                if let Some(rs) = &self.render_state {
+                    let renderer = rs.renderer.read();
+                    if let Some(gpu_state) =
+                        renderer.callback_resources.get::<crate::gpu::GpuState>()
+                    {
+                        self.lut_bg =
+                            Some(gpu_state.create_lut_bind_group(&rs.device, &rs.queue, &lut));
+                        self.lut_error = None;
+                    } else {
+                        self.lut_error = Some("GPU state not found".to_string());
+                    }
+                } else {
+                    self.lut_error = Some("Render state not found".to_string());
+                }
+            }
+            Err(e) => {
+                self.lut_error = Some(format!("Failed to load LUT: {}", e));
+                self.lut_bg = None;
+                self.enable_lut = false;
+            }
+        }
     }
 
     fn open_file(&mut self, path: PathBuf, is_b: bool) {
@@ -326,6 +371,10 @@ impl eframe::App for ExrApp {
         }
 
         if self.show_settings {
+            // `.open(&mut self.show_settings)` holds a field borrow for the whole
+            // closure, so we can't call the whole-`self` `reload_lut` inside it.
+            // Record the request and act on it after the window block closes.
+            let mut lut_reload_requested = false;
             egui::Window::new("Color Management").open(&mut self.show_settings).show(ui.ctx(), |ui| {
                 ui.heading("Settings");
                 ui.add_space(5.0);
@@ -347,27 +396,7 @@ impl eframe::App for ExrApp {
                             .pick_file()
                         {
                             self.lut_path = path.to_string_lossy().to_string();
-                            match crate::color::cube::CubeLut::load(&path) {
-                                Ok(lut) => {
-                                    self.lut_error = None;
-                                    if let Some(rs) = &self.render_state {
-                                        let renderer = rs.renderer.read();
-                                        if let Some(gpu_state) = renderer.callback_resources.get::<crate::gpu::GpuState>() {
-                                            self.lut_bg = Some(gpu_state.create_lut_bind_group(&rs.device, &rs.queue, &lut));
-                                            self.enable_lut = true; // Auto-enable on successful load
-                                        } else {
-                                            self.lut_error = Some("GPU state not found".to_string());
-                                        }
-                                    } else {
-                                        self.lut_error = Some("Render state not found".to_string());
-                                    }
-                                }
-                                Err(e) => {
-                                    self.lut_error = Some(format!("Failed to load LUT: {}", e));
-                                    self.lut_bg = None;
-                                    self.enable_lut = false;
-                                }
-                            }
+                            lut_reload_requested = true;
                         }
                 });
                 ui.checkbox(&mut self.enable_lut, "Enable Custom LUT");
@@ -381,6 +410,13 @@ impl eframe::App for ExrApp {
                 ui.add_space(10.0);
                 ui.label(egui::RichText::new("Note: OCIO is penciled in for future GPU rendering phases and is not currently active.").italics());
             });
+
+            if lut_reload_requested {
+                self.reload_lut();
+                if self.lut_bg.is_some() {
+                    self.enable_lut = true; // Auto-enable on successful load
+                }
+            }
         }
 
         // Full-screen mode (#2) hides the menu bar and side panel for a clean,
