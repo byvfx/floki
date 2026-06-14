@@ -578,15 +578,23 @@ impl eframe::App for ExrApp {
                                             .map(|l| l.physical_index)
                                             .unwrap_or(0);
 
-                                        let channels: Vec<_> = d
-                                            .logical_layers
-                                            .iter()
-                                            .map(|l| l.name.as_str())
-                                            .collect();
-                                        let mut channels_str = channels.join(",");
-                                        if channels_str.len() > 50 {
-                                            channels_str.truncate(50);
-                                            channels_str.push_str("...");
+                                        // Built fresh each frame (immediate mode),
+                                        // but stop once we pass the 50-char display
+                                        // cap so we don't allocate a Vec + join every
+                                        // layer name (Blender EXRs have 100+) only to
+                                        // truncate it away.
+                                        let mut channels_str = String::new();
+                                        for name in d.logical_layers.iter().map(|l| l.name.as_str())
+                                        {
+                                            if !channels_str.is_empty() {
+                                                channels_str.push(',');
+                                            }
+                                            channels_str.push_str(name);
+                                            if channels_str.len() > 50 {
+                                                channels_str.truncate(50);
+                                                channels_str.push_str("...");
+                                                break;
+                                            }
                                         }
 
                                         if let Some(layer) = d.image.layer_data.get(phys_idx) {
