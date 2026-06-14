@@ -54,16 +54,35 @@ impl CubeLut {
                     }
                 }
                 _ => {
-                    // Must be a data row
-                    if parts.len() >= 3
-                        && let (Ok(r), Ok(g), Ok(b)) = (
-                            parts[0].parse::<f32>(),
-                            parts[1].parse::<f32>(),
-                            parts[2].parse::<f32>(),
-                        )
-                    {
-                        data.push([r, g, b, 1.0]); // Alpha is 1.0
+                    // A data row starts with a number. If the first token isn't a
+                    // float, this is an unknown keyword we don't model (e.g.
+                    // LUT_1D_SIZE, LUT_3D_INPUT_RANGE) — skip it leniently.
+                    let Ok(r) = parts[0].parse::<f32>() else {
+                        continue;
+                    };
+                    // It *is* a data row: now be strict. Silently dropping a
+                    // malformed/garbage row would desync the count check or, worse,
+                    // pass with wrong data; a non-finite value would upload NaN/inf
+                    // into the LUT texture and render as garbage with no error.
+                    if parts.len() < 3 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("LUT data row needs 3 components: {line}"),
+                        ));
                     }
+                    let (Ok(g), Ok(b)) = (parts[1].parse::<f32>(), parts[2].parse::<f32>()) else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("Malformed LUT data row: {line}"),
+                        ));
+                    };
+                    if !(r.is_finite() && g.is_finite() && b.is_finite()) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("Non-finite value in LUT data row: {line}"),
+                        ));
+                    }
+                    data.push([r, g, b, 1.0]); // Alpha is 1.0
                 }
             }
         }
@@ -216,6 +235,55 @@ LUT_3D_SIZE 2
         let err =
             CubeLut::load("definitely/does/not/exist.cube").expect_err("missing file must error");
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn non_finite_value_is_invalid_data() {
+        // A NaN/inf in a data row would upload garbage into the LUT texture.
+        let contents = "\
+LUT_3D_SIZE 2
+0.0 0.0 0.0
+nan 0.0 0.0
+0.0 1.0 0.0
+1.0 1.0 0.0
+0.0 0.0 1.0
+inf 0.0 1.0
+0.0 1.0 1.0
+1.0 1.0 1.0
+";
+        let err =
+            CubeLut::load(cube_file(contents).path()).expect_err("must reject non-finite values");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn malformed_data_row_is_invalid_data() {
+        // A row that starts numeric but has a garbage component must not be
+        // silently dropped (which would only surface as a confusing count error).
+        let contents = "\
+LUT_3D_SIZE 2
+0.0 0.0 0.0
+1.0 zzz 0.0
+0.0 1.0 0.0
+1.0 1.0 0.0
+0.0 0.0 1.0
+1.0 0.0 1.0
+0.0 1.0 1.0
+1.0 1.0 1.0
+";
+        let err =
+            CubeLut::load(cube_file(contents).path()).expect_err("must reject malformed data rows");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn unknown_keyword_lines_are_skipped() {
+        // Non-numeric keyword lines we don't model must be ignored, not treated
+        // as data rows.
+        let contents = format!("LUT_3D_INPUT_RANGE 0.0 1.0\n{VALID_2X2X2}");
+        let lut =
+            CubeLut::load(cube_file(&contents).path()).expect("unknown keywords must be skipped");
+        assert_eq!(lut.data.len(), 8);
     }
 
     #[test]
