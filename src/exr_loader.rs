@@ -202,20 +202,25 @@ fn component_slot(token: &str) -> Option<usize> {
 /// grayscale (r=g=b); a multi-channel group with no recognizable color
 /// component falls back to replicating its first channel.
 fn group_channels(names: &[String]) -> Vec<RawGroup> {
-    let mut order: Vec<String> = Vec::new();
-    let mut members: Vec<Vec<(usize, String)>> = Vec::new();
+    use std::collections::HashMap;
+
+    // First-seen prefix order with a side index map so lookup is O(1): grouping
+    // stays O(n) on channel count rather than O(n^2). Blender EXRs routinely have
+    // 50-150+ channels, so this runs on the load hot path. Prefixes and tokens are
+    // borrowed `&str` from `names` to avoid a `String` allocation per channel; the
+    // only owned allocation is the final `group_key` (one per group).
+    let mut order: Vec<&str> = Vec::new();
+    let mut index: HashMap<&str, usize> = HashMap::new();
+    let mut members: Vec<Vec<(usize, &str)>> = Vec::new();
 
     for (idx, name) in names.iter().enumerate() {
         let (prefix, token) = split_channel_name(name);
-        let pos = match order.iter().position(|k| k == prefix) {
-            Some(p) => p,
-            None => {
-                order.push(prefix.to_string());
-                members.push(Vec::new());
-                order.len() - 1
-            }
-        };
-        members[pos].push((idx, token.to_string()));
+        let pos = *index.entry(prefix).or_insert_with(|| {
+            order.push(prefix);
+            members.push(Vec::new());
+            order.len() - 1
+        });
+        members[pos].push((idx, token));
     }
 
     order
@@ -230,12 +235,12 @@ fn group_channels(names: &[String]) -> Vec<RawGroup> {
                 g = Some(only);
                 b = Some(only);
             } else {
-                for (ci, token) in &mem {
+                for &(ci, token) in &mem {
                     match component_slot(token) {
-                        Some(0) => r = Some(*ci),
-                        Some(1) => g = Some(*ci),
-                        Some(2) => b = Some(*ci),
-                        Some(3) => a = Some(*ci),
+                        Some(0) => r = Some(ci),
+                        Some(1) => g = Some(ci),
+                        Some(2) => b = Some(ci),
+                        Some(3) => a = Some(ci),
                         _ => {}
                     }
                 }
@@ -247,7 +252,7 @@ fn group_channels(names: &[String]) -> Vec<RawGroup> {
                 }
             }
             RawGroup {
-                group_key,
+                group_key: group_key.to_string(),
                 r,
                 g,
                 b,
