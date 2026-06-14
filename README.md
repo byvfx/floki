@@ -25,10 +25,13 @@ Powered by `egui`, `wgpu`, and the pure-Rust `exr` crate, it allows you to insta
 
 ### Advanced A/B Comparison
 Load a Reference Image (Image B) to unlock advanced visual diffing:
-* **Wipe:** Classic split-screen slider for side-by-side boundary checks.
+* **Wipe:** Split-screen slider for boundary checks — with adjustable center, rotation angle, and divider-line opacity for wipes at any orientation.
 * **Side-by-Side:** View Image A and Image B glued together in a continuous panorama. They share the same camera for synchronized panning and zooming.
 * **Diff Matte:** Renders `|A - B| * multiplier` to easily spot fractional floating-point discrepancies in your render pipelines.
-* **Blink Mode:** Hold `Spacebar` to rapidly strobe between Image A and Image B.
+* **Composite:** Blend A over B directly in-viewport with selectable blend modes (Over, Under, Add, Multiply, Screen).
+* **Blink Mode:** Press `Spacebar` to strobe between Image A and Image B at an adjustable interval.
+
+Comparison controls follow a two-tier toolbar: the everyday controls stay on a single row, while the active mode's parameters slide into a contextual second row only when needed.
 
 ### Image Analysis
 * **Dynamic Luminance Histogram:** Real-time histogram mapped to Exposure Values (EV stops). Effortlessly spot floating-point highlights over `1.0` using the Logarithmic view.
@@ -43,7 +46,9 @@ Load a Reference Image (Image B) to unlock advanced visual diffing:
 
 ### High-Performance UI
 * **Immediate-Mode UI:** Built on `egui` for a responsive, minimal-overhead interface.
-* **Persistent State:** Remembers your UI layout, recent files list, and preferences across sessions.
+* **Light / Dark / System Themes:** Switch the interface theme from the **Theme** menu; the `System` option tracks your OS light/dark setting live. Your choice persists across sessions.
+* **Recent Files for A & B:** `File ▸ Open Recent A` / `Open Recent B` reload a recent EXR straight into the main or reference slot.
+* **Persistent State:** Remembers your UI layout, recent files list, theme, and preferences across sessions.
 * **Software Tone Mapping:** Apply Exposure, Gamma, and sRGB transforms instantly without altering the underlying raw data.
 
 ---

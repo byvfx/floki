@@ -118,6 +118,11 @@ pub struct ExrViewer {
     pub last_hover_pos_img: Option<(usize, usize)>,
     pub last_sampled_val_a: Option<[f32; 4]>,
     pub last_sampled_val_b: Option<[f32; 4]>,
+
+    /// Natural (unclipped) height of the contextual mode-param row, recorded each
+    /// frame it renders so the slide-in animation knows how far to grow. Transient
+    /// runtime state — not persisted.
+    row2_full_height: f32,
 }
 
 impl Default for ExrViewer {
@@ -162,6 +167,7 @@ impl Default for ExrViewer {
             last_hover_pos_img: None,
             last_sampled_val_a: None,
             last_sampled_val_b: None,
+            row2_full_height: 0.0,
         }
     }
 }
@@ -267,6 +273,290 @@ impl ExrViewer {
         self.invalidate_tone();
     }
 
+    /// Whether the active comparison mode has parameters that belong on the
+    /// contextual second toolbar row. Drives the slide-in/out of that row.
+    /// Pure and GPU-free so it can be unit-tested headlessly.
+    ///
+    /// Blink is checked first because, while blinking, [`Self::ui`] overwrites
+    /// `compare_mode` with `SingleA`/`SingleB` each frame (which would otherwise
+    /// report no params) — yet the blink-speed control still needs a home.
+    fn has_mode_params(&self) -> bool {
+        if self.blink_state {
+            return true;
+        }
+        matches!(
+            self.compare_mode,
+            CompareMode::Wipe
+                | CompareMode::DiffMatte
+                | CompareMode::SideBySide
+                | CompareMode::Composite
+        )
+    }
+
+    /// Row 1 of the viewer controls — the always-present essentials: compare-mode
+    /// selector, compact exposure/gamma drag-values, channel isolation, sample
+    /// aperture, and a `Display ▾` menu for the rarely-touched options.
+    fn primary_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        exr_data: &ExrData,
+        has_b: bool,
+        layer_count: usize,
+    ) {
+        ui.horizontal(|ui| {
+            if has_b {
+                ui.label("Compare:");
+                ui.selectable_value(&mut self.compare_mode, CompareMode::SingleA, "A");
+                ui.selectable_value(&mut self.compare_mode, CompareMode::SingleB, "B");
+
+                ui.add_enabled_ui(!self.show_contact_sheet, |ui| {
+                    ui.selectable_value(&mut self.compare_mode, CompareMode::Wipe, "Wipe");
+                });
+                ui.selectable_value(
+                    &mut self.compare_mode,
+                    CompareMode::SideBySide,
+                    "Side-by-Side",
+                );
+                ui.add_enabled_ui(!self.show_contact_sheet, |ui| {
+                    ui.selectable_value(&mut self.compare_mode, CompareMode::DiffMatte, "Diff");
+                    ui.selectable_value(&mut self.compare_mode, CompareMode::Composite, "Comp");
+                });
+                if ui
+                    .toggle_value(&mut self.blink_state, "Blink (Spc)")
+                    .clicked()
+                    && !self.blink_state
+                {
+                    self.compare_mode = CompareMode::SingleA;
+                }
+            }
+
+            // Contact Sheet is a view-mode toggle that belongs with the compare
+            // modes; it applies to any multi-layer image, with or without B.
+            if layer_count > 1
+                && ui
+                    .toggle_value(&mut self.show_contact_sheet, "Contact Sheet")
+                    .changed()
+                && self.show_contact_sheet
+                && (self.compare_mode == CompareMode::Wipe
+                    || self.compare_mode == CompareMode::DiffMatte
+                    || self.compare_mode == CompareMode::Composite)
+            {
+                self.compare_mode = CompareMode::SideBySide;
+            }
+
+            if has_b || layer_count > 1 {
+                ui.separator();
+            }
+
+            // Compact exposure drag-value. Right-click resets to 0.0 (also key E).
+            let exp = ui
+                .add(
+                    egui::DragValue::new(&mut self.exposure)
+                        .speed(0.01)
+                        .range(-5.0..=5.0)
+                        .prefix("EV ")
+                        .fixed_decimals(2),
+                )
+                .on_hover_text("Drag to adjust • right-click resets to 0.0 (key: E)");
+            if exp.changed() {
+                self.invalidate_tone();
+            }
+            if exp.secondary_clicked() {
+                self.reset_exposure();
+            }
+
+            // Compact gamma drag-value. Right-click resets to 1.0 (also Shift+G).
+            let gam = ui
+                .add(
+                    egui::DragValue::new(&mut self.gamma)
+                        .speed(0.01)
+                        .range(0.1..=5.0)
+                        .prefix("γ ")
+                        .fixed_decimals(2),
+                )
+                .on_hover_text("Drag to adjust • right-click resets to 1.0 (key: Shift+G)");
+            if gam.changed() {
+                self.invalidate_tone();
+            }
+            if gam.secondary_clicked() {
+                self.reset_gamma();
+            }
+
+            if ui
+                .button("⟲")
+                .on_hover_text("Reset exposure (0.0) & gamma (1.0)")
+                .clicked()
+            {
+                self.reset_exposure();
+                self.reset_gamma();
+            }
+            if ui.checkbox(&mut self.srgb, "sRGB").changed() {
+                self.invalidate_tone();
+            }
+
+            ui.separator();
+            ui.label("Channel:");
+            let prev_mode = self.channel_mode;
+            ui.selectable_value(&mut self.channel_mode, ChannelMode::RGB, "RGB (C)");
+            ui.selectable_value(&mut self.channel_mode, ChannelMode::R, "R");
+            ui.selectable_value(&mut self.channel_mode, ChannelMode::G, "G");
+            ui.selectable_value(&mut self.channel_mode, ChannelMode::B, "B");
+            ui.selectable_value(&mut self.channel_mode, ChannelMode::A, "A");
+            if self.channel_mode != prev_mode {
+                self.textures.fill(None);
+            }
+
+            ui.separator();
+            // Sample aperture as a compact dropdown.
+            let sample_label = match self.sample_aperture {
+                1 => "1px",
+                9 => "9×9",
+                _ => "3×3",
+            };
+            ui.label("Sample:");
+            egui::ComboBox::from_id_salt("sample_aperture")
+                .selected_text(sample_label)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.sample_aperture, 1, "1px");
+                    ui.selectable_value(&mut self.sample_aperture, 3, "3×3");
+                    ui.selectable_value(&mut self.sample_aperture, 9, "9×9");
+                });
+
+            // Rarely-touched controls tucked behind a menu.
+            ui.menu_button("Display ▾", |ui| {
+                ui.label("Overscan Opacity:");
+                ui.add(egui::Slider::new(&mut self.overscan_opacity, 0.0..=1.0));
+                ui.checkbox(&mut self.show_tooltip, "Show Pixel Tooltip");
+            });
+
+            if !self.show_contact_sheet {
+                ui.separator();
+                if ui.button("Frame (F)").clicked() {
+                    self.first_frame = true;
+                }
+
+                // Layer (pass) selection
+                if layer_count > 1 {
+                    ui.label("Layer:");
+                    let selected_name = exr_data
+                        .logical_layers
+                        .get(self.active_layer)
+                        .map(|l| l.name.as_str())
+                        .unwrap_or("Unnamed");
+                    egui::ComboBox::from_id_salt("layer_select")
+                        .selected_text(selected_name)
+                        .show_ui(ui, |ui| {
+                            for (i, ll) in exr_data.logical_layers.iter().enumerate() {
+                                if ui
+                                    .selectable_value(&mut self.active_layer, i, &ll.name)
+                                    .clicked()
+                                {
+                                    self.first_frame = true;
+                                }
+                            }
+                        });
+                }
+            }
+        });
+    }
+
+    /// Row 2 content — only the active comparison mode's parameters. Rendered
+    /// (clipped/animated) by [`Self::animated_mode_param_row`]. Kept in lockstep
+    /// with [`Self::has_mode_params`]: every arm that draws here must report
+    /// `true` there, and vice versa.
+    fn mode_param_row(&mut self, ui: &mut egui::Ui) {
+        // While blinking, `compare_mode` toggles A/B each frame, so key off
+        // `blink_state` and expose the blink-speed control instead.
+        if self.blink_state {
+            ui.label("Blink speed:");
+            ui.add(egui::Slider::new(&mut self.blink_interval, 0.05..=5.0).suffix("s"));
+            return;
+        }
+        match self.compare_mode {
+            CompareMode::Wipe => {
+                ui.label("Wipe Center:");
+                ui.add(
+                    egui::Slider::new(&mut self.wipe_center[0], 0.0..=1.0)
+                        .suffix(" X")
+                        .show_value(false),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.wipe_center[1], 0.0..=1.0)
+                        .suffix(" Y")
+                        .show_value(false),
+                );
+                ui.add(egui::Slider::new(&mut self.wipe_angle, -180.0..=180.0).text("Angle (°)"));
+                ui.add(
+                    egui::Slider::new(&mut self.wipe_line_opacity, 0.0..=1.0).text("Line Opacity"),
+                );
+            }
+            CompareMode::DiffMatte => {
+                ui.add(
+                    egui::Slider::new(&mut self.diff_multiplier, 1.0..=100.0)
+                        .text("Diff Multiplier"),
+                );
+            }
+            CompareMode::SideBySide => {
+                ui.checkbox(&mut self.normalize_side_by_side, "Normalize Size");
+            }
+            CompareMode::Composite => {
+                ui.label("Blend:");
+                egui::ComboBox::from_id_salt("blend_mode_select")
+                    .selected_text(self.blend_mode.label())
+                    .show_ui(ui, |ui| {
+                        for mode in [
+                            BlendMode::Over,
+                            BlendMode::Under,
+                            BlendMode::Add,
+                            BlendMode::Multiply,
+                            BlendMode::Screen,
+                        ] {
+                            ui.selectable_value(&mut self.blend_mode, mode, mode.label());
+                        }
+                    });
+            }
+            CompareMode::SingleA | CompareMode::SingleB => {}
+        }
+    }
+
+    /// Render the contextual mode-param row with a vertical slide in/out. The
+    /// row's natural height is captured each frame into `row2_full_height`; the
+    /// visible slice is `full_height * t`, where `t` eases 0→1 as the row appears
+    /// and 1→0 as it leaves. Contents are clipped to the revealed slice so they
+    /// appear to slide out from under Row 1.
+    fn animated_mode_param_row(&mut self, ui: &mut egui::Ui) {
+        let id = ui.make_persistent_id("viewer_row2_anim");
+        let t = ui
+            .ctx()
+            .animate_bool_with_time(id, self.has_mode_params(), 0.12);
+        if t <= 0.0 {
+            return;
+        }
+        ui.scope(|ui| {
+            let full_h = self.row2_full_height.max(1.0);
+            let (rect, _) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), full_h * t),
+                egui::Sense::hover(),
+            );
+            // Lay the full-height row out at the top of the allocated slice, then
+            // clip to the slice so only `full_h * t` of it shows.
+            let mut child = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(egui::Rect::from_min_size(
+                        rect.min,
+                        egui::vec2(rect.width(), full_h),
+                    ))
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            );
+            child.set_clip_rect(rect);
+            self.mode_param_row(&mut child);
+            let measured = child.min_rect().height();
+            if measured > 0.0 {
+                self.row2_full_height = measured;
+            }
+        });
+    }
+
     pub fn ui(
         &mut self,
         ui: &mut egui::Ui,
@@ -287,189 +577,12 @@ impl ExrViewer {
             }
         }
 
+        let layer_count = exr_data.logical_layers.len();
         egui::Panel::top("viewer_controls").show_inside(ui, |ui| {
-            ui.horizontal(|ui| {
-                if exr_data_b.is_some() {
-                    ui.label("Compare:");
-                    ui.selectable_value(&mut self.compare_mode, CompareMode::SingleA, "A");
-                    ui.selectable_value(&mut self.compare_mode, CompareMode::SingleB, "B");
-
-                    ui.add_enabled_ui(!self.show_contact_sheet, |ui| {
-                        ui.selectable_value(&mut self.compare_mode, CompareMode::Wipe, "Wipe");
-                    });
-                    ui.selectable_value(
-                        &mut self.compare_mode,
-                        CompareMode::SideBySide,
-                        "Side-by-Side",
-                    );
-                    ui.add_enabled_ui(!self.show_contact_sheet, |ui| {
-                        ui.selectable_value(&mut self.compare_mode, CompareMode::DiffMatte, "Diff");
-                        ui.selectable_value(&mut self.compare_mode, CompareMode::Composite, "Comp");
-                    });
-                    if ui
-                        .toggle_value(&mut self.blink_state, "Blink (Spc)")
-                        .clicked()
-                        && !self.blink_state
-                    {
-                        self.compare_mode = CompareMode::SingleA;
-                    }
-                    if self.blink_state {
-                        ui.add(egui::Slider::new(&mut self.blink_interval, 0.05..=5.0).suffix("s"));
-                    }
-
-                    if self.compare_mode == CompareMode::Wipe {
-                        ui.label("Wipe Center:");
-                        ui.add(
-                            egui::Slider::new(&mut self.wipe_center[0], 0.0..=1.0)
-                                .suffix(" X")
-                                .show_value(false),
-                        );
-                        ui.add(
-                            egui::Slider::new(&mut self.wipe_center[1], 0.0..=1.0)
-                                .suffix(" Y")
-                                .show_value(false),
-                        );
-                        ui.add(
-                            egui::Slider::new(&mut self.wipe_angle, -180.0..=180.0)
-                                .text("Angle (°)"),
-                        );
-                        ui.add(
-                            egui::Slider::new(&mut self.wipe_line_opacity, 0.0..=1.0)
-                                .text("Line Opacity"),
-                        );
-                    } else if self.compare_mode == CompareMode::DiffMatte {
-                        ui.add(
-                            egui::Slider::new(&mut self.diff_multiplier, 1.0..=100.0)
-                                .text("Diff Multiplier"),
-                        );
-                    } else if self.compare_mode == CompareMode::SideBySide {
-                        ui.checkbox(&mut self.normalize_side_by_side, "Normalize Size");
-                    } else if self.compare_mode == CompareMode::Composite {
-                        ui.label("Blend:");
-                        egui::ComboBox::from_id_salt("blend_mode_select")
-                            .selected_text(self.blend_mode.label())
-                            .show_ui(ui, |ui| {
-                                for mode in [
-                                    BlendMode::Over,
-                                    BlendMode::Under,
-                                    BlendMode::Add,
-                                    BlendMode::Multiply,
-                                    BlendMode::Screen,
-                                ] {
-                                    ui.selectable_value(&mut self.blend_mode, mode, mode.label());
-                                }
-                            });
-                    }
-                    ui.separator();
-                }
-
-                // Right-clicking the label resets that control (Nuke-style).
-                if ui
-                    .add(egui::Label::new("Exposure:").sense(egui::Sense::click()))
-                    .on_hover_text("Right-click to reset to 0.0 (key: E)")
-                    .secondary_clicked()
-                {
-                    self.reset_exposure();
-                }
-                if ui
-                    .add(egui::Slider::new(&mut self.exposure, -5.0..=5.0))
-                    .changed()
-                {
-                    self.invalidate_tone();
-                }
-
-                ui.label("Overscan Opacity:");
-                ui.add(egui::Slider::new(&mut self.overscan_opacity, 0.0..=1.0));
-                if ui
-                    .add(egui::Label::new("Gamma:").sense(egui::Sense::click()))
-                    .on_hover_text("Right-click to reset to 1.0 (key: Shift+G)")
-                    .secondary_clicked()
-                {
-                    self.reset_gamma();
-                }
-                if ui
-                    .add(egui::Slider::new(&mut self.gamma, 0.1..=5.0))
-                    .changed()
-                {
-                    self.invalidate_tone();
-                }
-                if ui
-                    .button("⟲")
-                    .on_hover_text("Reset exposure (0.0) & gamma (1.0)")
-                    .clicked()
-                {
-                    self.reset_exposure();
-                    self.reset_gamma();
-                }
-                if ui.checkbox(&mut self.srgb, "sRGB").changed() {
-                    self.invalidate_tone();
-                }
-
-                ui.checkbox(&mut self.show_tooltip, "Show Pixel Tooltip");
-
-                ui.separator();
-                ui.label("Sample:");
-                ui.selectable_value(&mut self.sample_aperture, 1, "1px");
-                ui.selectable_value(&mut self.sample_aperture, 3, "3×3");
-                ui.selectable_value(&mut self.sample_aperture, 9, "9×9");
-
-                let layer_count = exr_data.logical_layers.len();
-                if layer_count > 1
-                    && ui
-                        .toggle_value(&mut self.show_contact_sheet, "Contact Sheet")
-                        .changed()
-                    && self.show_contact_sheet
-                    && (self.compare_mode == CompareMode::Wipe
-                        || self.compare_mode == CompareMode::DiffMatte
-                        || self.compare_mode == CompareMode::Composite)
-                {
-                    self.compare_mode = CompareMode::SideBySide;
-                }
-
-                ui.separator();
-                ui.label("Channel:");
-                let prev_mode = self.channel_mode;
-                ui.selectable_value(&mut self.channel_mode, ChannelMode::RGB, "RGB (C)");
-                ui.selectable_value(&mut self.channel_mode, ChannelMode::R, "R");
-                ui.selectable_value(&mut self.channel_mode, ChannelMode::G, "G");
-                ui.selectable_value(&mut self.channel_mode, ChannelMode::B, "B");
-                ui.selectable_value(&mut self.channel_mode, ChannelMode::A, "A");
-
-                if self.channel_mode != prev_mode {
-                    self.textures.fill(None);
-                }
-
-                if !self.show_contact_sheet {
-                    if ui.button("Frame (F)").clicked() {
-                        self.first_frame = true;
-                    }
-
-                    // Layer (pass) selection
-                    if layer_count > 1 {
-                        ui.label("Layer:");
-                        let selected_name = exr_data
-                            .logical_layers
-                            .get(self.active_layer)
-                            .map(|l| l.name.as_str())
-                            .unwrap_or("Unnamed");
-                        egui::ComboBox::from_id_salt("layer_select")
-                            .selected_text(selected_name)
-                            .show_ui(ui, |ui| {
-                                for (i, ll) in exr_data.logical_layers.iter().enumerate() {
-                                    if ui
-                                        .selectable_value(&mut self.active_layer, i, &ll.name)
-                                        .clicked()
-                                    {
-                                        self.first_frame = true;
-                                    }
-                                }
-                            });
-                    }
-                }
-            });
+            self.primary_row(ui, exr_data, exr_data_b.is_some(), layer_count);
+            self.animated_mode_param_row(ui);
         });
 
-        let layer_count = exr_data.logical_layers.len();
         if self.textures.len() != layer_count {
             self.textures.clear();
             self.textures.resize(layer_count, None);
@@ -2364,5 +2477,33 @@ mod gui_tests {
         assert!(!is_even_phase(0.5));
         assert!(!is_even_phase(0.75));
         assert!(is_even_phase(1.0));
+    }
+
+    #[test]
+    fn has_mode_params_drives_contextual_row() {
+        let mut v = ExrViewer::default();
+
+        // Single-view modes carry no contextual params → no second row.
+        // (Default `compare_mode` is `SingleA`, so check it before mutating.)
+        assert_eq!(v.compare_mode, CompareMode::SingleA);
+        assert!(!v.has_mode_params());
+        v.compare_mode = CompareMode::SingleB;
+        assert!(!v.has_mode_params());
+
+        // Parameterized modes do.
+        for mode in [
+            CompareMode::Wipe,
+            CompareMode::DiffMatte,
+            CompareMode::SideBySide,
+            CompareMode::Composite,
+        ] {
+            v.compare_mode = mode;
+            assert!(v.has_mode_params(), "{mode:?} should show a contextual row");
+        }
+
+        // Blink wins even though it overwrites compare_mode to a single view.
+        v.compare_mode = CompareMode::SingleB;
+        v.blink_state = true;
+        assert!(v.has_mode_params(), "blink exposes the speed control");
     }
 }

@@ -4,6 +4,26 @@ use eframe::egui;
 use rfd::FileDialog;
 use std::path::PathBuf;
 
+/// User theme preference, persisted across sessions. Maps to egui's
+/// [`egui::ThemePreference`]; `System` follows the OS light/dark setting.
+#[derive(serde::Deserialize, serde::Serialize, Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub enum ThemeChoice {
+    #[default]
+    Dark,
+    Light,
+    System,
+}
+
+impl From<ThemeChoice> for egui::ThemePreference {
+    fn from(choice: ThemeChoice) -> Self {
+        match choice {
+            ThemeChoice::Dark => egui::ThemePreference::Dark,
+            ThemeChoice::Light => egui::ThemePreference::Light,
+            ThemeChoice::System => egui::ThemePreference::System,
+        }
+    }
+}
+
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct ExrApp {
@@ -21,6 +41,7 @@ pub struct ExrApp {
     viewer: ExrViewer,
 
     recent_files: Vec<PathBuf>,
+    theme: ThemeChoice,
 
     #[serde(skip)]
     show_help: bool,
@@ -63,6 +84,7 @@ impl Default for ExrApp {
             error_msg: None,
             viewer: ExrViewer::default(),
             recent_files: Vec::new(),
+            theme: ThemeChoice::default(),
             show_help: false,
             show_settings: false,
             render_state: None,
@@ -160,6 +182,10 @@ impl eframe::App for ExrApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Apply the persisted theme preference. Idempotent per frame; `System`
+        // tracks the OS light/dark setting via egui's input each frame.
+        ui.ctx().set_theme(self.theme);
+
         if self.show_help {
             egui::Window::new("Help & Shortcuts")
                 .open(&mut self.show_help)
@@ -381,7 +407,7 @@ impl eframe::App for ExrApp {
                             }
                             ui.close();
                         }
-                        ui.menu_button("Open Recent", |ui| {
+                        ui.menu_button("Open Recent A", |ui| {
                             if self.recent_files.is_empty() {
                                 ui.label("No recent files");
                             } else {
@@ -398,6 +424,27 @@ impl eframe::App for ExrApp {
                                 }
                                 if let Some(path) = clicked_path {
                                     self.open_file(path, false);
+                                    ui.close();
+                                }
+                            }
+                        });
+                        ui.menu_button("Open Recent B", |ui| {
+                            if self.recent_files.is_empty() {
+                                ui.label("No recent files");
+                            } else {
+                                let mut clicked_path = None;
+                                for path in &self.recent_files {
+                                    if ui
+                                        .button(
+                                            path.file_name().unwrap_or_default().to_string_lossy(),
+                                        )
+                                        .clicked()
+                                    {
+                                        clicked_path = Some(path.clone());
+                                    }
+                                }
+                                if let Some(path) = clicked_path {
+                                    self.open_file(path, true);
                                     ui.close();
                                 }
                             }
@@ -430,6 +477,12 @@ impl eframe::App for ExrApp {
                             self.show_settings = true;
                             ui.close();
                         }
+                    });
+
+                    ui.menu_button("Theme", |ui| {
+                        ui.selectable_value(&mut self.theme, ThemeChoice::Dark, "Dark");
+                        ui.selectable_value(&mut self.theme, ThemeChoice::Light, "Light");
+                        ui.selectable_value(&mut self.theme, ThemeChoice::System, "System");
                     });
 
                     ui.menu_button("Tools", |ui| {
