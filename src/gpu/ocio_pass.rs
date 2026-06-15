@@ -574,6 +574,9 @@ mod metal_tests {
             .expect("build gpu shader bundle");
 
         let output_format = wgpu::TextureFormat::Rgba8Unorm;
+        // Validate GpuState's pipelines too (pipeline_linear + blit) — catches issues like a
+        // non-blendable offscreen format that the OCIO pass alone wouldn't exercise.
+        let _gpu = GpuState::new(&device, output_format);
         // This is where naga generates MSL and the driver compiles it — the real de-risk.
         let pass = OcioGpuPass::from_bundle(&device, &queue, &bundle, output_format)
             .expect("OCIO pipeline should create on this device");

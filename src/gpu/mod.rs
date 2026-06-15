@@ -268,8 +268,10 @@ impl GpuState {
                 module: &shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
+                    // Rgba32Float is not a blendable format; pass 1 is a single full-quad draw
+                    // into a cleared target, so no blending is needed.
                     format: wgpu::TextureFormat::Rgba32Float,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
                 compilation_options: Default::default(),
