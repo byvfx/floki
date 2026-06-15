@@ -36,6 +36,9 @@ public:
     std::unique_ptr<OcioCpuProcessor> build_cpu_processor(
         rust::Str input_cs, rust::Str display, rust::Str view) const;
 
+    OcioShaderData build_gpu_shader(
+        rust::Str input_cs, rust::Str display, rust::Str view, std::uint8_t language) const;
+
 private:
     OCIO::ConstConfigRcPtr cfg_;
 };

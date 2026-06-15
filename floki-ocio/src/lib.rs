@@ -29,6 +29,8 @@ pub use error::{OcioError, Result};
 mod ffi;
 #[cfg(feature = "_native")]
 mod backend;
+#[cfg(feature = "_native")]
+mod transpile;
 
 // ---------------------------------------------------------------------------
 // Config source

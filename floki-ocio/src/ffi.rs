@@ -21,6 +21,31 @@ pub mod bridge {
         default_view: String,
     }
 
+    /// A LUT texture OCIO wants uploaded, with raw (un-repacked) channel data.
+    struct OcioTexture {
+        /// GLSL variable name OCIO emitted.
+        name: String,
+        sampler_name: String,
+        /// 1, 2, or 3.
+        dim: u8,
+        width: u32,
+        height: u32,
+        depth: u32,
+        /// 1 (RED) or 3 (RGB) channels in `data`.
+        channels: u8,
+        /// OCIO Interpolation enum value (1=nearest, 2=linear, 3=tetrahedral).
+        interpolation: u8,
+        /// Raw texel data, `width*height*depth*channels` floats.
+        data: Vec<f32>,
+    }
+
+    /// Raw OCIO GPU shader extraction (pre-transpile).
+    struct OcioShaderData {
+        glsl: String,
+        function_name: String,
+        textures: Vec<OcioTexture>,
+    }
+
     unsafe extern "C++" {
         include!("floki-ocio/cpp/shim.h");
 
@@ -45,6 +70,16 @@ pub mod bridge {
             display: &str,
             view: &str,
         ) -> Result<UniquePtr<OcioCpuProcessor>>;
+
+        /// Extract the OCIO-generated GPU shader + LUT textures. `language`:
+        /// 0 = GLSL 4.0 (combined samplers), 1 = GLSL for Vulkan 4.6 (explicit bindings).
+        fn build_gpu_shader(
+            self: &OcioConfig,
+            input_cs: &str,
+            display: &str,
+            view: &str,
+            language: u8,
+        ) -> Result<OcioShaderData>;
 
         /// Apply the transform in place to interleaved RGBA f32 (`pixels.len() == w*h*4`).
         fn apply_rgba(

@@ -19,13 +19,16 @@ vendored-ocio = ["_native", "dep:cmake"]
 # located via OPENCOLORIO_ROOT or Homebrew. Avoids two OCIO copies in one process.
 system-ocio = ["_native"]
 
-# Internal: shared by both backends. Pulls in the cxx FFI toolchain. The GLSL->SPIR-V
-# transpile + reflection deps (shaderc/rspirv/naga) are added in Stage 2.
-_native = ["dep:cxx", "dep:cxx-build"]
+# Internal: shared by both backends. Pulls in the cxx FFI toolchain plus the GLSL->SPIR-V
+# transpile (shaderc) and SPIR-V reflection / WGSL emission (naga).
+_native = ["dep:cxx", "dep:cxx-build", "dep:shaderc", "dep:naga"]
 
 [dependencies]
 thiserror = "2.0"
 cxx = { version = "1.0", optional = true }
+shaderc = { version = "0.10", optional = true }                       # GLSL -> SPIR-V (glslang)
+# naga 29 matches floki's wgpu 29, so its validation faithfully predicts wgpu acceptance.
+naga = { version = "29", optional = true, features = ["spv-in", "wgsl-out"] }
 
 [build-dependencies]
 cxx-build = { version = "1.0", optional = true }

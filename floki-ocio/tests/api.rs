@@ -74,6 +74,58 @@ fn cpu_processor_transforms_scene_linear_to_display() {
 
 #[test]
 #[cfg(feature = "_native")]
+fn build_gpu_shader_produces_spirv_bindings_and_wgsl() {
+    use floki_ocio::{BindingKind, DisplayTransformRequest};
+
+    let cfg = floki_ocio::OcioConfig::load(ConfigSource::BuiltIn("ocio://default"))
+        .expect("built-in default config should load");
+    let input_colorspace = cfg
+        .scene_linear_colorspace()
+        .or_else(|| cfg.color_spaces().into_iter().find(|c| !c.is_data).map(|c| c.name))
+        .unwrap();
+    let display = cfg.default_display();
+    let view = cfg
+        .displays()
+        .into_iter()
+        .find(|d| d.name == display)
+        .map(|d| d.default_view)
+        .unwrap();
+
+    let bundle = cfg
+        .build_gpu_shader(&DisplayTransformRequest {
+            input_colorspace,
+            display,
+            view,
+        })
+        .expect("should generate + transpile a GPU shader bundle");
+
+    assert!(!bundle.spirv.is_empty(), "SPIR-V must be non-empty");
+    assert_eq!(bundle.entry_point, "main");
+    assert!(
+        bundle.wgsl.as_deref().is_some_and(|w| w.contains("fn main")),
+        "WGSL output should contain a main entry point"
+    );
+
+    // The scene input texture + sampler must be reflected (set 1), plus OCIO's own LUTs.
+    let has_scene_tex = bundle
+        .bindings
+        .iter()
+        .any(|b| b.group == 1 && matches!(b.kind, BindingKind::Texture(_)));
+    let has_scene_sampler = bundle
+        .bindings
+        .iter()
+        .any(|b| b.group == 1 && b.kind == BindingKind::Sampler);
+    assert!(has_scene_tex && has_scene_sampler, "scene input must be reflected: {:?}", bundle.bindings);
+
+    // ACES config emits LUT textures; each must be repacked to RGBA (4 floats/texel).
+    for t in &bundle.textures {
+        let texels = (t.width as usize) * (t.height.max(1) as usize) * (t.depth.max(1) as usize);
+        assert_eq!(t.data_rgba.len(), texels * 4, "texture {} must be RGBA-packed", t.name);
+    }
+}
+
+#[test]
+#[cfg(feature = "_native")]
 fn apply_rgba_rejects_wrong_buffer_length() {
     use floki_ocio::{DisplayTransformRequest, OcioError};
 
