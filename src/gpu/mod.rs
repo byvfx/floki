@@ -2,6 +2,9 @@ use bytemuck::{Pod, Zeroable};
 use eframe::egui_wgpu::wgpu;
 use std::sync::Arc;
 
+#[cfg(feature = "ocio")]
+pub mod ocio_pass;
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct Uniforms {

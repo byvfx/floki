@@ -1433,6 +1433,7 @@ dependencies = [
  "exr",
  "floki-ocio",
  "log",
+ "pollster",
  "rayon",
  "rfd",
  "serde",
