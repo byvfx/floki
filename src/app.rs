@@ -58,6 +58,37 @@ pub struct ExrApp {
     pub lut_bg: Option<std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>>,
     pub lut_error: Option<String>,
 
+    #[cfg(feature = "ocio")]
+    #[serde(default)]
+    ocio_display: String,
+    #[cfg(feature = "ocio")]
+    #[serde(default)]
+    ocio_view: String,
+    #[cfg(feature = "ocio")]
+    #[serde(default)]
+    ocio_input_cs: String,
+    #[cfg(feature = "ocio")]
+    #[serde(default)]
+    pub ocio_enabled: bool,
+    #[cfg(feature = "ocio")]
+    #[serde(skip)]
+    ocio_config: Option<floki_ocio::OcioConfig>,
+    #[cfg(feature = "ocio")]
+    #[serde(skip)]
+    ocio_displays: Vec<floki_ocio::Display>,
+    #[cfg(feature = "ocio")]
+    #[serde(skip)]
+    ocio_colorspaces: Vec<String>,
+    #[cfg(feature = "ocio")]
+    #[serde(skip)]
+    ocio_error: Option<String>,
+    #[cfg(feature = "ocio")]
+    #[serde(skip)]
+    ocio_ready: bool,
+    #[cfg(feature = "ocio")]
+    #[serde(skip)]
+    ocio_cpu: Option<std::rc::Rc<floki_ocio::CpuProcessor>>,
+
     #[serde(skip)]
     show_tools_window: bool,
     #[serde(skip)]
@@ -93,6 +124,26 @@ impl Default for ExrApp {
             enable_lut: false,
             lut_bg: None,
             lut_error: None,
+            #[cfg(feature = "ocio")]
+            ocio_display: String::new(),
+            #[cfg(feature = "ocio")]
+            ocio_view: String::new(),
+            #[cfg(feature = "ocio")]
+            ocio_input_cs: String::new(),
+            #[cfg(feature = "ocio")]
+            ocio_enabled: false,
+            #[cfg(feature = "ocio")]
+            ocio_config: None,
+            #[cfg(feature = "ocio")]
+            ocio_displays: Vec::new(),
+            #[cfg(feature = "ocio")]
+            ocio_colorspaces: Vec::new(),
+            #[cfg(feature = "ocio")]
+            ocio_error: None,
+            #[cfg(feature = "ocio")]
+            ocio_ready: false,
+            #[cfg(feature = "ocio")]
+            ocio_cpu: None,
             show_tools_window: false,
             tools_input_dir: String::new(),
             tools_output_dir: String::new(),
@@ -130,7 +181,129 @@ impl ExrApp {
             }
         }
 
+        // OCIO state (config handle + GPU pass) can't persist either; rebuild from the
+        // persisted path/display/view if OCIO was enabled.
+        #[cfg(feature = "ocio")]
+        if app.ocio_enabled {
+            app.reload_ocio();
+            if !app.ocio_ready {
+                app.ocio_enabled = false;
+            }
+        }
+
         app
+    }
+
+    /// Load the OCIO config (from `ocio_path`, or built-in `ocio://default` if empty),
+    /// enumerate its color spaces/displays/views, pick sensible defaults, and build the GPU
+    /// pass. Errors land in `ocio_error` and clear `ocio_ready`.
+    #[cfg(feature = "ocio")]
+    fn reload_ocio(&mut self) {
+        use floki_ocio::{ConfigSource, OcioConfig};
+
+        self.ocio_error = None;
+        // Precedence: explicit path > $OCIO env > built-in ACES.
+        let env_ocio = std::env::var("OCIO").ok().filter(|v| !v.trim().is_empty());
+        let src = if !self.ocio_path.trim().is_empty() {
+            ConfigSource::File(std::path::Path::new(&self.ocio_path))
+        } else if env_ocio.is_some() {
+            ConfigSource::Env
+        } else {
+            ConfigSource::BuiltIn("ocio://default")
+        };
+        let cfg = match OcioConfig::load(src) {
+            Ok(c) => c,
+            Err(e) => {
+                self.ocio_error = Some(format!("Load failed: {e}"));
+                self.ocio_ready = false;
+                self.ocio_config = None;
+                return;
+            }
+        };
+
+        self.ocio_colorspaces = cfg.color_spaces().into_iter().map(|c| c.name).collect();
+        self.ocio_displays = cfg.displays();
+
+        // Default any unset / now-invalid selections from the config.
+        if !self.ocio_displays.iter().any(|d| d.name == self.ocio_display) {
+            self.ocio_display = cfg.default_display();
+        }
+        let views = self
+            .ocio_displays
+            .iter()
+            .find(|d| d.name == self.ocio_display)
+            .cloned();
+        if let Some(d) = &views {
+            if !d.views.contains(&self.ocio_view) {
+                self.ocio_view = d.default_view.clone();
+            }
+        }
+        if self.ocio_input_cs.is_empty() || !self.ocio_colorspaces.contains(&self.ocio_input_cs) {
+            self.ocio_input_cs = cfg
+                .scene_linear_colorspace()
+                .filter(|s| self.ocio_colorspaces.contains(s))
+                .or_else(|| self.ocio_colorspaces.first().cloned())
+                .unwrap_or_default();
+        }
+
+        self.ocio_config = Some(cfg);
+        self.rebuild_ocio_pass();
+    }
+
+    /// Rebuild just the GPU pass from the current config + input/display/view selection
+    /// (cheaper than reloading the config when the user changes a dropdown).
+    #[cfg(feature = "ocio")]
+    fn rebuild_ocio_pass(&mut self) {
+        use floki_ocio::DisplayTransformRequest;
+
+        self.ocio_cpu = None;
+        let Some(cfg) = &self.ocio_config else {
+            self.ocio_ready = false;
+            return;
+        };
+        if self.ocio_input_cs.is_empty() || self.ocio_display.is_empty() || self.ocio_view.is_empty()
+        {
+            self.ocio_ready = false;
+            return;
+        }
+        let req = DisplayTransformRequest {
+            input_colorspace: self.ocio_input_cs.clone(),
+            display: self.ocio_display.clone(),
+            view: self.ocio_view.clone(),
+        };
+        let bundle = match cfg.build_gpu_shader(&req) {
+            Ok(b) => b,
+            Err(e) => {
+                self.ocio_error = Some(format!("Shader build failed: {e}"));
+                self.ocio_ready = false;
+                return;
+            }
+        };
+        // CPU processor for thumbnails / fallback (best-effort; GPU path is primary).
+        self.ocio_cpu = cfg
+            .build_cpu_processor(&req)
+            .ok()
+            .map(std::rc::Rc::new);
+        let Some(rs) = &self.render_state else {
+            self.ocio_ready = false;
+            return;
+        };
+        match crate::gpu::ocio_pass::OcioGpuPass::from_bundle(
+            &rs.device,
+            &rs.queue,
+            &bundle,
+            rs.target_format,
+        ) {
+            Ok(pass) => {
+                rs.renderer.write().callback_resources.insert(pass);
+                self.ocio_ready = true;
+                self.ocio_error = None;
+            }
+            Err(e) => {
+                self.ocio_error = Some(format!("Pipeline failed: {e}"));
+                self.ocio_ready = false;
+            }
+        }
     }
 
     /// (Re)build the GPU LUT bind group from `self.lut_path`, updating `lut_bg`
@@ -380,16 +553,123 @@ impl eframe::App for ExrApp {
             // closure, so we can't call the whole-`self` `reload_lut` inside it.
             // Record the request and act on it after the window block closes.
             let mut lut_reload_requested = false;
+            #[cfg(feature = "ocio")]
+            let mut ocio_load_requested = false;
+            #[cfg(feature = "ocio")]
+            let mut ocio_rebuild_requested = false;
+            // Snapshot the enumerations so the combos can read them while the closure holds
+            // a mutable borrow of `self` for the selections.
+            #[cfg(feature = "ocio")]
+            let ocio_displays = self.ocio_displays.clone();
+            #[cfg(feature = "ocio")]
+            let ocio_colorspaces = self.ocio_colorspaces.clone();
             egui::Window::new("Color Management").open(&mut self.show_settings).show(ui.ctx(), |ui| {
                 ui.heading("Settings");
                 ui.add_space(5.0);
 
-                ui.label("OCIO Environment / Config Path:");
-                ui.horizontal(|ui| {
-                    ui.text_edit_singleline(&mut self.ocio_path);
-                    ui.add_enabled(false, egui::Button::new("Browse"))
-                        .on_disabled_hover_text("Coming soon");
-                });
+                #[cfg(not(feature = "ocio"))]
+                {
+                    ui.label("OCIO Environment / Config Path:");
+                    ui.horizontal(|ui| {
+                        ui.text_edit_singleline(&mut self.ocio_path);
+                        ui.add_enabled(false, egui::Button::new("Browse"))
+                            .on_disabled_hover_text("Build with --features ocio");
+                    });
+                }
+
+                #[cfg(feature = "ocio")]
+                {
+                    ui.label("OCIO Config (.ocio) — empty uses built-in ACES (ocio://default):");
+                    ui.horizontal(|ui| {
+                        ui.text_edit_singleline(&mut self.ocio_path);
+                        if ui.button("Browse").clicked()
+                            && let Some(path) = rfd::FileDialog::new()
+                                .add_filter("OCIO", &["ocio"])
+                                .pick_file()
+                        {
+                            self.ocio_path = path.to_string_lossy().to_string();
+                            ocio_load_requested = true;
+                        }
+                        if ui.button("Load").clicked() {
+                            ocio_load_requested = true;
+                        }
+                    });
+
+                    // Clarify what an empty path resolves to.
+                    if self.ocio_path.trim().is_empty() {
+                        let hint = match std::env::var("OCIO")
+                            .ok()
+                            .filter(|v| !v.trim().is_empty())
+                        {
+                            Some(v) => format!("Empty path → using $OCIO: {v}"),
+                            None => "Empty path → using built-in ACES (ocio://default)".to_string(),
+                        };
+                        ui.label(egui::RichText::new(hint).weak());
+                    }
+
+                    if !ocio_displays.is_empty() {
+                        egui::ComboBox::from_label("Input color space")
+                            .selected_text(self.ocio_input_cs.clone())
+                            .show_ui(ui, |ui| {
+                                for cs in &ocio_colorspaces {
+                                    if ui
+                                        .selectable_value(&mut self.ocio_input_cs, cs.clone(), cs)
+                                        .clicked()
+                                    {
+                                        ocio_rebuild_requested = true;
+                                    }
+                                }
+                            });
+                        egui::ComboBox::from_label("Display")
+                            .selected_text(self.ocio_display.clone())
+                            .show_ui(ui, |ui| {
+                                for d in &ocio_displays {
+                                    if ui
+                                        .selectable_value(
+                                            &mut self.ocio_display,
+                                            d.name.clone(),
+                                            &d.name,
+                                        )
+                                        .clicked()
+                                    {
+                                        // Reset the view if it isn't valid for the new display.
+                                        if let Some(nd) =
+                                            ocio_displays.iter().find(|x| x.name == self.ocio_display)
+                                            && !nd.views.contains(&self.ocio_view)
+                                        {
+                                            self.ocio_view = nd.default_view.clone();
+                                        }
+                                        ocio_rebuild_requested = true;
+                                    }
+                                }
+                            });
+                        let cur_views = ocio_displays
+                            .iter()
+                            .find(|d| d.name == self.ocio_display)
+                            .map(|d| d.views.clone())
+                            .unwrap_or_default();
+                        egui::ComboBox::from_label("View")
+                            .selected_text(self.ocio_view.clone())
+                            .show_ui(ui, |ui| {
+                                for v in &cur_views {
+                                    if ui
+                                        .selectable_value(&mut self.ocio_view, v.clone(), v)
+                                        .clicked()
+                                    {
+                                        ocio_rebuild_requested = true;
+                                    }
+                                }
+                            });
+                        ui.checkbox(&mut self.ocio_enabled, "Enable OCIO");
+                    }
+                    if let Some(err) = &self.ocio_error {
+                        ui.label(egui::RichText::new(err).color(egui::Color32::RED));
+                    } else if self.ocio_ready {
+                        ui.label(
+                            egui::RichText::new("OCIO active").color(egui::Color32::GREEN),
+                        );
+                    }
+                }
 
                 ui.add_space(10.0);
 
@@ -413,8 +693,6 @@ impl eframe::App for ExrApp {
                     ui.label(egui::RichText::new("LUT loaded and active!").color(egui::Color32::GREEN));
                 }
 
-                ui.add_space(10.0);
-                ui.label(egui::RichText::new("Note: OCIO is penciled in for future GPU rendering phases and is not currently active.").italics());
             });
 
             if lut_reload_requested {
@@ -422,6 +700,16 @@ impl eframe::App for ExrApp {
                 if self.lut_bg.is_some() {
                     self.enable_lut = true; // Auto-enable on successful load
                 }
+            }
+
+            #[cfg(feature = "ocio")]
+            if ocio_load_requested {
+                self.reload_ocio();
+                if self.ocio_ready {
+                    self.ocio_enabled = true; // Auto-enable on successful load
+                }
+            } else if ocio_rebuild_requested {
+                self.rebuild_ocio_pass();
             }
         }
 
@@ -1086,6 +1374,15 @@ impl eframe::App for ExrApp {
             if self.loaded_file.is_some() {
                 if let Some(data) = &self.exr_data {
                     self.viewer.enable_lut = self.enable_lut && self.lut_bg.is_some();
+                    #[cfg(feature = "ocio")]
+                    {
+                        self.viewer.ocio_active = self.ocio_enabled && self.ocio_ready;
+                        self.viewer.ocio_cpu = if self.viewer.ocio_active {
+                            self.ocio_cpu.clone()
+                        } else {
+                            None
+                        };
+                    }
                     self.viewer.ui(
                         ui,
                         data,
