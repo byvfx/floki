@@ -267,6 +267,7 @@ pub struct OcioTargets {
     scene_view: wgpu::TextureView,
     display_view: wgpu::TextureView,
     blit_bind_group: wgpu::BindGroup,
+    blit_uniform_buffer: wgpu::Buffer,
     _scene: wgpu::Texture,
     _display: wgpu::Texture,
 }
@@ -307,6 +308,12 @@ impl OcioTargets {
         });
         let scene_view = scene.create_view(&wgpu::TextureViewDescriptor::default());
         let display_view = display.create_view(&wgpu::TextureViewDescriptor::default());
+        let blit_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("OCIO blit uniform buffer"),
+            size: std::mem::size_of::<crate::gpu::BlitUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let blit_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("OCIO blit bind group"),
             layout: blit_layout,
@@ -319,6 +326,14 @@ impl OcioTargets {
                     binding: 1,
                     resource: wgpu::BindingResource::Sampler(blit_sampler),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&scene_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: blit_uniform_buffer.as_entire_binding(),
+                },
             ],
         });
         Self {
@@ -327,28 +342,39 @@ impl OcioTargets {
             scene_view,
             display_view,
             blit_bind_group,
+            blit_uniform_buffer,
             _scene: scene,
             _display: display,
         }
     }
 }
 
-/// egui paint callback for the OCIO single-image path. Carries the same bind groups as the
-/// normal `ExrCallback`; `prepare` runs pass 1 (via `GpuState::pipeline_linear`) + pass 2
-/// (the `OcioGpuPass` in callback_resources), and `paint` blits the result.
-pub struct OcioCallback {
+/// One pass-1 draw for the OCIO path: the four bind groups a single `pipeline_linear`
+/// draw needs. A frame carries one of these per image (1 for single/wipe/diff/composite,
+/// 2 for side-by-side) — all rendered into the one scene-linear offscreen before a single
+/// OCIO display pass, so OCIO runs once over the composited frame.
+pub struct OcioPass1Draw {
     pub bg_a: Arc<wgpu::BindGroup>,
     pub bg_b: Arc<wgpu::BindGroup>,
     pub uniform_bg: wgpu::BindGroup,
     pub lut_bg: Arc<wgpu::BindGroup>,
+}
+
+/// egui paint callback for the OCIO path. `prepare` runs pass 1 (one `pipeline_linear`
+/// draw per `OcioPass1Draw`, all into the shared scene-linear offscreen) + pass 2 (the
+/// single `OcioGpuPass` display transform), and `paint` blits the result — compositing the
+/// display-space checker and overscan dim from `blit_uniforms`.
+pub struct OcioCallback {
+    pub draws: Vec<OcioPass1Draw>,
     pub display_format: wgpu::TextureFormat,
+    pub blit_uniforms: crate::gpu::BlitUniforms,
 }
 
 impl eframe::egui_wgpu::CallbackTrait for OcioCallback {
     fn prepare(
         &self,
         device: &wgpu::Device,
-        _queue: &wgpu::Queue,
+        queue: &wgpu::Queue,
         screen_descriptor: &eframe::egui_wgpu::ScreenDescriptor,
         _egui_encoder: &mut wgpu::CommandEncoder,
         callback_resources: &mut eframe::egui_wgpu::CallbackResources,
@@ -365,9 +391,26 @@ impl eframe::egui_wgpu::CallbackTrait for OcioCallback {
                 let gpu = callback_resources.get::<GpuState>().unwrap();
                 (gpu.blit_layout.clone(), gpu.blit_sampler.clone())
             };
-            let targets =
-                OcioTargets::new(device, &blit_layout, &blit_sampler, w, h, self.display_format);
+            let targets = OcioTargets::new(
+                device,
+                &blit_layout,
+                &blit_sampler,
+                w,
+                h,
+                self.display_format,
+            );
             callback_resources.insert(targets);
+        }
+
+        // Per-frame blit params (display window, overscan dim, checker) — written every
+        // frame so `paint` (which has no queue) can just bind the existing buffer.
+        {
+            let targets = callback_resources.get::<OcioTargets>().unwrap();
+            queue.write_buffer(
+                &targets.blit_uniform_buffer,
+                0,
+                bytemuck::bytes_of(&self.blit_uniforms),
+            );
         }
 
         // The OCIO pass may not exist yet (config not loaded); nothing to do then.
@@ -379,10 +422,15 @@ impl eframe::egui_wgpu::CallbackTrait for OcioCallback {
         let ocio = callback_resources.get::<OcioGpuPass>().unwrap();
         let targets = callback_resources.get::<OcioTargets>().unwrap();
 
-        let mut encoder =
-            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("OCIO") });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("OCIO"),
+        });
 
-        // Pass 1: composite + exposure into scene-linear (uniforms set srgb=0/gamma=1/lut=0).
+        // Pass 1: composite + exposure into scene-linear (uniforms set srgb=0/gamma=1/lut=0/
+        // skip_checker=1). Each draw maps its own rect via the vertex shader, so two
+        // side-by-side draws land in their sub-rects within the one offscreen. Alpha is
+        // cleared to a negative sentinel: the blit treats scene_a < 0 as "no image" so the
+        // checker only shows under drawn pixels (matching the non-OCIO path).
         {
             let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("OCIO pass 1 (scene-linear)"),
@@ -391,7 +439,12 @@ impl eframe::egui_wgpu::CallbackTrait for OcioCallback {
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.0,
+                            g: 0.0,
+                            b: 0.0,
+                            a: -1.0,
+                        }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -402,15 +455,22 @@ impl eframe::egui_wgpu::CallbackTrait for OcioCallback {
             });
             rp.set_viewport(0.0, 0.0, w as f32, h as f32, 0.0, 1.0);
             rp.set_pipeline(&gpu.pipeline_linear);
-            rp.set_bind_group(0, self.bg_a.as_ref(), &[]);
-            rp.set_bind_group(1, self.bg_b.as_ref(), &[]);
-            rp.set_bind_group(2, &self.uniform_bg, &[]);
-            rp.set_bind_group(3, self.lut_bg.as_ref(), &[]);
-            rp.draw(0..6, 0..1);
+            for d in &self.draws {
+                rp.set_bind_group(0, d.bg_a.as_ref(), &[]);
+                rp.set_bind_group(1, d.bg_b.as_ref(), &[]);
+                rp.set_bind_group(2, &d.uniform_bg, &[]);
+                rp.set_bind_group(3, d.lut_bg.as_ref(), &[]);
+                rp.draw(0..6, 0..1);
+            }
         }
 
         // Pass 2: OCIO display transform scene-linear -> display.
-        ocio.render(device, &mut encoder, &targets.scene_view, &targets.display_view);
+        ocio.render(
+            device,
+            &mut encoder,
+            &targets.scene_view,
+            &targets.display_view,
+        );
 
         vec![encoder.finish()]
     }
@@ -644,5 +704,246 @@ mod metal_tests {
         pass.render(&device, &mut encoder, &input_view, &output_view);
         queue.submit([encoder.finish()]);
         let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    }
+
+    // Validates the OCIO blit pipeline (new bind-group layout + BLIT_SHADER) compiles and
+    // runs on the platform GPU, and that its three behaviors are correct: the negative-alpha
+    // sentinel means "no image" (transparent), opaque pixels pass the OCIO display color
+    // through, and transparent-but-covered pixels show the display-space checker.
+    #[test]
+    fn blit_coverage_and_checker_on_device() {
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let adapter = match pollster::block_on(
+            instance.request_adapter(&wgpu::RequestAdapterOptions::default()),
+        ) {
+            Ok(a) => a,
+            Err(_) => {
+                eprintln!("no GPU adapter available; skipping on-device blit test");
+                return;
+            }
+        };
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("blit-test-device"),
+            required_features: wgpu::Features::FLOAT32_FILTERABLE,
+            ..Default::default()
+        }))
+        .expect("request_device");
+
+        let output_format = wgpu::TextureFormat::Rgba8Unorm;
+        let gpu = GpuState::new(&device, output_format);
+
+        // 3x1 scene-linear input: texel0 alpha=-1 (sentinel/no image), texel1 alpha=1
+        // (opaque), texel2 alpha=0 (covered but transparent).
+        let scene = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("scene"),
+            size: wgpu::Extent3d {
+                width: 3,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let scene_px: Vec<f32> = vec![
+            0.0, 0.0, 0.0, -1.0, // texel0: no image
+            0.0, 0.0, 0.0, 1.0, // texel1: opaque
+            0.0, 0.0, 0.0, 0.0, // texel2: covered, transparent
+        ];
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &scene,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(&scene_px),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(3 * 16),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: 3,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        let scene_view = scene.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // 3x1 "OCIO display" color: texel1 mid-grey (0.5), others black.
+        let display = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("display"),
+            size: wgpu::Extent3d {
+                width: 3,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: output_format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let display_px: [u8; 12] = [0, 0, 0, 255, 128, 128, 128, 255, 0, 0, 0, 255];
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &display,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &display_px,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(3 * 4),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: 3,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        let display_view = display.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // checker_size=3 so all texels land in the same (dark, 0.1) cell; whole row inside
+        // the display window so no overscan dim.
+        let bu = crate::gpu::BlitUniforms {
+            display_min: [0.0, 0.0],
+            display_max: [3.0, 1.0],
+            screen_size: [3.0, 1.0],
+            checker_dark: 0.1,
+            checker_light: 0.2,
+            checker_size: 3.0,
+            checker_enabled: 1.0,
+            overscan_factor: 0.5,
+            _pad0: 0.0,
+        };
+        let ubuf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("blit-uniforms"),
+            size: std::mem::size_of::<crate::gpu::BlitUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&ubuf, 0, bytemuck::bytes_of(&bu));
+
+        let blit_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("blit-bg"),
+            layout: &gpu.blit_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&display_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&gpu.blit_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&scene_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: ubuf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let out = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("blit-out"),
+            size: wgpu::Extent3d {
+                width: 3,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: output_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let out_view = out.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Read-back buffer: bytes_per_row must be 256-aligned.
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("blit-readback"),
+            size: 256,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("blit-test-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &out_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            rp.set_pipeline(&gpu.blit_pipeline);
+            rp.set_bind_group(0, &blit_bg, &[]);
+            rp.draw(0..3, 0..1);
+        }
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &out,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(256),
+                    rows_per_image: Some(1),
+                },
+            },
+            wgpu::Extent3d {
+                width: 3,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit([encoder.finish()]);
+
+        readback.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let data = readback.slice(..).get_mapped_range();
+        let px = &data[..12];
+
+        // texel0: sentinel -> fully transparent (nothing drawn).
+        assert_eq!(px[3], 0, "sentinel texel should be transparent");
+        // texel1: opaque -> OCIO display color (mid-grey) passes through, checker adds nothing.
+        assert!(
+            (px[4] as i32 - 128).abs() <= 3 && px[7] == 255,
+            "opaque texel should pass display color through (got {:?})",
+            &px[4..8]
+        );
+        // texel2: covered but transparent -> display-space checker (dark cell ~0.1).
+        assert!(
+            (px[8] as i32 - 26).abs() <= 6 && px[11] == 255,
+            "transparent covered texel should show the checker (got {:?})",
+            &px[8..12]
+        );
     }
 }
