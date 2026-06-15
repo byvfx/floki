@@ -97,6 +97,14 @@ pub struct ExrViewer {
     /// two-pass OCIO callback instead of the direct display chain. Set by the app.
     #[cfg(feature = "ocio")]
     pub ocio_active: bool,
+    /// CPU display transform for thumbnails / CPU fallback (mirrors the GPU OCIO path). Set by
+    /// the app; shared via `Rc` because `CpuProcessor` isn't `Clone`.
+    #[cfg(feature = "ocio")]
+    pub ocio_cpu: Option<std::rc::Rc<floki_ocio::CpuProcessor>>,
+    /// Identity of the current OCIO CPU state; cached CPU textures are invalidated when it
+    /// changes (toggle on/off or a new display/view).
+    #[cfg(feature = "ocio")]
+    ocio_sig: usize,
     pub show_tooltip: bool,
     pub channel_mode: ChannelMode,
     pub compare_mode: CompareMode,
@@ -154,6 +162,10 @@ impl Default for ExrViewer {
             enable_lut: false,
             #[cfg(feature = "ocio")]
             ocio_active: false,
+            #[cfg(feature = "ocio")]
+            ocio_cpu: None,
+            #[cfg(feature = "ocio")]
+            ocio_sig: 0,
             show_tooltip: true,
             channel_mode: ChannelMode::RGB,
             compare_mode: CompareMode::SingleA,
@@ -576,6 +588,25 @@ impl ExrViewer {
         lut_bg_opt: Option<std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>>,
     ) {
         self.handle_hotkeys(ui, exr_data_b.is_some());
+
+        // Invalidate cached CPU textures (thumbnails / fallback) when the OCIO CPU state
+        // changes, so they regenerate with — or without — the display transform.
+        #[cfg(feature = "ocio")]
+        {
+            let sig = if self.ocio_active {
+                self.ocio_cpu
+                    .as_ref()
+                    .map(|p| std::rc::Rc::as_ptr(p) as usize)
+                    .unwrap_or(1)
+            } else {
+                0
+            };
+            if sig != self.ocio_sig {
+                self.ocio_sig = sig;
+                self.textures.fill(None);
+                self.textures_b.fill(None);
+            }
+        }
 
         if self.blink_state && exr_data_b.is_some() {
             ui.ctx().request_repaint();
@@ -1788,6 +1819,13 @@ impl ExrViewer {
         exr_data: &ExrData,
         layer_index: usize,
     ) -> Option<egui::TextureHandle> {
+        #[cfg(feature = "ocio")]
+        if self.ocio_active
+            && let Some(proc) = &self.ocio_cpu
+        {
+            return self.generate_texture_ocio(ctx, exr_data, layer_index, proc);
+        }
+
         let (layer, r_chan, g_chan, b_chan, a_chan) = exr_data.logical_channels(layer_index)?;
         let width = layer.size.0;
         let height = layer.size.1;
@@ -1898,6 +1936,119 @@ impl ExrViewer {
             pixels,
         };
 
+        Some(ctx.load_texture("exr_viewer", color_image, egui::TextureOptions::LINEAR))
+    }
+
+    /// CPU equivalent of the GPU OCIO path for thumbnails / CPU fallback: channel-select +
+    /// exposure + checkerboard composite (scene-linear), then the OCIO display transform.
+    #[cfg(feature = "ocio")]
+    fn generate_texture_ocio(
+        &self,
+        ctx: &egui::Context,
+        exr_data: &ExrData,
+        layer_index: usize,
+        proc: &std::rc::Rc<floki_ocio::CpuProcessor>,
+    ) -> Option<egui::TextureHandle> {
+        let (layer, r_chan, g_chan, b_chan, a_chan) = exr_data.logical_channels(layer_index)?;
+        let width = layer.size.0;
+        let height = layer.size.1;
+
+        let get_val = |chan: Option<&exr::image::AnyChannel<exr::image::FlatSamples>>,
+                       x: usize,
+                       y: usize|
+         -> f32 {
+            if let Some(c) = chan {
+                let index = y * width + x;
+                match &c.sample_data {
+                    exr::image::FlatSamples::F16(s) => s[index].to_f32(),
+                    exr::image::FlatSamples::F32(s) => s[index],
+                    exr::image::FlatSamples::U32(s) => s[index] as f32 / u32::MAX as f32,
+                }
+            } else {
+                0.0
+            }
+        };
+
+        let exp_mult = crate::render_math::exposure_to_multiplier(self.exposure);
+        let channel_mode = self.channel_mode;
+
+        // Build a scene-linear RGBA f32 buffer (exposure + checker composite), then let OCIO
+        // transform it in one call (OCIO's CPU path is internally vectorized).
+        let mut buf = vec![0.0_f32; width * height * 4];
+        buf.par_chunks_mut(width * 4)
+            .enumerate()
+            .for_each(|(y, row)| {
+                for x in 0..width {
+                    let mut r = get_val(r_chan, x, y);
+                    let mut g = get_val(g_chan, x, y);
+                    let mut b = get_val(b_chan, x, y);
+                    let mut a = get_val(a_chan, x, y);
+                    if a_chan.is_none() {
+                        a = 1.0;
+                    }
+                    match channel_mode {
+                        ChannelMode::R => {
+                            g = r;
+                            b = r;
+                            a = 1.0;
+                        }
+                        ChannelMode::G => {
+                            r = g;
+                            b = g;
+                            a = 1.0;
+                        }
+                        ChannelMode::B => {
+                            r = b;
+                            g = b;
+                            a = 1.0;
+                        }
+                        ChannelMode::A => {
+                            r = a;
+                            g = a;
+                            b = a;
+                            a = 1.0;
+                        }
+                        ChannelMode::RGB => {}
+                    }
+
+                    r *= exp_mult;
+                    g *= exp_mult;
+                    b *= exp_mult;
+
+                    let is_dark = ((x / 16) + (y / 16)) % 2 == 0;
+                    let bg_linear = if is_dark { 0.1 } else { 0.2 };
+                    let a_clamp = a.clamp(0.0, 1.0);
+                    r += bg_linear * (1.0 - a_clamp);
+                    g += bg_linear * (1.0 - a_clamp);
+                    b += bg_linear * (1.0 - a_clamp);
+
+                    let o = x * 4;
+                    row[o] = r;
+                    row[o + 1] = g;
+                    row[o + 2] = b;
+                    row[o + 3] = 1.0;
+                }
+            });
+
+        if let Err(e) = proc.apply_rgba(&mut buf, width, height) {
+            log::error!("OCIO CPU transform failed: {e}");
+        }
+
+        let mut pixels = vec![egui::Color32::BLACK; width * height];
+        pixels.par_iter_mut().enumerate().for_each(|(i, px)| {
+            let o = i * 4;
+            *px = egui::Color32::from_rgb(
+                (buf[o].clamp(0.0, 1.0) * 255.0) as u8,
+                (buf[o + 1].clamp(0.0, 1.0) * 255.0) as u8,
+                (buf[o + 2].clamp(0.0, 1.0) * 255.0) as u8,
+            );
+        });
+
+        let color_image = egui::ColorImage {
+            size: [width, height],
+            source_size: egui::vec2(width as f32, height as f32),
+            pixels,
+        };
         Some(ctx.load_texture("exr_viewer", color_image, egui::TextureOptions::LINEAR))
     }
 

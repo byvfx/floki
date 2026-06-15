@@ -85,6 +85,9 @@ pub struct ExrApp {
     #[cfg(feature = "ocio")]
     #[serde(skip)]
     ocio_ready: bool,
+    #[cfg(feature = "ocio")]
+    #[serde(skip)]
+    ocio_cpu: Option<std::rc::Rc<floki_ocio::CpuProcessor>>,
 
     #[serde(skip)]
     show_tools_window: bool,
@@ -139,6 +142,8 @@ impl Default for ExrApp {
             ocio_error: None,
             #[cfg(feature = "ocio")]
             ocio_ready: false,
+            #[cfg(feature = "ocio")]
+            ocio_cpu: None,
             show_tools_window: false,
             tools_input_dir: String::new(),
             tools_output_dir: String::new(),
@@ -247,6 +252,7 @@ impl ExrApp {
     fn rebuild_ocio_pass(&mut self) {
         use floki_ocio::DisplayTransformRequest;
 
+        self.ocio_cpu = None;
         let Some(cfg) = &self.ocio_config else {
             self.ocio_ready = false;
             return;
@@ -269,6 +275,11 @@ impl ExrApp {
                 return;
             }
         };
+        // CPU processor for thumbnails / fallback (best-effort; GPU path is primary).
+        self.ocio_cpu = cfg
+            .build_cpu_processor(&req)
+            .ok()
+            .map(std::rc::Rc::new);
         let Some(rs) = &self.render_state else {
             self.ocio_ready = false;
             return;
@@ -1350,6 +1361,11 @@ impl eframe::App for ExrApp {
                     #[cfg(feature = "ocio")]
                     {
                         self.viewer.ocio_active = self.ocio_enabled && self.ocio_ready;
+                        self.viewer.ocio_cpu = if self.viewer.ocio_active {
+                            self.ocio_cpu.clone()
+                        } else {
+                            None
+                        };
                     }
                     self.viewer.ui(
                         ui,
