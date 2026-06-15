@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.4] - 2026-06-14
+
+### Fixed
+- A depth `Z` channel packed alongside an unprefixed `R,G,B,A` beauty pass no
+  longer overwrites the Blue channel (it rendered pure white). Channel-to-slot
+  resolution now prioritizes canonical color names (`R/G/B/A`) over geometric
+  aliases (`X/Y/Z`), so a real Blue is never clobbered by depth.
+- Leftover non-color channels (e.g. depth `Z`) in an RGBA group are now surfaced
+  as their own grayscale layer instead of being silently dropped.
+
 ## [1.4.3] - 2026-06-14
 
 ### Performance
@@ -139,7 +149,8 @@ Initial release.
 - Advanced metadata header inspector.
 - Cross-platform GitHub Actions builds (Linux, Windows, macOS).
 
-[Unreleased]: https://github.com/byvfx/floki/compare/v1.4.3...HEAD
+[Unreleased]: https://github.com/byvfx/floki/compare/v1.4.4...HEAD
+[1.4.4]: https://github.com/byvfx/floki/compare/v1.4.3...v1.4.4
 [1.4.3]: https://github.com/byvfx/floki/compare/v1.4.2...v1.4.3
 [1.4.2]: https://github.com/byvfx/floki/compare/v1.4.1...v1.4.2
 [1.4.1]: https://github.com/byvfx/floki/compare/v1.4.0...v1.4.1

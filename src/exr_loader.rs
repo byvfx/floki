@@ -180,18 +180,34 @@ fn split_channel_name(name: &str) -> (&str, &str) {
     }
 }
 
-/// Map a component token to an RGBA slot (`0=r, 1=g, 2=b, 3=a`), or `None` if it
-/// is not a recognized color/vector component. Vector passes map `X->r, Y->g, Z->b`.
-fn component_slot(token: &str) -> Option<usize> {
+/// Map a canonical color token to an RGBA slot (`0=r, 1=g, 2=b, 3=a`), or `None`.
+/// This is the high-priority tier: a real `R/G/B/A` always wins its slot.
+fn color_slot(token: &str) -> Option<usize> {
     let eq = |s: &str| token.eq_ignore_ascii_case(s);
-    if eq("R") || eq("red") || eq("X") {
+    if eq("R") || eq("red") {
         Some(0)
-    } else if eq("G") || eq("green") || eq("Y") {
+    } else if eq("G") || eq("green") {
         Some(1)
-    } else if eq("B") || eq("blue") || eq("Z") {
+    } else if eq("B") || eq("blue") {
         Some(2)
     } else if eq("A") || eq("alpha") {
         Some(3)
+    } else {
+        None
+    }
+}
+
+/// Map a geometric/vector token (normal, position, depth) to a display slot:
+/// `X->r, Y->g, Z->b`. This is the low-priority tier and only fills slots a
+/// `color_slot` match left empty, so a depth `Z` never overwrites a real Blue.
+fn vector_slot(token: &str) -> Option<usize> {
+    let eq = |s: &str| token.eq_ignore_ascii_case(s);
+    if eq("X") {
+        Some(0)
+    } else if eq("Y") {
+        Some(1)
+    } else if eq("Z") {
+        Some(2)
     } else {
         None
     }
@@ -223,43 +239,83 @@ fn group_channels(names: &[String]) -> Vec<RawGroup> {
         members[pos].push((idx, token));
     }
 
-    order
-        .into_iter()
-        .zip(members)
-        .map(|(group_key, mem)| {
-            let (mut r, mut g, mut b, mut a) = (None, None, None, None);
-            if mem.len() == 1 {
-                // Single-channel pass (Z-depth, mist, a mask): show as grayscale.
-                let only = mem[0].0;
-                r = Some(only);
-                g = Some(only);
-                b = Some(only);
-            } else {
-                for &(ci, token) in &mem {
-                    match component_slot(token) {
-                        Some(0) => r = Some(ci),
-                        Some(1) => g = Some(ci),
-                        Some(2) => b = Some(ci),
-                        Some(3) => a = Some(ci),
-                        _ => {}
-                    }
-                }
-                if r.is_none() && g.is_none() && b.is_none() {
-                    let first = mem[0].0;
-                    r = Some(first);
-                    g = Some(first);
-                    b = Some(first);
-                }
-            }
-            RawGroup {
+    let mut groups: Vec<RawGroup> = Vec::new();
+    for (group_key, mem) in order.into_iter().zip(members) {
+        let (mut r, mut g, mut b, mut a) = (None, None, None, None);
+
+        if mem.len() == 1 {
+            // Single-channel pass (Z-depth, mist, a mask): show as grayscale.
+            let only = mem[0].0;
+            groups.push(RawGroup {
                 group_key: group_key.to_string(),
-                r,
-                g,
-                b,
-                a,
+                r: Some(only),
+                g: Some(only),
+                b: Some(only),
+                a: None,
+            });
+            continue;
+        }
+
+        // Pass 1: canonical colors (R/G/B/A) claim their slot outright.
+        for &(ci, token) in &mem {
+            match color_slot(token) {
+                Some(0) => r = Some(ci),
+                Some(1) => g = Some(ci),
+                Some(2) => b = Some(ci),
+                Some(3) => a = Some(ci),
+                _ => {}
             }
-        })
-        .collect()
+        }
+        // Pass 2: vector aliases (X/Y/Z) fill only still-empty slots, so a depth
+        // `Z` packed next to RGBA can never overwrite the Blue pass 1 resolved.
+        for &(ci, token) in &mem {
+            match vector_slot(token) {
+                Some(0) if r.is_none() => r = Some(ci),
+                Some(1) if g.is_none() => g = Some(ci),
+                Some(2) if b.is_none() => b = Some(ci),
+                _ => {}
+            }
+        }
+
+        if r.is_none() && g.is_none() && b.is_none() {
+            // Unrecognized multi-channel pass: replicate the first channel and
+            // keep it as one group (no per-channel splitting of e.g. UV/chroma).
+            let first = mem[0].0;
+            groups.push(RawGroup {
+                group_key: group_key.to_string(),
+                r: Some(first),
+                g: Some(first),
+                b: Some(first),
+                a,
+            });
+            continue;
+        }
+
+        // A genuine color group: emit it, then surface any leftover member
+        // channels (e.g. a depth `Z` stored alongside RGBA) as their own
+        // grayscale layers so they stay viewable instead of being dropped.
+        let claimed = [r, g, b, a];
+        groups.push(RawGroup {
+            group_key: group_key.to_string(),
+            r,
+            g,
+            b,
+            a,
+        });
+        for &(ci, _token) in &mem {
+            if claimed.contains(&Some(ci)) {
+                continue;
+            }
+            groups.push(RawGroup {
+                group_key: names[ci].clone(),
+                r: Some(ci),
+                g: Some(ci),
+                b: Some(ci),
+                a: None,
+            });
+        }
+    }
+    groups
 }
 
 /// Combine a physical layer name with a channel-prefix into one full group key.
@@ -351,14 +407,19 @@ mod tests {
 
     #[test]
     fn maps_color_and_vector_components() {
-        assert_eq!(component_slot("R"), Some(0));
-        assert_eq!(component_slot("g"), Some(1));
-        assert_eq!(component_slot("BLUE"), Some(2));
-        assert_eq!(component_slot("A"), Some(3));
-        assert_eq!(component_slot("X"), Some(0));
-        assert_eq!(component_slot("Y"), Some(1));
-        assert_eq!(component_slot("Z"), Some(2));
-        assert_eq!(component_slot("mask"), None);
+        // Canonical colors are the high-priority tier.
+        assert_eq!(color_slot("R"), Some(0));
+        assert_eq!(color_slot("g"), Some(1));
+        assert_eq!(color_slot("BLUE"), Some(2));
+        assert_eq!(color_slot("A"), Some(3));
+        assert_eq!(color_slot("mask"), None);
+        // Vector aliases are a separate, lower-priority tier and do NOT match
+        // color names (so a Blue is never resolved via the X/Y/Z path).
+        assert_eq!(vector_slot("X"), Some(0));
+        assert_eq!(vector_slot("Y"), Some(1));
+        assert_eq!(vector_slot("Z"), Some(2));
+        assert_eq!(vector_slot("R"), None);
+        assert_eq!(vector_slot("B"), None);
     }
 
     #[test]
@@ -407,6 +468,48 @@ mod tests {
         assert_eq!(
             (g[0].r, g[0].g, g[0].b, g[0].a),
             (Some(0), Some(1), Some(2), Some(3))
+        );
+    }
+
+    #[test]
+    fn depth_z_does_not_clobber_blue_in_rgba_group() {
+        // Regression: a Blender beauty pass with an unprefixed RGBA layer plus a
+        // depth `Z` channel. EXR stores channels alphabetically on disk, so the
+        // list order is A, B, G, R, Z (indices 0..=4). The Blue slot must resolve
+        // to the real `B` channel (index 1), NOT the `Z` depth channel (index 4),
+        // which previously overwrote it and rendered pure white.
+        let g = group_channels(&names(&["A", "B", "G", "R", "Z"]));
+
+        // The RGBA color group comes first, then the leftover depth channel.
+        assert_eq!(g.len(), 2);
+
+        let rgba = &g[0];
+        assert_eq!(rgba.group_key, "");
+        assert_eq!(
+            (rgba.r, rgba.g, rgba.b, rgba.a),
+            (Some(3), Some(2), Some(1), Some(0)),
+            "blue must point at B (idx 1), not Z (idx 4)"
+        );
+
+        // The depth Z surfaces as its own grayscale layer.
+        let depth = &g[1];
+        assert_eq!(depth.group_key, "Z");
+        assert_eq!(
+            (depth.r, depth.g, depth.b, depth.a),
+            (Some(4), Some(4), Some(4), None)
+        );
+    }
+
+    #[test]
+    fn vector_pass_maps_xyz_without_leftovers() {
+        // A pure normal pass (no R/G/B) still maps X/Y/Z -> r/g/b and emits no
+        // extra grayscale layer.
+        let g = group_channels(&names(&["N.X", "N.Y", "N.Z"]));
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].group_key, "N");
+        assert_eq!(
+            (g[0].r, g[0].g, g[0].b, g[0].a),
+            (Some(0), Some(1), Some(2), None)
         );
     }
 

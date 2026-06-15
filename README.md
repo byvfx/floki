@@ -9,6 +9,8 @@
 
 Powered by `egui`, `wgpu`, and the pure-Rust `exr` crate, it allows you to instantly view dense pixel data, isolate color channels, explore unbounded floating-point histograms, and perform pixel-perfect A/B diffing natively on your GPU.
 
+![Floki viewer](assets/floki-1.4.png)
+
 ---
 
 ## Key Features
