@@ -37,7 +37,37 @@ pub struct GpuState {
     pub default_lut_bind_group: Arc<wgpu::BindGroup>,
     pub sampler: wgpu::Sampler,
     pub lut_sampler: wgpu::Sampler,
+    /// Same shader/layout as `pipeline` but renders into an `Rgba32Float` offscreen target
+    /// (the OCIO "pass 1" scene-linear buffer). Drive it with `srgb=0, gamma=1, enable_lut=0`
+    /// so it emits linear color for the OCIO display transform.
+    #[cfg(feature = "ocio")]
+    pub pipeline_linear: wgpu::RenderPipeline,
+    /// Blits the OCIO display texture into egui's render pass (OCIO "paint").
+    #[cfg(feature = "ocio")]
+    pub blit_pipeline: wgpu::RenderPipeline,
+    #[cfg(feature = "ocio")]
+    pub blit_layout: wgpu::BindGroupLayout,
+    #[cfg(feature = "ocio")]
+    pub blit_sampler: wgpu::Sampler,
 }
+
+#[cfg(feature = "ocio")]
+const BLIT_SHADER: &str = r#"
+struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VOut {
+    var c = array<vec2<f32>, 3>(vec2<f32>(-1.0,-1.0), vec2<f32>(3.0,-1.0), vec2<f32>(-1.0,3.0));
+    let xy = c[vi];
+    var o: VOut;
+    o.pos = vec4<f32>(xy, 0.0, 1.0);
+    o.uv = vec2<f32>((xy.x + 1.0) * 0.5, 1.0 - (xy.y + 1.0) * 0.5);
+    return o;
+}
+@group(0) @binding(0) var t: texture_2d<f32>;
+@group(0) @binding(1) var s: sampler;
+@fragment
+fn fs_main(i: VOut) -> @location(0) vec4<f32> { return textureSample(t, s, i.uv); }
+"#;
 
 impl GpuState {
     pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
@@ -224,6 +254,99 @@ impl GpuState {
                 ],
             }));
 
+        #[cfg(feature = "ocio")]
+        let pipeline_linear = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Exr Linear Offscreen Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba32Float,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        #[cfg(feature = "ocio")]
+        let (blit_pipeline, blit_layout, blit_sampler) = {
+            let blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Blit Shader"),
+                source: wgpu::ShaderSource::Wgsl(BLIT_SHADER.into()),
+            });
+            let blit_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Blit Bind Group Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                        count: None,
+                    },
+                ],
+            });
+            let blit_pl_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Blit Pipeline Layout"),
+                bind_group_layouts: &[Some(&blit_layout)],
+                immediate_size: 0,
+            });
+            let blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Blit Pipeline"),
+                layout: Some(&blit_pl_layout),
+                vertex: wgpu::VertexState {
+                    module: &blit_shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &blit_shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: target_format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+            let blit_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("Blit Sampler"),
+                mag_filter: wgpu::FilterMode::Nearest,
+                min_filter: wgpu::FilterMode::Nearest,
+                ..Default::default()
+            });
+            (blit_pipeline, blit_layout, blit_sampler)
+        };
+
         Self {
             pipeline,
             bind_group_layout_tex,
@@ -233,6 +356,14 @@ impl GpuState {
             default_lut_bind_group,
             sampler,
             lut_sampler,
+            #[cfg(feature = "ocio")]
+            pipeline_linear,
+            #[cfg(feature = "ocio")]
+            blit_pipeline,
+            #[cfg(feature = "ocio")]
+            blit_layout,
+            #[cfg(feature = "ocio")]
+            blit_sampler,
         }
     }
 

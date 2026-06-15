@@ -250,6 +250,199 @@ impl OcioGpuPass {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Two-pass viewer integration: pass 1 (composite + exposure -> scene-linear
+// offscreen) then pass 2 (OCIO display transform), blitted into egui's pass.
+// ---------------------------------------------------------------------------
+
+use std::sync::Arc;
+
+use crate::gpu::GpuState;
+
+/// Screen-sized offscreen targets for the OCIO path, plus the blit bind group for `paint`.
+/// Recreated when the viewport size changes.
+pub struct OcioTargets {
+    width: u32,
+    height: u32,
+    scene_view: wgpu::TextureView,
+    display_view: wgpu::TextureView,
+    blit_bind_group: wgpu::BindGroup,
+    _scene: wgpu::Texture,
+    _display: wgpu::Texture,
+}
+
+impl OcioTargets {
+    fn new(
+        device: &wgpu::Device,
+        blit_layout: &wgpu::BindGroupLayout,
+        blit_sampler: &wgpu::Sampler,
+        width: u32,
+        height: u32,
+        display_format: wgpu::TextureFormat,
+    ) -> Self {
+        let extent = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+        let scene = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("OCIO scene-linear target"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let display = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("OCIO display target"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: display_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let scene_view = scene.create_view(&wgpu::TextureViewDescriptor::default());
+        let display_view = display.create_view(&wgpu::TextureViewDescriptor::default());
+        let blit_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("OCIO blit bind group"),
+            layout: blit_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&display_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(blit_sampler),
+                },
+            ],
+        });
+        Self {
+            width,
+            height,
+            scene_view,
+            display_view,
+            blit_bind_group,
+            _scene: scene,
+            _display: display,
+        }
+    }
+}
+
+/// egui paint callback for the OCIO single-image path. Carries the same bind groups as the
+/// normal `ExrCallback`; `prepare` runs pass 1 (via `GpuState::pipeline_linear`) + pass 2
+/// (the `OcioGpuPass` in callback_resources), and `paint` blits the result.
+pub struct OcioCallback {
+    pub bg_a: Arc<wgpu::BindGroup>,
+    pub bg_b: Arc<wgpu::BindGroup>,
+    pub uniform_bg: wgpu::BindGroup,
+    pub lut_bg: Arc<wgpu::BindGroup>,
+    pub display_format: wgpu::TextureFormat,
+}
+
+impl eframe::egui_wgpu::CallbackTrait for OcioCallback {
+    fn prepare(
+        &self,
+        device: &wgpu::Device,
+        _queue: &wgpu::Queue,
+        screen_descriptor: &eframe::egui_wgpu::ScreenDescriptor,
+        _egui_encoder: &mut wgpu::CommandEncoder,
+        callback_resources: &mut eframe::egui_wgpu::CallbackResources,
+    ) -> Vec<wgpu::CommandBuffer> {
+        let [w, h] = screen_descriptor.size_in_pixels;
+        let (w, h) = (w.max(1), h.max(1));
+
+        // (Re)create offscreen targets on first use / resize.
+        let need_new = callback_resources
+            .get::<OcioTargets>()
+            .is_none_or(|t| t.width != w || t.height != h);
+        if need_new {
+            let (blit_layout, blit_sampler) = {
+                let gpu = callback_resources.get::<GpuState>().unwrap();
+                (gpu.blit_layout.clone(), gpu.blit_sampler.clone())
+            };
+            let targets =
+                OcioTargets::new(device, &blit_layout, &blit_sampler, w, h, self.display_format);
+            callback_resources.insert(targets);
+        }
+
+        // The OCIO pass may not exist yet (config not loaded); nothing to do then.
+        if callback_resources.get::<OcioGpuPass>().is_none() {
+            return Vec::new();
+        }
+
+        let gpu = callback_resources.get::<GpuState>().unwrap();
+        let ocio = callback_resources.get::<OcioGpuPass>().unwrap();
+        let targets = callback_resources.get::<OcioTargets>().unwrap();
+
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("OCIO") });
+
+        // Pass 1: composite + exposure into scene-linear (uniforms set srgb=0/gamma=1/lut=0).
+        {
+            let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("OCIO pass 1 (scene-linear)"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &targets.scene_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            rp.set_viewport(0.0, 0.0, w as f32, h as f32, 0.0, 1.0);
+            rp.set_pipeline(&gpu.pipeline_linear);
+            rp.set_bind_group(0, self.bg_a.as_ref(), &[]);
+            rp.set_bind_group(1, self.bg_b.as_ref(), &[]);
+            rp.set_bind_group(2, &self.uniform_bg, &[]);
+            rp.set_bind_group(3, self.lut_bg.as_ref(), &[]);
+            rp.draw(0..6, 0..1);
+        }
+
+        // Pass 2: OCIO display transform scene-linear -> display.
+        ocio.render(device, &mut encoder, &targets.scene_view, &targets.display_view);
+
+        vec![encoder.finish()]
+    }
+
+    fn paint(
+        &self,
+        info: eframe::egui::PaintCallbackInfo,
+        render_pass: &mut wgpu::RenderPass<'static>,
+        callback_resources: &eframe::egui_wgpu::CallbackResources,
+    ) {
+        let Some(gpu) = callback_resources.get::<GpuState>() else {
+            return;
+        };
+        let Some(targets) = callback_resources.get::<OcioTargets>() else {
+            return;
+        };
+        // Override egui's per-primitive viewport to full screen so the screen-aligned display
+        // texture maps 1:1; egui's scissor (the callback clip rect) limits what's shown.
+        render_pass.set_viewport(
+            0.0,
+            0.0,
+            info.screen_size_px[0] as f32,
+            info.screen_size_px[1] as f32,
+            0.0,
+            1.0,
+        );
+        render_pass.set_pipeline(&gpu.blit_pipeline);
+        render_pass.set_bind_group(0, &targets.blit_bind_group, &[]);
+        render_pass.draw(0..3, 0..1);
+    }
+}
+
 fn view_dim(dim: TexDim) -> wgpu::TextureViewDimension {
     match dim {
         TexDim::D1 => wgpu::TextureViewDimension::D1,

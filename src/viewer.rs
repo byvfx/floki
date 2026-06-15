@@ -93,6 +93,10 @@ pub struct ExrViewer {
     pub gamma: f32,
     pub srgb: bool,
     pub enable_lut: bool,
+    /// When true (OCIO config loaded + enabled), the single-image central path renders via the
+    /// two-pass OCIO callback instead of the direct display chain. Set by the app.
+    #[cfg(feature = "ocio")]
+    pub ocio_active: bool,
     pub show_tooltip: bool,
     pub channel_mode: ChannelMode,
     pub compare_mode: CompareMode,
@@ -148,6 +152,8 @@ impl Default for ExrViewer {
             gamma: 1.0,
             srgb: true,
             enable_lut: false,
+            #[cfg(feature = "ocio")]
+            ocio_active: false,
             show_tooltip: true,
             channel_mode: ChannelMode::RGB,
             compare_mode: CompareMode::SingleA,
@@ -962,6 +968,8 @@ impl ExrViewer {
                             .unwrap_or_else(|| gpu_state.default_lut_bind_group.clone());
                         (layout, lut, gpu_state.default_tex_bind_group.clone())
                     };
+                    #[cfg(feature = "ocio")]
+                    let ocio_active = self.ocio_active;
                     let draw_gpu =
                         |painter: &egui::Painter,
                          bg_a: std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>,
@@ -977,6 +985,15 @@ impl ExrViewer {
                             u.is_diff_mode = if is_diff { 1 } else { 0 };
                             u.is_composite = if is_composite { 1 } else { 0 };
                             u.opacity = opacity;
+
+                            // OCIO path: pass 1 must emit scene-linear, so bypass the built-in
+                            // display chain (sRGB/gamma/.cube LUT). Exposure stays (linear).
+                            #[cfg(feature = "ocio")]
+                            if ocio_active {
+                                u.srgb = 0;
+                                u.gamma = 1.0;
+                                u.enable_lut = 0;
+                            }
 
                             let device = &render_state.as_ref().unwrap().device;
 
@@ -1001,6 +1018,27 @@ impl ExrViewer {
                             );
 
                             let bg_b = bg_b_opt.unwrap_or_else(|| default_tex_bg.clone());
+                            let final_clip_rect = painter.clip_rect().intersect(clip_rect);
+
+                            #[cfg(feature = "ocio")]
+                            if ocio_active {
+                                let display_format =
+                                    render_state.as_ref().unwrap().target_format;
+                                let callback = crate::gpu::ocio_pass::OcioCallback {
+                                    bg_a,
+                                    bg_b,
+                                    uniform_bg,
+                                    lut_bg: active_lut_bg.clone(),
+                                    display_format,
+                                };
+                                painter.with_clip_rect(final_clip_rect).add(
+                                    eframe::egui_wgpu::Callback::new_paint_callback(
+                                        final_clip_rect,
+                                        callback,
+                                    ),
+                                );
+                                return;
+                            }
 
                             let callback = crate::gpu::ExrCallback {
                                 bg_a,
@@ -1008,8 +1046,6 @@ impl ExrViewer {
                                 uniform_bg,
                                 lut_bg: active_lut_bg.clone(),
                             };
-
-                            let final_clip_rect = painter.clip_rect().intersect(clip_rect);
                             painter.with_clip_rect(final_clip_rect).add(
                                 eframe::egui_wgpu::Callback::new_paint_callback(
                                     final_clip_rect,
@@ -1254,7 +1290,13 @@ impl ExrViewer {
                         };
 
                         let is_sbs = matches!(comp_mode, CompareMode::SideBySide);
-                        if self.overscan_opacity > 0.0 && !is_sbs {
+                        // OCIO runs once per frame over screen-sized offscreen targets, so the
+                        // overscan dim pass (a 2nd draw) is suppressed while OCIO is active.
+                        #[cfg(feature = "ocio")]
+                        let suppress_overscan = self.ocio_active;
+                        #[cfg(not(feature = "ocio"))]
+                        let suppress_overscan = false;
+                        if self.overscan_opacity > 0.0 && !is_sbs && !suppress_overscan {
                             draw_all(&unclipped_painter, self.overscan_opacity);
                         }
                         // Side-by-Side renders at full brightness with the full-canvas
