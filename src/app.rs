@@ -202,10 +202,14 @@ impl ExrApp {
         use floki_ocio::{ConfigSource, OcioConfig};
 
         self.ocio_error = None;
-        let src = if self.ocio_path.trim().is_empty() {
-            ConfigSource::BuiltIn("ocio://default")
-        } else {
+        // Precedence: explicit path > $OCIO env > built-in ACES.
+        let env_ocio = std::env::var("OCIO").ok().filter(|v| !v.trim().is_empty());
+        let src = if !self.ocio_path.trim().is_empty() {
             ConfigSource::File(std::path::Path::new(&self.ocio_path))
+        } else if env_ocio.is_some() {
+            ConfigSource::Env
+        } else {
+            ConfigSource::BuiltIn("ocio://default")
         };
         let cfg = match OcioConfig::load(src) {
             Ok(c) => c,
@@ -590,6 +594,18 @@ impl eframe::App for ExrApp {
                             ocio_load_requested = true;
                         }
                     });
+
+                    // Clarify what an empty path resolves to.
+                    if self.ocio_path.trim().is_empty() {
+                        let hint = match std::env::var("OCIO")
+                            .ok()
+                            .filter(|v| !v.trim().is_empty())
+                        {
+                            Some(v) => format!("Empty path → using $OCIO: {v}"),
+                            None => "Empty path → using built-in ACES (ocio://default)".to_string(),
+                        };
+                        ui.label(egui::RichText::new(hint).weak());
+                    }
 
                     if !ocio_displays.is_empty() {
                         egui::ComboBox::from_label("Input color space")

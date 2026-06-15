@@ -126,6 +126,19 @@ fn build_gpu_shader_produces_spirv_bindings_and_wgsl() {
 
 #[test]
 #[cfg(feature = "_native")]
+fn env_config_source_reads_ocio_var() {
+    // `$OCIO` accepts built-in URIs too, so this exercises the Env path without a config file.
+    // SAFETY: no other test reads/writes the OCIO env var.
+    unsafe { std::env::set_var("OCIO", "ocio://default") };
+    let result = floki_ocio::OcioConfig::load(ConfigSource::Env);
+    unsafe { std::env::remove_var("OCIO") };
+
+    let cfg = result.expect("should load the config named by $OCIO");
+    assert!(!cfg.displays().is_empty(), "config from $OCIO must enumerate displays");
+}
+
+#[test]
+#[cfg(feature = "_native")]
 fn apply_rgba_rejects_wrong_buffer_length() {
     use floki_ocio::{DisplayTransformRequest, OcioError};
 
