@@ -618,6 +618,190 @@ impl ExrViewer {
         });
     }
 
+    /// Drop cached CPU textures (thumbnails / fallback) when the OCIO CPU
+    /// processor changes, so they regenerate with — or without — the display
+    /// transform. A no-op while the processor identity is unchanged.
+    #[cfg(feature = "ocio")]
+    fn invalidate_ocio_cpu_textures(&mut self) {
+        let sig = if self.ocio_active {
+            self.ocio_cpu
+                .as_ref()
+                .map(|p| std::rc::Rc::as_ptr(p) as usize)
+                .unwrap_or(1)
+        } else {
+            0
+        };
+        if sig != self.ocio_sig {
+            self.ocio_sig = sig;
+            self.textures.fill(None);
+            self.textures_b.fill(None);
+        }
+    }
+
+    /// While blink is active (and B is loaded), alternate the displayed image
+    /// between A and B on `blink_interval`, requesting repaints to keep cycling.
+    fn apply_blink_mode(&mut self, ui: &egui::Ui, has_b: bool) {
+        if self.blink_state && has_b {
+            ui.ctx().request_repaint();
+            let time = ui.input(|i| i.time);
+            if ((time / self.blink_interval as f64) as usize).is_multiple_of(2) {
+                self.compare_mode = CompareMode::SingleA;
+            } else {
+                self.compare_mode = CompareMode::SingleB;
+            }
+        }
+    }
+
+    /// Resize the per-layer texture caches to the current A/B layer counts,
+    /// clearing them (forcing regeneration) whenever a count changes.
+    fn sync_texture_caches(&mut self, layer_count: usize, layer_count_b: usize) {
+        if self.textures.len() != layer_count {
+            self.textures.clear();
+            self.textures.resize(layer_count, None);
+            self.gpu_textures.clear();
+            self.gpu_textures.resize(layer_count, None);
+        }
+        if self.textures_b.len() != layer_count_b {
+            self.textures_b.clear();
+            self.textures_b.resize(layer_count_b, None);
+            self.gpu_textures_b.clear();
+            self.gpu_textures_b.resize(layer_count_b, None);
+        }
+    }
+
+    /// Render the contact sheet: a scrollable grid of per-layer thumbnails for A
+    /// (and B alongside, in the side-by-side / wipe / diff modes). Clicking a
+    /// thumbnail selects that layer and leaves the sheet.
+    fn draw_contact_sheet(
+        &mut self,
+        ui: &mut egui::Ui,
+        exr_data: &ExrData,
+        exr_data_b: Option<&ExrData>,
+    ) {
+        let draw_sheet = |viewer: &mut ExrViewer,
+                          ui: &mut egui::Ui,
+                          data: &crate::exr_loader::ExrData,
+                          is_a: bool| {
+            let l_count = data.logical_layers.len();
+            egui::ScrollArea::vertical()
+                .id_salt(if is_a { "sheet_a" } else { "sheet_b" })
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(16.0, 16.0);
+                        for i in 0..l_count {
+                            let tex_opt = if is_a {
+                                if viewer.textures[i].is_none() {
+                                    viewer.textures[i] = viewer.generate_texture(ui.ctx(), data, i);
+                                }
+                                viewer.textures[i].as_ref()
+                            } else {
+                                if viewer.textures_b[i].is_none() {
+                                    viewer.textures_b[i] =
+                                        viewer.generate_texture(ui.ctx(), data, i);
+                                }
+                                viewer.textures_b[i].as_ref()
+                            };
+
+                            if let Some(texture) = tex_opt {
+                                // Reserve an EXACTLY uniform cell, then position the image and
+                                // label by absolute geometry. Auto-layout (allocate_ui /
+                                // vertical_centered) let cell heights vary by a few px (inherited
+                                // item-spacing + variable label line count), and horizontal_wrapped
+                                // then center-aligned those unequal cells by different amounts —
+                                // producing the slight vertical "staircase". Fixed rects + paint_at
+                                // remove that degree of freedom entirely.
+                                let thumb_width = 256.0;
+                                let thumb_box = 256.0;
+                                let label_height = 30.0;
+                                let tex_size = texture.size_vec2();
+                                let aspect = if tex_size.y > 0.0 {
+                                    tex_size.x / tex_size.y
+                                } else {
+                                    1.0
+                                };
+                                let (fit_w, fit_h) = if aspect >= 1.0 {
+                                    (thumb_box, thumb_box / aspect)
+                                } else {
+                                    (thumb_box * aspect, thumb_box)
+                                };
+                                let name = data
+                                    .logical_layers
+                                    .get(i)
+                                    .map(|l| l.name.as_str())
+                                    .unwrap_or("Unnamed");
+
+                                let (cell_rect, response) = ui.allocate_exact_size(
+                                    egui::vec2(thumb_width, thumb_box + label_height),
+                                    egui::Sense::click(),
+                                );
+
+                                // Image: centered horizontally, centered within the top square box.
+                                let img_rect = egui::Rect::from_center_size(
+                                    egui::pos2(
+                                        cell_rect.center().x,
+                                        cell_rect.top() + thumb_box * 0.5,
+                                    ),
+                                    egui::vec2(fit_w, fit_h),
+                                );
+                                egui::Image::new(texture).paint_at(ui, img_rect);
+
+                                // Label: centered in the strip beneath the box.
+                                ui.painter().text(
+                                    egui::pos2(
+                                        cell_rect.center().x,
+                                        cell_rect.top() + thumb_box + label_height * 0.5,
+                                    ),
+                                    egui::Align2::CENTER_CENTER,
+                                    format!("{}: {}", i, name),
+                                    egui::FontId::proportional(14.0),
+                                    ui.visuals().strong_text_color(),
+                                );
+
+                                if response.clicked() {
+                                    viewer.active_layer = i;
+                                    viewer.show_contact_sheet = false;
+                                    viewer.first_frame = true;
+                                    if !is_a {
+                                        viewer.compare_mode = CompareMode::SingleB;
+                                    } else if viewer.compare_mode == CompareMode::SingleB {
+                                        viewer.compare_mode = CompareMode::SingleA;
+                                    }
+                                }
+                                if response.hovered() {
+                                    response
+                                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                        .on_hover_text("Click to view layer");
+                                }
+                            }
+                        }
+                    });
+                });
+        };
+
+        if let CompareMode::SideBySide | CompareMode::Wipe | CompareMode::DiffMatte =
+            self.compare_mode
+        {
+            if let Some(exr_b) = exr_data_b {
+                ui.columns(2, |cols| {
+                    cols[0].heading("Image A");
+                    draw_sheet(self, &mut cols[0], exr_data, true);
+                    cols[1].heading("Image B");
+                    draw_sheet(self, &mut cols[1], exr_b, false);
+                });
+            } else {
+                draw_sheet(self, ui, exr_data, true);
+            }
+        } else if self.compare_mode == CompareMode::SingleB {
+            if let Some(exr_b) = exr_data_b {
+                draw_sheet(self, ui, exr_b, false);
+            } else {
+                ui.label("Image B not loaded.");
+            }
+        } else {
+            draw_sheet(self, ui, exr_data, true);
+        }
+    }
+
     pub fn ui(
         &mut self,
         ui: &mut egui::Ui,
@@ -628,34 +812,10 @@ impl ExrViewer {
     ) {
         self.handle_hotkeys(ui, exr_data_b.is_some());
 
-        // Invalidate cached CPU textures (thumbnails / fallback) when the OCIO CPU state
-        // changes, so they regenerate with — or without — the display transform.
         #[cfg(feature = "ocio")]
-        {
-            let sig = if self.ocio_active {
-                self.ocio_cpu
-                    .as_ref()
-                    .map(|p| std::rc::Rc::as_ptr(p) as usize)
-                    .unwrap_or(1)
-            } else {
-                0
-            };
-            if sig != self.ocio_sig {
-                self.ocio_sig = sig;
-                self.textures.fill(None);
-                self.textures_b.fill(None);
-            }
-        }
+        self.invalidate_ocio_cpu_textures();
 
-        if self.blink_state && exr_data_b.is_some() {
-            ui.ctx().request_repaint();
-            let time = ui.input(|i| i.time);
-            if ((time / self.blink_interval as f64) as usize).is_multiple_of(2) {
-                self.compare_mode = CompareMode::SingleA;
-            } else {
-                self.compare_mode = CompareMode::SingleB;
-            }
-        }
+        self.apply_blink_mode(ui, exr_data_b.is_some());
 
         let layer_count = exr_data.logical_layers.len();
         egui::Panel::top("viewer_controls").show_inside(ui, |ui| {
@@ -663,144 +823,11 @@ impl ExrViewer {
             self.animated_mode_param_row(ui);
         });
 
-        if self.textures.len() != layer_count {
-            self.textures.clear();
-            self.textures.resize(layer_count, None);
-            self.gpu_textures.clear();
-            self.gpu_textures.resize(layer_count, None);
-        }
         let layer_count_b = exr_data_b.map(|d| d.logical_layers.len()).unwrap_or(0);
-        if self.textures_b.len() != layer_count_b {
-            self.textures_b.clear();
-            self.textures_b.resize(layer_count_b, None);
-            self.gpu_textures_b.clear();
-            self.gpu_textures_b.resize(layer_count_b, None);
-        }
+        self.sync_texture_caches(layer_count, layer_count_b);
 
         if self.show_contact_sheet {
-            let draw_sheet = |viewer: &mut ExrViewer,
-                              ui: &mut egui::Ui,
-                              data: &crate::exr_loader::ExrData,
-                              is_a: bool| {
-                let l_count = data.logical_layers.len();
-                egui::ScrollArea::vertical()
-                    .id_salt(if is_a { "sheet_a" } else { "sheet_b" })
-                    .show(ui, |ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.spacing_mut().item_spacing = egui::vec2(16.0, 16.0);
-                            for i in 0..l_count {
-                                let tex_opt = if is_a {
-                                    if viewer.textures[i].is_none() {
-                                        viewer.textures[i] =
-                                            viewer.generate_texture(ui.ctx(), data, i);
-                                    }
-                                    viewer.textures[i].as_ref()
-                                } else {
-                                    if viewer.textures_b[i].is_none() {
-                                        viewer.textures_b[i] =
-                                            viewer.generate_texture(ui.ctx(), data, i);
-                                    }
-                                    viewer.textures_b[i].as_ref()
-                                };
-
-                                if let Some(texture) = tex_opt {
-                                    // Reserve an EXACTLY uniform cell, then position the image and
-                                    // label by absolute geometry. Auto-layout (allocate_ui /
-                                    // vertical_centered) let cell heights vary by a few px (inherited
-                                    // item-spacing + variable label line count), and horizontal_wrapped
-                                    // then center-aligned those unequal cells by different amounts —
-                                    // producing the slight vertical "staircase". Fixed rects + paint_at
-                                    // remove that degree of freedom entirely.
-                                    let thumb_width = 256.0;
-                                    let thumb_box = 256.0;
-                                    let label_height = 30.0;
-                                    let tex_size = texture.size_vec2();
-                                    let aspect = if tex_size.y > 0.0 {
-                                        tex_size.x / tex_size.y
-                                    } else {
-                                        1.0
-                                    };
-                                    let (fit_w, fit_h) = if aspect >= 1.0 {
-                                        (thumb_box, thumb_box / aspect)
-                                    } else {
-                                        (thumb_box * aspect, thumb_box)
-                                    };
-                                    let name = data
-                                        .logical_layers
-                                        .get(i)
-                                        .map(|l| l.name.as_str())
-                                        .unwrap_or("Unnamed");
-
-                                    let (cell_rect, response) = ui.allocate_exact_size(
-                                        egui::vec2(thumb_width, thumb_box + label_height),
-                                        egui::Sense::click(),
-                                    );
-
-                                    // Image: centered horizontally, centered within the top square box.
-                                    let img_rect = egui::Rect::from_center_size(
-                                        egui::pos2(
-                                            cell_rect.center().x,
-                                            cell_rect.top() + thumb_box * 0.5,
-                                        ),
-                                        egui::vec2(fit_w, fit_h),
-                                    );
-                                    egui::Image::new(texture).paint_at(ui, img_rect);
-
-                                    // Label: centered in the strip beneath the box.
-                                    ui.painter().text(
-                                        egui::pos2(
-                                            cell_rect.center().x,
-                                            cell_rect.top() + thumb_box + label_height * 0.5,
-                                        ),
-                                        egui::Align2::CENTER_CENTER,
-                                        format!("{}: {}", i, name),
-                                        egui::FontId::proportional(14.0),
-                                        ui.visuals().strong_text_color(),
-                                    );
-
-                                    if response.clicked() {
-                                        viewer.active_layer = i;
-                                        viewer.show_contact_sheet = false;
-                                        viewer.first_frame = true;
-                                        if !is_a {
-                                            viewer.compare_mode = CompareMode::SingleB;
-                                        } else if viewer.compare_mode == CompareMode::SingleB {
-                                            viewer.compare_mode = CompareMode::SingleA;
-                                        }
-                                    }
-                                    if response.hovered() {
-                                        response
-                                            .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                            .on_hover_text("Click to view layer");
-                                    }
-                                }
-                            }
-                        });
-                    });
-            };
-
-            if let CompareMode::SideBySide | CompareMode::Wipe | CompareMode::DiffMatte =
-                self.compare_mode
-            {
-                if let Some(exr_b) = exr_data_b {
-                    ui.columns(2, |cols| {
-                        cols[0].heading("Image A");
-                        draw_sheet(self, &mut cols[0], exr_data, true);
-                        cols[1].heading("Image B");
-                        draw_sheet(self, &mut cols[1], exr_b, false);
-                    });
-                } else {
-                    draw_sheet(self, ui, exr_data, true);
-                }
-            } else if self.compare_mode == CompareMode::SingleB {
-                if let Some(exr_b) = exr_data_b {
-                    draw_sheet(self, ui, exr_b, false);
-                } else {
-                    ui.label("Image B not loaded.");
-                }
-            } else {
-                draw_sheet(self, ui, exr_data, true);
-            }
+            self.draw_contact_sheet(ui, exr_data, exr_data_b);
         } else {
             // Channel/frame hotkeys are handled up-front in `handle_hotkeys`.
             let (tw, th) = exr_data.logical_size(self.active_layer).unwrap_or((1, 1));
