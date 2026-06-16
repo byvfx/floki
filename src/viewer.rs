@@ -995,8 +995,9 @@ impl ExrViewer {
 
                 let image_rect = egui::Rect::from_min_size(disp_rect.min + data_offset, image_size);
 
+                // The display-window overlays below paint unclipped; the draw paths
+                // recompute their own display-clipped painter from `layout`.
                 let unclipped_painter = ui.painter().with_clip_rect(rect);
-                let painter = ui.painter().with_clip_rect(rect.intersect(disp_rect));
 
                 // Draw display window bounding box
                 if !is_side_by_side {
@@ -1048,508 +1049,8 @@ impl ExrViewer {
                     is_side_by_side,
                 };
 
-                if let Some(_rs) = render_state {
-                    // GPU RENDER PATH
-                    use eframe::egui_wgpu::wgpu::util::DeviceExt;
-                    let uniform_data = crate::gpu::Uniforms {
-                        rect_min: [image_rect.min.x, image_rect.min.y],
-                        rect_max: [image_rect.max.x, image_rect.max.y],
-                        screen_size: [
-                            ui.ctx().content_rect().width(),
-                            ui.ctx().content_rect().height(),
-                        ],
-                        exposure: self.exposure,
-                        gamma: self.gamma,
-                        diff_multiplier: self.diff_multiplier,
-                        channel_mode: self.channel_mode.as_u32(),
-                        is_diff_mode: 0,
-                        srgb: if self.srgb { 1 } else { 0 },
-                        enable_lut: if self.enable_lut { 1 } else { 0 },
-                        opacity: 1.0,
-                        is_composite: 0,
-                        blend_mode: self.blend_mode.as_u32(),
-                        is_wipe_mode: if self.compare_mode == CompareMode::Wipe {
-                            1
-                        } else {
-                            0
-                        },
-                        wipe_center: self.wipe_center,
-                        wipe_angle: self.wipe_angle.to_radians(),
-                        skip_checker: 0,
-                        _pad0: 0,
-                        _pad1: 0,
-                        _pad2: 0,
-                    };
-
-                    // Acquire the renderer read-lock ONCE per frame: clone out the
-                    // cheap (Arc-backed) uniform bind-group layout and the active LUT
-                    // bind group. `draw_gpu` then builds its per-draw buffer without
-                    // re-locking or re-looking-up GpuState. A single shared uniform
-                    // buffer is NOT viable: egui defers paint callbacks, so each of the
-                    // (up to 4) draws per frame needs its own immutable uniform snapshot
-                    // alive until paint time.
-                    let (uniform_layout, active_lut_bg, default_tex_bg) = {
-                        let guard = render_state.as_ref().unwrap().renderer.read();
-                        let gpu_state = guard
-                            .callback_resources
-                            .get::<crate::gpu::GpuState>()
-                            .unwrap();
-                        let layout = gpu_state.bind_group_layout_uniform.clone();
-                        let lut = lut_bg_opt
-                            .clone()
-                            .unwrap_or_else(|| gpu_state.default_lut_bind_group.clone());
-                        (layout, lut, gpu_state.default_tex_bind_group.clone())
-                    };
-                    #[cfg(feature = "ocio")]
-                    let ocio_active = self.ocio_active;
-                    // Under OCIO, draw_gpu accumulates pass-1 draws here instead of emitting a
-                    // callback per call; a single OcioCallback covering the whole frame (both
-                    // side-by-side images included) is emitted after draw_all.
-                    #[cfg(feature = "ocio")]
-                    let ocio_draws: std::cell::RefCell<
-                        Vec<crate::gpu::ocio_pass::OcioPass1Draw>,
-                    > = std::cell::RefCell::new(Vec::new());
-                    // Running FNV-1a hash of everything that affects the OCIO render (uniforms +
-                    // texture identities) so the (expensive) display transform is skipped on
-                    // repaints that change nothing — hover, menus, animations.
-                    #[cfg(feature = "ocio")]
-                    let ocio_sig = std::cell::Cell::new(0xcbf29ce484222325u64);
-                    let draw_gpu =
-                        |painter: &egui::Painter,
-                         bg_a: std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>,
-                         bg_b_opt: Option<std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>>,
-                         clip_rect: egui::Rect,
-                         target_rect: egui::Rect,
-                         is_diff: bool,
-                         is_composite: bool,
-                         opacity: f32| {
-                            let mut u = uniform_data;
-                            u.rect_min = [target_rect.min.x, target_rect.min.y];
-                            u.rect_max = [target_rect.max.x, target_rect.max.y];
-                            u.is_diff_mode = if is_diff { 1 } else { 0 };
-                            u.is_composite = if is_composite { 1 } else { 0 };
-                            u.opacity = opacity;
-
-                            // OCIO path: pass 1 must emit scene-linear, so bypass the built-in
-                            // display chain (sRGB/gamma/.cube LUT). Exposure stays (linear).
-                            #[cfg(feature = "ocio")]
-                            if ocio_active {
-                                u.srgb = 0;
-                                u.gamma = 1.0;
-                                u.enable_lut = 0;
-                                // Don't bake the checker into scene-linear; it's composited
-                                // in display space (blit pass) after the OCIO transform.
-                                u.skip_checker = 1;
-                            }
-
-                            let device = &render_state.as_ref().unwrap().device;
-
-                            let uniform_buffer = device.create_buffer_init(
-                                &eframe::egui_wgpu::wgpu::util::BufferInitDescriptor {
-                                    label: Some("Exr Uniform Buffer"),
-                                    contents: bytemuck::bytes_of(&u),
-                                    usage: eframe::egui_wgpu::wgpu::BufferUsages::UNIFORM
-                                        | eframe::egui_wgpu::wgpu::BufferUsages::COPY_DST,
-                                },
-                            );
-
-                            let uniform_bg = device.create_bind_group(
-                                &eframe::egui_wgpu::wgpu::BindGroupDescriptor {
-                                    label: Some("Exr Uniform Bind Group"),
-                                    layout: &uniform_layout,
-                                    entries: &[eframe::egui_wgpu::wgpu::BindGroupEntry {
-                                        binding: 0,
-                                        resource: uniform_buffer.as_entire_binding(),
-                                    }],
-                                },
-                            );
-
-                            let bg_b = bg_b_opt.unwrap_or_else(|| default_tex_bg.clone());
-                            let final_clip_rect = painter.clip_rect().intersect(clip_rect);
-
-                            // Diff is a false-color heat-map visualization (display-space,
-                            // not color-managed), so it always uses the normal pipeline —
-                            // even under OCIO it is NOT accumulated into the OCIO pass.
-                            #[cfg(feature = "ocio")]
-                            if ocio_active && !is_diff {
-                                // Fold this draw's inputs (uniform bytes + texture pointers) into
-                                // the per-frame render signature; OcioCallback re-renders only
-                                // when this changes.
-                                let mut h = ocio_sig.get();
-                                for chunk in bytemuck::bytes_of(&u).chunks(8) {
-                                    let mut b = [0u8; 8];
-                                    b[..chunk.len()].copy_from_slice(chunk);
-                                    h = (h ^ u64::from_le_bytes(b)).wrapping_mul(0x100000001b3);
-                                }
-                                for p in [
-                                    std::sync::Arc::as_ptr(&bg_a) as *const () as u64,
-                                    std::sync::Arc::as_ptr(&bg_b) as *const () as u64,
-                                    std::sync::Arc::as_ptr(&active_lut_bg) as *const () as u64,
-                                ] {
-                                    h = (h ^ p).wrapping_mul(0x100000001b3);
-                                }
-                                ocio_sig.set(h);
-
-                                // Accumulate; the single per-frame OcioCallback is emitted
-                                // after draw_all so one OCIO pass covers the whole frame.
-                                ocio_draws.borrow_mut().push(
-                                    crate::gpu::ocio_pass::OcioPass1Draw {
-                                        bg_a,
-                                        bg_b,
-                                        uniform_bg,
-                                        lut_bg: active_lut_bg.clone(),
-                                    },
-                                );
-                                return;
-                            }
-
-                            let callback = crate::gpu::ExrCallback {
-                                bg_a,
-                                bg_b,
-                                uniform_bg,
-                                lut_bg: active_lut_bg.clone(),
-                            };
-                            painter.with_clip_rect(final_clip_rect).add(
-                                eframe::egui_wgpu::Callback::new_paint_callback(
-                                    final_clip_rect,
-                                    callback,
-                                ),
-                            );
-                        };
-
-                    let bg_a_opt = self.gpu_textures[self.active_layer].clone();
-                    if let Some(bg_a) = bg_a_opt {
-                        let comp_mode = if self.blink_state {
-                            if ((ui.input(|i| i.time) / self.blink_interval as f64) as usize)
-                                .is_multiple_of(2)
-                            {
-                                CompareMode::SingleA
-                            } else {
-                                CompareMode::SingleB
-                            }
-                        } else {
-                            self.compare_mode
-                        };
-
-                        // Wipe interaction logic (drag to move, scroll to rotate)
-                        if self.compare_mode == CompareMode::Wipe {
-                            let center_screen = egui::pos2(
-                                image_rect.min.x + image_rect.width() * self.wipe_center[0],
-                                image_rect.min.y + image_rect.height() * self.wipe_center[1],
-                            );
-                            let handle_rect =
-                                egui::Rect::from_center_size(center_screen, egui::vec2(24.0, 24.0));
-                            let handle_id = ui.id().with("wipe_handle");
-                            let response = ui.interact(handle_rect, handle_id, egui::Sense::drag());
-
-                            if response.dragged() {
-                                let delta = response.drag_delta();
-                                self.wipe_center[0] = (self.wipe_center[0]
-                                    + delta.x / image_rect.width())
-                                .clamp(0.0, 1.0);
-                                self.wipe_center[1] = (self.wipe_center[1]
-                                    + delta.y / image_rect.height())
-                                .clamp(0.0, 1.0);
-                            }
-                            if response.hovered() {
-                                let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-                                if scroll != 0.0 {
-                                    self.wipe_angle =
-                                        (self.wipe_angle + scroll * 2.0).clamp(-180.0, 180.0);
-                                }
-                            }
-                        }
-
-                        let draw_all = |p: &egui::Painter, opac: f32| match comp_mode {
-                            CompareMode::SingleA => {
-                                draw_gpu(
-                                    p,
-                                    bg_a.clone(),
-                                    None,
-                                    rect,
-                                    image_rect,
-                                    false,
-                                    false,
-                                    opac,
-                                );
-                            }
-                            CompareMode::SingleB => {
-                                if let Some(bg_b) = exr_data_b.and_then(|d| {
-                                    self.gpu_textures_b[self
-                                        .active_layer
-                                        .min(d.logical_layers.len().saturating_sub(1))]
-                                    .clone()
-                                }) {
-                                    draw_gpu(
-                                        p,
-                                        bg_b.clone(),
-                                        None,
-                                        rect,
-                                        image_rect,
-                                        false,
-                                        false,
-                                        opac,
-                                    );
-                                }
-                            }
-                            CompareMode::Wipe => {
-                                let bg_b_opt = exr_data_b.and_then(|d| {
-                                    self.gpu_textures_b[self
-                                        .active_layer
-                                        .min(d.logical_layers.len().saturating_sub(1))]
-                                    .clone()
-                                });
-                                // Single draw call: the shader handles the wipe split.
-                                // Bind the real B texture so the shader can sample it when
-                                // is_wipe_mode is set; falls back to the default texture if
-                                // no B image is loaded.
-                                draw_gpu(
-                                    p,
-                                    bg_a.clone(),
-                                    bg_b_opt,
-                                    rect,
-                                    image_rect,
-                                    false,
-                                    false,
-                                    opac,
-                                );
-
-                                // Draw the rotated wipe line and handle
-                                let center_screen = egui::pos2(
-                                    image_rect.min.x + image_rect.width() * self.wipe_center[0],
-                                    image_rect.min.y + image_rect.height() * self.wipe_center[1],
-                                );
-                                let angle_rad = self.wipe_angle.to_radians();
-                                // Line direction is perpendicular to the normal (cos, sin)
-                                let dir = egui::vec2(-angle_rad.sin(), angle_rad.cos());
-                                let max_dist = image_rect.width().hypot(image_rect.height());
-                                let p1 = center_screen + dir * max_dist;
-                                let p2 = center_screen - dir * max_dist;
-
-                                let alpha = (self.wipe_line_opacity * 255.0) as u8;
-                                let color = egui::Color32::from_white_alpha(alpha);
-
-                                p.line_segment([p1, p2], (2.0, color));
-                                p.circle_filled(center_screen, 8.0, color);
-                            }
-                            CompareMode::SideBySide => {
-                                let bg_b_opt = exr_data_b.and_then(|d| {
-                                    self.gpu_textures_b[self
-                                        .active_layer
-                                        .min(d.logical_layers.len().saturating_sub(1))]
-                                    .clone()
-                                });
-                                if let Some(bg_b) = bg_b_opt {
-                                    let mut image_size_b = tex_size_b.unwrap() * self.scale;
-                                    if self.normalize_side_by_side {
-                                        let scale_b =
-                                            (tex_size.y * self.scale) / tex_size_b.unwrap().y;
-                                        image_size_b = tex_size_b.unwrap() * scale_b;
-                                    }
-                                    let combined_width = image_size.x + image_size_b.x;
-                                    let combined_height = image_size.y.max(image_size_b.y);
-                                    let combined_rect = egui::Rect::from_center_size(
-                                        rect.center() + self.translation,
-                                        egui::vec2(combined_width, combined_height),
-                                    );
-                                    let mut image_rect_a =
-                                        egui::Rect::from_min_size(combined_rect.min, image_size);
-                                    image_rect_a.set_center(egui::pos2(
-                                        image_rect_a.center().x,
-                                        combined_rect.center().y,
-                                    ));
-                                    let mut image_rect_b = egui::Rect::from_min_size(
-                                        egui::pos2(
-                                            combined_rect.min.x + image_size.x,
-                                            combined_rect.min.y,
-                                        ),
-                                        image_size_b,
-                                    );
-                                    image_rect_b.set_center(egui::pos2(
-                                        image_rect_b.center().x,
-                                        combined_rect.center().y,
-                                    ));
-
-                                    draw_gpu(
-                                        p,
-                                        bg_a.clone(),
-                                        None,
-                                        rect,
-                                        image_rect_a,
-                                        false,
-                                        false,
-                                        opac,
-                                    );
-                                    draw_gpu(
-                                        p,
-                                        bg_b.clone(),
-                                        None,
-                                        rect,
-                                        image_rect_b,
-                                        false,
-                                        false,
-                                        opac,
-                                    );
-                                    p.line_segment(
-                                        [
-                                            egui::pos2(image_rect_b.min.x, combined_rect.min.y),
-                                            egui::pos2(image_rect_b.min.x, combined_rect.max.y),
-                                        ],
-                                        (2.0, egui::Color32::GRAY),
-                                    );
-                                } else {
-                                    draw_gpu(
-                                        p,
-                                        bg_a.clone(),
-                                        None,
-                                        rect,
-                                        image_rect,
-                                        false,
-                                        false,
-                                        opac,
-                                    );
-                                }
-                            }
-                            CompareMode::DiffMatte => {
-                                let bg_b_opt = exr_data_b.and_then(|d| {
-                                    self.gpu_textures_b[self
-                                        .active_layer
-                                        .min(d.logical_layers.len().saturating_sub(1))]
-                                    .clone()
-                                });
-                                if let Some(bg_b) = bg_b_opt {
-                                    draw_gpu(
-                                        p,
-                                        bg_a.clone(),
-                                        Some(bg_b.clone()),
-                                        rect,
-                                        image_rect,
-                                        true,
-                                        false,
-                                        opac,
-                                    );
-                                }
-                            }
-                            CompareMode::Composite => {
-                                let bg_b_opt = exr_data_b.and_then(|d| {
-                                    self.gpu_textures_b[self
-                                        .active_layer
-                                        .min(d.logical_layers.len().saturating_sub(1))]
-                                    .clone()
-                                });
-                                if let Some(bg_b) = bg_b_opt {
-                                    draw_gpu(
-                                        p,
-                                        bg_a.clone(),
-                                        Some(bg_b.clone()),
-                                        rect,
-                                        image_rect,
-                                        false,
-                                        true,
-                                        opac,
-                                    );
-                                }
-                            }
-                        };
-
-                        let is_sbs = matches!(comp_mode, CompareMode::SideBySide);
-
-                        // OCIO path: one pass over the whole frame. Accumulate the pass-1
-                        // draws (draw_gpu pushes into ocio_draws) and emit a single
-                        // OcioCallback. The checker + overscan dim are applied post-OCIO in
-                        // the blit, so there is no separate dim draw here. Diff opts out: it
-                        // renders a display-space heat map via the normal pipeline (see
-                        // draw_gpu), so OCIO never runs for it.
-                        #[cfg(feature = "ocio")]
-                        let ocio_handled = if self.ocio_active
-                            && !matches!(comp_mode, CompareMode::DiffMatte)
-                        {
-                            // Overscan is dimmed in the blit (when opacity > 0); when opacity
-                            // is 0 we hide it by clipping the callback to the display window.
-                            let overscan_dim = !is_sbs && self.overscan_opacity > 0.0;
-                            let slot_painter = if !is_sbs && self.overscan_opacity == 0.0 {
-                                &painter
-                            } else {
-                                &unclipped_painter
-                            };
-                            // Reserve the image slot BEFORE annotations so the image renders
-                            // beneath the wipe/SBS lines (same layer, insertion order).
-                            let slot = slot_painter.add(egui::Shape::Noop);
-                            let cb_clip = slot_painter.clip_rect();
-
-                            draw_all(&unclipped_painter, 1.0);
-
-                            let draws = std::mem::take(&mut *ocio_draws.borrow_mut());
-                            if !draws.is_empty() {
-                                let display_format = render_state.as_ref().unwrap().target_format;
-                                let content = ui.ctx().content_rect();
-                                let blit_uniforms = crate::gpu::BlitUniforms {
-                                    display_min: [disp_rect.min.x, disp_rect.min.y],
-                                    display_max: [disp_rect.max.x, disp_rect.max.y],
-                                    screen_size: [content.width(), content.height()],
-                                    checker_dark: 0.1,
-                                    checker_light: 0.2,
-                                    checker_size: 16.0,
-                                    checker_enabled: 1.0,
-                                    overscan_factor: if overscan_dim {
-                                        self.overscan_opacity
-                                    } else {
-                                        1.0
-                                    },
-                                    _pad0: 0.0,
-                                };
-                                // Finalize the render signature with the OCIO config/view
-                                // identity (its CPU processor is rebuilt on any config change),
-                                // so changing the display/view forces a re-render.
-                                let mut render_sig = ocio_sig.get();
-                                if let Some(p) = &self.ocio_cpu {
-                                    render_sig = (render_sig
-                                        ^ (std::rc::Rc::as_ptr(p) as *const () as u64))
-                                        .wrapping_mul(0x100000001b3);
-                                }
-                                // Scissor the OCIO transform to the visible image so it skips
-                                // the empty background. Side-by-side spans the canvas with two
-                                // images, so it opts out (None = whole target).
-                                let scissor_pts = if is_sbs {
-                                    None
-                                } else {
-                                    Some([
-                                        image_rect.min.x,
-                                        image_rect.min.y,
-                                        image_rect.max.x,
-                                        image_rect.max.y,
-                                    ])
-                                };
-                                let callback = crate::gpu::ocio_pass::OcioCallback {
-                                    draws,
-                                    display_format,
-                                    blit_uniforms,
-                                    render_sig,
-                                    scissor_pts,
-                                };
-                                slot_painter.set(
-                                    slot,
-                                    eframe::egui_wgpu::Callback::new_paint_callback(
-                                        cb_clip, callback,
-                                    ),
-                                );
-                            }
-                            true
-                        } else {
-                            false
-                        };
-                        #[cfg(not(feature = "ocio"))]
-                        let ocio_handled = false;
-
-                        if !ocio_handled {
-                            if self.overscan_opacity > 0.0 && !is_sbs {
-                                draw_all(&unclipped_painter, self.overscan_opacity);
-                            }
-                            // Side-by-Side renders at full brightness with the full-canvas
-                            // clip (no display-window clip), so overscan dimming is skipped.
-                            draw_all(if is_sbs { &unclipped_painter } else { &painter }, 1.0);
-                        }
-                    }
+                if let Some(rs) = render_state {
+                    self.draw_canvas_gpu(ui, &layout, exr_data_b, rs, lut_bg_opt.clone());
                 } else {
                     self.draw_canvas_cpu(ui, &layout, exr_data_b);
                 }
@@ -1956,6 +1457,486 @@ impl ExrViewer {
             },
             1.0,
         );
+    }
+
+    /// GPU render path (the default): build per-draw uniforms and emit wgpu
+    /// paint callbacks for the active compare mode. Under OCIO the per-image
+    /// pass-1 draws are accumulated into a single display-transform pass. Also
+    /// handles the wipe-handle drag/scroll interaction (hence `&mut self`).
+    fn draw_canvas_gpu(
+        &mut self,
+        ui: &egui::Ui,
+        layout: &CanvasLayout,
+        exr_data_b: Option<&ExrData>,
+        render_state: &eframe::egui_wgpu::RenderState,
+        lut_bg_opt: Option<std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>>,
+    ) {
+        let CanvasLayout {
+            rect,
+            disp_rect,
+            image_rect,
+            image_size,
+            tex_size,
+            tex_size_b,
+            ..
+        } = *layout;
+        let unclipped_painter = ui.painter().with_clip_rect(rect);
+        let painter = ui.painter().with_clip_rect(rect.intersect(disp_rect));
+
+        // GPU RENDER PATH
+        use eframe::egui_wgpu::wgpu::util::DeviceExt;
+        let uniform_data = crate::gpu::Uniforms {
+            rect_min: [image_rect.min.x, image_rect.min.y],
+            rect_max: [image_rect.max.x, image_rect.max.y],
+            screen_size: [
+                ui.ctx().content_rect().width(),
+                ui.ctx().content_rect().height(),
+            ],
+            exposure: self.exposure,
+            gamma: self.gamma,
+            diff_multiplier: self.diff_multiplier,
+            channel_mode: self.channel_mode.as_u32(),
+            is_diff_mode: 0,
+            srgb: if self.srgb { 1 } else { 0 },
+            enable_lut: if self.enable_lut { 1 } else { 0 },
+            opacity: 1.0,
+            is_composite: 0,
+            blend_mode: self.blend_mode.as_u32(),
+            is_wipe_mode: if self.compare_mode == CompareMode::Wipe {
+                1
+            } else {
+                0
+            },
+            wipe_center: self.wipe_center,
+            wipe_angle: self.wipe_angle.to_radians(),
+            skip_checker: 0,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+        };
+
+        // Acquire the renderer read-lock ONCE per frame: clone out the
+        // cheap (Arc-backed) uniform bind-group layout and the active LUT
+        // bind group. `draw_gpu` then builds its per-draw buffer without
+        // re-locking or re-looking-up GpuState. A single shared uniform
+        // buffer is NOT viable: egui defers paint callbacks, so each of the
+        // (up to 4) draws per frame needs its own immutable uniform snapshot
+        // alive until paint time.
+        let (uniform_layout, active_lut_bg, default_tex_bg) = {
+            let guard = render_state.renderer.read();
+            let gpu_state = guard
+                .callback_resources
+                .get::<crate::gpu::GpuState>()
+                .unwrap();
+            let layout = gpu_state.bind_group_layout_uniform.clone();
+            let lut = lut_bg_opt
+                .clone()
+                .unwrap_or_else(|| gpu_state.default_lut_bind_group.clone());
+            (layout, lut, gpu_state.default_tex_bind_group.clone())
+        };
+        #[cfg(feature = "ocio")]
+        let ocio_active = self.ocio_active;
+        // Under OCIO, draw_gpu accumulates pass-1 draws here instead of emitting a
+        // callback per call; a single OcioCallback covering the whole frame (both
+        // side-by-side images included) is emitted after draw_all.
+        #[cfg(feature = "ocio")]
+        let ocio_draws: std::cell::RefCell<Vec<crate::gpu::ocio_pass::OcioPass1Draw>> =
+            std::cell::RefCell::new(Vec::new());
+        // Running FNV-1a hash of everything that affects the OCIO render (uniforms +
+        // texture identities) so the (expensive) display transform is skipped on
+        // repaints that change nothing — hover, menus, animations.
+        #[cfg(feature = "ocio")]
+        let ocio_sig = std::cell::Cell::new(0xcbf29ce484222325u64);
+        let draw_gpu = |painter: &egui::Painter,
+                        bg_a: std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>,
+                        bg_b_opt: Option<std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>>,
+                        clip_rect: egui::Rect,
+                        target_rect: egui::Rect,
+                        is_diff: bool,
+                        is_composite: bool,
+                        opacity: f32| {
+            let mut u = uniform_data;
+            u.rect_min = [target_rect.min.x, target_rect.min.y];
+            u.rect_max = [target_rect.max.x, target_rect.max.y];
+            u.is_diff_mode = if is_diff { 1 } else { 0 };
+            u.is_composite = if is_composite { 1 } else { 0 };
+            u.opacity = opacity;
+
+            // OCIO path: pass 1 must emit scene-linear, so bypass the built-in
+            // display chain (sRGB/gamma/.cube LUT). Exposure stays (linear).
+            #[cfg(feature = "ocio")]
+            if ocio_active {
+                u.srgb = 0;
+                u.gamma = 1.0;
+                u.enable_lut = 0;
+                // Don't bake the checker into scene-linear; it's composited
+                // in display space (blit pass) after the OCIO transform.
+                u.skip_checker = 1;
+            }
+
+            let device = &render_state.device;
+
+            let uniform_buffer =
+                device.create_buffer_init(&eframe::egui_wgpu::wgpu::util::BufferInitDescriptor {
+                    label: Some("Exr Uniform Buffer"),
+                    contents: bytemuck::bytes_of(&u),
+                    usage: eframe::egui_wgpu::wgpu::BufferUsages::UNIFORM
+                        | eframe::egui_wgpu::wgpu::BufferUsages::COPY_DST,
+                });
+
+            let uniform_bg =
+                device.create_bind_group(&eframe::egui_wgpu::wgpu::BindGroupDescriptor {
+                    label: Some("Exr Uniform Bind Group"),
+                    layout: &uniform_layout,
+                    entries: &[eframe::egui_wgpu::wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: uniform_buffer.as_entire_binding(),
+                    }],
+                });
+
+            let bg_b = bg_b_opt.unwrap_or_else(|| default_tex_bg.clone());
+            let final_clip_rect = painter.clip_rect().intersect(clip_rect);
+
+            // Diff is a false-color heat-map visualization (display-space,
+            // not color-managed), so it always uses the normal pipeline —
+            // even under OCIO it is NOT accumulated into the OCIO pass.
+            #[cfg(feature = "ocio")]
+            if ocio_active && !is_diff {
+                // Fold this draw's inputs (uniform bytes + texture pointers) into
+                // the per-frame render signature; OcioCallback re-renders only
+                // when this changes.
+                let mut h = ocio_sig.get();
+                for chunk in bytemuck::bytes_of(&u).chunks(8) {
+                    let mut b = [0u8; 8];
+                    b[..chunk.len()].copy_from_slice(chunk);
+                    h = (h ^ u64::from_le_bytes(b)).wrapping_mul(0x100000001b3);
+                }
+                for p in [
+                    std::sync::Arc::as_ptr(&bg_a) as *const () as u64,
+                    std::sync::Arc::as_ptr(&bg_b) as *const () as u64,
+                    std::sync::Arc::as_ptr(&active_lut_bg) as *const () as u64,
+                ] {
+                    h = (h ^ p).wrapping_mul(0x100000001b3);
+                }
+                ocio_sig.set(h);
+
+                // Accumulate; the single per-frame OcioCallback is emitted
+                // after draw_all so one OCIO pass covers the whole frame.
+                ocio_draws
+                    .borrow_mut()
+                    .push(crate::gpu::ocio_pass::OcioPass1Draw {
+                        bg_a,
+                        bg_b,
+                        uniform_bg,
+                        lut_bg: active_lut_bg.clone(),
+                    });
+                return;
+            }
+
+            let callback = crate::gpu::ExrCallback {
+                bg_a,
+                bg_b,
+                uniform_bg,
+                lut_bg: active_lut_bg.clone(),
+            };
+            painter.with_clip_rect(final_clip_rect).add(
+                eframe::egui_wgpu::Callback::new_paint_callback(final_clip_rect, callback),
+            );
+        };
+
+        let bg_a_opt = self.gpu_textures[self.active_layer].clone();
+        if let Some(bg_a) = bg_a_opt {
+            let comp_mode = if self.blink_state {
+                if ((ui.input(|i| i.time) / self.blink_interval as f64) as usize).is_multiple_of(2)
+                {
+                    CompareMode::SingleA
+                } else {
+                    CompareMode::SingleB
+                }
+            } else {
+                self.compare_mode
+            };
+
+            // Wipe interaction logic (drag to move, scroll to rotate)
+            if self.compare_mode == CompareMode::Wipe {
+                let center_screen = egui::pos2(
+                    image_rect.min.x + image_rect.width() * self.wipe_center[0],
+                    image_rect.min.y + image_rect.height() * self.wipe_center[1],
+                );
+                let handle_rect =
+                    egui::Rect::from_center_size(center_screen, egui::vec2(24.0, 24.0));
+                let handle_id = ui.id().with("wipe_handle");
+                let response = ui.interact(handle_rect, handle_id, egui::Sense::drag());
+
+                if response.dragged() {
+                    let delta = response.drag_delta();
+                    self.wipe_center[0] =
+                        (self.wipe_center[0] + delta.x / image_rect.width()).clamp(0.0, 1.0);
+                    self.wipe_center[1] =
+                        (self.wipe_center[1] + delta.y / image_rect.height()).clamp(0.0, 1.0);
+                }
+                if response.hovered() {
+                    let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+                    if scroll != 0.0 {
+                        self.wipe_angle = (self.wipe_angle + scroll * 2.0).clamp(-180.0, 180.0);
+                    }
+                }
+            }
+
+            let draw_all = |p: &egui::Painter, opac: f32| match comp_mode {
+                CompareMode::SingleA => {
+                    draw_gpu(p, bg_a.clone(), None, rect, image_rect, false, false, opac);
+                }
+                CompareMode::SingleB => {
+                    if let Some(bg_b) = exr_data_b.and_then(|d| {
+                        self.gpu_textures_b[self
+                            .active_layer
+                            .min(d.logical_layers.len().saturating_sub(1))]
+                        .clone()
+                    }) {
+                        draw_gpu(p, bg_b.clone(), None, rect, image_rect, false, false, opac);
+                    }
+                }
+                CompareMode::Wipe => {
+                    let bg_b_opt = exr_data_b.and_then(|d| {
+                        self.gpu_textures_b[self
+                            .active_layer
+                            .min(d.logical_layers.len().saturating_sub(1))]
+                        .clone()
+                    });
+                    // Single draw call: the shader handles the wipe split.
+                    // Bind the real B texture so the shader can sample it when
+                    // is_wipe_mode is set; falls back to the default texture if
+                    // no B image is loaded.
+                    draw_gpu(
+                        p,
+                        bg_a.clone(),
+                        bg_b_opt,
+                        rect,
+                        image_rect,
+                        false,
+                        false,
+                        opac,
+                    );
+
+                    // Draw the rotated wipe line and handle
+                    let center_screen = egui::pos2(
+                        image_rect.min.x + image_rect.width() * self.wipe_center[0],
+                        image_rect.min.y + image_rect.height() * self.wipe_center[1],
+                    );
+                    let angle_rad = self.wipe_angle.to_radians();
+                    // Line direction is perpendicular to the normal (cos, sin)
+                    let dir = egui::vec2(-angle_rad.sin(), angle_rad.cos());
+                    let max_dist = image_rect.width().hypot(image_rect.height());
+                    let p1 = center_screen + dir * max_dist;
+                    let p2 = center_screen - dir * max_dist;
+
+                    let alpha = (self.wipe_line_opacity * 255.0) as u8;
+                    let color = egui::Color32::from_white_alpha(alpha);
+
+                    p.line_segment([p1, p2], (2.0, color));
+                    p.circle_filled(center_screen, 8.0, color);
+                }
+                CompareMode::SideBySide => {
+                    let bg_b_opt = exr_data_b.and_then(|d| {
+                        self.gpu_textures_b[self
+                            .active_layer
+                            .min(d.logical_layers.len().saturating_sub(1))]
+                        .clone()
+                    });
+                    if let Some(bg_b) = bg_b_opt {
+                        let mut image_size_b = tex_size_b.unwrap() * self.scale;
+                        if self.normalize_side_by_side {
+                            let scale_b = (tex_size.y * self.scale) / tex_size_b.unwrap().y;
+                            image_size_b = tex_size_b.unwrap() * scale_b;
+                        }
+                        let combined_width = image_size.x + image_size_b.x;
+                        let combined_height = image_size.y.max(image_size_b.y);
+                        let combined_rect = egui::Rect::from_center_size(
+                            rect.center() + self.translation,
+                            egui::vec2(combined_width, combined_height),
+                        );
+                        let mut image_rect_a =
+                            egui::Rect::from_min_size(combined_rect.min, image_size);
+                        image_rect_a.set_center(egui::pos2(
+                            image_rect_a.center().x,
+                            combined_rect.center().y,
+                        ));
+                        let mut image_rect_b = egui::Rect::from_min_size(
+                            egui::pos2(combined_rect.min.x + image_size.x, combined_rect.min.y),
+                            image_size_b,
+                        );
+                        image_rect_b.set_center(egui::pos2(
+                            image_rect_b.center().x,
+                            combined_rect.center().y,
+                        ));
+
+                        draw_gpu(
+                            p,
+                            bg_a.clone(),
+                            None,
+                            rect,
+                            image_rect_a,
+                            false,
+                            false,
+                            opac,
+                        );
+                        draw_gpu(
+                            p,
+                            bg_b.clone(),
+                            None,
+                            rect,
+                            image_rect_b,
+                            false,
+                            false,
+                            opac,
+                        );
+                        p.line_segment(
+                            [
+                                egui::pos2(image_rect_b.min.x, combined_rect.min.y),
+                                egui::pos2(image_rect_b.min.x, combined_rect.max.y),
+                            ],
+                            (2.0, egui::Color32::GRAY),
+                        );
+                    } else {
+                        draw_gpu(p, bg_a.clone(), None, rect, image_rect, false, false, opac);
+                    }
+                }
+                CompareMode::DiffMatte => {
+                    let bg_b_opt = exr_data_b.and_then(|d| {
+                        self.gpu_textures_b[self
+                            .active_layer
+                            .min(d.logical_layers.len().saturating_sub(1))]
+                        .clone()
+                    });
+                    if let Some(bg_b) = bg_b_opt {
+                        draw_gpu(
+                            p,
+                            bg_a.clone(),
+                            Some(bg_b.clone()),
+                            rect,
+                            image_rect,
+                            true,
+                            false,
+                            opac,
+                        );
+                    }
+                }
+                CompareMode::Composite => {
+                    let bg_b_opt = exr_data_b.and_then(|d| {
+                        self.gpu_textures_b[self
+                            .active_layer
+                            .min(d.logical_layers.len().saturating_sub(1))]
+                        .clone()
+                    });
+                    if let Some(bg_b) = bg_b_opt {
+                        draw_gpu(
+                            p,
+                            bg_a.clone(),
+                            Some(bg_b.clone()),
+                            rect,
+                            image_rect,
+                            false,
+                            true,
+                            opac,
+                        );
+                    }
+                }
+            };
+
+            let is_sbs = matches!(comp_mode, CompareMode::SideBySide);
+
+            // OCIO path: one pass over the whole frame. Accumulate the pass-1
+            // draws (draw_gpu pushes into ocio_draws) and emit a single
+            // OcioCallback. The checker + overscan dim are applied post-OCIO in
+            // the blit, so there is no separate dim draw here. Diff opts out: it
+            // renders a display-space heat map via the normal pipeline (see
+            // draw_gpu), so OCIO never runs for it.
+            #[cfg(feature = "ocio")]
+            let ocio_handled = if self.ocio_active && !matches!(comp_mode, CompareMode::DiffMatte) {
+                // Overscan is dimmed in the blit (when opacity > 0); when opacity
+                // is 0 we hide it by clipping the callback to the display window.
+                let overscan_dim = !is_sbs && self.overscan_opacity > 0.0;
+                let slot_painter = if !is_sbs && self.overscan_opacity == 0.0 {
+                    &painter
+                } else {
+                    &unclipped_painter
+                };
+                // Reserve the image slot BEFORE annotations so the image renders
+                // beneath the wipe/SBS lines (same layer, insertion order).
+                let slot = slot_painter.add(egui::Shape::Noop);
+                let cb_clip = slot_painter.clip_rect();
+
+                draw_all(&unclipped_painter, 1.0);
+
+                let draws = std::mem::take(&mut *ocio_draws.borrow_mut());
+                if !draws.is_empty() {
+                    let display_format = render_state.target_format;
+                    let content = ui.ctx().content_rect();
+                    let blit_uniforms = crate::gpu::BlitUniforms {
+                        display_min: [disp_rect.min.x, disp_rect.min.y],
+                        display_max: [disp_rect.max.x, disp_rect.max.y],
+                        screen_size: [content.width(), content.height()],
+                        checker_dark: 0.1,
+                        checker_light: 0.2,
+                        checker_size: 16.0,
+                        checker_enabled: 1.0,
+                        overscan_factor: if overscan_dim {
+                            self.overscan_opacity
+                        } else {
+                            1.0
+                        },
+                        _pad0: 0.0,
+                    };
+                    // Finalize the render signature with the OCIO config/view
+                    // identity (its CPU processor is rebuilt on any config change),
+                    // so changing the display/view forces a re-render.
+                    let mut render_sig = ocio_sig.get();
+                    if let Some(p) = &self.ocio_cpu {
+                        render_sig = (render_sig ^ (std::rc::Rc::as_ptr(p) as *const () as u64))
+                            .wrapping_mul(0x100000001b3);
+                    }
+                    // Scissor the OCIO transform to the visible image so it skips
+                    // the empty background. Side-by-side spans the canvas with two
+                    // images, so it opts out (None = whole target).
+                    let scissor_pts = if is_sbs {
+                        None
+                    } else {
+                        Some([
+                            image_rect.min.x,
+                            image_rect.min.y,
+                            image_rect.max.x,
+                            image_rect.max.y,
+                        ])
+                    };
+                    let callback = crate::gpu::ocio_pass::OcioCallback {
+                        draws,
+                        display_format,
+                        blit_uniforms,
+                        render_sig,
+                        scissor_pts,
+                    };
+                    slot_painter.set(
+                        slot,
+                        eframe::egui_wgpu::Callback::new_paint_callback(cb_clip, callback),
+                    );
+                }
+                true
+            } else {
+                false
+            };
+            #[cfg(not(feature = "ocio"))]
+            let ocio_handled = false;
+
+            if !ocio_handled {
+                if self.overscan_opacity > 0.0 && !is_sbs {
+                    draw_all(&unclipped_painter, self.overscan_opacity);
+                }
+                // Side-by-Side renders at full brightness with the full-canvas
+                // clip (no display-window clip), so overscan dimming is skipped.
+                draw_all(if is_sbs { &unclipped_painter } else { &painter }, 1.0);
+            }
+        }
     }
 
     /// The real render path: upload `layer_index`'s RGBA into a GPU bind group.
