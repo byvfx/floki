@@ -357,6 +357,11 @@ impl ExrApp {
             Ok(data) => {
                 if is_b {
                     self.exr_data_b = Some(data);
+                    // The texture caches only rebuild on a layer-count change, so a new B
+                    // with the same layer count would keep showing the previous image.
+                    // Force the reference textures (and the B-dependent diff/composite) to
+                    // regenerate from the new data.
+                    self.viewer.invalidate_reference_textures();
                     // B isn't part of the histogram cache key — refresh it so the
                     // B histogram appears without waiting for a layer change.
                     self.viewer.invalidate_histogram();

@@ -26,6 +26,33 @@ pub struct Uniforms {
     pub is_composite: u32,
     pub blend_mode: u32,
     pub is_wipe_mode: u32,
+    /// When 1, pass 1 skips the checkerboard composite and emits the real image
+    /// alpha (the OCIO path composites the checker in display space afterwards).
+    /// Keep in lockstep with `Uniforms.skip_checker` in `shader.wgsl`.
+    pub skip_checker: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
+}
+
+/// Uniforms for the OCIO blit pass: composites the transparency checkerboard in
+/// display space (after the OCIO transform, so neutral grey stays neutral) and
+/// applies the overscan dim factor outside the display window. All rects/sizes are
+/// in egui *points* (the same unit as `Uniforms.screen_size` / `rect_min`), so the
+/// 16-point checker and the display-window boundary match the non-OCIO path on HiDPI.
+#[cfg(feature = "ocio")]
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct BlitUniforms {
+    pub display_min: [f32; 2],
+    pub display_max: [f32; 2],
+    pub screen_size: [f32; 2],
+    pub checker_dark: f32,
+    pub checker_light: f32,
+    pub checker_size: f32,
+    pub checker_enabled: f32,
+    pub overscan_factor: f32,
+    pub _pad0: f32,
 }
 
 pub struct GpuState {
@@ -63,10 +90,56 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VOut {
     o.uv = vec2<f32>((xy.x + 1.0) * 0.5, 1.0 - (xy.y + 1.0) * 0.5);
     return o;
 }
-@group(0) @binding(0) var t: texture_2d<f32>;
+struct BlitUniforms {
+    display_min: vec2<f32>,
+    display_max: vec2<f32>,
+    screen_size: vec2<f32>,
+    checker_dark: f32,
+    checker_light: f32,
+    checker_size: f32,
+    checker_enabled: f32,
+    overscan_factor: f32,
+    _pad0: f32,
+};
+@group(0) @binding(0) var t: texture_2d<f32>;       // OCIO display-transformed color
 @group(0) @binding(1) var s: sampler;
+@group(0) @binding(2) var scene_t: texture_2d<f32>; // pre-OCIO scene-linear (for alpha/coverage)
+@group(0) @binding(3) var<uniform> bu: BlitUniforms;
 @fragment
-fn fs_main(i: VOut) -> @location(0) vec4<f32> { return textureSample(t, s, i.uv); }
+fn fs_main(i: VOut) -> @location(0) vec4<f32> {
+    // Pass 1 clears the scene target's alpha to a negative sentinel; the image quad(s)
+    // write alpha in [0,1]. So scene_a < 0 means "no image here" -> show nothing (the
+    // egui panel background), matching the non-OCIO path where the checker only appears
+    // under the image.
+    let scene_a = textureSample(scene_t, s, i.uv).a;
+    if scene_a < 0.0 {
+        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    }
+    let disp = textureSample(t, s, i.uv);
+    let a = clamp(scene_a, 0.0, 1.0);
+
+    // Display-space checkerboard (16-point cells), composited AFTER OCIO so the grey
+    // checker is not color-managed.
+    var rgb = disp.rgb;
+    if bu.checker_enabled > 0.5 {
+        let screen_pt = i.uv * bu.screen_size;
+        let cx = u32(screen_pt.x / bu.checker_size);
+        let cy = u32(screen_pt.y / bu.checker_size);
+        let is_dark = (cx + cy) % 2u == 0u;
+        let bg = select(bu.checker_light, bu.checker_dark, is_dark);
+        rgb = rgb + vec3<f32>(bg) * (1.0 - a);
+    }
+
+    // Overscan dim: multiply by the dim factor where the pixel is outside the display
+    // window (data-window overscan region).
+    let screen_pt2 = i.uv * bu.screen_size;
+    let inside = screen_pt2.x >= bu.display_min.x && screen_pt2.x <= bu.display_max.x
+              && screen_pt2.y >= bu.display_min.y && screen_pt2.y <= bu.display_max.y;
+    let dim = select(bu.overscan_factor, 1.0, inside);
+    rgb = rgb * dim;
+
+    return vec4<f32>(rgb, 1.0);
+}
 "#;
 
 impl GpuState {
@@ -308,6 +381,28 @@ impl GpuState {
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
                         count: None,
                     },
+                    // Pre-OCIO scene-linear texture, sampled only for its alpha (coverage
+                    // + the post-OCIO checker composite).
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
                 ],
             });
             let blit_pl_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -490,8 +585,25 @@ mod tests {
             "Uniforms size ({size}) must be a multiple of 16"
         );
         assert_eq!(
-            size, 80,
+            size, 96,
             "Uniforms layout changed — update shader.wgsl to match"
+        );
+    }
+
+    #[cfg(feature = "ocio")]
+    #[test]
+    fn blit_uniforms_size_is_16_byte_aligned() {
+        // The OCIO blit uniform buffer must be a multiple of 16 bytes (WGSL uniform rule).
+        // Keep in lockstep with the `BlitUniforms` struct in `BLIT_SHADER`.
+        let size = std::mem::size_of::<BlitUniforms>();
+        assert_eq!(
+            size % 16,
+            0,
+            "BlitUniforms size ({size}) must be a multiple of 16"
+        );
+        assert_eq!(
+            size, 48,
+            "BlitUniforms layout changed — update BLIT_SHADER to match"
         );
     }
 
@@ -516,6 +628,10 @@ mod tests {
             is_wipe_mode: 1,
             wipe_center: [0.5, 0.5],
             wipe_angle: 0.0,
+            skip_checker: 1,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
         };
         let bytes = bytemuck::bytes_of(&u);
         assert_eq!(bytes.len(), std::mem::size_of::<Uniforms>());
@@ -532,6 +648,7 @@ mod tests {
         assert_eq!(back.is_composite, 1);
         assert_eq!(back.blend_mode, 2);
         assert_eq!(back.screen_size, [800.0, 600.0]);
+        assert_eq!(back.skip_checker, 1);
     }
 
     #[test]

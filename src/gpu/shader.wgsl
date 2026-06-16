@@ -22,6 +22,14 @@ struct Uniforms {
     is_composite: u32,
     blend_mode: u32,
     is_wipe_mode: u32,
+    // When 1, skip the background checkerboard composite and emit the real image
+    // alpha (instead of `opacity`). Used by the OCIO "pass 1" so the checker can be
+    // composited in display space *after* the OCIO transform. Keep in lockstep with
+    // `Uniforms.skip_checker` in src/gpu/mod.rs.
+    skip_checker: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 };
 
 @group(0) @binding(0) var tex_a: texture_2d<f32>;
@@ -84,10 +92,20 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     var a = color_a.a;
 
     if uniforms.is_diff_mode == 1u {
-        r = abs(r - color_b.r) * uniforms.diff_multiplier;
-        g = abs(g - color_b.g) * uniforms.diff_multiplier;
-        b = abs(b - color_b.b) * uniforms.diff_multiplier;
-        a = 1.0;
+        // VFX-style diff: the magnitude of the per-channel difference, mapped to a
+        // black-body heat ramp (identical = black; hotter = larger difference). This is
+        // a false-color visualization, so it is emitted directly in display space and is
+        // NOT color-managed — the viewer routes diff through this pipeline even under
+        // OCIO. `diff_multiplier` sets sensitivity. Keep the ramp in lockstep with
+        // `heat_ramp` in src/viewer.rs (CPU diff parity).
+        let d = max(abs(r - color_b.r), max(abs(g - color_b.g), abs(b - color_b.b)));
+        let m = clamp(d * uniforms.diff_multiplier, 0.0, 1.0);
+        let heat = vec3<f32>(
+            clamp(m * 3.0, 0.0, 1.0),
+            clamp(m * 3.0 - 1.0, 0.0, 1.0),
+            clamp(m * 3.0 - 2.0, 0.0, 1.0),
+        );
+        return vec4<f32>(heat, uniforms.opacity);
     }
 
     // Premultiplied-alpha compositing. Keep the `blend_mode` switch in lockstep
@@ -171,17 +189,21 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     b *= exp_mult;
     
     // Background Checkerboard compositing
-    // In screen space we can do a checkerboard
-    let screen_pos = mix(uniforms.rect_min, uniforms.rect_max, in.uv);
-    let check_x = u32(screen_pos.x / 16.0);
-    let check_y = u32(screen_pos.y / 16.0);
-    let is_dark = (check_x + check_y) % 2u == 0u;
-    let bg_linear = select(0.2, 0.1, is_dark);
-    
-    let a_clamp = clamp(a, 0.0, 1.0);
-    r = r + bg_linear * (1.0 - a_clamp);
-    g = g + bg_linear * (1.0 - a_clamp);
-    b = b + bg_linear * (1.0 - a_clamp);
+    // In screen space we can do a checkerboard.
+    // Skipped under OCIO (skip_checker==1): the checker is composited in display
+    // space after the OCIO transform (in the blit pass) so neutral grey stays neutral.
+    if uniforms.skip_checker == 0u {
+        let screen_pos = mix(uniforms.rect_min, uniforms.rect_max, in.uv);
+        let check_x = u32(screen_pos.x / 16.0);
+        let check_y = u32(screen_pos.y / 16.0);
+        let is_dark = (check_x + check_y) % 2u == 0u;
+        let bg_linear = select(0.2, 0.1, is_dark);
+
+        let a_clamp = clamp(a, 0.0, 1.0);
+        r = r + bg_linear * (1.0 - a_clamp);
+        g = g + bg_linear * (1.0 - a_clamp);
+        b = b + bg_linear * (1.0 - a_clamp);
+    }
 
     // Gamma
     if uniforms.gamma != 1.0 {
@@ -205,5 +227,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         b = linear_to_srgb(b);
     }
 
-    return vec4<f32>(r, g, b, uniforms.opacity);
+    // Under OCIO (skip_checker==1) emit the real image alpha so the display-space
+    // checker + overscan dim (in the blit pass) have a coverage/alpha signal. The
+    // `opacity` dim is applied post-OCIO in that case, not here.
+    let out_a = select(uniforms.opacity, a, uniforms.skip_checker == 1u);
+    return vec4<f32>(r, g, b, out_a);
 }
