@@ -80,8 +80,12 @@ namespace {
 
 OCIO::GpuLanguage map_language(std::uint8_t language) {
     switch (language) {
+#if OCIO_VERSION_HEX >= 0x02050000
+        // Vulkan-flavored GLSL (separate texture/sampler objects); OCIO 2.5+ only. On 2.4.x
+        // this case falls through to GLSL_4_0 (combined samplers, split in transpile.rs).
         case 1:
             return OCIO::GPU_LANGUAGE_GLSL_VK_4_6;
+#endif
         case 0:
         default:
             return OCIO::GPU_LANGUAGE_GLSL_4_0;

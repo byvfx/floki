@@ -87,6 +87,25 @@ cd floki
 cargo run --release
 ```
 
+### Color management (OpenColorIO)
+
+OCIO support is **off by default** (the standard build needs no C++ toolchain). Two opt-in builds:
+
+```bash
+# Dev: link an installed OCIO (Homebrew, or OPENCOLORIO_ROOT). Fast, no cmake.
+cargo run --release --features ocio
+
+# Distributable: statically build OCIO 2.4.2 from the vendored submodule, so the
+# binary needs no installed OCIO. Heavy first build; needs cmake + a C++ compiler.
+git submodule update --init --recursive
+cargo run --release --features ocio-vendored
+```
+
+Once running, enable it in **Color Management…** (check *Enable OCIO*). With the config-path
+field empty it uses the built-in ACES config, or `$OCIO` if that environment variable is set
+(e.g. `OCIO=ocio://studio-config-latest`). See [`floki-ocio/README.md`](floki-ocio/README.md)
+for backend/build details.
+
 ## Debugging & Logging
 
 The app initializes [`env_logger`](https://docs.rs/env_logger), so runtime logging is
