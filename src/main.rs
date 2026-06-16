@@ -1,12 +1,5 @@
-mod app;
-mod color;
-mod exr_loader;
-mod gpu;
-mod render_math;
-mod tools;
-mod viewer;
-
 use eframe::egui;
+use floki::app;
 
 fn main() -> eframe::Result<()> {
     env_logger::init(); // Log to stderr (if you run with `RUST_LOG=debug`).

@@ -42,6 +42,14 @@ tempfile = "3"          # scoped temp dirs/files for test fixtures (auto-cleanup
 egui_kittest = "0.34"   # headless egui interaction harness (no wgpu/snapshot feature)
 approx = "0.5"          # float-tolerant assertions for color math
 pollster = "0.4"        # block on wgpu async in headless GPU tests
+criterion = "0.5"       # statistical benchmark harness (benches/)
+
+# EXR decode + logical-layer grouping benchmark (the `ExrData::load` hot path).
+# Runs synthetic fixtures everywhere; also benches real renders dropped into
+# `assets/perf/` (or $FLOKI_PERF_FIXTURES) — see assets/perf/README.md.
+[[bench]]
+name = "exr_load"
+harness = false
 
 # Patched exr: decompresses ZIP/PXR24 via miniz_oxide instead of zune-inflate,
 # which panics (and aborts the app via a rayon worker) on some valid files.
