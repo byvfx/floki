@@ -92,10 +92,20 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     var a = color_a.a;
 
     if uniforms.is_diff_mode == 1u {
-        r = abs(r - color_b.r) * uniforms.diff_multiplier;
-        g = abs(g - color_b.g) * uniforms.diff_multiplier;
-        b = abs(b - color_b.b) * uniforms.diff_multiplier;
-        a = 1.0;
+        // VFX-style diff: the magnitude of the per-channel difference, mapped to a
+        // black-body heat ramp (identical = black; hotter = larger difference). This is
+        // a false-color visualization, so it is emitted directly in display space and is
+        // NOT color-managed — the viewer routes diff through this pipeline even under
+        // OCIO. `diff_multiplier` sets sensitivity. Keep the ramp in lockstep with
+        // `heat_ramp` in src/viewer.rs (CPU diff parity).
+        let d = max(abs(r - color_b.r), max(abs(g - color_b.g), abs(b - color_b.b)));
+        let m = clamp(d * uniforms.diff_multiplier, 0.0, 1.0);
+        let heat = vec3<f32>(
+            clamp(m * 3.0, 0.0, 1.0),
+            clamp(m * 3.0 - 1.0, 0.0, 1.0),
+            clamp(m * 3.0 - 2.0, 0.0, 1.0),
+        );
+        return vec4<f32>(heat, uniforms.opacity);
     }
 
     // Premultiplied-alpha compositing. Keep the `blend_mode` switch in lockstep

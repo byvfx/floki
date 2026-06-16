@@ -174,7 +174,7 @@ impl Default for ExrViewer {
             wipe_center: [0.5, 0.5],
             wipe_angle: 0.0,
             wipe_line_opacity: 1.0,
-            diff_multiplier: 1.0,
+            diff_multiplier: 8.0,
             active_layer: 0,
             show_contact_sheet: false,
             normalize_side_by_side: true,
@@ -514,8 +514,7 @@ impl ExrViewer {
             }
             CompareMode::DiffMatte => {
                 ui.add(
-                    egui::Slider::new(&mut self.diff_multiplier, 1.0..=100.0)
-                        .text("Diff Multiplier"),
+                    egui::Slider::new(&mut self.diff_multiplier, 0.0..=100.0).text("Diff Gain"),
                 );
             }
             CompareMode::SideBySide => {
@@ -1065,8 +1064,11 @@ impl ExrViewer {
                             let bg_b = bg_b_opt.unwrap_or_else(|| default_tex_bg.clone());
                             let final_clip_rect = painter.clip_rect().intersect(clip_rect);
 
+                            // Diff is a false-color heat-map visualization (display-space,
+                            // not color-managed), so it always uses the normal pipeline —
+                            // even under OCIO it is NOT accumulated into the OCIO pass.
                             #[cfg(feature = "ocio")]
-                            if ocio_active {
+                            if ocio_active && !is_diff {
                                 // Accumulate; the single per-frame OcioCallback is emitted
                                 // after draw_all so one OCIO pass covers the whole frame.
                                 ocio_draws.borrow_mut().push(
@@ -1334,9 +1336,13 @@ impl ExrViewer {
                         // OCIO path: one pass over the whole frame. Accumulate the pass-1
                         // draws (draw_gpu pushes into ocio_draws) and emit a single
                         // OcioCallback. The checker + overscan dim are applied post-OCIO in
-                        // the blit, so there is no separate dim draw here.
+                        // the blit, so there is no separate dim draw here. Diff opts out: it
+                        // renders a display-space heat map via the normal pipeline (see
+                        // draw_gpu), so OCIO never runs for it.
                         #[cfg(feature = "ocio")]
-                        let ocio_handled = if self.ocio_active {
+                        let ocio_handled = if self.ocio_active
+                            && !matches!(comp_mode, CompareMode::DiffMatte)
+                        {
                             // Overscan is dimmed in the blit (when opacity > 0); when opacity
                             // is 0 we hide it by clipping the callback to the display window.
                             let overscan_dim = !is_sbs && self.overscan_opacity > 0.0;
@@ -2125,20 +2131,6 @@ impl ExrViewer {
         layer_a_idx: usize,
         layer_b_idx: usize,
     ) -> Option<egui::TextureHandle> {
-        #[cfg(feature = "ocio")]
-        if self.ocio_active
-            && let Some(proc) = &self.ocio_cpu
-        {
-            return self.generate_diff_texture_ocio(
-                ctx,
-                data_a,
-                data_b,
-                layer_a_idx,
-                layer_b_idx,
-                proc,
-            );
-        }
-
         let (layer_a, r_chan_a, g_chan_a, b_chan_a, _) = data_a.logical_channels(layer_a_idx)?;
         let (layer_b, r_chan_b, g_chan_b, b_chan_b, _) = data_b.logical_channels(layer_b_idx)?;
 
@@ -2168,11 +2160,9 @@ impl ExrViewer {
             }
         };
 
-        // Hoist all loop-invariant scalars out of the per-pixel work.
-        let exp_mult = crate::render_math::exposure_to_multiplier(self.exposure);
-        let gamma = self.gamma;
-        let apply_gamma = self.gamma != 1.0;
-        let apply_srgb = self.srgb;
+        // VFX-style diff: per-pixel difference magnitude mapped to a black-body heat ramp
+        // (identical = black; hotter = larger difference). Display-space false color,
+        // matching the GPU diff branch in shader.wgsl. `diff_multiplier` sets sensitivity.
         let diff_multiplier = self.diff_multiplier;
         let (aw, ah) = (layer_a.size.0, layer_a.size.1);
         let (bw, bh) = (layer_b.size.0, layer_b.size.1);
@@ -2182,41 +2172,16 @@ impl ExrViewer {
             .enumerate()
             .for_each(|(y, row)| {
                 for (x, px) in row.iter_mut().enumerate() {
-                    let r_a = get_val(r_chan_a, x, y, aw, ah);
-                    let g_a = get_val(g_chan_a, x, y, aw, ah);
-                    let b_a = get_val(b_chan_a, x, y, aw, ah);
-
-                    let r_b = get_val(r_chan_b, x, y, bw, bh);
-                    let g_b = get_val(g_chan_b, x, y, bw, bh);
-                    let b_b = get_val(b_chan_b, x, y, bw, bh);
-
-                    // Difference calculation
-                    let mut diff_r = (r_a - r_b).abs() * diff_multiplier;
-                    let mut diff_g = (g_a - g_b).abs() * diff_multiplier;
-                    let mut diff_b = (b_a - b_b).abs() * diff_multiplier;
-
-                    // Tone mapping logic for the diff to be visible
-                    diff_r *= exp_mult;
-                    diff_g *= exp_mult;
-                    diff_b *= exp_mult;
-
-                    if apply_gamma {
-                        diff_r = crate::render_math::apply_gamma(diff_r, gamma);
-                        diff_g = crate::render_math::apply_gamma(diff_g, gamma);
-                        diff_b = crate::render_math::apply_gamma(diff_b, gamma);
-                    }
-
-                    if apply_srgb {
-                        diff_r = Self::linear_to_srgb(diff_r);
-                        diff_g = Self::linear_to_srgb(diff_g);
-                        diff_b = Self::linear_to_srgb(diff_b);
-                    }
-
-                    let r_u8 = (diff_r.clamp(0.0, 1.0) * 255.0) as u8;
-                    let g_u8 = (diff_g.clamp(0.0, 1.0) * 255.0) as u8;
-                    let b_u8 = (diff_b.clamp(0.0, 1.0) * 255.0) as u8;
-
-                    *px = egui::Color32::from_rgb(r_u8, g_u8, b_u8);
+                    let dr = (get_val(r_chan_a, x, y, aw, ah) - get_val(r_chan_b, x, y, bw, bh)).abs();
+                    let dg = (get_val(g_chan_a, x, y, aw, ah) - get_val(g_chan_b, x, y, bw, bh)).abs();
+                    let db = (get_val(b_chan_a, x, y, aw, ah) - get_val(b_chan_b, x, y, bw, bh)).abs();
+                    let m = (dr.max(dg).max(db) * diff_multiplier).clamp(0.0, 1.0);
+                    let (hr, hg, hb) = Self::heat_ramp(m);
+                    *px = egui::Color32::from_rgb(
+                        (hr * 255.0) as u8,
+                        (hg * 255.0) as u8,
+                        (hb * 255.0) as u8,
+                    );
                 }
             });
 
@@ -2226,98 +2191,6 @@ impl ExrViewer {
             pixels,
         };
 
-        Some(ctx.load_texture("exr_viewer_diff", color_image, egui::TextureOptions::LINEAR))
-    }
-
-    /// CPU OCIO parity for [`CompareMode::DiffMatte`]: builds the scene-linear diff
-    /// (|A-B|·multiplier, opaque) then runs the OCIO display transform — mirrors
-    /// [`Self::generate_texture_ocio`]. Gamma/sRGB are owned by OCIO, so they're skipped here.
-    #[cfg(feature = "ocio")]
-    fn generate_diff_texture_ocio(
-        &self,
-        ctx: &egui::Context,
-        data_a: &ExrData,
-        data_b: &ExrData,
-        layer_a_idx: usize,
-        layer_b_idx: usize,
-        proc: &std::rc::Rc<floki_ocio::CpuProcessor>,
-    ) -> Option<egui::TextureHandle> {
-        let (layer_a, r_chan_a, g_chan_a, b_chan_a, _) = data_a.logical_channels(layer_a_idx)?;
-        let (layer_b, r_chan_b, g_chan_b, b_chan_b, _) = data_b.logical_channels(layer_b_idx)?;
-
-        let width = layer_a.size.0.max(layer_b.size.0);
-        let height = layer_a.size.1.max(layer_b.size.1);
-
-        let get_val = |chan: Option<&exr::image::AnyChannel<exr::image::FlatSamples>>,
-                       x: usize,
-                       y: usize,
-                       w: usize,
-                       h: usize|
-         -> f32 {
-            if x >= w || y >= h {
-                return 0.0;
-            }
-            if let Some(c) = chan {
-                let index = y * w + x;
-                match &c.sample_data {
-                    exr::image::FlatSamples::F16(s) => s[index].to_f32(),
-                    exr::image::FlatSamples::F32(s) => s[index],
-                    exr::image::FlatSamples::U32(s) => s[index] as f32 / u32::MAX as f32,
-                }
-            } else {
-                0.0
-            }
-        };
-
-        let exp_mult = crate::render_math::exposure_to_multiplier(self.exposure);
-        let diff_multiplier = self.diff_multiplier;
-        let (aw, ah) = (layer_a.size.0, layer_a.size.1);
-        let (bw, bh) = (layer_b.size.0, layer_b.size.1);
-
-        let mut buf = vec![0.0_f32; width * height * 4];
-        buf.par_chunks_mut(width * 4)
-            .enumerate()
-            .for_each(|(y, row)| {
-                for x in 0..width {
-                    let dr = (get_val(r_chan_a, x, y, aw, ah) - get_val(r_chan_b, x, y, bw, bh))
-                        .abs()
-                        * diff_multiplier
-                        * exp_mult;
-                    let dg = (get_val(g_chan_a, x, y, aw, ah) - get_val(g_chan_b, x, y, bw, bh))
-                        .abs()
-                        * diff_multiplier
-                        * exp_mult;
-                    let db = (get_val(b_chan_a, x, y, aw, ah) - get_val(b_chan_b, x, y, bw, bh))
-                        .abs()
-                        * diff_multiplier
-                        * exp_mult;
-                    let o = x * 4;
-                    row[o] = dr;
-                    row[o + 1] = dg;
-                    row[o + 2] = db;
-                    row[o + 3] = 1.0;
-                }
-            });
-
-        if let Err(e) = proc.apply_rgba(&mut buf, width, height) {
-            log::error!("OCIO CPU diff transform failed: {e}");
-        }
-
-        let mut pixels = vec![egui::Color32::BLACK; width * height];
-        pixels.par_iter_mut().enumerate().for_each(|(i, px)| {
-            let o = i * 4;
-            *px = egui::Color32::from_rgb(
-                (buf[o].clamp(0.0, 1.0) * 255.0) as u8,
-                (buf[o + 1].clamp(0.0, 1.0) * 255.0) as u8,
-                (buf[o + 2].clamp(0.0, 1.0) * 255.0) as u8,
-            );
-        });
-
-        let color_image = egui::ColorImage {
-            size: [width, height],
-            source_size: egui::vec2(width as f32, height as f32),
-            pixels,
-        };
         Some(ctx.load_texture("exr_viewer_diff", color_image, egui::TextureOptions::LINEAR))
     }
 
@@ -2689,11 +2562,34 @@ impl ExrViewer {
         crate::render_math::linear_to_srgb(l)
     }
 
+    /// Black-body heat ramp for the diff visualization: 0 → black, ramping through
+    /// red → yellow → white as the (already gained + clamped) magnitude `m` ∈ [0,1]
+    /// rises. Kept in lockstep with the `heat` ramp in the GPU diff branch (shader.wgsl).
+    fn heat_ramp(m: f32) -> (f32, f32, f32) {
+        (
+            (m * 3.0).clamp(0.0, 1.0),
+            (m * 3.0 - 1.0).clamp(0.0, 1.0),
+            (m * 3.0 - 2.0).clamp(0.0, 1.0),
+        )
+    }
+
     /// Invalidate the cached histogram so the next [`calculate_histogram`] call
     /// recomputes. Call this when image B changes (load/unload) — B identity is
     /// not part of the cache key.
     pub fn invalidate_histogram(&mut self) {
         self.histogram_key = None;
+    }
+
+    /// Drop every cached reference-image (B) texture so the viewport rebuilds from the
+    /// newly loaded data. The texture caches otherwise only refresh when the layer *count*
+    /// changes, so re-loading a different B with the same layer count would keep showing the
+    /// stale image. Clears the GPU bind groups, the CPU thumbnails, and the cached
+    /// diff/composite textures (which both depend on B).
+    pub fn invalidate_reference_textures(&mut self) {
+        self.textures_b.fill(None);
+        self.gpu_textures_b.fill(None);
+        self.diff_texture = None;
+        self.composite_texture = None;
     }
 
     pub fn calculate_histogram(&mut self, exr_data: &ExrData, exr_data_b: Option<&ExrData>) {
