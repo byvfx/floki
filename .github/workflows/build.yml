@@ -51,6 +51,8 @@ jobs:
       - name: Run tests
         run: cargo test --all-targets
 
+  # Non-OCIO build: guards that the default (no C++ toolchain) build still compiles
+  # cross-platform and uploads a "lite" artifact. Releases ship the OCIO build below.
   build:
     name: Build on ${{ matrix.os }}
     needs: test
@@ -63,17 +65,14 @@ jobs:
             target: x86_64-unknown-linux-gnu
             executable: floki
             artifact_name: floki-linux-x86_64
-            release_file: floki-linux-x86_64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             executable: floki.exe
             artifact_name: floki-windows-x86_64
-            release_file: floki-windows-x86_64.exe
           - os: macos-latest
             target: aarch64-apple-darwin
             executable: floki
             artifact_name: floki-macos-arm64
-            release_file: floki-macos-arm64
 
     steps:
       - uses: actions/checkout@v5
@@ -99,6 +98,84 @@ jobs:
           path: target/${{ matrix.target }}/release/${{ matrix.executable }}
           if-no-files-found: error
 
+  # Self-contained OCIO build: statically links OpenColorIO 2.4.2 (cmake-built from the
+  # vendored submodule), so the binary runs on machines with no OCIO installed. cmake,
+  # make/MSBuild and python are preinstalled on the runners; the only extra cost is the
+  # one-time OCIO compile (cached by rust-cache between runs). This job also lints the
+  # OCIO-gated code (the `test` job builds without the `ocio` feature, so it can't) and,
+  # on a tag push, produces the published GitHub Release binaries (OCIO is now the default
+  # shipped build).
+  build-ocio:
+    name: OCIO vendored build (${{ matrix.os }})
+    needs: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            executable: floki
+            artifact_name: floki-linux-x86_64-ocio
+            release_file: floki-linux-x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            executable: floki.exe
+            artifact_name: floki-windows-x86_64-ocio
+            release_file: floki-windows-x86_64.exe
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            executable: floki
+            artifact_name: floki-macos-arm64-ocio
+            release_file: floki-macos-arm64
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: clippy
+
+      - name: Install Linux Dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libasound2-dev libudev-dev libgtk-3-dev
+
+      # Caches the cargo registry/git and target/ — including the build-script OUT_DIR with the
+      # compiled OCIO — so the expensive static build only reruns when build.rs / the submodule change.
+      - name: Cache cargo & OCIO build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ocio-vendored
+
+      # Lint the OCIO-gated code with the feature on (the `test` job builds without `ocio`, so
+      # these paths — app.rs OCIO UI, gpu/ocio_pass.rs, floki-ocio — are otherwise never linted).
+      # Linux-only: clippy findings are platform-independent, no need to pay it on all three.
+      - name: Clippy (OCIO, deny warnings)
+        if: runner.os == 'Linux'
+        run: cargo clippy --workspace --all-targets --features ocio-vendored -- -D warnings
+
+      # Functional smoke check of the vendored OCIO on every platform: loads a config and
+      # generates a GPU shader bundle (GLSL->SPIR-V->WGSL). Validates the static OCIO links and
+      # works, independent of a GPU (the on-device Metal test only runs on macOS).
+      - name: OCIO smoke test (config load + shader transpile)
+        run: cargo test -p floki-ocio --release --features vendored-ocio
+
+      - name: Build app (vendored OCIO)
+        run: cargo build --release --features ocio-vendored --target ${{ matrix.target }}
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: target/${{ matrix.target }}/release/${{ matrix.executable }}
+          if-no-files-found: error
+
       - name: Prepare release asset
         if: startsWith(github.ref, 'refs/tags/')
         shell: bash
@@ -106,8 +183,8 @@ jobs:
           cp "target/${{ matrix.target }}/release/${{ matrix.executable }}" \
              "target/${{ matrix.target }}/release/${{ matrix.release_file }}"
 
-      # Pull this tag's section out of CHANGELOG.md (e.g. tag v1.4.3 -> the
-      # `## [1.4.3]` block) so the GitHub Release body matches the changelog.
+      # Pull this tag's section out of CHANGELOG.md (e.g. tag v1.5.0 -> the
+      # `## [1.5.0]` block) so the GitHub Release body matches the changelog.
       # Fails the release if the section is missing, so a tag can't ship with
       # empty/auto notes. Runs on every matrix OS via git-bash.
       - name: Extract release notes from CHANGELOG
@@ -136,67 +213,3 @@ jobs:
         with:
           files: target/${{ matrix.target }}/release/${{ matrix.release_file }}
           body_path: release_notes.md
-# Self-contained OCIO build: statically links OpenColorIO 2.4.2 (cmake-built from the
-  # vendored submodule), so the binary runs on machines with no OCIO installed. cmake,
-  # make/MSBuild and python are preinstalled on the runners; the only extra cost is the
-  # one-time OCIO compile (cached by rust-cache between runs). These artifacts are not yet
-  # wired into the GitHub Release — flip the `build` job over to them once this is proven green.
-  build-ocio:
-    name: OCIO vendored build (${{ matrix.os }})
-    needs: test
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            executable: floki
-            artifact_name: floki-linux-x86_64-ocio
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            executable: floki.exe
-            artifact_name: floki-windows-x86_64-ocio
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            executable: floki
-            artifact_name: floki-macos-arm64-ocio
-
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          submodules: recursive
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Install Linux Dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libasound2-dev libudev-dev libgtk-3-dev
-
-      # Caches the cargo registry/git and target/ — including the build-script OUT_DIR with the
-      # compiled OCIO — so the expensive static build only reruns when build.rs / the submodule change.
-      - name: Cache cargo & OCIO build
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: ocio-vendored
-
-      # Functional smoke check of the vendored OCIO on every platform: loads a config and
-      # generates a GPU shader bundle (GLSL->SPIR-V->WGSL). Validates the static OCIO links and
-      # works, independent of a GPU (the on-device Metal test only runs on macOS).
-      - name: OCIO smoke test (config load + shader transpile)
-        run: cargo test -p floki-ocio --release --features vendored-ocio
-
-      - name: Build app (vendored OCIO)
-        run: cargo build --release --features ocio-vendored --target ${{ matrix.target }}
-
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact_name }}
-          path: target/${{ matrix.target }}/release/${{ matrix.executable }}
-          if-no-files-found: error

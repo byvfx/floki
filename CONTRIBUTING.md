@@ -11,6 +11,9 @@ If you've noticed a bug or have a feature request, please make sure to open an i
 1. Ensure you have Rust and Cargo installed via [rustup](https://rustup.rs/).
 2. Fork the repository and clone it locally.
 3. Run `cargo build` to ensure everything compiles correctly on your system.
+4. To work on OCIO (color management), build with it enabled: `cargo ocio-run` for the
+   self-contained vendored build (needs cmake/ninja/python + a C++ toolchain; see the
+   [README](README.md#color-management-opencolorio)).
 
 ## Submitting a Pull Request (PR)
 

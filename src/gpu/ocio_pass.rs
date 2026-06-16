@@ -6,8 +6,10 @@
 //! ("pass 1") composites + exposes into the offscreen input this pass reads.
 //!
 //! Binding convention (authored in `floki-ocio`'s transpiler, matched here):
-//!   * set 1: binding 0 = scene input texture, binding 1 = scene sampler.
-//!   * set 0: binding 2*i = LUT texture i, binding 2*i+1 = its sampler.
+//!
+//! * set 1: binding 0 = scene input texture, binding 1 = scene sampler.
+//! * set 0: binding 2*i = LUT texture i, binding 2*i+1 = its sampler.
+//!
 //! Bind group *layouts* are built from reflection so they always match the shader; the
 //! resource *assignment* uses the deterministic binding scheme above.
 

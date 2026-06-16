@@ -158,6 +158,15 @@ fn reflect_and_emit_wgsl(spirv: &[u32]) -> Result<(Vec<BindingInfo>, String)> {
     Ok((bindings, wgsl))
 }
 
+fn map_dim(dim: naga::ImageDimension) -> TexDim {
+    match dim {
+        naga::ImageDimension::D1 => TexDim::D1,
+        naga::ImageDimension::D2 => TexDim::D2,
+        naga::ImageDimension::D3 => TexDim::D3,
+        naga::ImageDimension::Cube => TexDim::D2,
+    }
+}
+
 #[cfg(test)]
 mod probe {
     use super::*;
@@ -189,14 +198,5 @@ mod probe {
             round_trip(glsl).is_err(),
             "naga unexpectedly accepted a combined image-sampler"
         );
-    }
-}
-
-fn map_dim(dim: naga::ImageDimension) -> TexDim {
-    match dim {
-        naga::ImageDimension::D1 => TexDim::D1,
-        naga::ImageDimension::D2 => TexDim::D2,
-        naga::ImageDimension::D3 => TexDim::D3,
-        naga::ImageDimension::Cube => TexDim::D2,
     }
 }

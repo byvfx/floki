@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-06-16
+
+### Added
+- **Color management ships by default.** Release binaries now statically bundle
+  OpenColorIO (vendored OCIO 2.4.2), so OCIO color management works out of the
+  box with no install or C++ toolchain on the user's machine. Previously OCIO
+  was a manual opt-in build.
+- Convenience build wrappers for OCIO: `cargo ocio-run` / `cargo ocio-build` /
+  `cargo ocio-test` (cargo aliases, zero install) and a `justfile` (`just ocio`)
+  that also inits the OCIO submodule. The self-contained vendored build is now
+  the documented, recommended cross-platform path.
+
+### Fixed
+- Vendored OCIO build (`--features ocio-vendored`) now links on Windows machines
+  that have vcpkg's user-wide MSBuild integration (`vcpkg integrate install`).
+  That integration silently injected vcpkg's headers (including a different
+  yaml-cpp ABI) into OCIO's Visual Studio build, producing `LNK2019`
+  unresolved `__imp_*` symbols against OCIO's own statically built yaml-cpp.
+  `build.rs` now builds OCIO hermetically (disables the vcpkg MSBuild hooks),
+  so the vendored build is reproducible regardless of the host's vcpkg state.
+- `cargo run` is no longer ambiguous against the `src/bin` helper binaries
+  (`default-run = "floki"`).
+
 ## [1.4.4] - 2026-06-14
 
 ### Fixed
@@ -149,7 +172,8 @@ Initial release.
 - Advanced metadata header inspector.
 - Cross-platform GitHub Actions builds (Linux, Windows, macOS).
 
-[Unreleased]: https://github.com/byvfx/floki/compare/v1.4.4...HEAD
+[Unreleased]: https://github.com/byvfx/floki/compare/v1.5.0...HEAD
+[1.5.0]: https://github.com/byvfx/floki/compare/v1.4.4...v1.5.0
 [1.4.4]: https://github.com/byvfx/floki/compare/v1.4.3...v1.4.4
 [1.4.3]: https://github.com/byvfx/floki/compare/v1.4.2...v1.4.3
 [1.4.2]: https://github.com/byvfx/floki/compare/v1.4.1...v1.4.2
