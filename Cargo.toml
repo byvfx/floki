@@ -8,15 +8,19 @@ members = [".", "floki-ocio"]
 
 [features]
 default = []
-# Enables OpenColorIO support. Pulls in the floki-ocio crate, which builds a
-# native OCIO via cmake (vendored). Off by default so the standard build needs
-# no C++ toolchain. See plans/i-want-to-map-modular-hinton.md.
-ocio = ["dep:floki-ocio"]
+# OpenColorIO support, linking an installed OCIO (Homebrew / OPENCOLORIO_ROOT).
+# This is the dev default — fast, no cmake. Off by default so the standard build
+# needs no C++ toolchain.
+ocio = ["dep:floki-ocio", "floki-ocio/system-ocio"]
+# Distributable build: the same app OCIO support, but with OCIO statically built
+# from the vendored submodule (cmake) so the binary is self-contained. Enables
+# `ocio` for the app code; the vendored backend takes precedence over system-ocio
+# in floki-ocio/build.rs. Heavy first build; needs cmake/ninja/python + a C++ compiler.
+ocio-vendored = ["ocio", "floki-ocio/vendored-ocio"]
 
 [dependencies]
-# Dev uses system-ocio (links the installed OpenColorIO). Switch to "vendored-ocio"
-# for self-contained distributable builds once the cmake wiring lands.
-floki-ocio = { path = "floki-ocio", optional = true, features = ["system-ocio"] }
+# Backend selected via the root `ocio` / `ocio-vendored` features above.
+floki-ocio = { path = "floki-ocio", optional = true }
 eframe = { version = "0.34.3", features = ["persistence", "wgpu"] }
 egui = "0.34.3"
 serde = { version = "1.0", features = ["derive"] }

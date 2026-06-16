@@ -18,31 +18,37 @@ A native OCIO must be linked via exactly one cargo feature. With neither, the cr
 to pure-Rust stubs and every OCIO call returns `OcioError::NotCompiled` (so it never forces a
 C++ toolchain on unrelated builds).
 
-| Feature         | What it does                                                             |
-|-----------------|--------------------------------------------------------------------------|
-| `vendored-ocio` | Builds OCIO from the vendored submodule via cmake (reproducible).         |
-| `system-ocio`   | Links an externally-provided OCIO (e.g. the one the USD app builds).      |
+| Feature         | What it does                                                                      |
+|-----------------|-----------------------------------------------------------------------------------|
+| `system-ocio`   | Links an externally-provided OCIO (Homebrew / `OPENCOLORIO_ROOT`). **Dev default** — fast, no cmake. |
+| `vendored-ocio` | Statically builds OCIO 2.4.2 from the vendored submodule via cmake. **Distributable** — the binary needs no installed OCIO. |
+
+If both are enabled, `vendored-ocio` wins (a self-contained build never falls back to a system OCIO).
 
 ## Build prerequisites (for the native backends)
 
-- `cmake`, `ninja`, `python3` on PATH (OCIO via cmake; the GLSL→SPIR-V step needs ninja+python).
 - A C++ toolchain: clang+libc++ (macOS), MSVC (Windows), gcc/clang+libstdc++ (Linux).
+- `python3` and a build tool (`make` or `ninja`) on PATH — needed by the GLSL→SPIR-V (shaderc) step.
+- **`vendored-ocio` additionally needs `cmake`** to build OCIO. CMake ≥ 3.14; CMake 4 works
+  (the build sets `CMAKE_POLICY_VERSION_MINIMUM=3.5` as a var **and** an env var so OCIO's bundled
+  ext deps — which still declare a pre-3.5 minimum — configure under it).
 
-## Vendored OCIO (Stage 1)
+## Vendored OCIO
 
-The OCIO source is a git submodule pinned to a release tag (matched to the USD app's
-VFX Reference Platform year; default 2.4.x):
+The OCIO source is a git submodule pinned to **v2.4.2** (matched to the USD app's VFX Reference
+Platform year, so both link the same OCIO). After cloning floki:
 
 ```sh
-git submodule add -b v2.4.2 https://github.com/AcademySoftwareFoundation/OpenColorIO \
-    floki-ocio/vendor/OCIO
+git submodule update --init --recursive
 ```
 
-`build.rs` then cmake-builds it with apps/tests/python off and `OCIO_INSTALL_EXT_PACKAGES=ALL`
-(OCIO builds its own Imath/yaml-cpp/expat/pystring/minizip), static-linked.
+`build.rs` then cmake-builds it static (`BUILD_SHARED_LIBS=OFF`) with apps/tests/python/docs off
+and `OCIO_INSTALL_EXT_PACKAGES=ALL` (OCIO builds its own Imath/yaml-cpp/expat/pystring/minizip-ng),
+discovers the installed static archives, and links them (OpenColorIO first) plus the C++ runtime.
+The first build is slow (it compiles OCIO + all ext deps); subsequent builds are incremental.
 
-## Status
+Build the app against it from the workspace root:
 
-Scaffolding only. `build.rs` is a no-op without a backend feature and panics (intentionally)
-if a backend is enabled before the Stage 1 cmake/cxx wiring lands. See
-`plans/i-want-to-map-modular-hinton.md`.
+```sh
+cargo build --release --features ocio-vendored
+```
