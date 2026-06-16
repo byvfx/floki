@@ -114,6 +114,27 @@ impl BlendMode {
     }
 }
 
+/// Per-frame canvas geometry computed once in [`ExrViewer::ui`] and handed to the
+/// GPU/CPU draw paths, so they take one value instead of a long parameter list
+/// and don't recompute layout. All rects are in screen space.
+struct CanvasLayout {
+    /// Full canvas rect allocated for the image.
+    rect: egui::Rect,
+    /// Display-window rect (the EXR's framing), scaled + translated.
+    disp_rect: egui::Rect,
+    /// Data-window rect: where image A's pixels actually land.
+    image_rect: egui::Rect,
+    /// Size of image A in screen pixels (`tex_size * scale`).
+    image_size: egui::Vec2,
+    /// Pixel dimensions of image A's active layer.
+    tex_size: egui::Vec2,
+    /// Pixel dimensions of image B's active layer, if B is loaded.
+    tex_size_b: Option<egui::Vec2>,
+    /// Whether the active compare mode is side-by-side (skips overscan dimming
+    /// and the display-window overlays).
+    is_side_by_side: bool,
+}
+
 /// All canvas state for one A/B pair: view transform, tone controls, the active
 /// [`CompareMode`], the texture caches described in the module docs, plus
 /// sampling/histogram/contact-sheet state. Driven each frame by [`Self::ui`].
@@ -1017,6 +1038,16 @@ impl ExrViewer {
                     );
                 }
 
+                let layout = CanvasLayout {
+                    rect,
+                    disp_rect,
+                    image_rect,
+                    image_size,
+                    tex_size,
+                    tex_size_b,
+                    is_side_by_side,
+                };
+
                 if let Some(_rs) = render_state {
                     // GPU RENDER PATH
                     use eframe::egui_wgpu::wgpu::util::DeviceExt;
@@ -1520,144 +1551,7 @@ impl ExrViewer {
                         }
                     }
                 } else {
-                    let texture = &self.textures[self.active_layer];
-                    let draw_image = |painter: &egui::Painter,
-                                      tex: &egui::TextureHandle,
-                                      clip_rect: egui::Rect,
-                                      target_rect: egui::Rect,
-                                      opacity: f32| {
-                        let alpha = opacity;
-                        let final_clip_rect = painter.clip_rect().intersect(clip_rect);
-                        painter.with_clip_rect(final_clip_rect).image(
-                            tex.id(),
-                            target_rect,
-                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                            egui::Color32::from_white_alpha((alpha * 255.0) as u8),
-                        );
-                    };
-
-                    let draw_all_cpu = |p: &egui::Painter, opac: f32| match self.compare_mode {
-                        CompareMode::SingleA => {
-                            draw_image(p, texture.as_ref().unwrap(), rect, image_rect, opac);
-                        }
-                        CompareMode::SingleB => {
-                            if let Some(tex_b) = exr_data_b.and_then(|d| {
-                                self.textures_b[self
-                                    .active_layer
-                                    .min(d.logical_layers.len().saturating_sub(1))]
-                                .as_ref()
-                            }) {
-                                draw_image(p, tex_b, rect, image_rect, opac);
-                            }
-                        }
-                        CompareMode::Wipe => {
-                            // CPU fallback: keep it vertical for simplicity, but use new center state
-                            let wipe_x =
-                                image_rect.min.x + image_rect.width() * self.wipe_center[0];
-                            let clamped_wipe_x = wipe_x.clamp(rect.min.x, rect.max.x);
-                            let mut rect_a = rect;
-                            rect_a.max.x = clamped_wipe_x;
-                            let mut rect_b = rect;
-                            rect_b.min.x = clamped_wipe_x;
-
-                            draw_image(p, texture.as_ref().unwrap(), rect_a, image_rect, opac);
-                            if let Some(tex_b) = exr_data_b.and_then(|d| {
-                                self.textures_b[self
-                                    .active_layer
-                                    .min(d.logical_layers.len().saturating_sub(1))]
-                                .as_ref()
-                            }) {
-                                draw_image(p, tex_b, rect_b, image_rect, opac);
-                            }
-
-                            let alpha = (self.wipe_line_opacity * 255.0) as u8;
-                            let color = egui::Color32::from_white_alpha(alpha);
-                            p.line_segment(
-                                [
-                                    egui::pos2(wipe_x, rect.min.y),
-                                    egui::pos2(wipe_x, rect.max.y),
-                                ],
-                                (2.0, color),
-                            );
-                        }
-                        CompareMode::SideBySide => {
-                            let tex_b_opt = exr_data_b.and_then(|d| {
-                                self.textures_b[self
-                                    .active_layer
-                                    .min(d.logical_layers.len().saturating_sub(1))]
-                                .as_ref()
-                            });
-                            if let Some(tex_b) = tex_b_opt {
-                                let mut image_size_b = tex_size_b.unwrap() * self.scale;
-                                if self.normalize_side_by_side {
-                                    let scale_b = (tex_size.y * self.scale) / tex_size_b.unwrap().y;
-                                    image_size_b = tex_size_b.unwrap() * scale_b;
-                                }
-                                let combined_width = image_size.x + image_size_b.x;
-                                let combined_height = image_size.y.max(image_size_b.y);
-
-                                let combined_rect = egui::Rect::from_center_size(
-                                    rect.center() + self.translation,
-                                    egui::vec2(combined_width, combined_height),
-                                );
-
-                                let mut image_rect_a =
-                                    egui::Rect::from_min_size(combined_rect.min, image_size);
-                                image_rect_a.set_center(egui::pos2(
-                                    image_rect_a.center().x,
-                                    combined_rect.center().y,
-                                ));
-
-                                let mut image_rect_b = egui::Rect::from_min_size(
-                                    egui::pos2(
-                                        combined_rect.min.x + image_size.x,
-                                        combined_rect.min.y,
-                                    ),
-                                    image_size_b,
-                                );
-                                image_rect_b.set_center(egui::pos2(
-                                    image_rect_b.center().x,
-                                    combined_rect.center().y,
-                                ));
-
-                                draw_image(p, texture.as_ref().unwrap(), rect, image_rect_a, opac);
-                                draw_image(p, tex_b, rect, image_rect_b, opac);
-
-                                p.line_segment(
-                                    [
-                                        egui::pos2(image_rect_b.min.x, combined_rect.min.y),
-                                        egui::pos2(image_rect_b.min.x, combined_rect.max.y),
-                                    ],
-                                    (2.0, egui::Color32::GRAY),
-                                );
-                            } else {
-                                draw_image(p, texture.as_ref().unwrap(), rect, image_rect, opac);
-                            }
-                        }
-                        CompareMode::DiffMatte => {
-                            if let Some(diff) = &self.diff_texture {
-                                draw_image(p, diff, rect, image_rect, opac);
-                            }
-                        }
-                        CompareMode::Composite => {
-                            if let Some(comp) = &self.composite_texture {
-                                draw_image(p, comp, rect, image_rect, opac);
-                            }
-                        }
-                    };
-
-                    if self.overscan_opacity > 0.0 && !is_side_by_side {
-                        draw_all_cpu(&unclipped_painter, self.overscan_opacity);
-                    }
-                    // Side-by-Side renders at full brightness with the full-canvas clip.
-                    draw_all_cpu(
-                        if is_side_by_side {
-                            &unclipped_painter
-                        } else {
-                            &painter
-                        },
-                        1.0,
-                    );
+                    self.draw_canvas_cpu(ui, &layout, exr_data_b);
                 }
 
                 // Draw data window bounding box over the image
@@ -1910,6 +1804,158 @@ impl ExrViewer {
             self.last_sampled_val_a = None;
             self.last_sampled_val_b = None;
         }
+    }
+
+    /// CPU fallback render path (no GPU `render_state`): paint the already-baked
+    /// `egui::TextureHandle`s for the active compare mode. Mirrors the GPU path's
+    /// layout, minus the in-shader effects (those are pre-applied when the CPU
+    /// textures are generated).
+    fn draw_canvas_cpu(&self, ui: &egui::Ui, layout: &CanvasLayout, exr_data_b: Option<&ExrData>) {
+        let CanvasLayout {
+            rect,
+            disp_rect,
+            image_rect,
+            image_size,
+            tex_size,
+            tex_size_b,
+            is_side_by_side,
+        } = *layout;
+        let unclipped_painter = ui.painter().with_clip_rect(rect);
+        let painter = ui.painter().with_clip_rect(rect.intersect(disp_rect));
+
+        let texture = &self.textures[self.active_layer];
+        let draw_image = |painter: &egui::Painter,
+                          tex: &egui::TextureHandle,
+                          clip_rect: egui::Rect,
+                          target_rect: egui::Rect,
+                          opacity: f32| {
+            let alpha = opacity;
+            let final_clip_rect = painter.clip_rect().intersect(clip_rect);
+            painter.with_clip_rect(final_clip_rect).image(
+                tex.id(),
+                target_rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::from_white_alpha((alpha * 255.0) as u8),
+            );
+        };
+
+        let draw_all_cpu = |p: &egui::Painter, opac: f32| match self.compare_mode {
+            CompareMode::SingleA => {
+                draw_image(p, texture.as_ref().unwrap(), rect, image_rect, opac);
+            }
+            CompareMode::SingleB => {
+                if let Some(tex_b) = exr_data_b.and_then(|d| {
+                    self.textures_b[self
+                        .active_layer
+                        .min(d.logical_layers.len().saturating_sub(1))]
+                    .as_ref()
+                }) {
+                    draw_image(p, tex_b, rect, image_rect, opac);
+                }
+            }
+            CompareMode::Wipe => {
+                // CPU fallback: keep it vertical for simplicity, but use new center state
+                let wipe_x = image_rect.min.x + image_rect.width() * self.wipe_center[0];
+                let clamped_wipe_x = wipe_x.clamp(rect.min.x, rect.max.x);
+                let mut rect_a = rect;
+                rect_a.max.x = clamped_wipe_x;
+                let mut rect_b = rect;
+                rect_b.min.x = clamped_wipe_x;
+
+                draw_image(p, texture.as_ref().unwrap(), rect_a, image_rect, opac);
+                if let Some(tex_b) = exr_data_b.and_then(|d| {
+                    self.textures_b[self
+                        .active_layer
+                        .min(d.logical_layers.len().saturating_sub(1))]
+                    .as_ref()
+                }) {
+                    draw_image(p, tex_b, rect_b, image_rect, opac);
+                }
+
+                let alpha = (self.wipe_line_opacity * 255.0) as u8;
+                let color = egui::Color32::from_white_alpha(alpha);
+                p.line_segment(
+                    [
+                        egui::pos2(wipe_x, rect.min.y),
+                        egui::pos2(wipe_x, rect.max.y),
+                    ],
+                    (2.0, color),
+                );
+            }
+            CompareMode::SideBySide => {
+                let tex_b_opt = exr_data_b.and_then(|d| {
+                    self.textures_b[self
+                        .active_layer
+                        .min(d.logical_layers.len().saturating_sub(1))]
+                    .as_ref()
+                });
+                if let Some(tex_b) = tex_b_opt {
+                    let mut image_size_b = tex_size_b.unwrap() * self.scale;
+                    if self.normalize_side_by_side {
+                        let scale_b = (tex_size.y * self.scale) / tex_size_b.unwrap().y;
+                        image_size_b = tex_size_b.unwrap() * scale_b;
+                    }
+                    let combined_width = image_size.x + image_size_b.x;
+                    let combined_height = image_size.y.max(image_size_b.y);
+
+                    let combined_rect = egui::Rect::from_center_size(
+                        rect.center() + self.translation,
+                        egui::vec2(combined_width, combined_height),
+                    );
+
+                    let mut image_rect_a = egui::Rect::from_min_size(combined_rect.min, image_size);
+                    image_rect_a.set_center(egui::pos2(
+                        image_rect_a.center().x,
+                        combined_rect.center().y,
+                    ));
+
+                    let mut image_rect_b = egui::Rect::from_min_size(
+                        egui::pos2(combined_rect.min.x + image_size.x, combined_rect.min.y),
+                        image_size_b,
+                    );
+                    image_rect_b.set_center(egui::pos2(
+                        image_rect_b.center().x,
+                        combined_rect.center().y,
+                    ));
+
+                    draw_image(p, texture.as_ref().unwrap(), rect, image_rect_a, opac);
+                    draw_image(p, tex_b, rect, image_rect_b, opac);
+
+                    p.line_segment(
+                        [
+                            egui::pos2(image_rect_b.min.x, combined_rect.min.y),
+                            egui::pos2(image_rect_b.min.x, combined_rect.max.y),
+                        ],
+                        (2.0, egui::Color32::GRAY),
+                    );
+                } else {
+                    draw_image(p, texture.as_ref().unwrap(), rect, image_rect, opac);
+                }
+            }
+            CompareMode::DiffMatte => {
+                if let Some(diff) = &self.diff_texture {
+                    draw_image(p, diff, rect, image_rect, opac);
+                }
+            }
+            CompareMode::Composite => {
+                if let Some(comp) = &self.composite_texture {
+                    draw_image(p, comp, rect, image_rect, opac);
+                }
+            }
+        };
+
+        if self.overscan_opacity > 0.0 && !is_side_by_side {
+            draw_all_cpu(&unclipped_painter, self.overscan_opacity);
+        }
+        // Side-by-Side renders at full brightness with the full-canvas clip.
+        draw_all_cpu(
+            if is_side_by_side {
+                &unclipped_painter
+            } else {
+                &painter
+            },
+            1.0,
+        );
     }
 
     /// The real render path: upload `layer_index`'s RGBA into a GPU bind group.
