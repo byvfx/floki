@@ -55,7 +55,13 @@ impl OcioGpuPass {
         output_format: wgpu::TextureFormat,
     ) -> Result<Self, String> {
         // --- Bind group layouts from reflection (so they always match the shader) ---
-        let max_group = bundle.bindings.iter().map(|b| b.group).max().unwrap_or(1).max(1);
+        let max_group = bundle
+            .bindings
+            .iter()
+            .map(|b| b.group)
+            .max()
+            .unwrap_or(1)
+            .max(1);
         let mut group_layouts = Vec::new();
         for g in 0..=max_group {
             let mut entries: Vec<wgpu::BindGroupLayoutEntry> = bundle
@@ -84,12 +90,12 @@ impl OcioGpuPass {
                 })
                 .collect();
             entries.sort_by_key(|e| e.binding);
-            group_layouts.push(device.create_bind_group_layout(
-                &wgpu::BindGroupLayoutDescriptor {
+            group_layouts.push(
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                     label: Some("OCIO bind group layout"),
                     entries: &entries,
-                },
-            ));
+                }),
+            );
         }
 
         // --- Pipeline ---
@@ -584,12 +590,15 @@ fn upload_lut(
 mod metal_tests {
     use super::*;
 
-    fn default_request(
-        cfg: &floki_ocio::OcioConfig,
-    ) -> floki_ocio::DisplayTransformRequest {
+    fn default_request(cfg: &floki_ocio::OcioConfig) -> floki_ocio::DisplayTransformRequest {
         let input_colorspace = cfg
             .scene_linear_colorspace()
-            .or_else(|| cfg.color_spaces().into_iter().find(|c| !c.is_data).map(|c| c.name))
+            .or_else(|| {
+                cfg.color_spaces()
+                    .into_iter()
+                    .find(|c| !c.is_data)
+                    .map(|c| c.name)
+            })
             .unwrap();
         let display = cfg.default_display();
         let view = cfg
@@ -611,15 +620,15 @@ mod metal_tests {
     fn ocio_pipeline_creates_and_runs_on_device() {
         let instance =
             wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-        let adapter =
-            match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
-            {
-                Ok(a) => a,
-                Err(_) => {
-                    eprintln!("no GPU adapter available; skipping on-device OCIO test");
-                    return;
-                }
-            };
+        let adapter = match pollster::block_on(
+            instance.request_adapter(&wgpu::RequestAdapterOptions::default()),
+        ) {
+            Ok(a) => a,
+            Err(_) => {
+                eprintln!("no GPU adapter available; skipping on-device OCIO test");
+                return;
+            }
+        };
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("ocio-test-device"),
             required_features: wgpu::Features::FLOAT32_FILTERABLE,
