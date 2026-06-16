@@ -258,8 +258,17 @@ mod native {
                 v.push(("dylib", "dl".to_string()));
                 v.push(("dylib", "pthread".to_string()));
             }
-            "windows" if env == "gnu" => v.push(("dylib", "stdc++".to_string())),
-            // MSVC links its C++ runtime automatically.
+            "windows" => {
+                // OCIO's SystemMonitor queries the OS for monitor ICC profiles via the GDI
+                // (CreateDC/GetICMProfile) and display-config (QueryDisplayConfig) APIs; a
+                // static consumer must link these system import libs itself.
+                v.push(("dylib", "gdi32".to_string()));
+                v.push(("dylib", "user32".to_string()));
+                // MinGW needs libstdc++; MSVC links its C++ runtime automatically.
+                if env == "gnu" {
+                    v.push(("dylib", "stdc++".to_string()));
+                }
+            }
             _ => {}
         }
         v
