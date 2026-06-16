@@ -136,11 +136,13 @@ jobs:
         with:
           files: target/${{ matrix.target }}/release/${{ matrix.release_file }}
           body_path: release_notes.md
-# Self-contained OCIO build: statically links OpenColorIO 2.4.2 (cmake-built from the
+  # Self-contained OCIO build: statically links OpenColorIO 2.4.2 (cmake-built from the
   # vendored submodule), so the binary runs on machines with no OCIO installed. cmake,
   # make/MSBuild and python are preinstalled on the runners; the only extra cost is the
-  # one-time OCIO compile (cached by rust-cache between runs). These artifacts are not yet
-  # wired into the GitHub Release — flip the `build` job over to them once this is proven green.
+  # one-time OCIO compile (cached by rust-cache between runs). This job also lints the
+  # OCIO-gated code (the `test` job builds without the `ocio` feature, so it can't). These
+  # artifacts are not yet wired into the GitHub Release — flip the `build` job over to them
+  # once this is proven green.
   build-ocio:
     name: OCIO vendored build (${{ matrix.os }})
     needs: test
@@ -171,6 +173,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+          components: clippy
 
       - name: Install Linux Dependencies
         if: runner.os == 'Linux'
@@ -184,6 +187,13 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: ocio-vendored
+
+      # Lint the OCIO-gated code with the feature on (the `test` job builds without `ocio`, so
+      # these paths — app.rs OCIO UI, gpu/ocio_pass.rs, floki-ocio — are otherwise never linted).
+      # Linux-only: clippy findings are platform-independent, no need to pay it on all three.
+      - name: Clippy (OCIO, deny warnings)
+        if: runner.os == 'Linux'
+        run: cargo clippy --workspace --all-targets --features ocio-vendored -- -D warnings
 
       # Functional smoke check of the vendored OCIO on every platform: loads a config and
       # generates a GPU shader bundle (GLSL->SPIR-V->WGSL). Validates the static OCIO links and
