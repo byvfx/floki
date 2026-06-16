@@ -26,9 +26,9 @@ pub use error::{OcioError, Result};
 
 // Native backend (cxx shim + transpile). Only compiled when a backend feature is enabled.
 #[cfg(feature = "_native")]
-mod ffi;
-#[cfg(feature = "_native")]
 mod backend;
+#[cfg(feature = "_native")]
+mod ffi;
 #[cfg(feature = "_native")]
 mod transpile;
 
@@ -260,7 +260,9 @@ impl OcioConfig {
     pub fn build_cpu_processor(&self, req: &DisplayTransformRequest) -> Result<CpuProcessor> {
         #[cfg(feature = "_native")]
         {
-            self.inner.build_cpu_processor(req).map(|inner| CpuProcessor { inner })
+            self.inner
+                .build_cpu_processor(req)
+                .map(|inner| CpuProcessor { inner })
         }
         #[cfg(not(feature = "_native"))]
         {
@@ -287,9 +289,7 @@ pub struct CpuProcessor {
 impl CpuProcessor {
     /// Apply the transform to interleaved RGBA f32 pixels, in place.
     pub fn apply_rgba(&self, pixels: &mut [f32], width: usize, height: usize) -> Result<()> {
-        let expected = width
-            .saturating_mul(height)
-            .saturating_mul(4);
+        let expected = width.saturating_mul(height).saturating_mul(4);
         if pixels.len() != expected {
             return Err(OcioError::BufferSize {
                 got: pixels.len(),

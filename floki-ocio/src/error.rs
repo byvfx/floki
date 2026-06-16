@@ -24,7 +24,9 @@ pub enum OcioError {
     Transpile(String),
 
     /// A buffer handed to a CPU processor had the wrong length for its dimensions.
-    #[error("pixel buffer length {got} does not match {width}x{height}x{channels} (expected {expected})")]
+    #[error(
+        "pixel buffer length {got} does not match {width}x{height}x{channels} (expected {expected})"
+    )]
     BufferSize {
         got: usize,
         width: usize,

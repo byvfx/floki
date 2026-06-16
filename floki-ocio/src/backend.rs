@@ -5,8 +5,8 @@ use cxx::UniquePtr;
 
 use crate::ffi::bridge;
 use crate::{
-    ColorSpace, ConfigSource, Display, DisplayTransformRequest, GpuShaderBundle, Interp, LutTexture,
-    OcioError, Result, TexDim,
+    ColorSpace, ConfigSource, Display, DisplayTransformRequest, GpuShaderBundle, Interp,
+    LutTexture, OcioError, Result, TexDim,
 };
 
 /// Wraps the opaque C++ config handle.
@@ -162,7 +162,12 @@ mod dump_tests {
             };
             let input = cfg
                 .scene_linear_colorspace()
-                .or_else(|| cfg.color_spaces().into_iter().find(|c| !c.is_data).map(|c| c.name))
+                .or_else(|| {
+                    cfg.color_spaces()
+                        .into_iter()
+                        .find(|c| !c.is_data)
+                        .map(|c| c.name)
+                })
                 .unwrap();
             let display = cfg.default_display();
             let view = cfg
@@ -189,8 +194,15 @@ mod dump_tests {
                 for t in &data.textures {
                     eprintln!(
                         "   {} (sampler {}): dim={} {}x{}x{} ch={} interp={} data_len={}",
-                        t.name, t.sampler_name, t.dim, t.width, t.height, t.depth, t.channels,
-                        t.interpolation, t.data.len()
+                        t.name,
+                        t.sampler_name,
+                        t.dim,
+                        t.width,
+                        t.height,
+                        t.depth,
+                        t.channels,
+                        t.interpolation,
+                        t.data.len()
                     );
                 }
                 eprintln!("-- GLSL ({} bytes):\n{}", data.glsl.len(), data.glsl);
