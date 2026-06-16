@@ -1682,211 +1682,233 @@ impl ExrViewer {
                     );
                 }
 
-                // Pixel Sampling & Swatches
-                let mut hovered_pixel = None;
-                if let Some(pos) = response.hover_pos() {
-                    let mut hover_x = None;
-                    let mut hover_y = None;
-                    let mut hovered_b = false;
+                self.handle_pixel_sampling(
+                    ui, &response, exr_data, exr_data_b, rect, image_rect, image_size, tex_size,
+                    tex_size_b,
+                );
+            }
+        }
+    }
 
-                    if self.compare_mode == CompareMode::SideBySide && exr_data_b.is_some() {
-                        let tex_b_opt = exr_data_b.and_then(|d| {
-                            self.textures_b[self
-                                .active_layer
-                                .min(d.logical_layers.len().saturating_sub(1))]
-                            .as_ref()
-                        });
-                        if tex_b_opt.is_some() {
-                            let mut image_size_b = tex_size_b.unwrap() * self.scale;
-                            if self.normalize_side_by_side {
-                                let scale_b = (tex_size.y * self.scale) / tex_size_b.unwrap().y;
-                                image_size_b = tex_size_b.unwrap() * scale_b;
-                            }
-                            let combined_width = image_size.x + image_size_b.x;
-                            let combined_height = image_size.y.max(image_size_b.y);
+    /// Hover/sample readout for the canvas: map the cursor to image pixel
+    /// coordinates (handling the side-by-side split), sample A (and B) at that
+    /// pixel, cache the last sample, show the value tooltip, and add a swatch on
+    /// Shift+Click. Geometry (`rect`/`image_rect`/sizes) comes from the caller's
+    /// layout so this stays purely about sampling.
+    #[allow(clippy::too_many_arguments)]
+    fn handle_pixel_sampling(
+        &mut self,
+        ui: &egui::Ui,
+        response: &egui::Response,
+        exr_data: &ExrData,
+        exr_data_b: Option<&ExrData>,
+        rect: egui::Rect,
+        image_rect: egui::Rect,
+        image_size: egui::Vec2,
+        tex_size: egui::Vec2,
+        tex_size_b: Option<egui::Vec2>,
+    ) {
+        let mut hovered_pixel = None;
+        if let Some(pos) = response.hover_pos() {
+            let mut hover_x = None;
+            let mut hover_y = None;
+            let mut hovered_b = false;
 
-                            let combined_rect = egui::Rect::from_center_size(
-                                rect.center() + self.translation,
-                                egui::vec2(combined_width, combined_height),
-                            );
-
-                            let mut image_rect_a =
-                                egui::Rect::from_min_size(combined_rect.min, image_size);
-                            image_rect_a.set_center(egui::pos2(
-                                image_rect_a.center().x,
-                                combined_rect.center().y,
-                            ));
-
-                            let mut image_rect_b = egui::Rect::from_min_size(
-                                egui::pos2(combined_rect.min.x + image_size.x, combined_rect.min.y),
-                                image_size_b,
-                            );
-                            image_rect_b.set_center(egui::pos2(
-                                image_rect_b.center().x,
-                                combined_rect.center().y,
-                            ));
-
-                            if image_rect_a.contains(pos) {
-                                let local = pos - image_rect_a.min;
-                                hover_x = Some((local.x / self.scale) as usize);
-                                hover_y = Some((local.y / self.scale) as usize);
-                            } else if image_rect_b.contains(pos) {
-                                let local = pos - image_rect_b.min;
-                                let scale_b = if self.normalize_side_by_side {
-                                    (tex_size.y * self.scale) / tex_size_b.unwrap().y
-                                } else {
-                                    self.scale
-                                };
-                                hover_x = Some((local.x / scale_b) as usize);
-                                hover_y = Some((local.y / scale_b) as usize);
-                                hovered_b = true;
-                            }
-                        }
-                    } else {
-                        let image_local_pos = pos - image_rect.min;
-                        if image_local_pos.x >= 0.0 && image_local_pos.y >= 0.0 {
-                            hover_x = Some((image_local_pos.x / self.scale) as usize);
-                            hover_y = Some((image_local_pos.y / self.scale) as usize);
-                        }
+            if self.compare_mode == CompareMode::SideBySide && exr_data_b.is_some() {
+                let tex_b_opt = exr_data_b.and_then(|d| {
+                    self.textures_b[self
+                        .active_layer
+                        .min(d.logical_layers.len().saturating_sub(1))]
+                    .as_ref()
+                });
+                if tex_b_opt.is_some() {
+                    let mut image_size_b = tex_size_b.unwrap() * self.scale;
+                    if self.normalize_side_by_side {
+                        let scale_b = (tex_size.y * self.scale) / tex_size_b.unwrap().y;
+                        image_size_b = tex_size_b.unwrap() * scale_b;
                     }
-                    let mut val_a_opt = None;
-                    let mut val_b_opt = None;
-                    let mut x_final = None;
-                    let mut y_final = None;
+                    let combined_width = image_size.x + image_size_b.x;
+                    let combined_height = image_size.y.max(image_size_b.y);
 
-                    if let (Some(x), Some(y)) = (hover_x, hover_y) {
-                        // Check if within bounds of the hovered image
-                        let mut valid = false;
-                        if hovered_b {
-                            if let Some(s) = tex_size_b
-                                && x < s.x as usize
-                                && y < s.y as usize
-                            {
-                                valid = true;
-                            }
-                        } else if x < tex_size.x as usize && y < tex_size.y as usize {
-                            valid = true;
-                        }
+                    let combined_rect = egui::Rect::from_center_size(
+                        rect.center() + self.translation,
+                        egui::vec2(combined_width, combined_height),
+                    );
 
-                        if valid {
-                            hovered_pixel = Some((x, y));
-                            x_final = Some(x);
-                            y_final = Some(y);
-                            val_a_opt = self.sample_pixel(exr_data, self.active_layer, x, y);
-                            val_b_opt = if let Some(exr_b) = exr_data_b {
-                                let layer_b = self
-                                    .active_layer
-                                    .min(exr_b.logical_layers.len().saturating_sub(1));
-                                self.sample_pixel(exr_b, layer_b, x, y)
-                            } else {
-                                None
-                            };
+                    let mut image_rect_a = egui::Rect::from_min_size(combined_rect.min, image_size);
+                    image_rect_a.set_center(egui::pos2(
+                        image_rect_a.center().x,
+                        combined_rect.center().y,
+                    ));
 
-                            self.last_hover_pos_img = Some((x, y));
-                            self.last_sampled_val_a = val_a_opt;
-                            self.last_sampled_val_b = val_b_opt;
-                        }
-                    }
+                    let mut image_rect_b = egui::Rect::from_min_size(
+                        egui::pos2(combined_rect.min.x + image_size.x, combined_rect.min.y),
+                        image_size_b,
+                    );
+                    image_rect_b.set_center(egui::pos2(
+                        image_rect_b.center().x,
+                        combined_rect.center().y,
+                    ));
 
-                    if self.show_tooltip
-                        && (val_a_opt.is_some() || val_b_opt.is_some())
-                        && let (Some(x), Some(y)) = (x_final, y_final)
-                    {
-                        egui::Window::new("Pixel Tooltip")
-                            .fixed_pos(pos + egui::vec2(15.0, 15.0))
-                            .title_bar(false)
-                            .resizable(false)
-                            .collapsible(false)
-                            .show(ui.ctx(), |ui| {
-                                ui.label(format!("x={} y={}", x, y));
-
-                                if let Some(val_a) = val_a_opt {
-                                    ui.horizontal(|ui| {
-                                        colored_rgba_label(
-                                            ui,
-                                            if val_b_opt.is_some() { "A:" } else { "" },
-                                            val_a,
-                                        );
-                                        let (r, g, b) = (
-                                            (val_a[0].clamp(0.0, 1.0) * 255.0) as u8,
-                                            (val_a[1].clamp(0.0, 1.0) * 255.0) as u8,
-                                            (val_a[2].clamp(0.0, 1.0) * 255.0) as u8,
-                                        );
-                                        let (rect, _) = ui.allocate_exact_size(
-                                            egui::vec2(16.0, 16.0),
-                                            egui::Sense::hover(),
-                                        );
-                                        ui.painter().rect_filled(
-                                            rect,
-                                            0.0,
-                                            egui::Color32::from_rgb(r, g, b),
-                                        );
-                                    });
-                                    let (h, s, v, l) = rgb_to_hsvl(val_a[0], val_a[1], val_a[2]);
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "H:{:.0} S:{:.2} V:{:.2} L:{:.5}",
-                                            h, s, v, l
-                                        ))
-                                        .color(egui::Color32::LIGHT_GRAY),
-                                    );
-                                }
-
-                                if let Some(val_b) = val_b_opt {
-                                    ui.horizontal(|ui| {
-                                        colored_rgba_label(ui, "B:", val_b);
-                                        let (r, g, b) = (
-                                            (val_b[0].clamp(0.0, 1.0) * 255.0) as u8,
-                                            (val_b[1].clamp(0.0, 1.0) * 255.0) as u8,
-                                            (val_b[2].clamp(0.0, 1.0) * 255.0) as u8,
-                                        );
-                                        let (rect, _) = ui.allocate_exact_size(
-                                            egui::vec2(16.0, 16.0),
-                                            egui::Sense::hover(),
-                                        );
-                                        ui.painter().rect_filled(
-                                            rect,
-                                            0.0,
-                                            egui::Color32::from_rgb(r, g, b),
-                                        );
-                                    });
-                                    let (h, s, v, l) = rgb_to_hsvl(val_b[0], val_b[1], val_b[2]);
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "H:{:.0} S:{:.2} V:{:.2} L:{:.5}",
-                                            h, s, v, l
-                                        ))
-                                        .color(egui::Color32::LIGHT_GRAY),
-                                    );
-                                }
-
-                                if let (Some(val_a), Some(val_b)) = (val_a_opt, val_b_opt) {
-                                    let diff = [
-                                        (val_b[0] - val_a[0]).abs(),
-                                        (val_b[1] - val_a[1]).abs(),
-                                        (val_b[2] - val_a[2]).abs(),
-                                        (val_b[3] - val_a[3]).abs(),
-                                    ];
-                                    colored_rgba_label(ui, "Diff:", diff);
-                                }
-                            });
-
-                        // Shift+Click to add a persistent swatch
-                        if ui.input(|i| i.modifiers.shift)
-                            && response.clicked()
-                            && let Some(v) = val_a_opt.or(val_b_opt)
-                        {
-                            self.swatches.push(v);
-                        }
+                    if image_rect_a.contains(pos) {
+                        let local = pos - image_rect_a.min;
+                        hover_x = Some((local.x / self.scale) as usize);
+                        hover_y = Some((local.y / self.scale) as usize);
+                    } else if image_rect_b.contains(pos) {
+                        let local = pos - image_rect_b.min;
+                        let scale_b = if self.normalize_side_by_side {
+                            (tex_size.y * self.scale) / tex_size_b.unwrap().y
+                        } else {
+                            self.scale
+                        };
+                        hover_x = Some((local.x / scale_b) as usize);
+                        hover_y = Some((local.y / scale_b) as usize);
+                        hovered_b = true;
                     }
                 }
-
-                if hovered_pixel.is_none() {
-                    self.last_hover_pos_img = None;
-                    self.last_sampled_val_a = None;
-                    self.last_sampled_val_b = None;
+            } else {
+                let image_local_pos = pos - image_rect.min;
+                if image_local_pos.x >= 0.0 && image_local_pos.y >= 0.0 {
+                    hover_x = Some((image_local_pos.x / self.scale) as usize);
+                    hover_y = Some((image_local_pos.y / self.scale) as usize);
                 }
             }
+            let mut val_a_opt = None;
+            let mut val_b_opt = None;
+            let mut x_final = None;
+            let mut y_final = None;
+
+            if let (Some(x), Some(y)) = (hover_x, hover_y) {
+                // Check if within bounds of the hovered image
+                let mut valid = false;
+                if hovered_b {
+                    if let Some(s) = tex_size_b
+                        && x < s.x as usize
+                        && y < s.y as usize
+                    {
+                        valid = true;
+                    }
+                } else if x < tex_size.x as usize && y < tex_size.y as usize {
+                    valid = true;
+                }
+
+                if valid {
+                    hovered_pixel = Some((x, y));
+                    x_final = Some(x);
+                    y_final = Some(y);
+                    val_a_opt = self.sample_pixel(exr_data, self.active_layer, x, y);
+                    val_b_opt = if let Some(exr_b) = exr_data_b {
+                        let layer_b = self
+                            .active_layer
+                            .min(exr_b.logical_layers.len().saturating_sub(1));
+                        self.sample_pixel(exr_b, layer_b, x, y)
+                    } else {
+                        None
+                    };
+
+                    self.last_hover_pos_img = Some((x, y));
+                    self.last_sampled_val_a = val_a_opt;
+                    self.last_sampled_val_b = val_b_opt;
+                }
+            }
+
+            if self.show_tooltip
+                && (val_a_opt.is_some() || val_b_opt.is_some())
+                && let (Some(x), Some(y)) = (x_final, y_final)
+            {
+                egui::Window::new("Pixel Tooltip")
+                    .fixed_pos(pos + egui::vec2(15.0, 15.0))
+                    .title_bar(false)
+                    .resizable(false)
+                    .collapsible(false)
+                    .show(ui.ctx(), |ui| {
+                        ui.label(format!("x={} y={}", x, y));
+
+                        if let Some(val_a) = val_a_opt {
+                            ui.horizontal(|ui| {
+                                colored_rgba_label(
+                                    ui,
+                                    if val_b_opt.is_some() { "A:" } else { "" },
+                                    val_a,
+                                );
+                                let (r, g, b) = (
+                                    (val_a[0].clamp(0.0, 1.0) * 255.0) as u8,
+                                    (val_a[1].clamp(0.0, 1.0) * 255.0) as u8,
+                                    (val_a[2].clamp(0.0, 1.0) * 255.0) as u8,
+                                );
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(16.0, 16.0),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().rect_filled(
+                                    rect,
+                                    0.0,
+                                    egui::Color32::from_rgb(r, g, b),
+                                );
+                            });
+                            let (h, s, v, l) = rgb_to_hsvl(val_a[0], val_a[1], val_a[2]);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "H:{:.0} S:{:.2} V:{:.2} L:{:.5}",
+                                    h, s, v, l
+                                ))
+                                .color(egui::Color32::LIGHT_GRAY),
+                            );
+                        }
+
+                        if let Some(val_b) = val_b_opt {
+                            ui.horizontal(|ui| {
+                                colored_rgba_label(ui, "B:", val_b);
+                                let (r, g, b) = (
+                                    (val_b[0].clamp(0.0, 1.0) * 255.0) as u8,
+                                    (val_b[1].clamp(0.0, 1.0) * 255.0) as u8,
+                                    (val_b[2].clamp(0.0, 1.0) * 255.0) as u8,
+                                );
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(16.0, 16.0),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().rect_filled(
+                                    rect,
+                                    0.0,
+                                    egui::Color32::from_rgb(r, g, b),
+                                );
+                            });
+                            let (h, s, v, l) = rgb_to_hsvl(val_b[0], val_b[1], val_b[2]);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "H:{:.0} S:{:.2} V:{:.2} L:{:.5}",
+                                    h, s, v, l
+                                ))
+                                .color(egui::Color32::LIGHT_GRAY),
+                            );
+                        }
+
+                        if let (Some(val_a), Some(val_b)) = (val_a_opt, val_b_opt) {
+                            let diff = [
+                                (val_b[0] - val_a[0]).abs(),
+                                (val_b[1] - val_a[1]).abs(),
+                                (val_b[2] - val_a[2]).abs(),
+                                (val_b[3] - val_a[3]).abs(),
+                            ];
+                            colored_rgba_label(ui, "Diff:", diff);
+                        }
+                    });
+
+                // Shift+Click to add a persistent swatch
+                if ui.input(|i| i.modifiers.shift)
+                    && response.clicked()
+                    && let Some(v) = val_a_opt.or(val_b_opt)
+                {
+                    self.swatches.push(v);
+                }
+            }
+        }
+
+        if hovered_pixel.is_none() {
+            self.last_hover_pos_img = None;
+            self.last_sampled_val_a = None;
+            self.last_sampled_val_b = None;
         }
     }
 
