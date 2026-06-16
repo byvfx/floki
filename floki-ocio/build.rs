@@ -47,6 +47,13 @@ mod native {
         for inc in &backend.extra_includes {
             build.include(inc);
         }
+        // A statically-linked OCIO on Windows (MSVC) needs OCIO's headers to skip the
+        // `__declspec(dllimport)` decorations they apply by default (which assume a DLL);
+        // otherwise every OCIO symbol is an unresolved import at link time. No effect on the
+        // gcc/clang visibility-attribute path, so it's safe to define unconditionally here.
+        #[cfg(feature = "vendored-ocio")]
+        build.define("OpenColorIO_SKIP_IMPORTS", None);
+
         build.compile("floki_ocio_shim");
 
         // Emit link directives (search dirs first, then libs in order).
