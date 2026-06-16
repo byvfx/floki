@@ -106,6 +106,9 @@ fn repack_texture(t: &bridge::OcioTexture) -> LutTexture {
         let (r, g, b) = if ch >= 3 {
             (t.data[base], t.data[base + 1], t.data[base + 2])
         } else {
+            // 1-/2-channel LUT: replicate nothing — put the single channel in R and
+            // leave G/B at 0. `unwrap_or(0.0)` only guards a malformed texture whose
+            // declared size exceeds its data; 0.0 (black) is the safe neutral there.
             (t.data.get(base).copied().unwrap_or(0.0), 0.0, 0.0)
         };
         data_rgba.extend_from_slice(&[r, g, b, 1.0]);

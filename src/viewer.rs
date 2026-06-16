@@ -1,7 +1,40 @@
+//! The image canvas: pan/zoom, channel/exposure/gamma controls, the six
+//! [`CompareMode`]s, pixel sampling, histogram and contact sheet. State lives in
+//! [`ExrViewer`]; [`ExrViewer::ui`] is the per-frame entry point.
+//!
+//! # Texture generation
+//!
+//! Two rendering paths produce what's drawn, and which `generate_*` function
+//! runs depends on whether a GPU [`RenderState`](eframe::egui_wgpu::RenderState)
+//! is available:
+//!
+//! - **GPU (default).** [`Self::generate_gpu_texture`](ExrViewer::generate_gpu_texture)
+//!   uploads a layer's RGBA into a bind group; `gpu/shader.wgsl` then applies
+//!   channel isolation, exposure, gamma, sRGB **and every compare mode**
+//!   (wipe / diff / composite) in-shader. So in GPU mode a single generator
+//!   serves all modes, cached per layer in `gpu_textures` / `gpu_textures_b`.
+//!
+//! - **CPU (no `render_state`, plus contact-sheet thumbnails).** The result is
+//!   baked into an [`egui::TextureHandle`], so each compare mode needs its own
+//!   generator. When an OCIO CPU processor is active each path dispatches to its
+//!   `_ocio` sibling (display transform instead of the built-in sRGB tone math):
+//!
+//!   | Situation            | Function                       | OCIO-active variant               | Cache (key)                                 |
+//!   |----------------------|--------------------------------|-----------------------------------|---------------------------------------------|
+//!   | Single layer / thumb | `generate_texture`             | `generate_texture_ocio`           | `textures` / `textures_b` (per-layer slot)  |
+//!   | [`CompareMode::DiffMatte`] | `generate_diff_texture`   | — (diff is tone-mode-agnostic)    | `diff_texture`, key `(active_layer, diff_multiplier)` |
+//!   | [`CompareMode::Composite`] | `generate_composite_texture` | `generate_composite_texture_ocio` | `composite_texture`, key `(active_layer, blend_mode)` |
+//!
+//! All caches invalidate on a layer-count change; the per-layer slots also clear
+//! on an OCIO-state change and via [`ExrViewer::invalidate_reference_textures`]
+//! when B is replaced.
+
 use crate::exr_loader::ExrData;
 use eframe::egui;
 use rayon::prelude::*;
 
+/// Which channel(s) the canvas isolates. `RGB` shows full colour; the rest show
+/// a single channel as grayscale. Encoded for the shader via [`Self::as_u32`].
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 #[allow(clippy::upper_case_acronyms)] // RGB matches the documented channel_mode mapping
 pub enum ChannelMode {
@@ -29,6 +62,10 @@ impl ChannelMode {
     }
 }
 
+/// How A and B are shown together. `SingleA`/`SingleB` ignore the other image;
+/// the rest require a loaded B. `Wipe`, `SideBySide` and `DiffMatte`/`Composite`
+/// are all resolved in-shader on the GPU path (and have CPU-fallback generators
+/// for `DiffMatte`/`Composite` — see the module-level docs).
 #[derive(PartialEq, Clone, Copy, Debug)]
 pub enum CompareMode {
     SingleA,
@@ -39,6 +76,8 @@ pub enum CompareMode {
     Composite,
 }
 
+/// Compositing operator for [`CompareMode::Composite`] (premultiplied-alpha
+/// aware). Encoded for the shader via [`Self::as_u32`].
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 pub enum BlendMode {
     #[default]
@@ -75,6 +114,9 @@ impl BlendMode {
     }
 }
 
+/// All canvas state for one A/B pair: view transform, tone controls, the active
+/// [`CompareMode`], the texture caches described in the module docs, plus
+/// sampling/histogram/contact-sheet state. Driven each frame by [`Self::ui`].
 pub struct ExrViewer {
     textures: Vec<Option<egui::TextureHandle>>,
     textures_b: Vec<Option<egui::TextureHandle>>,
@@ -576,6 +618,190 @@ impl ExrViewer {
         });
     }
 
+    /// Drop cached CPU textures (thumbnails / fallback) when the OCIO CPU
+    /// processor changes, so they regenerate with — or without — the display
+    /// transform. A no-op while the processor identity is unchanged.
+    #[cfg(feature = "ocio")]
+    fn invalidate_ocio_cpu_textures(&mut self) {
+        let sig = if self.ocio_active {
+            self.ocio_cpu
+                .as_ref()
+                .map(|p| std::rc::Rc::as_ptr(p) as usize)
+                .unwrap_or(1)
+        } else {
+            0
+        };
+        if sig != self.ocio_sig {
+            self.ocio_sig = sig;
+            self.textures.fill(None);
+            self.textures_b.fill(None);
+        }
+    }
+
+    /// While blink is active (and B is loaded), alternate the displayed image
+    /// between A and B on `blink_interval`, requesting repaints to keep cycling.
+    fn apply_blink_mode(&mut self, ui: &egui::Ui, has_b: bool) {
+        if self.blink_state && has_b {
+            ui.ctx().request_repaint();
+            let time = ui.input(|i| i.time);
+            if ((time / self.blink_interval as f64) as usize).is_multiple_of(2) {
+                self.compare_mode = CompareMode::SingleA;
+            } else {
+                self.compare_mode = CompareMode::SingleB;
+            }
+        }
+    }
+
+    /// Resize the per-layer texture caches to the current A/B layer counts,
+    /// clearing them (forcing regeneration) whenever a count changes.
+    fn sync_texture_caches(&mut self, layer_count: usize, layer_count_b: usize) {
+        if self.textures.len() != layer_count {
+            self.textures.clear();
+            self.textures.resize(layer_count, None);
+            self.gpu_textures.clear();
+            self.gpu_textures.resize(layer_count, None);
+        }
+        if self.textures_b.len() != layer_count_b {
+            self.textures_b.clear();
+            self.textures_b.resize(layer_count_b, None);
+            self.gpu_textures_b.clear();
+            self.gpu_textures_b.resize(layer_count_b, None);
+        }
+    }
+
+    /// Render the contact sheet: a scrollable grid of per-layer thumbnails for A
+    /// (and B alongside, in the side-by-side / wipe / diff modes). Clicking a
+    /// thumbnail selects that layer and leaves the sheet.
+    fn draw_contact_sheet(
+        &mut self,
+        ui: &mut egui::Ui,
+        exr_data: &ExrData,
+        exr_data_b: Option<&ExrData>,
+    ) {
+        let draw_sheet = |viewer: &mut ExrViewer,
+                          ui: &mut egui::Ui,
+                          data: &crate::exr_loader::ExrData,
+                          is_a: bool| {
+            let l_count = data.logical_layers.len();
+            egui::ScrollArea::vertical()
+                .id_salt(if is_a { "sheet_a" } else { "sheet_b" })
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(16.0, 16.0);
+                        for i in 0..l_count {
+                            let tex_opt = if is_a {
+                                if viewer.textures[i].is_none() {
+                                    viewer.textures[i] = viewer.generate_texture(ui.ctx(), data, i);
+                                }
+                                viewer.textures[i].as_ref()
+                            } else {
+                                if viewer.textures_b[i].is_none() {
+                                    viewer.textures_b[i] =
+                                        viewer.generate_texture(ui.ctx(), data, i);
+                                }
+                                viewer.textures_b[i].as_ref()
+                            };
+
+                            if let Some(texture) = tex_opt {
+                                // Reserve an EXACTLY uniform cell, then position the image and
+                                // label by absolute geometry. Auto-layout (allocate_ui /
+                                // vertical_centered) let cell heights vary by a few px (inherited
+                                // item-spacing + variable label line count), and horizontal_wrapped
+                                // then center-aligned those unequal cells by different amounts —
+                                // producing the slight vertical "staircase". Fixed rects + paint_at
+                                // remove that degree of freedom entirely.
+                                let thumb_width = 256.0;
+                                let thumb_box = 256.0;
+                                let label_height = 30.0;
+                                let tex_size = texture.size_vec2();
+                                let aspect = if tex_size.y > 0.0 {
+                                    tex_size.x / tex_size.y
+                                } else {
+                                    1.0
+                                };
+                                let (fit_w, fit_h) = if aspect >= 1.0 {
+                                    (thumb_box, thumb_box / aspect)
+                                } else {
+                                    (thumb_box * aspect, thumb_box)
+                                };
+                                let name = data
+                                    .logical_layers
+                                    .get(i)
+                                    .map(|l| l.name.as_str())
+                                    .unwrap_or("Unnamed");
+
+                                let (cell_rect, response) = ui.allocate_exact_size(
+                                    egui::vec2(thumb_width, thumb_box + label_height),
+                                    egui::Sense::click(),
+                                );
+
+                                // Image: centered horizontally, centered within the top square box.
+                                let img_rect = egui::Rect::from_center_size(
+                                    egui::pos2(
+                                        cell_rect.center().x,
+                                        cell_rect.top() + thumb_box * 0.5,
+                                    ),
+                                    egui::vec2(fit_w, fit_h),
+                                );
+                                egui::Image::new(texture).paint_at(ui, img_rect);
+
+                                // Label: centered in the strip beneath the box.
+                                ui.painter().text(
+                                    egui::pos2(
+                                        cell_rect.center().x,
+                                        cell_rect.top() + thumb_box + label_height * 0.5,
+                                    ),
+                                    egui::Align2::CENTER_CENTER,
+                                    format!("{}: {}", i, name),
+                                    egui::FontId::proportional(14.0),
+                                    ui.visuals().strong_text_color(),
+                                );
+
+                                if response.clicked() {
+                                    viewer.active_layer = i;
+                                    viewer.show_contact_sheet = false;
+                                    viewer.first_frame = true;
+                                    if !is_a {
+                                        viewer.compare_mode = CompareMode::SingleB;
+                                    } else if viewer.compare_mode == CompareMode::SingleB {
+                                        viewer.compare_mode = CompareMode::SingleA;
+                                    }
+                                }
+                                if response.hovered() {
+                                    response
+                                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                        .on_hover_text("Click to view layer");
+                                }
+                            }
+                        }
+                    });
+                });
+        };
+
+        if let CompareMode::SideBySide | CompareMode::Wipe | CompareMode::DiffMatte =
+            self.compare_mode
+        {
+            if let Some(exr_b) = exr_data_b {
+                ui.columns(2, |cols| {
+                    cols[0].heading("Image A");
+                    draw_sheet(self, &mut cols[0], exr_data, true);
+                    cols[1].heading("Image B");
+                    draw_sheet(self, &mut cols[1], exr_b, false);
+                });
+            } else {
+                draw_sheet(self, ui, exr_data, true);
+            }
+        } else if self.compare_mode == CompareMode::SingleB {
+            if let Some(exr_b) = exr_data_b {
+                draw_sheet(self, ui, exr_b, false);
+            } else {
+                ui.label("Image B not loaded.");
+            }
+        } else {
+            draw_sheet(self, ui, exr_data, true);
+        }
+    }
+
     pub fn ui(
         &mut self,
         ui: &mut egui::Ui,
@@ -586,34 +812,10 @@ impl ExrViewer {
     ) {
         self.handle_hotkeys(ui, exr_data_b.is_some());
 
-        // Invalidate cached CPU textures (thumbnails / fallback) when the OCIO CPU state
-        // changes, so they regenerate with — or without — the display transform.
         #[cfg(feature = "ocio")]
-        {
-            let sig = if self.ocio_active {
-                self.ocio_cpu
-                    .as_ref()
-                    .map(|p| std::rc::Rc::as_ptr(p) as usize)
-                    .unwrap_or(1)
-            } else {
-                0
-            };
-            if sig != self.ocio_sig {
-                self.ocio_sig = sig;
-                self.textures.fill(None);
-                self.textures_b.fill(None);
-            }
-        }
+        self.invalidate_ocio_cpu_textures();
 
-        if self.blink_state && exr_data_b.is_some() {
-            ui.ctx().request_repaint();
-            let time = ui.input(|i| i.time);
-            if ((time / self.blink_interval as f64) as usize).is_multiple_of(2) {
-                self.compare_mode = CompareMode::SingleA;
-            } else {
-                self.compare_mode = CompareMode::SingleB;
-            }
-        }
+        self.apply_blink_mode(ui, exr_data_b.is_some());
 
         let layer_count = exr_data.logical_layers.len();
         egui::Panel::top("viewer_controls").show_inside(ui, |ui| {
@@ -621,144 +823,11 @@ impl ExrViewer {
             self.animated_mode_param_row(ui);
         });
 
-        if self.textures.len() != layer_count {
-            self.textures.clear();
-            self.textures.resize(layer_count, None);
-            self.gpu_textures.clear();
-            self.gpu_textures.resize(layer_count, None);
-        }
         let layer_count_b = exr_data_b.map(|d| d.logical_layers.len()).unwrap_or(0);
-        if self.textures_b.len() != layer_count_b {
-            self.textures_b.clear();
-            self.textures_b.resize(layer_count_b, None);
-            self.gpu_textures_b.clear();
-            self.gpu_textures_b.resize(layer_count_b, None);
-        }
+        self.sync_texture_caches(layer_count, layer_count_b);
 
         if self.show_contact_sheet {
-            let draw_sheet = |viewer: &mut ExrViewer,
-                              ui: &mut egui::Ui,
-                              data: &crate::exr_loader::ExrData,
-                              is_a: bool| {
-                let l_count = data.logical_layers.len();
-                egui::ScrollArea::vertical()
-                    .id_salt(if is_a { "sheet_a" } else { "sheet_b" })
-                    .show(ui, |ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.spacing_mut().item_spacing = egui::vec2(16.0, 16.0);
-                            for i in 0..l_count {
-                                let tex_opt = if is_a {
-                                    if viewer.textures[i].is_none() {
-                                        viewer.textures[i] =
-                                            viewer.generate_texture(ui.ctx(), data, i);
-                                    }
-                                    viewer.textures[i].as_ref()
-                                } else {
-                                    if viewer.textures_b[i].is_none() {
-                                        viewer.textures_b[i] =
-                                            viewer.generate_texture(ui.ctx(), data, i);
-                                    }
-                                    viewer.textures_b[i].as_ref()
-                                };
-
-                                if let Some(texture) = tex_opt {
-                                    // Reserve an EXACTLY uniform cell, then position the image and
-                                    // label by absolute geometry. Auto-layout (allocate_ui /
-                                    // vertical_centered) let cell heights vary by a few px (inherited
-                                    // item-spacing + variable label line count), and horizontal_wrapped
-                                    // then center-aligned those unequal cells by different amounts —
-                                    // producing the slight vertical "staircase". Fixed rects + paint_at
-                                    // remove that degree of freedom entirely.
-                                    let thumb_width = 256.0;
-                                    let thumb_box = 256.0;
-                                    let label_height = 30.0;
-                                    let tex_size = texture.size_vec2();
-                                    let aspect = if tex_size.y > 0.0 {
-                                        tex_size.x / tex_size.y
-                                    } else {
-                                        1.0
-                                    };
-                                    let (fit_w, fit_h) = if aspect >= 1.0 {
-                                        (thumb_box, thumb_box / aspect)
-                                    } else {
-                                        (thumb_box * aspect, thumb_box)
-                                    };
-                                    let name = data
-                                        .logical_layers
-                                        .get(i)
-                                        .map(|l| l.name.as_str())
-                                        .unwrap_or("Unnamed");
-
-                                    let (cell_rect, response) = ui.allocate_exact_size(
-                                        egui::vec2(thumb_width, thumb_box + label_height),
-                                        egui::Sense::click(),
-                                    );
-
-                                    // Image: centered horizontally, centered within the top square box.
-                                    let img_rect = egui::Rect::from_center_size(
-                                        egui::pos2(
-                                            cell_rect.center().x,
-                                            cell_rect.top() + thumb_box * 0.5,
-                                        ),
-                                        egui::vec2(fit_w, fit_h),
-                                    );
-                                    egui::Image::new(texture).paint_at(ui, img_rect);
-
-                                    // Label: centered in the strip beneath the box.
-                                    ui.painter().text(
-                                        egui::pos2(
-                                            cell_rect.center().x,
-                                            cell_rect.top() + thumb_box + label_height * 0.5,
-                                        ),
-                                        egui::Align2::CENTER_CENTER,
-                                        format!("{}: {}", i, name),
-                                        egui::FontId::proportional(14.0),
-                                        ui.visuals().strong_text_color(),
-                                    );
-
-                                    if response.clicked() {
-                                        viewer.active_layer = i;
-                                        viewer.show_contact_sheet = false;
-                                        viewer.first_frame = true;
-                                        if !is_a {
-                                            viewer.compare_mode = CompareMode::SingleB;
-                                        } else if viewer.compare_mode == CompareMode::SingleB {
-                                            viewer.compare_mode = CompareMode::SingleA;
-                                        }
-                                    }
-                                    if response.hovered() {
-                                        response
-                                            .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                            .on_hover_text("Click to view layer");
-                                    }
-                                }
-                            }
-                        });
-                    });
-            };
-
-            if let CompareMode::SideBySide | CompareMode::Wipe | CompareMode::DiffMatte =
-                self.compare_mode
-            {
-                if let Some(exr_b) = exr_data_b {
-                    ui.columns(2, |cols| {
-                        cols[0].heading("Image A");
-                        draw_sheet(self, &mut cols[0], exr_data, true);
-                        cols[1].heading("Image B");
-                        draw_sheet(self, &mut cols[1], exr_b, false);
-                    });
-                } else {
-                    draw_sheet(self, ui, exr_data, true);
-                }
-            } else if self.compare_mode == CompareMode::SingleB {
-                if let Some(exr_b) = exr_data_b {
-                    draw_sheet(self, ui, exr_b, false);
-                } else {
-                    ui.label("Image B not loaded.");
-                }
-            } else {
-                draw_sheet(self, ui, exr_data, true);
-            }
+            self.draw_contact_sheet(ui, exr_data, exr_data_b);
         } else {
             // Channel/frame hotkeys are handled up-front in `handle_hotkeys`.
             let (tw, th) = exr_data.logical_size(self.active_layer).unwrap_or((1, 1));
@@ -1613,214 +1682,240 @@ impl ExrViewer {
                     );
                 }
 
-                // Pixel Sampling & Swatches
-                let mut hovered_pixel = None;
-                if let Some(pos) = response.hover_pos() {
-                    let mut hover_x = None;
-                    let mut hover_y = None;
-                    let mut hovered_b = false;
-
-                    if self.compare_mode == CompareMode::SideBySide && exr_data_b.is_some() {
-                        let tex_b_opt = exr_data_b.and_then(|d| {
-                            self.textures_b[self
-                                .active_layer
-                                .min(d.logical_layers.len().saturating_sub(1))]
-                            .as_ref()
-                        });
-                        if tex_b_opt.is_some() {
-                            let mut image_size_b = tex_size_b.unwrap() * self.scale;
-                            if self.normalize_side_by_side {
-                                let scale_b = (tex_size.y * self.scale) / tex_size_b.unwrap().y;
-                                image_size_b = tex_size_b.unwrap() * scale_b;
-                            }
-                            let combined_width = image_size.x + image_size_b.x;
-                            let combined_height = image_size.y.max(image_size_b.y);
-
-                            let combined_rect = egui::Rect::from_center_size(
-                                rect.center() + self.translation,
-                                egui::vec2(combined_width, combined_height),
-                            );
-
-                            let mut image_rect_a =
-                                egui::Rect::from_min_size(combined_rect.min, image_size);
-                            image_rect_a.set_center(egui::pos2(
-                                image_rect_a.center().x,
-                                combined_rect.center().y,
-                            ));
-
-                            let mut image_rect_b = egui::Rect::from_min_size(
-                                egui::pos2(combined_rect.min.x + image_size.x, combined_rect.min.y),
-                                image_size_b,
-                            );
-                            image_rect_b.set_center(egui::pos2(
-                                image_rect_b.center().x,
-                                combined_rect.center().y,
-                            ));
-
-                            if image_rect_a.contains(pos) {
-                                let local = pos - image_rect_a.min;
-                                hover_x = Some((local.x / self.scale) as usize);
-                                hover_y = Some((local.y / self.scale) as usize);
-                            } else if image_rect_b.contains(pos) {
-                                let local = pos - image_rect_b.min;
-                                let scale_b = if self.normalize_side_by_side {
-                                    (tex_size.y * self.scale) / tex_size_b.unwrap().y
-                                } else {
-                                    self.scale
-                                };
-                                hover_x = Some((local.x / scale_b) as usize);
-                                hover_y = Some((local.y / scale_b) as usize);
-                                hovered_b = true;
-                            }
-                        }
-                    } else {
-                        let image_local_pos = pos - image_rect.min;
-                        if image_local_pos.x >= 0.0 && image_local_pos.y >= 0.0 {
-                            hover_x = Some((image_local_pos.x / self.scale) as usize);
-                            hover_y = Some((image_local_pos.y / self.scale) as usize);
-                        }
-                    }
-                    let mut val_a_opt = None;
-                    let mut val_b_opt = None;
-                    let mut x_final = None;
-                    let mut y_final = None;
-
-                    if let (Some(x), Some(y)) = (hover_x, hover_y) {
-                        // Check if within bounds of the hovered image
-                        let mut valid = false;
-                        if hovered_b {
-                            if let Some(s) = tex_size_b
-                                && x < s.x as usize
-                                && y < s.y as usize
-                            {
-                                valid = true;
-                            }
-                        } else if x < tex_size.x as usize && y < tex_size.y as usize {
-                            valid = true;
-                        }
-
-                        if valid {
-                            hovered_pixel = Some((x, y));
-                            x_final = Some(x);
-                            y_final = Some(y);
-                            val_a_opt = self.sample_pixel(exr_data, self.active_layer, x, y);
-                            val_b_opt = if let Some(exr_b) = exr_data_b {
-                                let layer_b = self
-                                    .active_layer
-                                    .min(exr_b.logical_layers.len().saturating_sub(1));
-                                self.sample_pixel(exr_b, layer_b, x, y)
-                            } else {
-                                None
-                            };
-
-                            self.last_hover_pos_img = Some((x, y));
-                            self.last_sampled_val_a = val_a_opt;
-                            self.last_sampled_val_b = val_b_opt;
-                        }
-                    }
-
-                    if self.show_tooltip
-                        && (val_a_opt.is_some() || val_b_opt.is_some())
-                        && let (Some(x), Some(y)) = (x_final, y_final)
-                    {
-                        egui::Window::new("Pixel Tooltip")
-                            .fixed_pos(pos + egui::vec2(15.0, 15.0))
-                            .title_bar(false)
-                            .resizable(false)
-                            .collapsible(false)
-                            .show(ui.ctx(), |ui| {
-                                ui.label(format!("x={} y={}", x, y));
-
-                                if let Some(val_a) = val_a_opt {
-                                    ui.horizontal(|ui| {
-                                        colored_rgba_label(
-                                            ui,
-                                            if val_b_opt.is_some() { "A:" } else { "" },
-                                            val_a,
-                                        );
-                                        let (r, g, b) = (
-                                            (val_a[0].clamp(0.0, 1.0) * 255.0) as u8,
-                                            (val_a[1].clamp(0.0, 1.0) * 255.0) as u8,
-                                            (val_a[2].clamp(0.0, 1.0) * 255.0) as u8,
-                                        );
-                                        let (rect, _) = ui.allocate_exact_size(
-                                            egui::vec2(16.0, 16.0),
-                                            egui::Sense::hover(),
-                                        );
-                                        ui.painter().rect_filled(
-                                            rect,
-                                            0.0,
-                                            egui::Color32::from_rgb(r, g, b),
-                                        );
-                                    });
-                                    let (h, s, v, l) = rgb_to_hsvl(val_a[0], val_a[1], val_a[2]);
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "H:{:.0} S:{:.2} V:{:.2} L:{:.5}",
-                                            h, s, v, l
-                                        ))
-                                        .color(egui::Color32::LIGHT_GRAY),
-                                    );
-                                }
-
-                                if let Some(val_b) = val_b_opt {
-                                    ui.horizontal(|ui| {
-                                        colored_rgba_label(ui, "B:", val_b);
-                                        let (r, g, b) = (
-                                            (val_b[0].clamp(0.0, 1.0) * 255.0) as u8,
-                                            (val_b[1].clamp(0.0, 1.0) * 255.0) as u8,
-                                            (val_b[2].clamp(0.0, 1.0) * 255.0) as u8,
-                                        );
-                                        let (rect, _) = ui.allocate_exact_size(
-                                            egui::vec2(16.0, 16.0),
-                                            egui::Sense::hover(),
-                                        );
-                                        ui.painter().rect_filled(
-                                            rect,
-                                            0.0,
-                                            egui::Color32::from_rgb(r, g, b),
-                                        );
-                                    });
-                                    let (h, s, v, l) = rgb_to_hsvl(val_b[0], val_b[1], val_b[2]);
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "H:{:.0} S:{:.2} V:{:.2} L:{:.5}",
-                                            h, s, v, l
-                                        ))
-                                        .color(egui::Color32::LIGHT_GRAY),
-                                    );
-                                }
-
-                                if let (Some(val_a), Some(val_b)) = (val_a_opt, val_b_opt) {
-                                    let diff = [
-                                        (val_b[0] - val_a[0]).abs(),
-                                        (val_b[1] - val_a[1]).abs(),
-                                        (val_b[2] - val_a[2]).abs(),
-                                        (val_b[3] - val_a[3]).abs(),
-                                    ];
-                                    colored_rgba_label(ui, "Diff:", diff);
-                                }
-                            });
-
-                        // Shift+Click to add a persistent swatch
-                        if ui.input(|i| i.modifiers.shift)
-                            && response.clicked()
-                            && let Some(v) = val_a_opt.or(val_b_opt)
-                        {
-                            self.swatches.push(v);
-                        }
-                    }
-                }
-
-                if hovered_pixel.is_none() {
-                    self.last_hover_pos_img = None;
-                    self.last_sampled_val_a = None;
-                    self.last_sampled_val_b = None;
-                }
+                self.handle_pixel_sampling(
+                    ui, &response, exr_data, exr_data_b, rect, image_rect, image_size, tex_size,
+                    tex_size_b,
+                );
             }
         }
     }
 
+    /// Hover/sample readout for the canvas: map the cursor to image pixel
+    /// coordinates (handling the side-by-side split), sample A (and B) at that
+    /// pixel, cache the last sample, show the value tooltip, and add a swatch on
+    /// Shift+Click. Geometry (`rect`/`image_rect`/sizes) comes from the caller's
+    /// layout so this stays purely about sampling.
+    #[allow(clippy::too_many_arguments)]
+    fn handle_pixel_sampling(
+        &mut self,
+        ui: &egui::Ui,
+        response: &egui::Response,
+        exr_data: &ExrData,
+        exr_data_b: Option<&ExrData>,
+        rect: egui::Rect,
+        image_rect: egui::Rect,
+        image_size: egui::Vec2,
+        tex_size: egui::Vec2,
+        tex_size_b: Option<egui::Vec2>,
+    ) {
+        let mut hovered_pixel = None;
+        if let Some(pos) = response.hover_pos() {
+            let mut hover_x = None;
+            let mut hover_y = None;
+            let mut hovered_b = false;
+
+            if self.compare_mode == CompareMode::SideBySide && exr_data_b.is_some() {
+                let tex_b_opt = exr_data_b.and_then(|d| {
+                    self.textures_b[self
+                        .active_layer
+                        .min(d.logical_layers.len().saturating_sub(1))]
+                    .as_ref()
+                });
+                if tex_b_opt.is_some() {
+                    let mut image_size_b = tex_size_b.unwrap() * self.scale;
+                    if self.normalize_side_by_side {
+                        let scale_b = (tex_size.y * self.scale) / tex_size_b.unwrap().y;
+                        image_size_b = tex_size_b.unwrap() * scale_b;
+                    }
+                    let combined_width = image_size.x + image_size_b.x;
+                    let combined_height = image_size.y.max(image_size_b.y);
+
+                    let combined_rect = egui::Rect::from_center_size(
+                        rect.center() + self.translation,
+                        egui::vec2(combined_width, combined_height),
+                    );
+
+                    let mut image_rect_a = egui::Rect::from_min_size(combined_rect.min, image_size);
+                    image_rect_a.set_center(egui::pos2(
+                        image_rect_a.center().x,
+                        combined_rect.center().y,
+                    ));
+
+                    let mut image_rect_b = egui::Rect::from_min_size(
+                        egui::pos2(combined_rect.min.x + image_size.x, combined_rect.min.y),
+                        image_size_b,
+                    );
+                    image_rect_b.set_center(egui::pos2(
+                        image_rect_b.center().x,
+                        combined_rect.center().y,
+                    ));
+
+                    if image_rect_a.contains(pos) {
+                        let local = pos - image_rect_a.min;
+                        hover_x = Some((local.x / self.scale) as usize);
+                        hover_y = Some((local.y / self.scale) as usize);
+                    } else if image_rect_b.contains(pos) {
+                        let local = pos - image_rect_b.min;
+                        let scale_b = if self.normalize_side_by_side {
+                            (tex_size.y * self.scale) / tex_size_b.unwrap().y
+                        } else {
+                            self.scale
+                        };
+                        hover_x = Some((local.x / scale_b) as usize);
+                        hover_y = Some((local.y / scale_b) as usize);
+                        hovered_b = true;
+                    }
+                }
+            } else {
+                let image_local_pos = pos - image_rect.min;
+                if image_local_pos.x >= 0.0 && image_local_pos.y >= 0.0 {
+                    hover_x = Some((image_local_pos.x / self.scale) as usize);
+                    hover_y = Some((image_local_pos.y / self.scale) as usize);
+                }
+            }
+            let mut val_a_opt = None;
+            let mut val_b_opt = None;
+            let mut x_final = None;
+            let mut y_final = None;
+
+            if let (Some(x), Some(y)) = (hover_x, hover_y) {
+                // Check if within bounds of the hovered image
+                let mut valid = false;
+                if hovered_b {
+                    if let Some(s) = tex_size_b
+                        && x < s.x as usize
+                        && y < s.y as usize
+                    {
+                        valid = true;
+                    }
+                } else if x < tex_size.x as usize && y < tex_size.y as usize {
+                    valid = true;
+                }
+
+                if valid {
+                    hovered_pixel = Some((x, y));
+                    x_final = Some(x);
+                    y_final = Some(y);
+                    val_a_opt = self.sample_pixel(exr_data, self.active_layer, x, y);
+                    val_b_opt = if let Some(exr_b) = exr_data_b {
+                        let layer_b = self
+                            .active_layer
+                            .min(exr_b.logical_layers.len().saturating_sub(1));
+                        self.sample_pixel(exr_b, layer_b, x, y)
+                    } else {
+                        None
+                    };
+
+                    self.last_hover_pos_img = Some((x, y));
+                    self.last_sampled_val_a = val_a_opt;
+                    self.last_sampled_val_b = val_b_opt;
+                }
+            }
+
+            if self.show_tooltip
+                && (val_a_opt.is_some() || val_b_opt.is_some())
+                && let (Some(x), Some(y)) = (x_final, y_final)
+            {
+                egui::Window::new("Pixel Tooltip")
+                    .fixed_pos(pos + egui::vec2(15.0, 15.0))
+                    .title_bar(false)
+                    .resizable(false)
+                    .collapsible(false)
+                    .show(ui.ctx(), |ui| {
+                        ui.label(format!("x={} y={}", x, y));
+
+                        if let Some(val_a) = val_a_opt {
+                            ui.horizontal(|ui| {
+                                colored_rgba_label(
+                                    ui,
+                                    if val_b_opt.is_some() { "A:" } else { "" },
+                                    val_a,
+                                );
+                                let (r, g, b) = (
+                                    (val_a[0].clamp(0.0, 1.0) * 255.0) as u8,
+                                    (val_a[1].clamp(0.0, 1.0) * 255.0) as u8,
+                                    (val_a[2].clamp(0.0, 1.0) * 255.0) as u8,
+                                );
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(16.0, 16.0),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().rect_filled(
+                                    rect,
+                                    0.0,
+                                    egui::Color32::from_rgb(r, g, b),
+                                );
+                            });
+                            let (h, s, v, l) = rgb_to_hsvl(val_a[0], val_a[1], val_a[2]);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "H:{:.0} S:{:.2} V:{:.2} L:{:.5}",
+                                    h, s, v, l
+                                ))
+                                .color(egui::Color32::LIGHT_GRAY),
+                            );
+                        }
+
+                        if let Some(val_b) = val_b_opt {
+                            ui.horizontal(|ui| {
+                                colored_rgba_label(ui, "B:", val_b);
+                                let (r, g, b) = (
+                                    (val_b[0].clamp(0.0, 1.0) * 255.0) as u8,
+                                    (val_b[1].clamp(0.0, 1.0) * 255.0) as u8,
+                                    (val_b[2].clamp(0.0, 1.0) * 255.0) as u8,
+                                );
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(16.0, 16.0),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().rect_filled(
+                                    rect,
+                                    0.0,
+                                    egui::Color32::from_rgb(r, g, b),
+                                );
+                            });
+                            let (h, s, v, l) = rgb_to_hsvl(val_b[0], val_b[1], val_b[2]);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "H:{:.0} S:{:.2} V:{:.2} L:{:.5}",
+                                    h, s, v, l
+                                ))
+                                .color(egui::Color32::LIGHT_GRAY),
+                            );
+                        }
+
+                        if let (Some(val_a), Some(val_b)) = (val_a_opt, val_b_opt) {
+                            let diff = [
+                                (val_b[0] - val_a[0]).abs(),
+                                (val_b[1] - val_a[1]).abs(),
+                                (val_b[2] - val_a[2]).abs(),
+                                (val_b[3] - val_a[3]).abs(),
+                            ];
+                            colored_rgba_label(ui, "Diff:", diff);
+                        }
+                    });
+
+                // Shift+Click to add a persistent swatch
+                if ui.input(|i| i.modifiers.shift)
+                    && response.clicked()
+                    && let Some(v) = val_a_opt.or(val_b_opt)
+                {
+                    self.swatches.push(v);
+                }
+            }
+        }
+
+        if hovered_pixel.is_none() {
+            self.last_hover_pos_img = None;
+            self.last_sampled_val_a = None;
+            self.last_sampled_val_b = None;
+        }
+    }
+
+    /// The real render path: upload `layer_index`'s RGBA into a GPU bind group.
+    /// The shader applies channel isolation, exposure, gamma, sRGB and every
+    /// compare mode, so this one generator serves all modes; results are cached
+    /// per layer in `gpu_textures` / `gpu_textures_b`. See the module-level docs.
     fn generate_gpu_texture(
         &self,
         render_state: &eframe::egui_wgpu::RenderState,
@@ -1929,6 +2024,11 @@ impl ExrViewer {
         Some(std::sync::Arc::new(bind_group))
     }
 
+    /// CPU/thumbnail path: bake `layer_index` into an [`egui::TextureHandle`]
+    /// with the full channel-select → exposure → gamma → sRGB tone pipeline.
+    /// Used for contact-sheet thumbnails and as the fallback when no GPU
+    /// `render_state` is available. Dispatches to `generate_texture_ocio`
+    /// when an OCIO CPU processor is active.
     fn generate_texture(
         &self,
         ctx: &egui::Context,
@@ -2168,6 +2268,10 @@ impl ExrViewer {
         Some(ctx.load_texture("exr_viewer", color_image, egui::TextureOptions::LINEAR))
     }
 
+    /// CPU-fallback parity for [`CompareMode::DiffMatte`]: `|A − B|` scaled by
+    /// `diff_multiplier` and mapped through a heat ramp. Cached in `diff_texture`,
+    /// keyed by `(active_layer, diff_multiplier)`. The GPU path (default) does
+    /// this in-shader. Diff is tone-mode-agnostic, so there is no `_ocio` variant.
     fn generate_diff_texture(
         &self,
         ctx: &egui::Context,
@@ -2611,7 +2715,7 @@ impl ExrViewer {
     }
 
     /// Black-body heat ramp for the diff visualization: 0 → black, ramping through
-    /// red → yellow → white as the (already gained + clamped) magnitude `m` ∈ [0,1]
+    /// red → yellow → white as the (already gained + clamped) magnitude `m` ∈ `[0,1]`
     /// rises. Kept in lockstep with the `heat` ramp in the GPU diff branch (shader.wgsl).
     fn heat_ramp(m: f32) -> (f32, f32, f32) {
         (
@@ -2621,7 +2725,7 @@ impl ExrViewer {
         )
     }
 
-    /// Invalidate the cached histogram so the next [`calculate_histogram`] call
+    /// Invalidate the cached histogram so the next [`Self::calculate_histogram`] call
     /// recomputes. Call this when image B changes (load/unload) — B identity is
     /// not part of the cache key.
     pub fn invalidate_histogram(&mut self) {
@@ -2786,13 +2890,36 @@ fn draw_dashed_rect(
 
 #[cfg(test)]
 mod gui_tests {
-    //! Headless GUI interaction tests. They drive the rendering-free
-    //! [`ExrViewer::handle_hotkeys`] seam through `egui_kittest`, so they run
-    //! anywhere — no wgpu device, no loaded image — yet exercise the real egui
-    //! input pipeline (events → `key_pressed` → state mutation).
+    //! Headless GUI tests via `egui_kittest`, so they run anywhere — no wgpu
+    //! device. Most drive the rendering-free [`ExrViewer::handle_hotkeys`] seam
+    //! (events → `key_pressed` → state mutation); the smoke test additionally
+    //! drives the full [`ExrViewer::ui`] CPU path (`render_state = None`) across
+    //! every compare mode to guard the render/extraction seams.
     use super::{ChannelMode, CompareMode, ExrViewer};
+    use crate::exr_loader::ExrData;
     use eframe::egui;
     use egui_kittest::Harness;
+    use exr::prelude::*;
+
+    /// Tiny 2×2 RGBA EXR fixture so the CPU render path has real data to draw.
+    fn write_rgba_exr(path: &std::path::Path) {
+        let mut list = smallvec::SmallVec::new();
+        for name in ["R", "G", "B", "A"] {
+            list.push(AnyChannel::new(
+                Text::from(name),
+                FlatSamples::F32(vec![0.5; 4]),
+            ));
+        }
+        Image::from_layer(Layer::new(
+            (2, 2),
+            LayerAttributes::default(),
+            Encoding::FAST_LOSSLESS,
+            AnyChannels::sort(list),
+        ))
+        .write()
+        .to_file(path)
+        .expect("write rgba exr fixture");
+    }
 
     struct State {
         viewer: ExrViewer,
@@ -2981,5 +3108,57 @@ mod gui_tests {
         v.compare_mode = CompareMode::SingleB;
         v.blink_state = true;
         assert!(v.has_mode_params(), "blink exposes the speed control");
+    }
+
+    struct SmokeState {
+        viewer: ExrViewer,
+        a: ExrData,
+        b: Option<ExrData>,
+    }
+
+    /// Drive the full `ExrViewer::ui` CPU path (no GPU `render_state`) with a
+    /// loaded A and B across every compare mode plus the contact sheet, asserting
+    /// it lays out without panicking. Exercises the seams extracted from `ui()`
+    /// in #26 (contact sheet, pixel sampling, CPU draw paths).
+    #[test]
+    fn ui_renders_all_compare_modes_without_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let pa = dir.path().join("a.exr");
+        let pb = dir.path().join("b.exr");
+        write_rgba_exr(&pa);
+        write_rgba_exr(&pb);
+        let a = ExrData::load(&pa).unwrap();
+        let b = ExrData::load(&pb).unwrap();
+
+        let mut h = Harness::new_ui_state(
+            |ui, s: &mut SmokeState| {
+                // Disjoint field borrows: &mut viewer + &a/&b.
+                let SmokeState { viewer, a, b } = s;
+                viewer.ui(ui, a, b.as_ref(), None, None);
+            },
+            SmokeState {
+                viewer: ExrViewer::default(),
+                a,
+                b: Some(b),
+            },
+        );
+
+        for mode in [
+            CompareMode::SingleA,
+            CompareMode::SingleB,
+            CompareMode::Wipe,
+            CompareMode::SideBySide,
+            CompareMode::DiffMatte,
+            CompareMode::Composite,
+        ] {
+            h.state_mut().viewer.compare_mode = mode;
+            h.run();
+        }
+
+        // Contact sheet (single + dual) must also lay out cleanly.
+        h.state_mut().viewer.show_contact_sheet = true;
+        h.run();
+        h.state_mut().viewer.compare_mode = CompareMode::SideBySide;
+        h.run();
     }
 }

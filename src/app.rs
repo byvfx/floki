@@ -24,6 +24,20 @@ impl From<ThemeChoice> for egui::ThemePreference {
     }
 }
 
+/// Result of an off-thread EXR decode, delivered back to the UI thread by
+/// [`ExrApp::open_file`]'s worker and applied in [`ExrApp::apply_load_result`].
+/// `path` identifies which request this is, so a stale result from a
+/// superseded open can be discarded.
+struct LoadResult {
+    path: PathBuf,
+    is_b: bool,
+    result: Result<ExrData, String>,
+}
+
+/// Top-level application state and the [`eframe::App`] implementation. Owns the
+/// loaded A/B images, the `ExrViewer` canvas, OCIO/LUT colour state, and the
+/// menu/tool UI. Fields marked `#[serde(skip)]` are runtime-only (images, GPU
+/// handles); the rest persist across sessions.
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct ExrApp {
@@ -103,6 +117,18 @@ pub struct ExrApp {
     conversion_receiver: Option<std::sync::mpsc::Receiver<(usize, usize, String)>>,
     #[serde(skip)]
     conversion_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+
+    // Async image loading: decode runs on a worker thread (see `open_file`),
+    // results arrive over `load_rx` and are applied in `update`/`ui`. The
+    // `loading_*` flags drive the in-canvas spinner and keep repaints flowing.
+    #[serde(skip)]
+    loading_a: bool,
+    #[serde(skip)]
+    loading_b: bool,
+    #[serde(skip)]
+    load_tx: Option<std::sync::mpsc::Sender<LoadResult>>,
+    #[serde(skip)]
+    load_rx: Option<std::sync::mpsc::Receiver<LoadResult>>,
 }
 
 impl Default for ExrApp {
@@ -151,11 +177,17 @@ impl Default for ExrApp {
             conversion_status: String::new(),
             conversion_receiver: None,
             conversion_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            loading_a: false,
+            loading_b: false,
+            load_tx: None,
+            load_rx: None,
         }
     }
 }
 
 impl ExrApp {
+    /// Build the app: restore persisted state (or [`Default`]), then re-apply
+    /// the saved theme and re-establish OCIO/LUT state for the loaded settings.
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let mut app: Self = if let Some(storage) = cc.storage {
             eframe::get_value(storage, eframe::APP_KEY).unwrap_or_default()
@@ -343,19 +375,64 @@ impl ExrApp {
         }
     }
 
+    /// Begin loading an EXR into slot A or B. The decode runs on a worker thread
+    /// so the UI stays responsive on large files; the result is delivered over
+    /// `load_rx` and applied in [`Self::apply_load_result`]. Records the path
+    /// up-front and raises the matching `loading_*` flag (which drives the
+    /// spinner and keeps repaints flowing).
     fn open_file(&mut self, path: PathBuf, is_b: bool) {
         if !is_b {
             self.recent_files.retain(|p| p != &path);
             self.recent_files.insert(0, path.clone());
             self.recent_files.truncate(10);
             self.loaded_file = Some(path.clone());
+            self.loading_a = true;
         } else {
             self.loaded_file_b = Some(path.clone());
+            self.loading_b = true;
+        }
+        self.error_msg = None;
+
+        // Lazily create the result channel (mirrors `conversion_receiver`).
+        if self.load_rx.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.load_tx = Some(tx);
+            self.load_rx = Some(rx);
+        }
+        let tx = self
+            .load_tx
+            .clone()
+            .expect("load channel initialized above");
+        std::thread::spawn(move || {
+            let result = ExrData::load(&path);
+            // The receiver is dropped only on app exit; ignore a closed channel.
+            let _ = tx.send(LoadResult { path, is_b, result });
+        });
+    }
+
+    /// Apply a completed [`LoadResult`] from the worker thread. Ignores stale
+    /// results (a newer open of a different file superseded this one) by checking
+    /// the result path against the currently-requested path for its slot.
+    fn apply_load_result(&mut self, res: LoadResult) {
+        let current = if res.is_b {
+            self.loaded_file_b.as_ref()
+        } else {
+            self.loaded_file.as_ref()
+        };
+        if current != Some(&res.path) {
+            // Superseded by a later open (or the slot was reset); drop it.
+            return;
         }
 
-        match ExrData::load(&path) {
+        if res.is_b {
+            self.loading_b = false;
+        } else {
+            self.loading_a = false;
+        }
+
+        match res.result {
             Ok(data) => {
-                if is_b {
+                if res.is_b {
                     self.exr_data_b = Some(data);
                     // The texture caches only rebuild on a layer-count change, so a new B
                     // with the same layer count would keep showing the previous image.
@@ -369,12 +446,13 @@ impl ExrApp {
                     self.exr_data = Some(data);
                     self.exr_data_b = None; // Reset B when A changes
                     self.loaded_file_b = None;
+                    self.loading_b = false; // A discards any in-flight B load
                     self.viewer = ExrViewer::default(); // Reset viewer state
                 }
                 self.error_msg = None;
             }
             Err(e) => {
-                if !is_b {
+                if !res.is_b {
                     self.exr_data = None;
                 }
                 self.error_msg = Some(e.to_string());
@@ -416,6 +494,23 @@ impl eframe::App for ExrApp {
         // Apply the persisted theme preference. Idempotent per frame; `System`
         // tracks the OS light/dark setting via egui's input each frame.
         ui.ctx().set_theme(self.theme);
+
+        // Drain completed async image loads (collect first so the `load_rx`
+        // borrow ends before the `&mut self` apply call).
+        let mut loaded = Vec::new();
+        if let Some(rx) = &self.load_rx {
+            while let Ok(res) = rx.try_recv() {
+                loaded.push(res);
+            }
+        }
+        for res in loaded {
+            self.apply_load_result(res);
+        }
+        if self.loading_a || self.loading_b {
+            // egui is reactive; keep polling the worker until the decode lands.
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(50));
+        }
 
         if self.show_help {
             egui::Window::new("Help & Shortcuts")
@@ -1408,6 +1503,21 @@ impl eframe::App for ExrApp {
                         self.render_state.as_ref(),
                         self.lut_bg.clone(),
                     );
+                } else if self.loading_a {
+                    // A requested but its decode hasn't landed yet (no prior image
+                    // to keep showing) — show progress instead of a blank canvas.
+                    let name = self
+                        .loaded_file
+                        .as_ref()
+                        .and_then(|p| p.file_name())
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    ui.centered_and_justified(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(format!("Loading {name}…"));
+                        });
+                    });
                 }
             } else {
                 ui.centered_and_justified(|ui| {
@@ -1415,5 +1525,112 @@ impl eframe::App for ExrApp {
                 });
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use exr::prelude::*;
+
+    /// Tiny 2×2 RGBA EXR so the success path has a real `ExrData` to apply.
+    fn write_rgba_exr(path: &std::path::Path) {
+        const W: usize = 2;
+        const H: usize = 2;
+        let mut list = smallvec::SmallVec::new();
+        for name in ["R", "G", "B", "A"] {
+            list.push(AnyChannel::new(
+                Text::from(name),
+                FlatSamples::F32(vec![0.5; W * H]),
+            ));
+        }
+        let layer = Layer::new(
+            (W, H),
+            LayerAttributes::default(),
+            Encoding::FAST_LOSSLESS,
+            AnyChannels::sort(list),
+        );
+        Image::from_layer(layer)
+            .write()
+            .to_file(path)
+            .expect("write rgba exr fixture");
+    }
+
+    #[test]
+    fn stale_load_result_is_ignored() {
+        // A result for a path the user has since navigated away from must not
+        // clobber state or clear the in-flight flag for the current request.
+        let mut app = ExrApp {
+            loaded_file: Some(PathBuf::from("current.exr")),
+            loading_a: true,
+            ..Default::default()
+        };
+
+        app.apply_load_result(LoadResult {
+            path: PathBuf::from("superseded.exr"),
+            is_b: false,
+            result: Err("boom".to_string()),
+        });
+
+        assert!(
+            app.error_msg.is_none(),
+            "stale result must not surface its error"
+        );
+        assert!(
+            app.loading_a,
+            "stale result must leave the current load in flight"
+        );
+    }
+
+    #[test]
+    fn matching_error_result_surfaces_and_clears_loading() {
+        let mut app = ExrApp {
+            loaded_file: Some(PathBuf::from("current.exr")),
+            loading_a: true,
+            ..Default::default()
+        };
+
+        app.apply_load_result(LoadResult {
+            path: PathBuf::from("current.exr"),
+            is_b: false,
+            result: Err("bad exr".to_string()),
+        });
+
+        assert_eq!(app.error_msg.as_deref(), Some("bad exr"));
+        assert!(!app.loading_a, "matching result clears the loading flag");
+        assert!(app.exr_data.is_none());
+    }
+
+    #[test]
+    fn a_success_resets_b_and_clears_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.exr");
+        write_rgba_exr(&path);
+        let data_a = ExrData::load(&path).unwrap();
+        let data_b = ExrData::load(&path).unwrap();
+
+        let mut app = ExrApp {
+            loaded_file: Some(path.clone()),
+            loaded_file_b: Some(PathBuf::from("b.exr")),
+            exr_data_b: Some(data_b),
+            loading_a: true,
+            loading_b: true,
+            ..Default::default()
+        };
+
+        app.apply_load_result(LoadResult {
+            path,
+            is_b: false,
+            result: Ok(data_a),
+        });
+
+        assert!(app.exr_data.is_some(), "A data applied");
+        assert!(app.exr_data_b.is_none(), "B reset when A changes");
+        assert!(app.loaded_file_b.is_none(), "B path cleared when A changes");
+        assert!(
+            !app.loading_a && !app.loading_b,
+            "both loading flags cleared (A discards any in-flight B)"
+        );
+        assert!(app.error_msg.is_none());
     }
 }
