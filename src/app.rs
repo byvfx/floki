@@ -237,10 +237,10 @@ impl ExrApp {
             .iter()
             .find(|d| d.name == self.ocio_display)
             .cloned();
-        if let Some(d) = &views {
-            if !d.views.contains(&self.ocio_view) {
-                self.ocio_view = d.default_view.clone();
-            }
+        if let Some(d) = &views
+            && !d.views.contains(&self.ocio_view)
+        {
+            self.ocio_view = d.default_view.clone();
         }
         if self.ocio_input_cs.is_empty() || !self.ocio_colorspaces.contains(&self.ocio_input_cs) {
             self.ocio_input_cs = cfg

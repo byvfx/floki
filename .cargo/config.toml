@@ -1,0 +1,17 @@
+# Convenience aliases for the self-contained (vendored) OpenColorIO build.
+#
+# `cargo ocio-run` is the easy, cross-platform way to run floki with OCIO: it
+# statically builds OCIO 2.4.2 from the `floki-ocio/vendor/OCIO` submodule via
+# cmake, so nothing needs to be installed system-wide. The first build is slow
+# (minutes) and then cached.
+#
+# Prerequisites: a C++ toolchain (MSVC "Desktop development with C++" on Windows;
+# clang/gcc elsewhere), cmake >= 3.14, ninja, python3, and the OCIO submodule
+# checked out (`git submodule update --init --recursive`, or use `just ocio`).
+#
+# These are plain aliases, not a feature remap: a bare `cargo build --features
+# ocio` still uses the lightweight system backend and never triggers cmake.
+[alias]
+ocio-run = "run --release --features ocio-vendored"
+ocio-build = "build --release --features ocio-vendored"
+ocio-test = "test --features ocio-vendored"

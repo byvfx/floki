@@ -2,6 +2,10 @@
 name = "floki"
 version = "1.4.4"
 edition = "2024"
+# The app binary. Without this, `cargo run` is ambiguous because src/bin/ also has
+# the convert_dir/inspect_exr/check_types helper bins (so `cargo run`, `cargo ocio-run`,
+# etc. would error asking for --bin).
+default-run = "floki"
 
 [workspace]
 members = [".", "floki-ocio"]

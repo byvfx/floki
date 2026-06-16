@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Vendored OCIO build (`--features ocio-vendored`) now links on Windows machines
+  that have vcpkg's user-wide MSBuild integration (`vcpkg integrate install`).
+  That integration silently injected vcpkg's headers (including a different
+  yaml-cpp ABI) into OCIO's Visual Studio build, producing `LNK2019`
+  unresolved `__imp_*` symbols against OCIO's own statically built yaml-cpp.
+  `build.rs` now builds OCIO hermetically (disables the vcpkg MSBuild hooks),
+  so the vendored build is reproducible regardless of the host's vcpkg state.
+
+### Added
+- Convenience build wrappers for OCIO: `cargo ocio-run` / `cargo ocio-build` /
+  `cargo ocio-test` (cargo aliases, zero install) and a `justfile` (`just ocio`)
+  that also inits the OCIO submodule. The self-contained vendored build is now
+  the documented, recommended cross-platform path.
+
 ## [1.4.4] - 2026-06-14
 
 ### Fixed

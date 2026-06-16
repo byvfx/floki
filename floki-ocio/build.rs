@@ -82,8 +82,12 @@ mod native {
             (prefix.join("include"), prefix.join("lib"))
         } else {
             panic!(
-                "could not locate OpenColorIO; set OPENCOLORIO_ROOT to its install prefix \
-                 (containing include/ and lib/), or build with --features vendored-ocio"
+                "could not locate a system OpenColorIO.\n\
+                 For a self-contained build that needs no installed OCIO, run `cargo ocio-run` \
+                 (or `cargo build --release --features ocio-vendored`) — it statically builds \
+                 OCIO from the vendored submodule via cmake.\n\
+                 To link an installed OCIO instead, set OPENCOLORIO_ROOT to its install prefix \
+                 (containing include/ and lib/), or install it via Homebrew (macOS)."
             );
         };
 
@@ -172,6 +176,21 @@ mod native {
             }
             cflags.push_str("-Dfdopen=fdopen");
             config.env("CFLAGS", cflags);
+        }
+
+        // Keep the OCIO build hermetic from a host vcpkg install. On Windows the cmake crate
+        // uses the Visual Studio (MSBuild) generator, and vcpkg's *user-wide* integration
+        // (`vcpkg integrate install`, a `vcpkg.user.targets` under %LOCALAPPDATA%) silently
+        // injects vcpkg's include dir into *every* MSBuild project. OCIO then compiles its core
+        // (e.g. OCIOYaml.cpp) against vcpkg's yaml-cpp 0.8 headers — which decorate symbols with
+        // `__declspec(dllimport)` by default — while build.rs links OCIO's own statically-built
+        // yaml-cpp (plain symbols). The result is LNK2019 unresolved `__imp_*` symbols. Disable
+        // both vcpkg MSBuild hooks via environment (MSBuild reads properties from env, and env
+        // propagates to OCIO's ext ExternalProject sub-builds too, so the whole tree stays clean).
+        // No-ops when vcpkg isn't installed, and irrelevant off Windows.
+        if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+            config.env("VCPkgLocalAppDataDisabled", "1"); // skip the user-wide vcpkg.user.targets
+            config.env("VcpkgEnabled", "false"); // disable any project/manifest-mode vcpkg
         }
 
         let dst = config.build();

@@ -91,14 +91,27 @@ cargo run --release
 
 OCIO support is **off by default** (the standard build needs no C++ toolchain). Two opt-in builds:
 
-```bash
-# Dev: link an installed OCIO (Homebrew, or OPENCOLORIO_ROOT). Fast, no cmake.
-cargo run --release --features ocio
+**Recommended — self-contained (vendored):** statically builds OCIO 2.4.2 from the vendored
+submodule, so nothing needs to be installed system-wide. Works the same on Windows, Linux,
+and macOS. The first build is slow (minutes); then it's cached.
 
-# Distributable: statically build OCIO 2.4.2 from the vendored submodule, so the
-# binary needs no installed OCIO. Heavy first build; needs cmake + a C++ compiler.
-git submodule update --init --recursive
-cargo run --release --features ocio-vendored
+```bash
+# One short command on any OS (cargo alias from .cargo/config.toml):
+cargo ocio-run
+
+# …or, to also init the submodule in one shot (requires `just`):
+just ocio
+```
+
+Prerequisites: a C++ toolchain (MSVC "Desktop development with C++" on Windows; clang/gcc
+elsewhere), **cmake ≥ 3.14**, **ninja**, **python3**, and the OCIO submodule checked out
+(`git submodule update --init --recursive` — done automatically by `just ocio`).
+
+**Fast dev — link an installed OCIO (system):** for when you already have OCIO installed.
+
+```bash
+# Located via OPENCOLORIO_ROOT (any OS) or Homebrew (macOS). Fast, no cmake.
+cargo run --release --features ocio
 ```
 
 Once running, enable it in **Color Management…** (check *Enable OCIO*). With the config-path

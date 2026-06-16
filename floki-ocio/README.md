@@ -52,3 +52,13 @@ Build the app against it from the workspace root:
 ```sh
 cargo build --release --features ocio-vendored
 ```
+
+Or use the convenience wrappers (defined in the workspace `.cargo/config.toml` and `justfile`):
+
+```sh
+cargo ocio-run     # run floki with vendored OCIO (cargo alias; submodule must be checked out)
+cargo ocio-build   # build only
+cargo ocio-test    # static-link smoke test
+
+just ocio          # inits the submodule first, then runs (one-shot from a fresh clone; needs `just`)
+```
