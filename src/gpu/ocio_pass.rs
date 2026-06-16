@@ -210,13 +210,15 @@ impl OcioGpuPass {
     }
 
     /// Encode the OCIO pass: sample `input_view` (scene-linear) and write the display result
-    /// into `output_view`.
+    /// into `output_view`. `scissor` (x, y, w, h in pixels) limits the (expensive) transform
+    /// to the visible image region; `None` runs it over the whole target.
     pub fn render(
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
         input_view: &wgpu::TextureView,
         output_view: &wgpu::TextureView,
+        scissor: Option<[u32; 4]>,
     ) {
         let set1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("OCIO scene bind group"),
@@ -249,6 +251,9 @@ impl OcioGpuPass {
             occlusion_query_set: None,
             multiview_mask: None,
         });
+        if let Some([x, y, w, h]) = scissor {
+            rp.set_scissor_rect(x, y, w, h);
+        }
         rp.set_pipeline(&self.pipeline);
         rp.set_bind_group(0, &self.set0_bind_group, &[]);
         rp.set_bind_group(1, &set1, &[]);
@@ -274,6 +279,9 @@ pub struct OcioTargets {
     display_view: wgpu::TextureView,
     blit_bind_group: wgpu::BindGroup,
     blit_uniform_buffer: wgpu::Buffer,
+    /// `render_sig` of the content currently in `display_view`; lets `prepare` skip the
+    /// two passes when nothing changed. `None` after (re)creation forces a first render.
+    last_render_sig: Option<u64>,
     _scene: wgpu::Texture,
     _display: wgpu::Texture,
 }
@@ -298,7 +306,9 @@ impl OcioTargets {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba32Float,
+            // Rgba16Float: half the bandwidth of 32F, ample range for viewing. Must match
+            // `GpuState::pipeline_linear`'s color target format in gpu/mod.rs.
+            format: wgpu::TextureFormat::Rgba16Float,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
@@ -349,6 +359,7 @@ impl OcioTargets {
             display_view,
             blit_bind_group,
             blit_uniform_buffer,
+            last_render_sig: None,
             _scene: scene,
             _display: display,
         }
@@ -374,6 +385,14 @@ pub struct OcioCallback {
     pub draws: Vec<OcioPass1Draw>,
     pub display_format: wgpu::TextureFormat,
     pub blit_uniforms: crate::gpu::BlitUniforms,
+    /// Visible image bounds in egui points (xmin, ymin, xmax, ymax). The OCIO transform is
+    /// scissored to this region so it doesn't run over the empty background. `None` = whole
+    /// target (e.g. side-by-side, where image content spans the canvas).
+    pub scissor_pts: Option<[f32; 4]>,
+    /// Hash of everything affecting the OCIO render (uniforms + texture identities + config).
+    /// When it matches the last render, the two expensive passes are skipped and `paint` just
+    /// re-blits the cached `display_view` — so hover / menu / animation repaints stay cheap.
+    pub render_sig: u64,
 }
 
 impl eframe::egui_wgpu::CallbackTrait for OcioCallback {
@@ -424,61 +443,92 @@ impl eframe::egui_wgpu::CallbackTrait for OcioCallback {
             return Vec::new();
         }
 
-        let gpu = callback_resources.get::<GpuState>().unwrap();
-        let ocio = callback_resources.get::<OcioGpuPass>().unwrap();
-        let targets = callback_resources.get::<OcioTargets>().unwrap();
-
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("OCIO"),
-        });
-
-        // Pass 1: composite + exposure into scene-linear (uniforms set srgb=0/gamma=1/lut=0/
-        // skip_checker=1). Each draw maps its own rect via the vertex shader, so two
-        // side-by-side draws land in their sub-rects within the one offscreen. Alpha is
-        // cleared to a negative sentinel: the blit treats scene_a < 0 as "no image" so the
-        // checker only shows under drawn pixels (matching the non-OCIO path).
-        {
-            let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("OCIO pass 1 (scene-linear)"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &targets.scene_view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.0,
-                            g: 0.0,
-                            b: 0.0,
-                            a: -1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            rp.set_viewport(0.0, 0.0, w as f32, h as f32, 0.0, 1.0);
-            rp.set_pipeline(&gpu.pipeline_linear);
-            for d in &self.draws {
-                rp.set_bind_group(0, d.bg_a.as_ref(), &[]);
-                rp.set_bind_group(1, d.bg_b.as_ref(), &[]);
-                rp.set_bind_group(2, &d.uniform_bg, &[]);
-                rp.set_bind_group(3, d.lut_bg.as_ref(), &[]);
-                rp.draw(0..6, 0..1);
-            }
+        // Skip the two passes when nothing affecting the render changed; `paint` re-blits the
+        // cached display_view, so hover / menu / animation repaints stay cheap.
+        let dirty = callback_resources
+            .get::<OcioTargets>()
+            .unwrap()
+            .last_render_sig
+            != Some(self.render_sig);
+        if !dirty {
+            return Vec::new();
         }
 
-        // Pass 2: OCIO display transform scene-linear -> display.
-        ocio.render(
-            device,
-            &mut encoder,
-            &targets.scene_view,
-            &targets.display_view,
-        );
+        let cmd = {
+            let gpu = callback_resources.get::<GpuState>().unwrap();
+            let ocio = callback_resources.get::<OcioGpuPass>().unwrap();
+            let targets = callback_resources.get::<OcioTargets>().unwrap();
 
-        vec![encoder.finish()]
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("OCIO"),
+            });
+
+            // Pass 1: composite + exposure into scene-linear (uniforms set srgb=0/gamma=1/lut=0/
+            // skip_checker=1). Each draw maps its own rect via the vertex shader, so two
+            // side-by-side draws land in their sub-rects within the one offscreen. Alpha is
+            // cleared to a negative sentinel: the blit treats scene_a < 0 as "no image" so the
+            // checker only shows under drawn pixels (matching the non-OCIO path).
+            {
+                let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("OCIO pass 1 (scene-linear)"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &targets.scene_view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.0,
+                                g: 0.0,
+                                b: 0.0,
+                                a: -1.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                rp.set_viewport(0.0, 0.0, w as f32, h as f32, 0.0, 1.0);
+                rp.set_pipeline(&gpu.pipeline_linear);
+                for d in &self.draws {
+                    rp.set_bind_group(0, d.bg_a.as_ref(), &[]);
+                    rp.set_bind_group(1, d.bg_b.as_ref(), &[]);
+                    rp.set_bind_group(2, &d.uniform_bg, &[]);
+                    rp.set_bind_group(3, d.lut_bg.as_ref(), &[]);
+                    rp.draw(0..6, 0..1);
+                }
+            }
+
+            // Pass 2: OCIO display transform, scissored to the visible image region (points ->
+            // px, clamped to the target) so the expensive shader skips the empty background.
+            let ppp = screen_descriptor.pixels_per_point;
+            let scissor = self
+                .scissor_pts
+                .map(|[x0, y0, x1, y1]| {
+                    let cx = ((x0 * ppp).floor().max(0.0) as u32).min(w);
+                    let cy = ((y0 * ppp).floor().max(0.0) as u32).min(h);
+                    let cw = ((x1 * ppp).ceil() as u32).min(w).saturating_sub(cx);
+                    let ch = ((y1 * ppp).ceil() as u32).min(h).saturating_sub(cy);
+                    [cx, cy, cw, ch]
+                })
+                .filter(|[_, _, sw, sh]| *sw > 0 && *sh > 0);
+            ocio.render(
+                device,
+                &mut encoder,
+                &targets.scene_view,
+                &targets.display_view,
+                scissor,
+            );
+
+            encoder.finish()
+        };
+
+        if let Some(t) = callback_resources.get_mut::<OcioTargets>() {
+            t.last_render_sig = Some(self.render_sig);
+        }
+        vec![cmd]
     }
 
     fn paint(
@@ -710,7 +760,7 @@ mod metal_tests {
 
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        pass.render(&device, &mut encoder, &input_view, &output_view);
+        pass.render(&device, &mut encoder, &input_view, &output_view, None);
         queue.submit([encoder.finish()]);
         let _ = device.poll(wgpu::PollType::wait_indefinitely());
     }
