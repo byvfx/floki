@@ -1009,6 +1009,11 @@ impl ExrViewer {
                     let ocio_draws: std::cell::RefCell<
                         Vec<crate::gpu::ocio_pass::OcioPass1Draw>,
                     > = std::cell::RefCell::new(Vec::new());
+                    // Running FNV-1a hash of everything that affects the OCIO render (uniforms +
+                    // texture identities) so the (expensive) display transform is skipped on
+                    // repaints that change nothing — hover, menus, animations.
+                    #[cfg(feature = "ocio")]
+                    let ocio_sig = std::cell::Cell::new(0xcbf29ce484222325u64);
                     let draw_gpu =
                         |painter: &egui::Painter,
                          bg_a: std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>,
@@ -1067,6 +1072,24 @@ impl ExrViewer {
                             // even under OCIO it is NOT accumulated into the OCIO pass.
                             #[cfg(feature = "ocio")]
                             if ocio_active && !is_diff {
+                                // Fold this draw's inputs (uniform bytes + texture pointers) into
+                                // the per-frame render signature; OcioCallback re-renders only
+                                // when this changes.
+                                let mut h = ocio_sig.get();
+                                for chunk in bytemuck::bytes_of(&u).chunks(8) {
+                                    let mut b = [0u8; 8];
+                                    b[..chunk.len()].copy_from_slice(chunk);
+                                    h = (h ^ u64::from_le_bytes(b)).wrapping_mul(0x100000001b3);
+                                }
+                                for p in [
+                                    std::sync::Arc::as_ptr(&bg_a) as *const () as u64,
+                                    std::sync::Arc::as_ptr(&bg_b) as *const () as u64,
+                                    std::sync::Arc::as_ptr(&active_lut_bg) as *const () as u64,
+                                ] {
+                                    h = (h ^ p).wrapping_mul(0x100000001b3);
+                                }
+                                ocio_sig.set(h);
+
                                 // Accumulate; the single per-frame OcioCallback is emitted
                                 // after draw_all so one OCIO pass covers the whole frame.
                                 ocio_draws.borrow_mut().push(
@@ -1375,10 +1398,34 @@ impl ExrViewer {
                                     },
                                     _pad0: 0.0,
                                 };
+                                // Finalize the render signature with the OCIO config/view
+                                // identity (its CPU processor is rebuilt on any config change),
+                                // so changing the display/view forces a re-render.
+                                let mut render_sig = ocio_sig.get();
+                                if let Some(p) = &self.ocio_cpu {
+                                    render_sig = (render_sig
+                                        ^ (std::rc::Rc::as_ptr(p) as *const () as u64))
+                                        .wrapping_mul(0x100000001b3);
+                                }
+                                // Scissor the OCIO transform to the visible image so it skips
+                                // the empty background. Side-by-side spans the canvas with two
+                                // images, so it opts out (None = whole target).
+                                let scissor_pts = if is_sbs {
+                                    None
+                                } else {
+                                    Some([
+                                        image_rect.min.x,
+                                        image_rect.min.y,
+                                        image_rect.max.x,
+                                        image_rect.max.y,
+                                    ])
+                                };
                                 let callback = crate::gpu::ocio_pass::OcioCallback {
                                     draws,
                                     display_format,
                                     blit_uniforms,
+                                    render_sig,
+                                    scissor_pts,
                                 };
                                 slot_painter.set(
                                     slot,

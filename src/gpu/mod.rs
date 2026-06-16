@@ -341,9 +341,12 @@ impl GpuState {
                 module: &shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    // Rgba32Float is not a blendable format; pass 1 is a single full-quad draw
-                    // into a cleared target, so no blending is needed.
-                    format: wgpu::TextureFormat::Rgba32Float,
+                    // Rgba16Float scene-linear offscreen: half the bandwidth of 32F for the
+                    // OCIO pass (write here, sampled by the display transform) and ample range
+                    // for viewing (half-float reaches 65504). Not blendable, but pass 1 is a
+                    // single full-quad draw into a cleared target, so no blending is needed.
+                    // Must match the OCIO scene target format in ocio_pass.rs.
+                    format: wgpu::TextureFormat::Rgba16Float,
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
