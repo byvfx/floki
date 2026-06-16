@@ -1,7 +1,40 @@
+//! The image canvas: pan/zoom, channel/exposure/gamma controls, the six
+//! [`CompareMode`]s, pixel sampling, histogram and contact sheet. State lives in
+//! [`ExrViewer`]; [`ExrViewer::ui`] is the per-frame entry point.
+//!
+//! # Texture generation
+//!
+//! Two rendering paths produce what's drawn, and which `generate_*` function
+//! runs depends on whether a GPU [`RenderState`](eframe::egui_wgpu::RenderState)
+//! is available:
+//!
+//! - **GPU (default).** [`Self::generate_gpu_texture`](ExrViewer::generate_gpu_texture)
+//!   uploads a layer's RGBA into a bind group; `gpu/shader.wgsl` then applies
+//!   channel isolation, exposure, gamma, sRGB **and every compare mode**
+//!   (wipe / diff / composite) in-shader. So in GPU mode a single generator
+//!   serves all modes, cached per layer in `gpu_textures` / `gpu_textures_b`.
+//!
+//! - **CPU (no `render_state`, plus contact-sheet thumbnails).** The result is
+//!   baked into an [`egui::TextureHandle`], so each compare mode needs its own
+//!   generator. When an OCIO CPU processor is active each path dispatches to its
+//!   `_ocio` sibling (display transform instead of the built-in sRGB tone math):
+//!
+//!   | Situation            | Function                       | OCIO-active variant               | Cache (key)                                 |
+//!   |----------------------|--------------------------------|-----------------------------------|---------------------------------------------|
+//!   | Single layer / thumb | `generate_texture`             | `generate_texture_ocio`           | `textures` / `textures_b` (per-layer slot)  |
+//!   | [`CompareMode::DiffMatte`] | `generate_diff_texture`   | — (diff is tone-mode-agnostic)    | `diff_texture`, key `(active_layer, diff_multiplier)` |
+//!   | [`CompareMode::Composite`] | `generate_composite_texture` | `generate_composite_texture_ocio` | `composite_texture`, key `(active_layer, blend_mode)` |
+//!
+//! All caches invalidate on a layer-count change; the per-layer slots also clear
+//! on an OCIO-state change and via [`ExrViewer::invalidate_reference_textures`]
+//! when B is replaced.
+
 use crate::exr_loader::ExrData;
 use eframe::egui;
 use rayon::prelude::*;
 
+/// Which channel(s) the canvas isolates. `RGB` shows full colour; the rest show
+/// a single channel as grayscale. Encoded for the shader via [`Self::as_u32`].
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 #[allow(clippy::upper_case_acronyms)] // RGB matches the documented channel_mode mapping
 pub enum ChannelMode {
@@ -29,6 +62,10 @@ impl ChannelMode {
     }
 }
 
+/// How A and B are shown together. `SingleA`/`SingleB` ignore the other image;
+/// the rest require a loaded B. `Wipe`, `SideBySide` and `DiffMatte`/`Composite`
+/// are all resolved in-shader on the GPU path (and have CPU-fallback generators
+/// for `DiffMatte`/`Composite` — see the module-level docs).
 #[derive(PartialEq, Clone, Copy, Debug)]
 pub enum CompareMode {
     SingleA,
@@ -39,6 +76,8 @@ pub enum CompareMode {
     Composite,
 }
 
+/// Compositing operator for [`CompareMode::Composite`] (premultiplied-alpha
+/// aware). Encoded for the shader via [`Self::as_u32`].
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 pub enum BlendMode {
     #[default]
@@ -75,6 +114,9 @@ impl BlendMode {
     }
 }
 
+/// All canvas state for one A/B pair: view transform, tone controls, the active
+/// [`CompareMode`], the texture caches described in the module docs, plus
+/// sampling/histogram/contact-sheet state. Driven each frame by [`Self::ui`].
 pub struct ExrViewer {
     textures: Vec<Option<egui::TextureHandle>>,
     textures_b: Vec<Option<egui::TextureHandle>>,
@@ -1821,6 +1863,10 @@ impl ExrViewer {
         }
     }
 
+    /// The real render path: upload `layer_index`'s RGBA into a GPU bind group.
+    /// The shader applies channel isolation, exposure, gamma, sRGB and every
+    /// compare mode, so this one generator serves all modes; results are cached
+    /// per layer in `gpu_textures` / `gpu_textures_b`. See the module-level docs.
     fn generate_gpu_texture(
         &self,
         render_state: &eframe::egui_wgpu::RenderState,
@@ -1929,6 +1975,11 @@ impl ExrViewer {
         Some(std::sync::Arc::new(bind_group))
     }
 
+    /// CPU/thumbnail path: bake `layer_index` into an [`egui::TextureHandle`]
+    /// with the full channel-select → exposure → gamma → sRGB tone pipeline.
+    /// Used for contact-sheet thumbnails and as the fallback when no GPU
+    /// `render_state` is available. Dispatches to `generate_texture_ocio`
+    /// when an OCIO CPU processor is active.
     fn generate_texture(
         &self,
         ctx: &egui::Context,
@@ -2168,6 +2219,10 @@ impl ExrViewer {
         Some(ctx.load_texture("exr_viewer", color_image, egui::TextureOptions::LINEAR))
     }
 
+    /// CPU-fallback parity for [`CompareMode::DiffMatte`]: `|A − B|` scaled by
+    /// `diff_multiplier` and mapped through a heat ramp. Cached in `diff_texture`,
+    /// keyed by `(active_layer, diff_multiplier)`. The GPU path (default) does
+    /// this in-shader. Diff is tone-mode-agnostic, so there is no `_ocio` variant.
     fn generate_diff_texture(
         &self,
         ctx: &egui::Context,
@@ -2611,7 +2666,7 @@ impl ExrViewer {
     }
 
     /// Black-body heat ramp for the diff visualization: 0 → black, ramping through
-    /// red → yellow → white as the (already gained + clamped) magnitude `m` ∈ [0,1]
+    /// red → yellow → white as the (already gained + clamped) magnitude `m` ∈ `[0,1]`
     /// rises. Kept in lockstep with the `heat` ramp in the GPU diff branch (shader.wgsl).
     fn heat_ramp(m: f32) -> (f32, f32, f32) {
         (
@@ -2621,7 +2676,7 @@ impl ExrViewer {
         )
     }
 
-    /// Invalidate the cached histogram so the next [`calculate_histogram`] call
+    /// Invalidate the cached histogram so the next [`Self::calculate_histogram`] call
     /// recomputes. Call this when image B changes (load/unload) — B identity is
     /// not part of the cache key.
     pub fn invalidate_histogram(&mut self) {

@@ -24,6 +24,10 @@ impl From<ThemeChoice> for egui::ThemePreference {
     }
 }
 
+/// Top-level application state and the [`eframe::App`] implementation. Owns the
+/// loaded A/B images, the `ExrViewer` canvas, OCIO/LUT colour state, and the
+/// menu/tool UI. Fields marked `#[serde(skip)]` are runtime-only (images, GPU
+/// handles); the rest persist across sessions.
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct ExrApp {
@@ -156,6 +160,8 @@ impl Default for ExrApp {
 }
 
 impl ExrApp {
+    /// Build the app: restore persisted state (or [`Default`]), then re-apply
+    /// the saved theme and re-establish OCIO/LUT state for the loaded settings.
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let mut app: Self = if let Some(storage) = cc.storage {
             eframe::get_value(storage, eframe::APP_KEY).unwrap_or_default()
@@ -343,6 +349,10 @@ impl ExrApp {
         }
     }
 
+    /// Load an EXR into slot A or B. Loading A resets B and the viewer; loading
+    /// B invalidates the reference-dependent texture and histogram caches. On
+    /// failure the path is still recorded but `error_msg` is set. Decode is
+    /// synchronous on the calling (UI) thread today — see #28.
     fn open_file(&mut self, path: PathBuf, is_b: bool) {
         if !is_b {
             self.recent_files.retain(|p| p != &path);
