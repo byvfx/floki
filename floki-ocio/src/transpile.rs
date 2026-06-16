@@ -151,12 +151,9 @@ fn reflect_and_emit_wgsl(spirv: &[u32]) -> Result<(Vec<BindingInfo>, String)> {
     }
     bindings.sort_by_key(|b| (b.group, b.binding));
 
-    let wgsl = naga::back::wgsl::write_string(
-        &module,
-        &info,
-        naga::back::wgsl::WriterFlags::empty(),
-    )
-    .map_err(|e| OcioError::Transpile(format!("WGSL emit (naga): {e}")))?;
+    let wgsl =
+        naga::back::wgsl::write_string(&module, &info, naga::back::wgsl::WriterFlags::empty())
+            .map_err(|e| OcioError::Transpile(format!("WGSL emit (naga): {e}")))?;
 
     Ok((bindings, wgsl))
 }

@@ -1053,8 +1053,7 @@ impl ExrViewer {
 
                             #[cfg(feature = "ocio")]
                             if ocio_active {
-                                let display_format =
-                                    render_state.as_ref().unwrap().target_format;
+                                let display_format = render_state.as_ref().unwrap().target_format;
                                 let callback = crate::gpu::ocio_pass::OcioCallback {
                                     bg_a,
                                     bg_b,

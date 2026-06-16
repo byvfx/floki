@@ -225,7 +225,11 @@ impl ExrApp {
         self.ocio_displays = cfg.displays();
 
         // Default any unset / now-invalid selections from the config.
-        if !self.ocio_displays.iter().any(|d| d.name == self.ocio_display) {
+        if !self
+            .ocio_displays
+            .iter()
+            .any(|d| d.name == self.ocio_display)
+        {
             self.ocio_display = cfg.default_display();
         }
         let views = self
@@ -261,7 +265,9 @@ impl ExrApp {
             self.ocio_ready = false;
             return;
         };
-        if self.ocio_input_cs.is_empty() || self.ocio_display.is_empty() || self.ocio_view.is_empty()
+        if self.ocio_input_cs.is_empty()
+            || self.ocio_display.is_empty()
+            || self.ocio_view.is_empty()
         {
             self.ocio_ready = false;
             return;
@@ -280,10 +286,7 @@ impl ExrApp {
             }
         };
         // CPU processor for thumbnails / fallback (best-effort; GPU path is primary).
-        self.ocio_cpu = cfg
-            .build_cpu_processor(&req)
-            .ok()
-            .map(std::rc::Rc::new);
+        self.ocio_cpu = cfg.build_cpu_processor(&req).ok().map(std::rc::Rc::new);
         let Some(rs) = &self.render_state else {
             self.ocio_ready = false;
             return;
@@ -563,137 +566,147 @@ impl eframe::App for ExrApp {
             let ocio_displays = self.ocio_displays.clone();
             #[cfg(feature = "ocio")]
             let ocio_colorspaces = self.ocio_colorspaces.clone();
-            egui::Window::new("Color Management").open(&mut self.show_settings).show(ui.ctx(), |ui| {
-                ui.heading("Settings");
-                ui.add_space(5.0);
+            egui::Window::new("Color Management")
+                .open(&mut self.show_settings)
+                .show(ui.ctx(), |ui| {
+                    ui.heading("Settings");
+                    ui.add_space(5.0);
 
-                #[cfg(not(feature = "ocio"))]
-                {
-                    ui.label("OCIO Environment / Config Path:");
-                    ui.horizontal(|ui| {
-                        ui.text_edit_singleline(&mut self.ocio_path);
-                        ui.add_enabled(false, egui::Button::new("Browse"))
-                            .on_disabled_hover_text("Build with --features ocio");
-                    });
-                }
+                    #[cfg(not(feature = "ocio"))]
+                    {
+                        ui.label("OCIO Environment / Config Path:");
+                        ui.horizontal(|ui| {
+                            ui.text_edit_singleline(&mut self.ocio_path);
+                            ui.add_enabled(false, egui::Button::new("Browse"))
+                                .on_disabled_hover_text("Build with --features ocio");
+                        });
+                    }
 
-                #[cfg(feature = "ocio")]
-                {
-                    ui.label("OCIO Config (.ocio) — empty uses built-in ACES (ocio://default):");
+                    #[cfg(feature = "ocio")]
+                    {
+                        ui.label(
+                            "OCIO Config (.ocio) — empty uses built-in ACES (ocio://default):",
+                        );
+                        ui.horizontal(|ui| {
+                            ui.text_edit_singleline(&mut self.ocio_path);
+                            if ui.button("Browse").clicked()
+                                && let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("OCIO", &["ocio"])
+                                    .pick_file()
+                            {
+                                self.ocio_path = path.to_string_lossy().to_string();
+                                ocio_load_requested = true;
+                            }
+                            if ui.button("Load").clicked() {
+                                ocio_load_requested = true;
+                            }
+                        });
+
+                        // Clarify what an empty path resolves to.
+                        if self.ocio_path.trim().is_empty() {
+                            let hint =
+                                match std::env::var("OCIO").ok().filter(|v| !v.trim().is_empty()) {
+                                    Some(v) => format!("Empty path → using $OCIO: {v}"),
+                                    None => "Empty path → using built-in ACES (ocio://default)"
+                                        .to_string(),
+                                };
+                            ui.label(egui::RichText::new(hint).weak());
+                        }
+
+                        if !ocio_displays.is_empty() {
+                            egui::ComboBox::from_label("Input color space")
+                                .selected_text(self.ocio_input_cs.clone())
+                                .show_ui(ui, |ui| {
+                                    for cs in &ocio_colorspaces {
+                                        if ui
+                                            .selectable_value(
+                                                &mut self.ocio_input_cs,
+                                                cs.clone(),
+                                                cs,
+                                            )
+                                            .clicked()
+                                        {
+                                            ocio_rebuild_requested = true;
+                                        }
+                                    }
+                                });
+                            egui::ComboBox::from_label("Display")
+                                .selected_text(self.ocio_display.clone())
+                                .show_ui(ui, |ui| {
+                                    for d in &ocio_displays {
+                                        if ui
+                                            .selectable_value(
+                                                &mut self.ocio_display,
+                                                d.name.clone(),
+                                                &d.name,
+                                            )
+                                            .clicked()
+                                        {
+                                            // Reset the view if it isn't valid for the new display.
+                                            if let Some(nd) = ocio_displays
+                                                .iter()
+                                                .find(|x| x.name == self.ocio_display)
+                                                && !nd.views.contains(&self.ocio_view)
+                                            {
+                                                self.ocio_view = nd.default_view.clone();
+                                            }
+                                            ocio_rebuild_requested = true;
+                                        }
+                                    }
+                                });
+                            let cur_views = ocio_displays
+                                .iter()
+                                .find(|d| d.name == self.ocio_display)
+                                .map(|d| d.views.clone())
+                                .unwrap_or_default();
+                            egui::ComboBox::from_label("View")
+                                .selected_text(self.ocio_view.clone())
+                                .show_ui(ui, |ui| {
+                                    for v in &cur_views {
+                                        if ui
+                                            .selectable_value(&mut self.ocio_view, v.clone(), v)
+                                            .clicked()
+                                        {
+                                            ocio_rebuild_requested = true;
+                                        }
+                                    }
+                                });
+                            ui.checkbox(&mut self.ocio_enabled, "Enable OCIO");
+                        }
+                        if let Some(err) = &self.ocio_error {
+                            ui.label(egui::RichText::new(err).color(egui::Color32::RED));
+                        } else if self.ocio_ready {
+                            ui.label(
+                                egui::RichText::new("OCIO active").color(egui::Color32::GREEN),
+                            );
+                        }
+                    }
+
+                    ui.add_space(10.0);
+
+                    ui.label("Custom LUT Path (.cube, .3dl):");
                     ui.horizontal(|ui| {
-                        ui.text_edit_singleline(&mut self.ocio_path);
+                        ui.text_edit_singleline(&mut self.lut_path);
                         if ui.button("Browse").clicked()
                             && let Some(path) = rfd::FileDialog::new()
-                                .add_filter("OCIO", &["ocio"])
+                                .add_filter("LUT", &["cube"])
                                 .pick_file()
-                        {
-                            self.ocio_path = path.to_string_lossy().to_string();
-                            ocio_load_requested = true;
-                        }
-                        if ui.button("Load").clicked() {
-                            ocio_load_requested = true;
-                        }
-                    });
-
-                    // Clarify what an empty path resolves to.
-                    if self.ocio_path.trim().is_empty() {
-                        let hint = match std::env::var("OCIO")
-                            .ok()
-                            .filter(|v| !v.trim().is_empty())
-                        {
-                            Some(v) => format!("Empty path → using $OCIO: {v}"),
-                            None => "Empty path → using built-in ACES (ocio://default)".to_string(),
-                        };
-                        ui.label(egui::RichText::new(hint).weak());
-                    }
-
-                    if !ocio_displays.is_empty() {
-                        egui::ComboBox::from_label("Input color space")
-                            .selected_text(self.ocio_input_cs.clone())
-                            .show_ui(ui, |ui| {
-                                for cs in &ocio_colorspaces {
-                                    if ui
-                                        .selectable_value(&mut self.ocio_input_cs, cs.clone(), cs)
-                                        .clicked()
-                                    {
-                                        ocio_rebuild_requested = true;
-                                    }
-                                }
-                            });
-                        egui::ComboBox::from_label("Display")
-                            .selected_text(self.ocio_display.clone())
-                            .show_ui(ui, |ui| {
-                                for d in &ocio_displays {
-                                    if ui
-                                        .selectable_value(
-                                            &mut self.ocio_display,
-                                            d.name.clone(),
-                                            &d.name,
-                                        )
-                                        .clicked()
-                                    {
-                                        // Reset the view if it isn't valid for the new display.
-                                        if let Some(nd) =
-                                            ocio_displays.iter().find(|x| x.name == self.ocio_display)
-                                            && !nd.views.contains(&self.ocio_view)
-                                        {
-                                            self.ocio_view = nd.default_view.clone();
-                                        }
-                                        ocio_rebuild_requested = true;
-                                    }
-                                }
-                            });
-                        let cur_views = ocio_displays
-                            .iter()
-                            .find(|d| d.name == self.ocio_display)
-                            .map(|d| d.views.clone())
-                            .unwrap_or_default();
-                        egui::ComboBox::from_label("View")
-                            .selected_text(self.ocio_view.clone())
-                            .show_ui(ui, |ui| {
-                                for v in &cur_views {
-                                    if ui
-                                        .selectable_value(&mut self.ocio_view, v.clone(), v)
-                                        .clicked()
-                                    {
-                                        ocio_rebuild_requested = true;
-                                    }
-                                }
-                            });
-                        ui.checkbox(&mut self.ocio_enabled, "Enable OCIO");
-                    }
-                    if let Some(err) = &self.ocio_error {
-                        ui.label(egui::RichText::new(err).color(egui::Color32::RED));
-                    } else if self.ocio_ready {
-                        ui.label(
-                            egui::RichText::new("OCIO active").color(egui::Color32::GREEN),
-                        );
-                    }
-                }
-
-                ui.add_space(10.0);
-
-                ui.label("Custom LUT Path (.cube, .3dl):");
-                ui.horizontal(|ui| {
-                    ui.text_edit_singleline(&mut self.lut_path);
-                    if ui.button("Browse").clicked()
-                        && let Some(path) = rfd::FileDialog::new()
-                            .add_filter("LUT", &["cube"])
-                            .pick_file()
                         {
                             self.lut_path = path.to_string_lossy().to_string();
                             lut_reload_requested = true;
                         }
+                    });
+                    ui.checkbox(&mut self.enable_lut, "Enable Custom LUT");
+                    if let Some(err) = &self.lut_error {
+                        ui.label(egui::RichText::new(err).color(egui::Color32::RED));
+                    }
+                    if self.lut_bg.is_some() {
+                        ui.label(
+                            egui::RichText::new("LUT loaded and active!")
+                                .color(egui::Color32::GREEN),
+                        );
+                    }
                 });
-                ui.checkbox(&mut self.enable_lut, "Enable Custom LUT");
-                if let Some(err) = &self.lut_error {
-                    ui.label(egui::RichText::new(err).color(egui::Color32::RED));
-                }
-                if self.lut_bg.is_some() {
-                    ui.label(egui::RichText::new("LUT loaded and active!").color(egui::Color32::GREEN));
-                }
-
-            });
 
             if lut_reload_requested {
                 self.reload_lut();
