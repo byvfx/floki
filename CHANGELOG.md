@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.1] - 2026-06-16
+
+### Performance
+- EXR files now decode on a background thread, so opening a large multi-layer
+  render no longer freezes the window — a loading spinner shows while it loads.
+  (The decode itself is unchanged; the UI just stays responsive during it.)
+
+### Changed
+- Internal: split the monolithic viewer `ui()` into focused units (contact
+  sheet, pixel sampling, and the GPU/CPU canvas render paths), added a
+  `criterion` benchmark harness for EXR load, and expanded API docs and tests.
+  No user-facing behavior change.
+
 ## [1.5.0] - 2026-06-16
 
 ### Added
@@ -172,7 +185,8 @@ Initial release.
 - Advanced metadata header inspector.
 - Cross-platform GitHub Actions builds (Linux, Windows, macOS).
 
-[Unreleased]: https://github.com/byvfx/floki/compare/v1.5.0...HEAD
+[Unreleased]: https://github.com/byvfx/floki/compare/v1.5.1...HEAD
+[1.5.1]: https://github.com/byvfx/floki/compare/v1.5.0...v1.5.1
 [1.5.0]: https://github.com/byvfx/floki/compare/v1.4.4...v1.5.0
 [1.4.4]: https://github.com/byvfx/floki/compare/v1.4.3...v1.4.4
 [1.4.3]: https://github.com/byvfx/floki/compare/v1.4.2...v1.4.3
