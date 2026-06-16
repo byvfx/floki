@@ -513,9 +513,7 @@ impl ExrViewer {
                 );
             }
             CompareMode::DiffMatte => {
-                ui.add(
-                    egui::Slider::new(&mut self.diff_multiplier, 0.0..=100.0).text("Diff Gain"),
-                );
+                ui.add(egui::Slider::new(&mut self.diff_multiplier, 0.0..=100.0).text("Diff Gain"));
             }
             CompareMode::SideBySide => {
                 ui.checkbox(&mut self.normalize_side_by_side, "Normalize Size");
@@ -2172,9 +2170,12 @@ impl ExrViewer {
             .enumerate()
             .for_each(|(y, row)| {
                 for (x, px) in row.iter_mut().enumerate() {
-                    let dr = (get_val(r_chan_a, x, y, aw, ah) - get_val(r_chan_b, x, y, bw, bh)).abs();
-                    let dg = (get_val(g_chan_a, x, y, aw, ah) - get_val(g_chan_b, x, y, bw, bh)).abs();
-                    let db = (get_val(b_chan_a, x, y, aw, ah) - get_val(b_chan_b, x, y, bw, bh)).abs();
+                    let dr =
+                        (get_val(r_chan_a, x, y, aw, ah) - get_val(r_chan_b, x, y, bw, bh)).abs();
+                    let dg =
+                        (get_val(g_chan_a, x, y, aw, ah) - get_val(g_chan_b, x, y, bw, bh)).abs();
+                    let db =
+                        (get_val(b_chan_a, x, y, aw, ah) - get_val(b_chan_b, x, y, bw, bh)).abs();
                     let m = (dr.max(dg).max(db) * diff_multiplier).clamp(0.0, 1.0);
                     let (hr, hg, hb) = Self::heat_ramp(m);
                     *px = egui::Color32::from_rgb(
