@@ -2890,13 +2890,36 @@ fn draw_dashed_rect(
 
 #[cfg(test)]
 mod gui_tests {
-    //! Headless GUI interaction tests. They drive the rendering-free
-    //! [`ExrViewer::handle_hotkeys`] seam through `egui_kittest`, so they run
-    //! anywhere — no wgpu device, no loaded image — yet exercise the real egui
-    //! input pipeline (events → `key_pressed` → state mutation).
+    //! Headless GUI tests via `egui_kittest`, so they run anywhere — no wgpu
+    //! device. Most drive the rendering-free [`ExrViewer::handle_hotkeys`] seam
+    //! (events → `key_pressed` → state mutation); the smoke test additionally
+    //! drives the full [`ExrViewer::ui`] CPU path (`render_state = None`) across
+    //! every compare mode to guard the render/extraction seams.
     use super::{ChannelMode, CompareMode, ExrViewer};
+    use crate::exr_loader::ExrData;
     use eframe::egui;
     use egui_kittest::Harness;
+    use exr::prelude::*;
+
+    /// Tiny 2×2 RGBA EXR fixture so the CPU render path has real data to draw.
+    fn write_rgba_exr(path: &std::path::Path) {
+        let mut list = smallvec::SmallVec::new();
+        for name in ["R", "G", "B", "A"] {
+            list.push(AnyChannel::new(
+                Text::from(name),
+                FlatSamples::F32(vec![0.5; 4]),
+            ));
+        }
+        Image::from_layer(Layer::new(
+            (2, 2),
+            LayerAttributes::default(),
+            Encoding::FAST_LOSSLESS,
+            AnyChannels::sort(list),
+        ))
+        .write()
+        .to_file(path)
+        .expect("write rgba exr fixture");
+    }
 
     struct State {
         viewer: ExrViewer,
@@ -3085,5 +3108,57 @@ mod gui_tests {
         v.compare_mode = CompareMode::SingleB;
         v.blink_state = true;
         assert!(v.has_mode_params(), "blink exposes the speed control");
+    }
+
+    struct SmokeState {
+        viewer: ExrViewer,
+        a: ExrData,
+        b: Option<ExrData>,
+    }
+
+    /// Drive the full `ExrViewer::ui` CPU path (no GPU `render_state`) with a
+    /// loaded A and B across every compare mode plus the contact sheet, asserting
+    /// it lays out without panicking. Exercises the seams extracted from `ui()`
+    /// in #26 (contact sheet, pixel sampling, CPU draw paths).
+    #[test]
+    fn ui_renders_all_compare_modes_without_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let pa = dir.path().join("a.exr");
+        let pb = dir.path().join("b.exr");
+        write_rgba_exr(&pa);
+        write_rgba_exr(&pb);
+        let a = ExrData::load(&pa).unwrap();
+        let b = ExrData::load(&pb).unwrap();
+
+        let mut h = Harness::new_ui_state(
+            |ui, s: &mut SmokeState| {
+                // Disjoint field borrows: &mut viewer + &a/&b.
+                let SmokeState { viewer, a, b } = s;
+                viewer.ui(ui, a, b.as_ref(), None, None);
+            },
+            SmokeState {
+                viewer: ExrViewer::default(),
+                a,
+                b: Some(b),
+            },
+        );
+
+        for mode in [
+            CompareMode::SingleA,
+            CompareMode::SingleB,
+            CompareMode::Wipe,
+            CompareMode::SideBySide,
+            CompareMode::DiffMatte,
+            CompareMode::Composite,
+        ] {
+            h.state_mut().viewer.compare_mode = mode;
+            h.run();
+        }
+
+        // Contact sheet (single + dual) must also lay out cleanly.
+        h.state_mut().viewer.show_contact_sheet = true;
+        h.run();
+        h.state_mut().viewer.compare_mode = CompareMode::SideBySide;
+        h.run();
     }
 }

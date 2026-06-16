@@ -2,6 +2,10 @@ use std::fs::File;
 use std::io::{self, BufRead};
 use std::path::Path;
 
+// Parsed and unit-tested, but not yet wired into the UI: .cube LUTs are loaded
+// via the GPU `lut_bg` path today, and this CPU-side representation is staged for
+// a planned CPU LUT-apply / inspection feature. Kept (with the allow) rather than
+// deleted so the parser + tests don't bit-rot before that lands.
 #[allow(dead_code)]
 #[derive(Debug)]
 pub struct CubeLut {
