@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.2] - 2026-06-17
+
 ### Fixed
 - Changing the OCIO config no longer produces a wgpu validation error (or
   silent black frame) when the window has not been resized since the previous
@@ -200,7 +202,8 @@ Initial release.
 - Advanced metadata header inspector.
 - Cross-platform GitHub Actions builds (Linux, Windows, macOS).
 
-[Unreleased]: https://github.com/byvfx/floki/compare/v1.5.1...HEAD
+[Unreleased]: https://github.com/byvfx/floki/compare/v1.5.2...HEAD
+[1.5.2]: https://github.com/byvfx/floki/compare/v1.5.1...v1.5.2
 [1.5.1]: https://github.com/byvfx/floki/compare/v1.5.0...v1.5.1
 [1.5.0]: https://github.com/byvfx/floki/compare/v1.4.4...v1.5.0
 [1.4.4]: https://github.com/byvfx/floki/compare/v1.4.3...v1.4.4
