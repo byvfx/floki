@@ -593,10 +593,11 @@ impl GpuState {
         queue: &wgpu::Queue,
         lut: &crate::color::cube::CubeLut,
     ) -> (Arc<wgpu::BindGroup>, wgpu::Texture) {
+        let (lut_size, lut_bytes) = lut.as_rgba_bytes();
         let size = wgpu::Extent3d {
-            width: lut.size as u32,
-            height: lut.size as u32,
-            depth_or_array_layers: lut.size as u32,
+            width: lut_size,
+            height: lut_size,
+            depth_or_array_layers: lut_size,
         };
 
         let tex = device.create_texture(&wgpu::TextureDescriptor {
@@ -617,11 +618,11 @@ impl GpuState {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            bytemuck::cast_slice(&lut.data),
+            lut_bytes,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(lut.size as u32 * 16),
-                rows_per_image: Some(lut.size as u32),
+                bytes_per_row: Some(lut_size * 16),
+                rows_per_image: Some(lut_size),
             },
             size,
         );

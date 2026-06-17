@@ -211,6 +211,18 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         b = b + bg_linear * (1.0 - a_clamp);
     }
 
+    // Display transform chain: gamma → LUT → sRGB.
+    //
+    // This order treats the .cube LUT as a "look" LUT applied in display space
+    // (after gamma adjustment but before sRGB encoding), which matches how most
+    // DCC tools (Nuke, Resolve) apply .cube LUTs for creative grading. The LUT
+    // input is clamped to its authored domain (see domain remap below) so HDR
+    // values above 1.0 are mapped, not discarded.
+    //
+    // If both enable_lut and srgb are on, the chain is: linear → gamma → LUT → sRGB.
+    // A pure display LUT (which includes its own display curve) would typically
+    // be used with srgb=0 to avoid double-applying a display curve.
+
     // Gamma
     if uniforms.gamma != 1.0 {
         let inv_gamma = 1.0 / uniforms.gamma;
@@ -219,7 +231,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         b = select(0.0, pow(b, inv_gamma), b > 0.0);
     }
 
-    // sRGB
+    // LUT
     if uniforms.enable_lut == 1u {
         // Remap the display-space RGB from the LUT's authored domain to [0,1]
         // texture coordinates. A unit-domain LUT (the common case) has

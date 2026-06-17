@@ -14,6 +14,13 @@ pub struct CubeLut {
 }
 
 impl CubeLut {
+    /// Returns `(size as u32, &[u8])` — the 3D LUT extent and the raw RGBA
+    /// bytes ready for `queue.write_texture`. Inverts the dependency so the
+    /// GPU layer doesn't need to know the `CubeLut` struct layout.
+    pub fn as_rgba_bytes(&self) -> (u32, &[u8]) {
+        (self.size as u32, bytemuck::cast_slice(&self.data))
+    }
+
     pub fn load<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let file = File::open(path)?;
         let reader = io::BufReader::new(file);

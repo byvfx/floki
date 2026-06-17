@@ -94,7 +94,7 @@ pub fn run_conversion_task(
                 .to_string();
             let out_path = output_dir.join(&file_name);
 
-            let msg = match convert_exr(&path, &out_path) {
+            let msg = match convert_exr(&path, &out_path, &cancel_flag) {
                 Ok(_) => {
                     log::debug!("converted {}", file_name);
                     format!("Converted: {}", file_name)
@@ -155,6 +155,7 @@ fn canonical_rgba(suffix: &str) -> Option<&'static str> {
 fn convert_exr(
     in_path: &Path,
     out_path: &Path,
+    cancel_flag: &std::sync::atomic::AtomicBool,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     use exr::block::writer::ChunksWriter;
     use std::fs::File;
@@ -233,6 +234,13 @@ fn convert_exr(
         |_, chunk_writer| {
             let chunks_reader = reader.all_chunks(false)?;
             for chunk_result in chunks_reader {
+                // Check cancellation mid-file so a large EXR doesn't keep
+                // converting for seconds after the user hits Cancel.
+                if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(
+                        std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled").into(),
+                    );
+                }
                 let chunk = chunk_result?;
                 let layer_idx = chunk.layer_index;
                 let header = &meta.headers[layer_idx];
@@ -310,7 +318,7 @@ mod tests {
         // Distinct value per channel so any scramble is detectable.
         write_single_layer(&src, "C", &[("R", 1.0), ("G", 2.0), ("B", 3.0), ("A", 4.0)]);
 
-        convert_exr(&src, &dst).expect("convert");
+        convert_exr(&src, &dst, &std::sync::atomic::AtomicBool::new(false)).expect("convert");
         let out: std::collections::HashMap<String, f32> = read_back(&dst).into_iter().collect();
 
         assert_eq!(out.get("rgba.R"), Some(&1.0), "R data must stay under .R");
@@ -327,7 +335,7 @@ mod tests {
         // Position-style pass; x/y/z must NOT be forced to R/G/B (that swapped X/Z).
         write_single_layer(&src, "P", &[("x", 10.0), ("y", 20.0), ("z", 30.0)]);
 
-        convert_exr(&src, &dst).expect("convert");
+        convert_exr(&src, &dst, &std::sync::atomic::AtomicBool::new(false)).expect("convert");
         let out: std::collections::HashMap<String, f32> = read_back(&dst).into_iter().collect();
 
         assert_eq!(out.get("x"), Some(&10.0), "x must keep its name and data");
@@ -371,7 +379,7 @@ mod tests {
         let dst = dir.path().join("reorder_dst.exr");
         write_single_layer(&src, "C", &[("R", 7.0), ("Z", 9.0)]);
 
-        convert_exr(&src, &dst).expect("convert");
+        convert_exr(&src, &dst, &std::sync::atomic::AtomicBool::new(false)).expect("convert");
         let out: std::collections::HashMap<String, f32> = read_back(&dst).into_iter().collect();
 
         assert_eq!(out.get("R"), Some(&7.0), "R must keep its name and data");
