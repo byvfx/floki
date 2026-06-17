@@ -34,6 +34,20 @@ struct LoadResult {
     result: Result<ExrData, String>,
 }
 
+/// Job sent to the dedicated EXR worker thread via `load_tx`.
+struct LoadJob {
+    path: PathBuf,
+    is_b: bool,
+}
+
+/// Result of an off-thread `.cube` LUT parse. The GPU bind group is created
+/// on the UI thread in [`ExrApp::apply_lut_load_result`] (wgpu device access);
+/// only the file I/O + parsing runs off-thread.
+struct LutLoadResult {
+    path: String,
+    result: Result<crate::color::cube::CubeLut, String>,
+}
+
 /// Top-level application state and the [`eframe::App`] implementation. Owns the
 /// loaded A/B images, the `ExrViewer` canvas, OCIO/LUT colour state, and the
 /// menu/tool UI. Fields marked `#[serde(skip)]` are runtime-only (images, GPU
@@ -70,7 +84,18 @@ pub struct ExrApp {
     pub enable_lut: bool,
     #[serde(skip)]
     pub lut_bg: Option<std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>>,
+    /// The LUT texture, kept alongside `lut_bg` so it can be `destroy()`ed
+    /// explicitly when replaced (wgpu's lazy drop defers GPU memory release).
+    #[serde(skip)]
+    lut_texture: Option<eframe::egui_wgpu::wgpu::Texture>,
     pub lut_error: Option<String>,
+    /// `.cube` LUT domain bounds (xyz + pad). Set in `reload_lut`, hydrated onto
+    /// `ExrViewer` each frame so the GPU uniform remaps the lookup coordinate for
+    /// non-unit-domain LUTs. `#[serde(skip)]` — re-derived from the LUT file.
+    #[serde(skip)]
+    lut_domain_min: [f32; 4],
+    #[serde(skip)]
+    lut_domain_max: [f32; 4],
 
     #[cfg(feature = "ocio")]
     #[serde(default)]
@@ -118,17 +143,35 @@ pub struct ExrApp {
     #[serde(skip)]
     conversion_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 
-    // Async image loading: decode runs on a worker thread (see `open_file`),
-    // results arrive over `load_rx` and are applied in `update`/`ui`. The
-    // `loading_*` flags drive the in-canvas spinner and keep repaints flowing.
+    // Async image loading: a single dedicated worker thread processes load
+    // requests one at a time (see `open_file`). Using one worker instead of
+    // spawning a thread per file prevents multiple parallel EXR parses from
+    // exhausting memory on large files — each parse can be GBs of working set.
     #[serde(skip)]
     loading_a: bool,
     #[serde(skip)]
     loading_b: bool,
+    /// Job queue sender: send `LoadJob { path, is_b }` to the single worker thread.
     #[serde(skip)]
-    load_tx: Option<std::sync::mpsc::Sender<LoadResult>>,
+    load_tx: Option<std::sync::mpsc::Sender<LoadJob>>,
+    /// Result receiver: the worker sends completed `LoadResult`s back here.
     #[serde(skip)]
     load_rx: Option<std::sync::mpsc::Receiver<LoadResult>>,
+
+    // Async LUT loading: .cube parsing runs on a worker thread (see
+    // `reload_lut`); the parsed CubeLut arrives over `lut_load_rx` and the
+    // GPU bind group is created on the UI thread in `apply_lut_load_result`.
+    #[serde(skip)]
+    lut_loading: bool,
+    /// Set by the Browse button so `apply_lut_load_result` knows to auto-enable
+    /// the LUT on success. Startup reloads don't set this (the `enable_lut`
+    /// field from persistence is respected, and cleared on failure).
+    #[serde(skip)]
+    lut_pending_auto_enable: bool,
+    #[serde(skip)]
+    lut_load_tx: Option<std::sync::mpsc::Sender<LutLoadResult>>,
+    #[serde(skip)]
+    lut_load_rx: Option<std::sync::mpsc::Receiver<LutLoadResult>>,
 }
 
 impl Default for ExrApp {
@@ -149,7 +192,10 @@ impl Default for ExrApp {
             lut_path: String::new(),
             enable_lut: false,
             lut_bg: None,
+            lut_texture: None,
             lut_error: None,
+            lut_domain_min: [0.0, 0.0, 0.0, 0.0],
+            lut_domain_max: [1.0, 1.0, 1.0, 0.0],
             #[cfg(feature = "ocio")]
             ocio_display: String::new(),
             #[cfg(feature = "ocio")]
@@ -181,6 +227,10 @@ impl Default for ExrApp {
             loading_b: false,
             load_tx: None,
             load_rx: None,
+            lut_loading: false,
+            lut_pending_auto_enable: false,
+            lut_load_tx: None,
+            lut_load_rx: None,
         }
     }
 }
@@ -198,7 +248,7 @@ impl ExrApp {
         app.render_state = cc.wgpu_render_state.clone();
 
         if let Some(rs) = &app.render_state {
-            let gpu_state = crate::gpu::GpuState::new(&rs.device, rs.target_format);
+            let gpu_state = crate::gpu::GpuState::new(&rs.device, &rs.queue, rs.target_format);
             rs.renderer.write().callback_resources.insert(gpu_state);
         }
 
@@ -208,9 +258,8 @@ impl ExrApp {
         // the persisted state matches reality.
         if app.enable_lut && !app.lut_path.is_empty() {
             app.reload_lut();
-            if app.lut_bg.is_none() {
-                app.enable_lut = false;
-            }
+            // LUT loads asynchronously now; `apply_lut_load_result` will clear
+            // `enable_lut` if the file was deleted since the last session.
         }
 
         // OCIO state (config handle + GPU pass) can't persist either; rebuild from the
@@ -330,7 +379,16 @@ impl ExrApp {
             rs.target_format,
         ) {
             Ok(pass) => {
-                rs.renderer.write().callback_resources.insert(pass);
+                let mut renderer = rs.renderer.write();
+                renderer.callback_resources.insert(pass);
+                // Invalidate the cached OcioTargets so it is recreated on the
+                // next frame against the new pipeline's bind group layout.
+                // Without this, a stale scene_bind_group from the old layout
+                // would be used with the new pipeline → wgpu validation error.
+                renderer
+                    .callback_resources
+                    .remove::<crate::gpu::ocio_pass::OcioTargets>();
+                drop(renderer);
                 self.ocio_ready = true;
                 self.ocio_error = None;
             }
@@ -341,36 +399,96 @@ impl ExrApp {
         }
     }
 
-    /// (Re)build the GPU LUT bind group from `self.lut_path`, updating `lut_bg`
-    /// and `lut_error` to reflect the outcome. A parse failure clears `lut_bg`
-    /// and disables the LUT. Does not force `enable_lut` on success — callers
-    /// decide whether loading should auto-enable (the Browse button does).
+    /// (Re)build the GPU LUT bind group from `self.lut_path`. The `.cube` file
+    /// is parsed on a worker thread so the UI stays responsive on large LUTs
+    /// (a 128³ LUT is ~2M rows); the GPU bind group is created on the UI thread
+    /// in [`Self::apply_lut_load_result`] when the parse completes. A parse
+    /// failure clears `lut_bg` and disables the LUT.
     fn reload_lut(&mut self) {
         if self.lut_path.is_empty() {
             return;
         }
+        // Lazily create the LUT load channel.
+        if self.lut_load_rx.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.lut_load_tx = Some(tx);
+            self.lut_load_rx = Some(rx);
+        }
+        let tx = self
+            .lut_load_tx
+            .clone()
+            .expect("lut load channel initialized above");
         let path = self.lut_path.clone();
-        match crate::color::cube::CubeLut::load(&path) {
+        self.lut_loading = true;
+        self.lut_error = None;
+        std::thread::spawn(move || {
+            let result = crate::color::cube::CubeLut::load(&path)
+                .map_err(|e| format!("Failed to load LUT: {}", e));
+            let _ = tx.send(LutLoadResult { path, result });
+        });
+    }
+
+    /// Apply a completed [`LutLoadResult`] from the worker thread: create the
+    /// GPU bind group, capture the domain bounds, and update `lut_bg` /
+    /// `lut_error` / `enable_lut`. Ignores stale results (a newer reload of a
+    /// different path superseded this one).
+    fn apply_lut_load_result(&mut self, res: LutLoadResult) {
+        // Discard stale results from a superseded reload.
+        if res.path != self.lut_path {
+            // Clear transient flags so stale results don't bleed into the next reload.
+            self.lut_loading = false;
+            self.lut_pending_auto_enable = false;
+            return;
+        }
+        self.lut_loading = false;
+        let auto_enable = self.lut_pending_auto_enable;
+        self.lut_pending_auto_enable = false;
+        match res.result {
             Ok(lut) => {
                 if let Some(rs) = &self.render_state {
                     let renderer = rs.renderer.read();
                     if let Some(gpu_state) =
                         renderer.callback_resources.get::<crate::gpu::GpuState>()
                     {
-                        self.lut_bg =
-                            Some(gpu_state.create_lut_bind_group(&rs.device, &rs.queue, &lut));
+                        // Explicitly destroy the old LUT texture before
+                        // replacing it, so GPU memory is released in this
+                        // submission cycle rather than waiting for the next
+                        // driver GC sweep.
+                        if let Some(old_tex) = self.lut_texture.take() {
+                            old_tex.destroy();
+                        }
+                        let (bg, tex) =
+                            gpu_state.create_lut_bind_group(&rs.device, &rs.queue, &lut);
+                        self.lut_bg = Some(bg);
+                        self.lut_texture = Some(tex);
                         self.lut_error = None;
+                        // Only update domain bounds once the bind group is live;
+                        // moving them here keeps the shader state consistent.
+                        self.lut_domain_min =
+                            [lut.domain_min[0], lut.domain_min[1], lut.domain_min[2], 0.0];
+                        self.lut_domain_max =
+                            [lut.domain_max[0], lut.domain_max[1], lut.domain_max[2], 0.0];
+                        if auto_enable {
+                            self.enable_lut = true;
+                        }
                     } else {
                         self.lut_error = Some("GPU state not found".to_string());
+                        self.enable_lut = false;
                     }
                 } else {
                     self.lut_error = Some("Render state not found".to_string());
+                    self.enable_lut = false;
                 }
             }
             Err(e) => {
-                self.lut_error = Some(format!("Failed to load LUT: {}", e));
+                self.lut_error = Some(e);
                 self.lut_bg = None;
+                if let Some(old_tex) = self.lut_texture.take() {
+                    old_tex.destroy();
+                }
                 self.enable_lut = false;
+                self.lut_domain_min = [0.0, 0.0, 0.0, 0.0];
+                self.lut_domain_max = [1.0, 1.0, 1.0, 0.0];
             }
         }
     }
@@ -393,21 +511,31 @@ impl ExrApp {
         }
         self.error_msg = None;
 
-        // Lazily create the result channel (mirrors `conversion_receiver`).
+        // Lazily create the load channel + spawn a single dedicated worker
+        // thread. The worker processes jobs one at a time, so rapidly opening
+        // 5 files queues them instead of spawning 5 parallel GBs-of-RAM parses.
+        // Stale jobs are discarded by `apply_load_result`'s path check.
         if self.load_rx.is_none() {
-            let (tx, rx) = std::sync::mpsc::channel();
-            self.load_tx = Some(tx);
-            self.load_rx = Some(rx);
+            let (job_tx, job_rx) = std::sync::mpsc::channel::<LoadJob>();
+            let (result_tx, result_rx) = std::sync::mpsc::channel::<LoadResult>();
+            std::thread::spawn(move || {
+                for job in job_rx {
+                    let result = ExrData::load(&job.path);
+                    let _ = result_tx.send(LoadResult {
+                        path: job.path,
+                        is_b: job.is_b,
+                        result,
+                    });
+                }
+            });
+            self.load_tx = Some(job_tx);
+            self.load_rx = Some(result_rx);
         }
         let tx = self
             .load_tx
             .clone()
             .expect("load channel initialized above");
-        std::thread::spawn(move || {
-            let result = ExrData::load(&path);
-            // The receiver is dropped only on app exit; ignore a closed channel.
-            let _ = tx.send(LoadResult { path, is_b, result });
-        });
+        let _ = tx.send(LoadJob { path, is_b });
     }
 
     /// Apply a completed [`LoadResult`] from the worker thread. Ignores stale
@@ -508,6 +636,21 @@ impl eframe::App for ExrApp {
         }
         if self.loading_a || self.loading_b {
             // egui is reactive; keep polling the worker until the decode lands.
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(50));
+        }
+
+        // Drain completed async LUT loads.
+        let mut lut_loaded = Vec::new();
+        if let Some(rx) = &self.lut_load_rx {
+            while let Ok(res) = rx.try_recv() {
+                lut_loaded.push(res);
+            }
+        }
+        for res in lut_loaded {
+            self.apply_lut_load_result(res);
+        }
+        if self.lut_loading {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(50));
         }
@@ -809,10 +952,8 @@ impl eframe::App for ExrApp {
                 });
 
             if lut_reload_requested {
+                self.lut_pending_auto_enable = true;
                 self.reload_lut();
-                if self.lut_bg.is_some() {
-                    self.enable_lut = true; // Auto-enable on successful load
-                }
             }
 
             #[cfg(feature = "ocio")]
@@ -957,6 +1098,7 @@ impl eframe::App for ExrApp {
                      data: Option<&ExrData>,
                      hover_pos: Option<(usize, usize)>,
                      val: Option<[f32; 4]>,
+                     physical_index: usize,
                      layer_name: &str| {
                         if let Some(d) = data {
                             // Scroll each row horizontally on its own. Wrapping the whole
@@ -969,36 +1111,10 @@ impl eframe::App for ExrApp {
                                         let disp_w = d.image.attributes.display_window.size.x();
                                         let disp_h = d.image.attributes.display_window.size.y();
 
-                                        // Resolve the *physical* layer backing this logical
-                                        // layer. `physical_index` maps into `image.layer_data`;
-                                        // never index it with a logical-layer position.
-                                        let phys_idx = d
-                                            .logical_layers
-                                            .iter()
-                                            .find(|l| l.name == layer_name)
-                                            .map(|l| l.physical_index)
-                                            .unwrap_or(0);
+                                        let channels_str = &d.channels_str;
 
-                                        // Built fresh each frame (immediate mode),
-                                        // but stop once we pass the 50-char display
-                                        // cap so we don't allocate a Vec + join every
-                                        // layer name (Blender EXRs have 100+) only to
-                                        // truncate it away.
-                                        let mut channels_str = String::new();
-                                        for name in d.logical_layers.iter().map(|l| l.name.as_str())
+                                        if let Some(layer) = d.image.layer_data.get(physical_index)
                                         {
-                                            if !channels_str.is_empty() {
-                                                channels_str.push(',');
-                                            }
-                                            channels_str.push_str(name);
-                                            if channels_str.len() > 50 {
-                                                channels_str.truncate(50);
-                                                channels_str.push_str("...");
-                                                break;
-                                            }
-                                        }
-
-                                        if let Some(layer) = d.image.layer_data.get(phys_idx) {
                                             let data_window_min = layer.attributes.layer_position;
                                             let data_w = layer.size.0;
                                             let data_h = layer.size.1;
@@ -1107,12 +1223,12 @@ impl eframe::App for ExrApp {
                         }
                     };
 
-                let layer_name_a = self
+                let ll_a = self
                     .exr_data
                     .as_ref()
-                    .and_then(|d| d.logical_layers.get(self.viewer.active_layer))
-                    .map(|l| l.name.as_str())
-                    .unwrap_or("");
+                    .and_then(|d| d.logical_layers.get(self.viewer.active_layer));
+                let phys_idx_a = ll_a.map(|l| l.physical_index).unwrap_or(0);
+                let layer_name_a = ll_a.map(|l| l.name.as_str()).unwrap_or("");
 
                 draw_nuke_status_line(
                     ui,
@@ -1120,19 +1236,18 @@ impl eframe::App for ExrApp {
                     self.exr_data.as_ref(),
                     self.viewer.last_hover_pos_img,
                     self.viewer.last_sampled_val_a,
+                    phys_idx_a,
                     layer_name_a,
                 );
 
                 if let Some(exr_b) = &self.exr_data_b {
-                    let layer_name_b = exr_b
-                        .logical_layers
-                        .get(
-                            self.viewer
-                                .active_layer
-                                .min(exr_b.logical_layers.len().saturating_sub(1)),
-                        )
-                        .map(|l| l.name.as_str())
-                        .unwrap_or("");
+                    let ll_b = exr_b.logical_layers.get(
+                        self.viewer
+                            .active_layer
+                            .min(exr_b.logical_layers.len().saturating_sub(1)),
+                    );
+                    let phys_idx_b = ll_b.map(|l| l.physical_index).unwrap_or(0);
+                    let layer_name_b = ll_b.map(|l| l.name.as_str()).unwrap_or("");
 
                     draw_nuke_status_line(
                         ui,
@@ -1140,6 +1255,7 @@ impl eframe::App for ExrApp {
                         Some(exr_b),
                         self.viewer.last_hover_pos_img,
                         self.viewer.last_sampled_val_b,
+                        phys_idx_b,
                         layer_name_b,
                     );
                 }
@@ -1300,6 +1416,10 @@ impl eframe::App for ExrApp {
                                         .id_salt("swatches_scroll")
                                         .show(ui, |ui| {
                                             let mut to_remove = None;
+                                            let exp_mult =
+                                                crate::render_math::exposure_to_multiplier(
+                                                    self.viewer.exposure,
+                                                );
                                             for (i, swatch) in
                                                 self.viewer.swatches.iter().enumerate()
                                             {
@@ -1307,43 +1427,33 @@ impl eframe::App for ExrApp {
                                                     let [r, g, b, _a] = *swatch;
 
                                                     // Preview color patch using current sRGB mode and exposure/gamma
-                                                    let mut disp_r =
-                                                        r * self.viewer.exposure.exp2();
-                                                    let mut disp_g =
-                                                        g * self.viewer.exposure.exp2();
-                                                    let mut disp_b =
-                                                        b * self.viewer.exposure.exp2();
+                                                    let mut disp_r = r * exp_mult;
+                                                    let mut disp_g = g * exp_mult;
+                                                    let mut disp_b = b * exp_mult;
 
                                                     if self.viewer.gamma != 1.0 {
-                                                        let inv_gamma = 1.0 / self.viewer.gamma;
-                                                        disp_r = if disp_r > 0.0 {
-                                                            disp_r.powf(inv_gamma)
-                                                        } else {
-                                                            0.0
-                                                        };
-                                                        disp_g = if disp_g > 0.0 {
-                                                            disp_g.powf(inv_gamma)
-                                                        } else {
-                                                            0.0
-                                                        };
-                                                        disp_b = if disp_b > 0.0 {
-                                                            disp_b.powf(inv_gamma)
-                                                        } else {
-                                                            0.0
-                                                        };
+                                                        disp_r = crate::render_math::apply_gamma(
+                                                            disp_r,
+                                                            self.viewer.gamma,
+                                                        );
+                                                        disp_g = crate::render_math::apply_gamma(
+                                                            disp_g,
+                                                            self.viewer.gamma,
+                                                        );
+                                                        disp_b = crate::render_math::apply_gamma(
+                                                            disp_b,
+                                                            self.viewer.gamma,
+                                                        );
                                                     }
 
                                                     if self.viewer.srgb {
-                                                        disp_r =
-                                                        crate::viewer::ExrViewer::linear_to_srgb(
+                                                        disp_r = crate::render_math::linear_to_srgb(
                                                             disp_r,
                                                         );
-                                                        disp_g =
-                                                        crate::viewer::ExrViewer::linear_to_srgb(
+                                                        disp_g = crate::render_math::linear_to_srgb(
                                                             disp_g,
                                                         );
-                                                        disp_b =
-                                                        crate::viewer::ExrViewer::linear_to_srgb(
+                                                        disp_b = crate::render_math::linear_to_srgb(
                                                             disp_b,
                                                         );
                                                     }
@@ -1436,7 +1546,8 @@ impl eframe::App for ExrApp {
                                     }
                                     let max_val = max_val.max(1.0);
 
-                                    let mut shapes = vec![];
+                                    // Up to 512 bars (256 bins × A/B); reserve to avoid reallocation.
+                                    let mut shapes = Vec::with_capacity(512);
                                     let bar_width = rect.width() / 256.0;
 
                                     for (i, &count) in bins.iter().enumerate() {
@@ -1487,6 +1598,8 @@ impl eframe::App for ExrApp {
             if self.loaded_file.is_some() {
                 if let Some(data) = &self.exr_data {
                     self.viewer.enable_lut = self.enable_lut && self.lut_bg.is_some();
+                    self.viewer.lut_domain_min = self.lut_domain_min;
+                    self.viewer.lut_domain_max = self.lut_domain_max;
                     #[cfg(feature = "ocio")]
                     {
                         self.viewer.ocio_active = self.ocio_enabled && self.ocio_ready;

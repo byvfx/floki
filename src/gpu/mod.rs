@@ -33,6 +33,13 @@ pub struct Uniforms {
     pub _pad0: u32,
     pub _pad1: u32,
     pub _pad2: u32,
+    /// `.cube` LUT domain bounds (xyz + pad). The lookup coordinate is remapped
+    /// from `[domain_min, domain_max]` to `[0, 1]` before sampling the 3D LUT
+    /// texture, so non-unit-domain LUTs (common for HDR/film looks) sample
+    /// correctly. Defaults to `[0,0,0,0]` / `[1,1,1,1]` (identity). Keep in
+    /// lockstep with `Uniforms.lut_domain_min/max` in `shader.wgsl`.
+    pub lut_domain_min: [f32; 4],
+    pub lut_domain_max: [f32; 4],
 }
 
 /// Uniforms for the OCIO blit pass: composites the transparency checkerboard in
@@ -58,12 +65,27 @@ pub struct BlitUniforms {
 pub struct GpuState {
     pub pipeline: wgpu::RenderPipeline,
     pub bind_group_layout_tex: wgpu::BindGroupLayout,
+    /// Kept on the struct for potential future use; the ring-buffer bind group
+    /// (`uniform_bind_group` below) is what the paint callbacks actually use.
+    #[allow(dead_code)]
     pub bind_group_layout_uniform: wgpu::BindGroupLayout,
     pub bind_group_layout_lut: wgpu::BindGroupLayout,
     pub default_tex_bind_group: Arc<wgpu::BindGroup>,
     pub default_lut_bind_group: Arc<wgpu::BindGroup>,
     pub sampler: wgpu::Sampler,
     pub lut_sampler: wgpu::Sampler,
+    /// Persistent uniform ring buffer (sized `UNIFORM_RING_SLOTS *
+    /// uniform_stride`). Per-draw uniform data is written via
+    /// `queue.write_buffer` at a dynamic offset, eliminating the per-frame
+    /// `create_buffer_init` + `create_bind_group` that previously ran 1–4× per
+    /// frame. The bind group is created once and rebound with a dynamic offset.
+    pub uniform_buffer: wgpu::Buffer,
+    pub uniform_bind_group: wgpu::BindGroup,
+    /// Stride per uniform slot in bytes, padded up to the device's
+    /// `min_uniform_buffer_offset_alignment` (typically 256). The raw
+    /// `Uniforms` struct is 128 bytes, but dynamic offsets must be aligned,
+    /// so each slot is padded.
+    pub uniform_stride: u32,
     /// Same shader/layout as `pipeline` but renders into an `Rgba32Float` offscreen target
     /// (the OCIO "pass 1" scene-linear buffer). Drive it with `srgb=0, gamma=1, enable_lut=0`
     /// so it emits linear color for the OCIO display transform.
@@ -142,8 +164,22 @@ fn fs_main(i: VOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// Number of uniform slots in the persistent ring buffer. Up to 4 draws per
+/// frame (A/B/diff/composite/side-by-side) — 16 gives ample headroom. At
+/// 256-byte stride (worst-case alignment) the buffer is 4 KB.
+pub const UNIFORM_RING_SLOTS: u64 = 16;
+
+/// Round `size` up to the next multiple of `align` (must be a power of two).
+fn align_to(size: u32, align: u32) -> u32 {
+    (size + align - 1) & !(align - 1)
+}
+
 impl GpuState {
-    pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        target_format: wgpu::TextureFormat,
+    ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Exr Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
@@ -180,8 +216,10 @@ impl GpuState {
                     visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                        has_dynamic_offset: true,
+                        min_binding_size: std::num::NonZeroU64::new(
+                            std::mem::size_of::<Uniforms>() as u64,
+                        ),
                     },
                     count: None,
                 }],
@@ -247,6 +285,39 @@ impl GpuState {
             cache: None,
         });
 
+        // Persistent uniform ring buffer: one buffer + one bind group, reused
+        // across all draws via dynamic offsets. Eliminates the per-draw
+        // `create_buffer_init` + `create_bind_group` that previously ran 1–4×
+        // per frame. Each slot is padded to the device's
+        // `min_uniform_buffer_offset_alignment` (typically 256) so dynamic
+        // offsets are always valid.
+        let align = device.limits().min_uniform_buffer_offset_alignment;
+        let uniform_stride = align_to(std::mem::size_of::<Uniforms>() as u32, align);
+        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Uniform Ring Buffer"),
+            size: UNIFORM_RING_SLOTS * uniform_stride as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Uniform Ring Bind Group"),
+            layout: &bind_group_layout_uniform,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &uniform_buffer,
+                    offset: 0,
+                    // Bind a single Uniforms-sized window; the dynamic offset
+                    // passed at `set_bind_group` slides this window across the
+                    // ring buffer. Must NOT use `as_entire_binding()` (size =
+                    // None) — wgpu requires that offset + bound_size <= buffer
+                    // size, and with the whole buffer bound any offset > 0
+                    // overruns.
+                    size: std::num::NonZeroU64::new(std::mem::size_of::<Uniforms>() as u64),
+                }),
+            }],
+        });
+
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             mag_filter: wgpu::FilterMode::Nearest,
             min_filter: wgpu::FilterMode::Nearest,
@@ -276,6 +347,30 @@ impl GpuState {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
+        // Explicitly zero the 1x1x1 LUT texel. wgpu does not guarantee
+        // zero-initialization on all backends (Vulkan leaves texture memory
+        // undefined); sampling garbage RGBA32Float (possibly NaN/Inf) into the
+        // exposure/LUT chain would silently corrupt the output when the LUT is
+        // disabled but the bind group is still bound.
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &default_lut_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[0u8; 16],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(16),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
         let default_lut_view = default_lut_tex.create_view(&wgpu::TextureViewDescriptor::default());
         let default_lut_bind_group =
             Arc::new(device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -293,7 +388,10 @@ impl GpuState {
                 ],
             }));
 
-        // Create a 1x1 black texture for default bind group
+        // Create a 1x1 black texture for default bind group. COPY_DST is needed
+        // to explicitly zero the texel — wgpu does not guarantee zero-initialization
+        // on all backends (Vulkan leaves it undefined), and sampling garbage
+        // RGBA32Float (possibly NaN/Inf) when image B is unset would corrupt output.
         let default_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Default Texture"),
             size: wgpu::Extent3d {
@@ -305,9 +403,28 @@ impl GpuState {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba32Float,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &default_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[0u8; 16],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(16),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
 
         let default_view = default_tex.create_view(&wgpu::TextureViewDescriptor::default());
 
@@ -456,6 +573,9 @@ impl GpuState {
             default_lut_bind_group,
             sampler,
             lut_sampler,
+            uniform_buffer,
+            uniform_bind_group,
+            uniform_stride,
             #[cfg(feature = "ocio")]
             pipeline_linear,
             #[cfg(feature = "ocio")]
@@ -472,11 +592,12 @@ impl GpuState {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         lut: &crate::color::cube::CubeLut,
-    ) -> Arc<wgpu::BindGroup> {
+    ) -> (Arc<wgpu::BindGroup>, wgpu::Texture) {
+        let (lut_size, lut_bytes) = lut.as_rgba_bytes();
         let size = wgpu::Extent3d {
-            width: lut.size as u32,
-            height: lut.size as u32,
-            depth_or_array_layers: lut.size as u32,
+            width: lut_size,
+            height: lut_size,
+            depth_or_array_layers: lut_size,
         };
 
         let tex = device.create_texture(&wgpu::TextureDescriptor {
@@ -497,18 +618,18 @@ impl GpuState {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            bytemuck::cast_slice(&lut.data),
+            lut_bytes,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(lut.size as u32 * 16),
-                rows_per_image: Some(lut.size as u32),
+                bytes_per_row: Some(lut_size * 16),
+                rows_per_image: Some(lut_size),
             },
             size,
         );
 
         let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
 
-        Arc::new(device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let bg = Arc::new(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("LUT Bind Group"),
             layout: &self.bind_group_layout_lut,
             entries: &[
@@ -521,14 +642,17 @@ impl GpuState {
                     resource: wgpu::BindingResource::Sampler(&self.lut_sampler),
                 },
             ],
-        }))
+        }));
+        (bg, tex)
     }
 }
 
 pub struct ExrCallback {
     pub bg_a: Arc<wgpu::BindGroup>,
     pub bg_b: Arc<wgpu::BindGroup>,
-    pub uniform_bg: wgpu::BindGroup,
+    /// Dynamic offset into `GpuState::uniform_buffer` where this draw's
+    /// `Uniforms` data was written via `queue.write_buffer`.
+    pub uniform_offset: u32,
     pub lut_bg: Arc<wgpu::BindGroup>,
 }
 
@@ -566,7 +690,7 @@ impl eframe::egui_wgpu::CallbackTrait for ExrCallback {
         render_pass.set_pipeline(&gpu_state.pipeline);
         render_pass.set_bind_group(0, self.bg_a.as_ref(), &[]);
         render_pass.set_bind_group(1, self.bg_b.as_ref(), &[]);
-        render_pass.set_bind_group(2, &self.uniform_bg, &[]);
+        render_pass.set_bind_group(2, &gpu_state.uniform_bind_group, &[self.uniform_offset]);
         render_pass.set_bind_group(3, self.lut_bg.as_ref(), &[]);
         render_pass.draw(0..6, 0..1);
     }
@@ -588,7 +712,7 @@ mod tests {
             "Uniforms size ({size}) must be a multiple of 16"
         );
         assert_eq!(
-            size, 96,
+            size, 128,
             "Uniforms layout changed — update shader.wgsl to match"
         );
     }
@@ -635,6 +759,8 @@ mod tests {
             _pad0: 0,
             _pad1: 0,
             _pad2: 0,
+            lut_domain_min: [-0.5, -0.5, -0.5, 0.0],
+            lut_domain_max: [1.5, 1.5, 1.5, 0.0],
         };
         let bytes = bytemuck::bytes_of(&u);
         assert_eq!(bytes.len(), std::mem::size_of::<Uniforms>());
@@ -652,6 +778,8 @@ mod tests {
         assert_eq!(back.blend_mode, 2);
         assert_eq!(back.screen_size, [800.0, 600.0]);
         assert_eq!(back.skip_checker, 1);
+        assert_eq!(back.lut_domain_min, [-0.5, -0.5, -0.5, 0.0]);
+        assert_eq!(back.lut_domain_max, [1.5, 1.5, 1.5, 0.0]);
     }
 
     #[test]

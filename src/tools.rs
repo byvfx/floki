@@ -5,12 +5,34 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 
+/// Aggregate result of a `run_conversion_task` call. The per-file progress
+/// messages still flow through the `mpsc` channel (the GUI relies on them for
+/// live updates); this struct is the return value so the `convert_dir` binary
+/// can set a correct exit code without parsing message strings.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ConversionSummary {
+    pub converted: usize,
+    pub failed: usize,
+    pub total: usize,
+    pub cancelled: bool,
+}
+
+impl ConversionSummary {
+    /// `true` if the run had no failures and was not cancelled.
+    // Only called from `src/bin/convert_dir.rs`, which re-includes this file
+    // via `#[path]` (separate compilation) — the lib crate doesn't see the use.
+    #[allow(dead_code)]
+    pub fn is_success(&self) -> bool {
+        !self.cancelled && self.failed == 0
+    }
+}
+
 pub fn run_conversion_task(
     input_dir: PathBuf,
     output_dir: PathBuf,
     sender: Sender<(usize, usize, String)>,
     cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) {
+) -> ConversionSummary {
     let mut files_to_process = Vec::new();
 
     // Read all .exr files in the input directory
@@ -29,7 +51,7 @@ pub fn run_conversion_task(
         Err(e) => {
             log::error!("Failed to read input directory {:?}: {}", input_dir, e);
             let _ = sender.send((0, 0, format!("Failed to read directory: {}", e)));
-            return;
+            return ConversionSummary::default();
         }
     }
 
@@ -37,13 +59,13 @@ pub fn run_conversion_task(
     if total == 0 {
         log::warn!("No EXR files found in {:?}", input_dir);
         let _ = sender.send((0, 0, "No EXR files found in directory.".to_string()));
-        return;
+        return ConversionSummary::default();
     }
 
     if let Err(e) = std::fs::create_dir_all(&output_dir) {
         log::error!("Failed to create output directory {:?}: {}", output_dir, e);
         let _ = sender.send((0, 0, format!("Failed to create output directory: {}", e)));
-        return;
+        return ConversionSummary::default();
     }
 
     log::info!(
@@ -72,7 +94,7 @@ pub fn run_conversion_task(
                 .to_string();
             let out_path = output_dir.join(&file_name);
 
-            let msg = match convert_exr(&path, &out_path) {
+            let msg = match convert_exr(&path, &out_path, &cancel_flag) {
                 Ok(_) => {
                     log::debug!("converted {}", file_name);
                     format!("Converted: {}", file_name)
@@ -105,6 +127,13 @@ pub fn run_conversion_task(
     log::info!("EXR convert finished: {}", final_msg);
     let count = if cancelled { done } else { total };
     let _ = sender.send((count, total, final_msg));
+
+    ConversionSummary {
+        converted,
+        failed,
+        total,
+        cancelled,
+    }
 }
 
 /// Maps an RGBA-style channel suffix to its canonical single letter, or `None`
@@ -126,6 +155,7 @@ fn canonical_rgba(suffix: &str) -> Option<&'static str> {
 fn convert_exr(
     in_path: &Path,
     out_path: &Path,
+    cancel_flag: &std::sync::atomic::AtomicBool,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     use exr::block::writer::ChunksWriter;
     use std::fs::File;
@@ -179,7 +209,7 @@ fn convert_exr(
                 channel.name = Text::from(new_name.as_str());
             }
         } else {
-            log::debug!(
+            log::warn!(
                 "{:?}: layer {} left unchanged (renaming would reorder channels)",
                 in_path,
                 layer_idx
@@ -204,6 +234,13 @@ fn convert_exr(
         |_, chunk_writer| {
             let chunks_reader = reader.all_chunks(false)?;
             for chunk_result in chunks_reader {
+                // Check cancellation mid-file so a large EXR doesn't keep
+                // converting for seconds after the user hits Cancel.
+                if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(
+                        std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled").into(),
+                    );
+                }
                 let chunk = chunk_result?;
                 let layer_idx = chunk.layer_index;
                 let header = &meta.headers[layer_idx];
@@ -281,7 +318,7 @@ mod tests {
         // Distinct value per channel so any scramble is detectable.
         write_single_layer(&src, "C", &[("R", 1.0), ("G", 2.0), ("B", 3.0), ("A", 4.0)]);
 
-        convert_exr(&src, &dst).expect("convert");
+        convert_exr(&src, &dst, &std::sync::atomic::AtomicBool::new(false)).expect("convert");
         let out: std::collections::HashMap<String, f32> = read_back(&dst).into_iter().collect();
 
         assert_eq!(out.get("rgba.R"), Some(&1.0), "R data must stay under .R");
@@ -298,7 +335,7 @@ mod tests {
         // Position-style pass; x/y/z must NOT be forced to R/G/B (that swapped X/Z).
         write_single_layer(&src, "P", &[("x", 10.0), ("y", 20.0), ("z", 30.0)]);
 
-        convert_exr(&src, &dst).expect("convert");
+        convert_exr(&src, &dst, &std::sync::atomic::AtomicBool::new(false)).expect("convert");
         let out: std::collections::HashMap<String, f32> = read_back(&dst).into_iter().collect();
 
         assert_eq!(out.get("x"), Some(&10.0), "x must keep its name and data");
@@ -342,7 +379,7 @@ mod tests {
         let dst = dir.path().join("reorder_dst.exr");
         write_single_layer(&src, "C", &[("R", 7.0), ("Z", 9.0)]);
 
-        convert_exr(&src, &dst).expect("convert");
+        convert_exr(&src, &dst, &std::sync::atomic::AtomicBool::new(false)).expect("convert");
         let out: std::collections::HashMap<String, f32> = read_back(&dst).into_iter().collect();
 
         assert_eq!(out.get("R"), Some(&7.0), "R must keep its name and data");
@@ -373,12 +410,22 @@ mod tests {
 
         let (tx, rx) = channel();
         let cancel = Arc::new(AtomicBool::new(false));
-        run_conversion_task(
+        let summary = run_conversion_task(
             in_dir.path().to_path_buf(),
             out_dir.path().to_path_buf(),
             tx,
             cancel,
         );
+
+        // The returned summary is authoritative for success/failure.
+        assert!(
+            summary.is_success(),
+            "non-cancelled run with all files converting must succeed: {summary:?}"
+        );
+        assert_eq!(summary.converted, N, "all {N} files must be converted");
+        assert_eq!(summary.failed, 0, "no failures expected");
+        assert_eq!(summary.total, N, "total must match file count");
+        assert!(!summary.cancelled, "must not be cancelled");
 
         let msgs: Vec<(usize, usize, String)> = rx.iter().collect();
         assert!(!msgs.is_empty(), "must emit progress");
@@ -432,13 +479,21 @@ mod tests {
 
         let (tx, rx) = channel();
         let cancel = Arc::new(AtomicBool::new(true)); // cancelled before it starts
-        run_conversion_task(
+        let summary = run_conversion_task(
             in_dir.path().to_path_buf(),
             out_dir.path().to_path_buf(),
             tx,
             cancel,
         );
         let _drain: Vec<_> = rx.iter().collect();
+
+        // The summary must reflect cancellation.
+        assert!(summary.cancelled, "summary must report cancelled");
+        assert!(
+            !summary.is_success(),
+            "cancelled run must not be a success: {summary:?}"
+        );
+        assert_eq!(summary.total, 3, "total must still report the file count");
 
         let produced = std::fs::read_dir(out_dir.path())
             .unwrap()

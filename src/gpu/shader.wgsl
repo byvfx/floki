@@ -30,6 +30,12 @@ struct Uniforms {
     _pad0: u32,
     _pad1: u32,
     _pad2: u32,
+    // .cube LUT domain bounds (xyz + pad). The lookup coordinate is remapped from
+    // [domain_min, domain_max] to [0, 1] before sampling the 3D LUT texture, so
+    // non-unit-domain LUTs (HDR/film looks) sample correctly. Defaults to identity.
+    // Keep in lockstep with `Uniforms.lut_domain_min/max` in src/gpu/mod.rs.
+    lut_domain_min: vec4<f32>,
+    lut_domain_max: vec4<f32>,
 };
 
 @group(0) @binding(0) var tex_a: texture_2d<f32>;
@@ -205,17 +211,37 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         b = b + bg_linear * (1.0 - a_clamp);
     }
 
+    // Display transform chain: gamma → LUT → sRGB.
+    //
+    // This order treats the .cube LUT as a "look" LUT applied in display space
+    // (after gamma adjustment but before sRGB encoding), which matches how most
+    // DCC tools (Nuke, Resolve) apply .cube LUTs for creative grading. The LUT
+    // input is clamped to its authored domain (see domain remap below) so HDR
+    // values above 1.0 are mapped, not discarded.
+    //
+    // If both enable_lut and srgb are on, the chain is: linear → gamma → LUT → sRGB.
+    // A pure display LUT (which includes its own display curve) would typically
+    // be used with srgb=0 to avoid double-applying a display curve.
+
     // Gamma
     if uniforms.gamma != 1.0 {
         let inv_gamma = 1.0 / uniforms.gamma;
-        r = select(0.0, pow(r, inv_gamma), r > 0.0);
-        g = select(0.0, pow(g, inv_gamma), g > 0.0);
-        b = select(0.0, pow(b, inv_gamma), b > 0.0);
+        r = pow(max(r, 0.0), inv_gamma);
+        g = pow(max(g, 0.0), inv_gamma);
+        b = pow(max(b, 0.0), inv_gamma);
     }
 
-    // sRGB
+    // LUT
     if uniforms.enable_lut == 1u {
-        let l_color = textureSample(lut_tex, lut_samp, clamp(vec3<f32>(r, g, b), vec3<f32>(0.0), vec3<f32>(1.0)));
+        // Remap the display-space RGB from the LUT's authored domain to [0,1]
+        // texture coordinates. A unit-domain LUT (the common case) has
+        // domain_min=0, domain_max=1 and the remap is identity. HDR/film LUTs
+        // authored with e.g. DOMAIN_MIN -0.5 / DOMAIN_MAX 1.5 would otherwise
+        // have their input clamped to [0,1] and sample the wrong texels.
+        let dmin = uniforms.lut_domain_min.xyz;
+        let dmax = uniforms.lut_domain_max.xyz;
+        let lut_uv = clamp((vec3<f32>(r, g, b) - dmin) / (dmax - dmin), vec3<f32>(0.0), vec3<f32>(1.0));
+        let l_color = textureSample(lut_tex, lut_samp, lut_uv);
         r = l_color.r;
         g = l_color.g;
         b = l_color.b;

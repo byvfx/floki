@@ -8,7 +8,7 @@
 /// Convert exposure stops (EV) to a linear multiplier: `2^ev`.
 /// EV 0 → 1.0, EV +1 → 2.0, EV −1 → 0.5.
 pub fn exposure_to_multiplier(ev: f32) -> f32 {
-    2.0_f32.powf(ev)
+    ev.exp2()
 }
 
 /// Apply display gamma to a value: `value^(1/gamma)`.
