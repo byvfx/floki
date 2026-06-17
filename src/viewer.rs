@@ -1117,17 +1117,18 @@ impl ExrViewer {
             let mut hovered_b = false;
 
             if self.compare_mode == CompareMode::SideBySide && exr_data_b.is_some() {
-                let tex_b_opt = exr_data_b.and_then(|d| {
-                    self.textures_b[self
-                        .active_layer
-                        .min(d.logical_layers.len().saturating_sub(1))]
-                    .as_ref()
-                });
-                if tex_b_opt.is_some() {
-                    let mut image_size_b = tex_size_b.unwrap() * self.scale;
+                // Gate on `tex_size_b` (geometry), NOT on `self.textures_b`
+                // (the CPU texture cache): the GPU path populates
+                // `gpu_textures_b` and leaves `textures_b` empty, so the old
+                // `textures_b[...].as_ref().is_some()` gate silently skipped
+                // the entire B-side hover/sampling branch on the GPU path.
+                // `tex_size_b` is the actual prerequisite for the geometry math
+                // below (it's unwrapped multiple times here).
+                if let Some(tex_size_b) = tex_size_b {
+                    let mut image_size_b = tex_size_b * self.scale;
                     if self.normalize_side_by_side {
-                        let scale_b = (tex_size.y * self.scale) / tex_size_b.unwrap().y;
-                        image_size_b = tex_size_b.unwrap() * scale_b;
+                        let scale_b = (tex_size.y * self.scale) / tex_size_b.y;
+                        image_size_b = tex_size_b * scale_b;
                     }
                     let combined_width = image_size.x + image_size_b.x;
                     let combined_height = image_size.y.max(image_size_b.y);
@@ -1159,7 +1160,7 @@ impl ExrViewer {
                     } else if image_rect_b.contains(pos) {
                         let local = pos - image_rect_b.min;
                         let scale_b = if self.normalize_side_by_side {
-                            (tex_size.y * self.scale) / tex_size_b.unwrap().y
+                            (tex_size.y * self.scale) / tex_size_b.y
                         } else {
                             self.scale
                         };
