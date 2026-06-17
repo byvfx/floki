@@ -34,6 +34,14 @@ struct LoadResult {
     result: Result<ExrData, String>,
 }
 
+/// Result of an off-thread `.cube` LUT parse. The GPU bind group is created
+/// on the UI thread in [`ExrApp::apply_lut_load_result`] (wgpu device access);
+/// only the file I/O + parsing runs off-thread.
+struct LutLoadResult {
+    path: String,
+    result: Result<crate::color::cube::CubeLut, String>,
+}
+
 /// Top-level application state and the [`eframe::App`] implementation. Owns the
 /// loaded A/B images, the `ExrViewer` canvas, OCIO/LUT colour state, and the
 /// menu/tool UI. Fields marked `#[serde(skip)]` are runtime-only (images, GPU
@@ -136,6 +144,21 @@ pub struct ExrApp {
     load_tx: Option<std::sync::mpsc::Sender<LoadResult>>,
     #[serde(skip)]
     load_rx: Option<std::sync::mpsc::Receiver<LoadResult>>,
+
+    // Async LUT loading: .cube parsing runs on a worker thread (see
+    // `reload_lut`); the parsed CubeLut arrives over `lut_load_rx` and the
+    // GPU bind group is created on the UI thread in `apply_lut_load_result`.
+    #[serde(skip)]
+    lut_loading: bool,
+    /// Set by the Browse button so `apply_lut_load_result` knows to auto-enable
+    /// the LUT on success. Startup reloads don't set this (the `enable_lut`
+    /// field from persistence is respected, and cleared on failure).
+    #[serde(skip)]
+    lut_pending_auto_enable: bool,
+    #[serde(skip)]
+    lut_load_tx: Option<std::sync::mpsc::Sender<LutLoadResult>>,
+    #[serde(skip)]
+    lut_load_rx: Option<std::sync::mpsc::Receiver<LutLoadResult>>,
 }
 
 impl Default for ExrApp {
@@ -190,6 +213,10 @@ impl Default for ExrApp {
             loading_b: false,
             load_tx: None,
             load_rx: None,
+            lut_loading: false,
+            lut_pending_auto_enable: false,
+            lut_load_tx: None,
+            lut_load_rx: None,
         }
     }
 }
@@ -217,9 +244,8 @@ impl ExrApp {
         // the persisted state matches reality.
         if app.enable_lut && !app.lut_path.is_empty() {
             app.reload_lut();
-            if app.lut_bg.is_none() {
-                app.enable_lut = false;
-            }
+            // LUT loads asynchronously now; `apply_lut_load_result` will clear
+            // `enable_lut` if the file was deleted since the last session.
         }
 
         // OCIO state (config handle + GPU pass) can't persist either; rebuild from the
@@ -350,19 +376,49 @@ impl ExrApp {
         }
     }
 
-    /// (Re)build the GPU LUT bind group from `self.lut_path`, updating `lut_bg`
-    /// and `lut_error` to reflect the outcome. A parse failure clears `lut_bg`
-    /// and disables the LUT. Does not force `enable_lut` on success — callers
-    /// decide whether loading should auto-enable (the Browse button does).
+    /// (Re)build the GPU LUT bind group from `self.lut_path`. The `.cube` file
+    /// is parsed on a worker thread so the UI stays responsive on large LUTs
+    /// (a 128³ LUT is ~2M rows); the GPU bind group is created on the UI thread
+    /// in [`Self::apply_lut_load_result`] when the parse completes. A parse
+    /// failure clears `lut_bg` and disables the LUT.
     fn reload_lut(&mut self) {
         if self.lut_path.is_empty() {
             return;
         }
+        // Lazily create the LUT load channel.
+        if self.lut_load_rx.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.lut_load_tx = Some(tx);
+            self.lut_load_rx = Some(rx);
+        }
+        let tx = self
+            .lut_load_tx
+            .clone()
+            .expect("lut load channel initialized above");
         let path = self.lut_path.clone();
-        match crate::color::cube::CubeLut::load(&path) {
+        self.lut_loading = true;
+        self.lut_error = None;
+        std::thread::spawn(move || {
+            let result = crate::color::cube::CubeLut::load(&path)
+                .map_err(|e| format!("Failed to load LUT: {}", e));
+            let _ = tx.send(LutLoadResult { path, result });
+        });
+    }
+
+    /// Apply a completed [`LutLoadResult`] from the worker thread: create the
+    /// GPU bind group, capture the domain bounds, and update `lut_bg` /
+    /// `lut_error` / `enable_lut`. Ignores stale results (a newer reload of a
+    /// different path superseded this one).
+    fn apply_lut_load_result(&mut self, res: LutLoadResult) {
+        // Discard stale results from a superseded reload.
+        if res.path != self.lut_path {
+            return;
+        }
+        self.lut_loading = false;
+        let auto_enable = self.lut_pending_auto_enable;
+        self.lut_pending_auto_enable = false;
+        match res.result {
             Ok(lut) => {
-                // Capture the LUT's authored domain so the GPU can remap the
-                // lookup coordinate. Pad xyz to vec4 (w unused by the shader).
                 self.lut_domain_min =
                     [lut.domain_min[0], lut.domain_min[1], lut.domain_min[2], 0.0];
                 self.lut_domain_max =
@@ -375,6 +431,9 @@ impl ExrApp {
                         self.lut_bg =
                             Some(gpu_state.create_lut_bind_group(&rs.device, &rs.queue, &lut));
                         self.lut_error = None;
+                        if auto_enable {
+                            self.enable_lut = true;
+                        }
                     } else {
                         self.lut_error = Some("GPU state not found".to_string());
                     }
@@ -383,7 +442,7 @@ impl ExrApp {
                 }
             }
             Err(e) => {
-                self.lut_error = Some(format!("Failed to load LUT: {}", e));
+                self.lut_error = Some(e);
                 self.lut_bg = None;
                 self.enable_lut = false;
                 self.lut_domain_min = [0.0, 0.0, 0.0, 0.0];
@@ -525,6 +584,21 @@ impl eframe::App for ExrApp {
         }
         if self.loading_a || self.loading_b {
             // egui is reactive; keep polling the worker until the decode lands.
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(50));
+        }
+
+        // Drain completed async LUT loads.
+        let mut lut_loaded = Vec::new();
+        if let Some(rx) = &self.lut_load_rx {
+            while let Ok(res) = rx.try_recv() {
+                lut_loaded.push(res);
+            }
+        }
+        for res in lut_loaded {
+            self.apply_lut_load_result(res);
+        }
+        if self.lut_loading {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(50));
         }
@@ -826,10 +900,8 @@ impl eframe::App for ExrApp {
                 });
 
             if lut_reload_requested {
+                self.lut_pending_auto_enable = true;
                 self.reload_lut();
-                if self.lut_bg.is_some() {
-                    self.enable_lut = true; // Auto-enable on successful load
-                }
             }
 
             #[cfg(feature = "ocio")]
