@@ -33,6 +33,77 @@ use crate::exr_loader::ExrData;
 use eframe::egui;
 use rayon::prelude::*;
 
+/// Sample a single channel at `(x, y)`. The `sample_data` match is invariant
+/// for the whole channel — in hot pixel loops, prefer pre-extracting the F32
+/// slice (the common case) via [`sample_channel_f32`] to avoid the per-pixel
+/// enum dispatch. This function is the fallback for F16/U32 channels and the
+/// single source of truth for the sampling logic (previously duplicated 8× as
+/// inline `get_val` closures).
+fn sample_channel(
+    chan: Option<&exr::image::AnyChannel<exr::image::FlatSamples>>,
+    x: usize,
+    y: usize,
+    width: usize,
+) -> f32 {
+    if let Some(c) = chan {
+        let index = y * width + x;
+        match &c.sample_data {
+            exr::image::FlatSamples::F16(s) => s[index].to_f32(),
+            exr::image::FlatSamples::F32(s) => s[index],
+            exr::image::FlatSamples::U32(s) => s[index] as f32 / u32::MAX as f32,
+        }
+    } else {
+        0.0
+    }
+}
+
+/// If the channel is F32 (the common EXR case), return its slice for direct
+/// indexing — eliminates the per-pixel `FlatSamples` enum match in hot loops.
+/// Non-F32 channels return `None`; fall back to [`sample_channel`] for those.
+fn sample_channel_f32(
+    chan: Option<&exr::image::AnyChannel<exr::image::FlatSamples>>,
+) -> Option<&[f32]> {
+    chan.and_then(|c| match &c.sample_data {
+        exr::image::FlatSamples::F32(s) => Some(s.as_slice()),
+        _ => None,
+    })
+}
+
+/// Read a pixel from a pre-extracted F32 slice, falling back to
+/// [`sample_channel`] for non-F32 channels. Used in hot pixel loops to skip
+/// the enum match on the F32 fast path.
+#[inline]
+fn pixel_val(
+    f32_slice: Option<&[f32]>,
+    chan: Option<&exr::image::AnyChannel<exr::image::FlatSamples>>,
+    x: usize,
+    y: usize,
+    width: usize,
+) -> f32 {
+    if let Some(s) = f32_slice {
+        s[y * width + x]
+    } else {
+        sample_channel(chan, x, y, width)
+    }
+}
+
+/// Like [`sample_channel`] but with a bounds check: returns `0.0` if `(x, y)`
+/// is outside `[0, w) × [0, h)`. Needed in diff/composite generators where
+/// images A and B may have different dimensions and the loop iterates over the
+/// union. Previously duplicated 3× as inline 5-arg `get_val` closures.
+fn sample_channel_bounded(
+    chan: Option<&exr::image::AnyChannel<exr::image::FlatSamples>>,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+) -> f32 {
+    if x >= w || y >= h {
+        return 0.0;
+    }
+    sample_channel(chan, x, y, w)
+}
+
 /// Which channel(s) the canvas isolates. `RGB` shows full colour; the rest show
 /// a single channel as grayscale. Encoded for the shader via [`Self::as_u32`].
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
@@ -1965,30 +2036,23 @@ impl ExrViewer {
         // Pack into Rgba32Float
         let mut pixels = vec![0.0f32; width * height * 4];
 
-        let get_val = |chan: Option<&exr::image::AnyChannel<exr::image::FlatSamples>>,
-                       x: usize,
-                       y: usize|
-         -> f32 {
-            if let Some(c) = chan {
-                let index = y * width + x;
-                match &c.sample_data {
-                    exr::image::FlatSamples::F16(s) => s[index].to_f32(),
-                    exr::image::FlatSamples::F32(s) => s[index],
-                    exr::image::FlatSamples::U32(s) => s[index] as f32 / u32::MAX as f32,
-                }
-            } else {
-                0.0
-            }
-        };
+        // Hoist the FlatSamples enum match out of the pixel loop: extract F32
+        // slices (the common case) for direct indexing. Non-F32 channels
+        // (rare: F16/U32) fall back to sample_channel per pixel.
+        let r_s = sample_channel_f32(r_chan);
+        let g_s = sample_channel_f32(g_chan);
+        let b_s = sample_channel_f32(b_chan);
+        let a_s = sample_channel_f32(a_chan);
+        let has_alpha = a_chan.is_some();
 
         for y in 0..height {
             for x in 0..width {
                 let i = (y * width + x) * 4;
-                pixels[i] = get_val(r_chan, x, y);
-                pixels[i + 1] = get_val(g_chan, x, y);
-                pixels[i + 2] = get_val(b_chan, x, y);
-                pixels[i + 3] = if a_chan.is_some() {
-                    get_val(a_chan, x, y)
+                pixels[i] = pixel_val(r_s, r_chan, x, y, width);
+                pixels[i + 1] = pixel_val(g_s, g_chan, x, y, width);
+                pixels[i + 2] = pixel_val(b_s, b_chan, x, y, width);
+                pixels[i + 3] = if has_alpha {
+                    pixel_val(a_s, a_chan, x, y, width)
                 } else {
                     1.0
                 };
@@ -2084,23 +2148,6 @@ impl ExrViewer {
 
         let mut pixels = vec![egui::Color32::BLACK; width * height];
 
-        // Helper to get a pixel value from a channel
-        let get_val = |chan: Option<&exr::image::AnyChannel<exr::image::FlatSamples>>,
-                       x: usize,
-                       y: usize|
-         -> f32 {
-            if let Some(c) = chan {
-                let index = y * width + x;
-                match &c.sample_data {
-                    exr::image::FlatSamples::F16(s) => s[index].to_f32(),
-                    exr::image::FlatSamples::F32(s) => s[index],
-                    exr::image::FlatSamples::U32(s) => s[index] as f32 / u32::MAX as f32,
-                }
-            } else {
-                0.0
-            }
-        };
-
         // Hoist all loop-invariant scalars out of the per-pixel work.
         let exp_mult = crate::render_math::exposure_to_multiplier(self.exposure);
         let gamma = self.gamma;
@@ -2114,10 +2161,10 @@ impl ExrViewer {
             .enumerate()
             .for_each(|(y, row)| {
                 for (x, px) in row.iter_mut().enumerate() {
-                    let mut r = get_val(r_chan, x, y);
-                    let mut g = get_val(g_chan, x, y);
-                    let mut b = get_val(b_chan, x, y);
-                    let mut a = get_val(a_chan, x, y);
+                    let mut r = sample_channel(r_chan, x, y, width);
+                    let mut g = sample_channel(g_chan, x, y, width);
+                    let mut b = sample_channel(b_chan, x, y, width);
+                    let mut a = sample_channel(a_chan, x, y, width);
 
                     if a_chan.is_none() {
                         a = 1.0;
@@ -2205,22 +2252,6 @@ impl ExrViewer {
         let width = layer.size.0;
         let height = layer.size.1;
 
-        let get_val = |chan: Option<&exr::image::AnyChannel<exr::image::FlatSamples>>,
-                       x: usize,
-                       y: usize|
-         -> f32 {
-            if let Some(c) = chan {
-                let index = y * width + x;
-                match &c.sample_data {
-                    exr::image::FlatSamples::F16(s) => s[index].to_f32(),
-                    exr::image::FlatSamples::F32(s) => s[index],
-                    exr::image::FlatSamples::U32(s) => s[index] as f32 / u32::MAX as f32,
-                }
-            } else {
-                0.0
-            }
-        };
-
         let exp_mult = crate::render_math::exposure_to_multiplier(self.exposure);
         let channel_mode = self.channel_mode;
 
@@ -2231,10 +2262,10 @@ impl ExrViewer {
             .enumerate()
             .for_each(|(y, row)| {
                 for x in 0..width {
-                    let mut r = get_val(r_chan, x, y);
-                    let mut g = get_val(g_chan, x, y);
-                    let mut b = get_val(b_chan, x, y);
-                    let mut a = get_val(a_chan, x, y);
+                    let mut r = sample_channel(r_chan, x, y, width);
+                    let mut g = sample_channel(g_chan, x, y, width);
+                    let mut b = sample_channel(b_chan, x, y, width);
+                    let mut a = sample_channel(a_chan, x, y, width);
                     if a_chan.is_none() {
                         a = 1.0;
                     }
@@ -2324,27 +2355,6 @@ impl ExrViewer {
 
         let mut pixels = vec![egui::Color32::BLACK; width * height];
 
-        let get_val = |chan: Option<&exr::image::AnyChannel<exr::image::FlatSamples>>,
-                       x: usize,
-                       y: usize,
-                       w: usize,
-                       h: usize|
-         -> f32 {
-            if x >= w || y >= h {
-                return 0.0;
-            }
-            if let Some(c) = chan {
-                let index = y * w + x;
-                match &c.sample_data {
-                    exr::image::FlatSamples::F16(s) => s[index].to_f32(),
-                    exr::image::FlatSamples::F32(s) => s[index],
-                    exr::image::FlatSamples::U32(s) => s[index] as f32 / u32::MAX as f32,
-                }
-            } else {
-                0.0
-            }
-        };
-
         // VFX-style diff: per-pixel difference magnitude mapped to a black-body heat ramp
         // (identical = black; hotter = larger difference). Display-space false color,
         // matching the GPU diff branch in shader.wgsl. `diff_multiplier` sets sensitivity.
@@ -2357,12 +2367,15 @@ impl ExrViewer {
             .enumerate()
             .for_each(|(y, row)| {
                 for (x, px) in row.iter_mut().enumerate() {
-                    let dr =
-                        (get_val(r_chan_a, x, y, aw, ah) - get_val(r_chan_b, x, y, bw, bh)).abs();
-                    let dg =
-                        (get_val(g_chan_a, x, y, aw, ah) - get_val(g_chan_b, x, y, bw, bh)).abs();
-                    let db =
-                        (get_val(b_chan_a, x, y, aw, ah) - get_val(b_chan_b, x, y, bw, bh)).abs();
+                    let dr = (sample_channel_bounded(r_chan_a, x, y, aw, ah)
+                        - sample_channel_bounded(r_chan_b, x, y, bw, bh))
+                    .abs();
+                    let dg = (sample_channel_bounded(g_chan_a, x, y, aw, ah)
+                        - sample_channel_bounded(g_chan_b, x, y, bw, bh))
+                    .abs();
+                    let db = (sample_channel_bounded(b_chan_a, x, y, aw, ah)
+                        - sample_channel_bounded(b_chan_b, x, y, bw, bh))
+                    .abs();
                     let m = (dr.max(dg).max(db) * diff_multiplier).clamp(0.0, 1.0);
                     let (hr, hg, hb) = Self::heat_ramp(m);
                     *px = egui::Color32::from_rgb(
@@ -2419,27 +2432,6 @@ impl ExrViewer {
 
         let mut pixels = vec![egui::Color32::BLACK; width * height];
 
-        let get_val = |chan: Option<&exr::image::AnyChannel<exr::image::FlatSamples>>,
-                       x: usize,
-                       y: usize,
-                       w: usize,
-                       h: usize|
-         -> f32 {
-            if x >= w || y >= h {
-                return 0.0;
-            }
-            if let Some(c) = chan {
-                let index = y * w + x;
-                match &c.sample_data {
-                    exr::image::FlatSamples::F16(s) => s[index].to_f32(),
-                    exr::image::FlatSamples::F32(s) => s[index],
-                    exr::image::FlatSamples::U32(s) => s[index] as f32 / u32::MAX as f32,
-                }
-            } else {
-                0.0
-            }
-        };
-
         let exp_mult = crate::render_math::exposure_to_multiplier(self.exposure);
         let gamma = self.gamma;
         let apply_gamma = self.gamma != 1.0;
@@ -2453,20 +2445,20 @@ impl ExrViewer {
             .enumerate()
             .for_each(|(y, row)| {
                 for (x, px) in row.iter_mut().enumerate() {
-                    let ar = get_val(r_chan_a, x, y, aw, ah);
-                    let ag = get_val(g_chan_a, x, y, aw, ah);
-                    let ab = get_val(b_chan_a, x, y, aw, ah);
+                    let ar = sample_channel_bounded(r_chan_a, x, y, aw, ah);
+                    let ag = sample_channel_bounded(g_chan_a, x, y, aw, ah);
+                    let ab = sample_channel_bounded(b_chan_a, x, y, aw, ah);
                     let aa = if a_chan_a.is_some() {
-                        get_val(a_chan_a, x, y, aw, ah)
+                        sample_channel_bounded(a_chan_a, x, y, aw, ah)
                     } else {
                         1.0
                     };
 
-                    let br = get_val(r_chan_b, x, y, bw, bh);
-                    let bg = get_val(g_chan_b, x, y, bw, bh);
-                    let bb = get_val(b_chan_b, x, y, bw, bh);
+                    let br = sample_channel_bounded(r_chan_b, x, y, bw, bh);
+                    let bg = sample_channel_bounded(g_chan_b, x, y, bw, bh);
+                    let bb = sample_channel_bounded(b_chan_b, x, y, bw, bh);
                     let ba = if a_chan_b.is_some() {
-                        get_val(a_chan_b, x, y, bw, bh)
+                        sample_channel_bounded(a_chan_b, x, y, bw, bh)
                     } else {
                         1.0
                     };
@@ -2563,27 +2555,6 @@ impl ExrViewer {
         let width = layer_a.size.0.max(layer_b.size.0);
         let height = layer_a.size.1.max(layer_b.size.1);
 
-        let get_val = |chan: Option<&exr::image::AnyChannel<exr::image::FlatSamples>>,
-                       x: usize,
-                       y: usize,
-                       w: usize,
-                       h: usize|
-         -> f32 {
-            if x >= w || y >= h {
-                return 0.0;
-            }
-            if let Some(c) = chan {
-                let index = y * w + x;
-                match &c.sample_data {
-                    exr::image::FlatSamples::F16(s) => s[index].to_f32(),
-                    exr::image::FlatSamples::F32(s) => s[index],
-                    exr::image::FlatSamples::U32(s) => s[index] as f32 / u32::MAX as f32,
-                }
-            } else {
-                0.0
-            }
-        };
-
         let exp_mult = crate::render_math::exposure_to_multiplier(self.exposure);
         let blend_mode = self.blend_mode;
         let (aw, ah) = (layer_a.size.0, layer_a.size.1);
@@ -2594,19 +2565,19 @@ impl ExrViewer {
             .enumerate()
             .for_each(|(y, row)| {
                 for x in 0..width {
-                    let ar = get_val(r_chan_a, x, y, aw, ah);
-                    let ag = get_val(g_chan_a, x, y, aw, ah);
-                    let ab = get_val(b_chan_a, x, y, aw, ah);
+                    let ar = sample_channel_bounded(r_chan_a, x, y, aw, ah);
+                    let ag = sample_channel_bounded(g_chan_a, x, y, aw, ah);
+                    let ab = sample_channel_bounded(b_chan_a, x, y, aw, ah);
                     let aa = if a_chan_a.is_some() {
-                        get_val(a_chan_a, x, y, aw, ah)
+                        sample_channel_bounded(a_chan_a, x, y, aw, ah)
                     } else {
                         1.0
                     };
-                    let br = get_val(r_chan_b, x, y, bw, bh);
-                    let bg = get_val(g_chan_b, x, y, bw, bh);
-                    let bb = get_val(b_chan_b, x, y, bw, bh);
+                    let br = sample_channel_bounded(r_chan_b, x, y, bw, bh);
+                    let bg = sample_channel_bounded(g_chan_b, x, y, bw, bh);
+                    let bb = sample_channel_bounded(b_chan_b, x, y, bw, bh);
                     let ba = if a_chan_b.is_some() {
-                        get_val(a_chan_b, x, y, bw, bh)
+                        sample_channel_bounded(a_chan_b, x, y, bw, bh)
                     } else {
                         1.0
                     };
@@ -2696,22 +2667,6 @@ impl ExrViewer {
             return None;
         }
 
-        let get_val = |chan: Option<&exr::image::AnyChannel<exr::image::FlatSamples>>,
-                       x: usize,
-                       y: usize|
-         -> f32 {
-            if let Some(c) = chan {
-                let index = y * width + x;
-                match &c.sample_data {
-                    exr::image::FlatSamples::F16(s) => s[index].to_f32(),
-                    exr::image::FlatSamples::F32(s) => s[index],
-                    exr::image::FlatSamples::U32(s) => s[index] as f32 / u32::MAX as f32,
-                }
-            } else {
-                0.0
-            }
-        };
-
         // Aperture averaging: 1 (single pixel), 3 (3×3) or 9 (9×9). The window is
         // centered on (x, y) with edge-clamped coordinates so it stays valid at
         // the image border (replicate edge), and the average is over every sample
@@ -2723,11 +2678,11 @@ impl ExrViewer {
             for dx in -radius..=radius {
                 let sx = (x as isize + dx).clamp(0, width as isize - 1) as usize;
                 let sy = (y as isize + dy).clamp(0, height as isize - 1) as usize;
-                sum[0] += get_val(r_chan, sx, sy);
-                sum[1] += get_val(g_chan, sx, sy);
-                sum[2] += get_val(b_chan, sx, sy);
+                sum[0] += sample_channel(r_chan, sx, sy, width);
+                sum[1] += sample_channel(g_chan, sx, sy, width);
+                sum[2] += sample_channel(b_chan, sx, sy, width);
                 sum[3] += if a_chan.is_some() {
-                    get_val(a_chan, sx, sy)
+                    sample_channel(a_chan, sx, sy, width)
                 } else {
                     1.0
                 };
@@ -2792,27 +2747,11 @@ impl ExrViewer {
             let width = layer.size.0;
             let height = layer.size.1;
 
-            let get_val = |chan: Option<&exr::image::AnyChannel<exr::image::FlatSamples>>,
-                           x: usize,
-                           y: usize|
-             -> f32 {
-                if let Some(c) = chan {
-                    let index = y * width + x;
-                    match &c.sample_data {
-                        exr::image::FlatSamples::F16(s) => s[index].to_f32(),
-                        exr::image::FlatSamples::F32(s) => s[index],
-                        exr::image::FlatSamples::U32(s) => s[index] as f32 / u32::MAX as f32,
-                    }
-                } else {
-                    0.0
-                }
-            };
-
             for y in 0..height {
                 for x in 0..width {
-                    let r = get_val(r_chan, x, y);
-                    let g = get_val(g_chan, x, y);
-                    let b = get_val(b_chan, x, y);
+                    let r = sample_channel(r_chan, x, y, width);
+                    let g = sample_channel(g_chan, x, y, width);
+                    let b = sample_channel(b_chan, x, y, width);
 
                     // Luminance
                     let lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
