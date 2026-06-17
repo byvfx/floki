@@ -33,6 +33,13 @@ pub struct Uniforms {
     pub _pad0: u32,
     pub _pad1: u32,
     pub _pad2: u32,
+    /// `.cube` LUT domain bounds (xyz + pad). The lookup coordinate is remapped
+    /// from `[domain_min, domain_max]` to `[0, 1]` before sampling the 3D LUT
+    /// texture, so non-unit-domain LUTs (common for HDR/film looks) sample
+    /// correctly. Defaults to `[0,0,0,0]` / `[1,1,1,1]` (identity). Keep in
+    /// lockstep with `Uniforms.lut_domain_min/max` in `shader.wgsl`.
+    pub lut_domain_min: [f32; 4],
+    pub lut_domain_max: [f32; 4],
 }
 
 /// Uniforms for the OCIO blit pass: composites the transparency checkerboard in
@@ -588,7 +595,7 @@ mod tests {
             "Uniforms size ({size}) must be a multiple of 16"
         );
         assert_eq!(
-            size, 96,
+            size, 128,
             "Uniforms layout changed — update shader.wgsl to match"
         );
     }
@@ -635,6 +642,8 @@ mod tests {
             _pad0: 0,
             _pad1: 0,
             _pad2: 0,
+            lut_domain_min: [-0.5, -0.5, -0.5, 0.0],
+            lut_domain_max: [1.5, 1.5, 1.5, 0.0],
         };
         let bytes = bytemuck::bytes_of(&u);
         assert_eq!(bytes.len(), std::mem::size_of::<Uniforms>());
@@ -652,6 +661,8 @@ mod tests {
         assert_eq!(back.blend_mode, 2);
         assert_eq!(back.screen_size, [800.0, 600.0]);
         assert_eq!(back.skip_checker, 1);
+        assert_eq!(back.lut_domain_min, [-0.5, -0.5, -0.5, 0.0]);
+        assert_eq!(back.lut_domain_max, [1.5, 1.5, 1.5, 0.0]);
     }
 
     #[test]

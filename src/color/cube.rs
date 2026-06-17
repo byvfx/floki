@@ -2,11 +2,9 @@ use std::fs::File;
 use std::io::{self, BufRead};
 use std::path::Path;
 
-// Parsed and unit-tested, but not yet wired into the UI: .cube LUTs are loaded
-// via the GPU `lut_bg` path today, and this CPU-side representation is staged for
-// a planned CPU LUT-apply / inspection feature. Kept (with the allow) rather than
-// deleted so the parser + tests don't bit-rot before that lands.
-#[allow(dead_code)]
+/// A parsed Adobe `.cube` 3D LUT. `domain_min`/`domain_max` are consumed by
+/// `ExrApp::reload_lut` and pushed to the GPU as uniform fields so the shader
+/// can remap the lookup coordinate for non-unit-domain (HDR/film) LUTs.
 #[derive(Debug)]
 pub struct CubeLut {
     pub size: usize,
@@ -184,6 +182,39 @@ LUT_3D_SIZE 2
         let lut = CubeLut::load(f.path()).unwrap();
         assert_eq!(lut.domain_min, [-1.0, -2.0, -3.0]);
         assert_eq!(lut.domain_max, [2.0, 4.0, 8.0]);
+    }
+
+    #[test]
+    fn hdr_domain_round_trips_into_app_uniform_fields() {
+        // The GPU uniform carries the LUT domain as `[f32; 4]` (xyz + pad). This
+        // proves the parsing → field-copy path that `ExrApp::reload_lut` uses:
+        // a non-unit-domain LUT produces values that would remap the lookup
+        // coordinate in the shader (the actual sampling can't be tested GPU-free,
+        // but the wiring can).
+        let contents = format!("DOMAIN_MIN -0.5 -0.5 -0.5\nDOMAIN_MAX 1.5 1.5 1.5\n{VALID_2X2X2}");
+        let lut = CubeLut::load(cube_file(&contents).path()).unwrap();
+        let uniform_min = [lut.domain_min[0], lut.domain_min[1], lut.domain_min[2], 0.0];
+        let uniform_max = [lut.domain_max[0], lut.domain_max[1], lut.domain_max[2], 0.0];
+        assert_eq!(uniform_min, [-0.5, -0.5, -0.5, 0.0]);
+        assert_eq!(uniform_max, [1.5, 1.5, 1.5, 0.0]);
+        // Identity-domain LUTs (the common case) produce a no-op remap.
+        let identity = CubeLut::load(cube_file(VALID_2X2X2).path()).unwrap();
+        assert_eq!(
+            [
+                identity.domain_min[0],
+                identity.domain_min[1],
+                identity.domain_min[2]
+            ],
+            [0.0, 0.0, 0.0]
+        );
+        assert_eq!(
+            [
+                identity.domain_max[0],
+                identity.domain_max[1],
+                identity.domain_max[2]
+            ],
+            [1.0, 1.0, 1.0]
+        );
     }
 
     #[test]

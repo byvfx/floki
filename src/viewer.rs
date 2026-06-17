@@ -156,6 +156,11 @@ pub struct ExrViewer {
     pub gamma: f32,
     pub srgb: bool,
     pub enable_lut: bool,
+    /// `.cube` LUT domain bounds (xyz + pad), hydrated from `ExrApp` each frame
+    /// alongside `enable_lut`. Used to build the GPU uniform so non-unit-domain
+    /// LUTs sample correctly. Defaults to the identity `[0,0,0,0]`/`[1,1,1,1]`.
+    pub lut_domain_min: [f32; 4],
+    pub lut_domain_max: [f32; 4],
     /// When true (OCIO config loaded + enabled), the single-image central path renders via the
     /// two-pass OCIO callback instead of the direct display chain. Set by the app.
     #[cfg(feature = "ocio")]
@@ -223,6 +228,8 @@ impl Default for ExrViewer {
             gamma: 1.0,
             srgb: true,
             enable_lut: false,
+            lut_domain_min: [0.0, 0.0, 0.0, 0.0],
+            lut_domain_max: [1.0, 1.0, 1.0, 0.0],
             #[cfg(feature = "ocio")]
             ocio_active: false,
             #[cfg(feature = "ocio")]
@@ -1513,6 +1520,8 @@ impl ExrViewer {
             _pad0: 0,
             _pad1: 0,
             _pad2: 0,
+            lut_domain_min: self.lut_domain_min,
+            lut_domain_max: self.lut_domain_max,
         };
 
         // Acquire the renderer read-lock ONCE per frame: clone out the

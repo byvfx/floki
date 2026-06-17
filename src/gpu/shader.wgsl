@@ -30,6 +30,12 @@ struct Uniforms {
     _pad0: u32,
     _pad1: u32,
     _pad2: u32,
+    // .cube LUT domain bounds (xyz + pad). The lookup coordinate is remapped from
+    // [domain_min, domain_max] to [0, 1] before sampling the 3D LUT texture, so
+    // non-unit-domain LUTs (HDR/film looks) sample correctly. Defaults to identity.
+    // Keep in lockstep with `Uniforms.lut_domain_min/max` in src/gpu/mod.rs.
+    lut_domain_min: vec4<f32>,
+    lut_domain_max: vec4<f32>,
 };
 
 @group(0) @binding(0) var tex_a: texture_2d<f32>;
@@ -215,7 +221,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // sRGB
     if uniforms.enable_lut == 1u {
-        let l_color = textureSample(lut_tex, lut_samp, clamp(vec3<f32>(r, g, b), vec3<f32>(0.0), vec3<f32>(1.0)));
+        // Remap the display-space RGB from the LUT's authored domain to [0,1]
+        // texture coordinates. A unit-domain LUT (the common case) has
+        // domain_min=0, domain_max=1 and the remap is identity. HDR/film LUTs
+        // authored with e.g. DOMAIN_MIN -0.5 / DOMAIN_MAX 1.5 would otherwise
+        // have their input clamped to [0,1] and sample the wrong texels.
+        let dmin = uniforms.lut_domain_min.xyz;
+        let dmax = uniforms.lut_domain_max.xyz;
+        let lut_uv = clamp((vec3<f32>(r, g, b) - dmin) / (dmax - dmin), vec3<f32>(0.0), vec3<f32>(1.0));
+        let l_color = textureSample(lut_tex, lut_samp, lut_uv);
         r = l_color.r;
         g = l_color.g;
         b = l_color.b;

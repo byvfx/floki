@@ -71,6 +71,13 @@ pub struct ExrApp {
     #[serde(skip)]
     pub lut_bg: Option<std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>>,
     pub lut_error: Option<String>,
+    /// `.cube` LUT domain bounds (xyz + pad). Set in `reload_lut`, hydrated onto
+    /// `ExrViewer` each frame so the GPU uniform remaps the lookup coordinate for
+    /// non-unit-domain LUTs. `#[serde(skip)]` — re-derived from the LUT file.
+    #[serde(skip)]
+    lut_domain_min: [f32; 4],
+    #[serde(skip)]
+    lut_domain_max: [f32; 4],
 
     #[cfg(feature = "ocio")]
     #[serde(default)]
@@ -150,6 +157,8 @@ impl Default for ExrApp {
             enable_lut: false,
             lut_bg: None,
             lut_error: None,
+            lut_domain_min: [0.0, 0.0, 0.0, 0.0],
+            lut_domain_max: [1.0, 1.0, 1.0, 0.0],
             #[cfg(feature = "ocio")]
             ocio_display: String::new(),
             #[cfg(feature = "ocio")]
@@ -352,6 +361,12 @@ impl ExrApp {
         let path = self.lut_path.clone();
         match crate::color::cube::CubeLut::load(&path) {
             Ok(lut) => {
+                // Capture the LUT's authored domain so the GPU can remap the
+                // lookup coordinate. Pad xyz to vec4 (w unused by the shader).
+                self.lut_domain_min =
+                    [lut.domain_min[0], lut.domain_min[1], lut.domain_min[2], 0.0];
+                self.lut_domain_max =
+                    [lut.domain_max[0], lut.domain_max[1], lut.domain_max[2], 0.0];
                 if let Some(rs) = &self.render_state {
                     let renderer = rs.renderer.read();
                     if let Some(gpu_state) =
@@ -371,6 +386,8 @@ impl ExrApp {
                 self.lut_error = Some(format!("Failed to load LUT: {}", e));
                 self.lut_bg = None;
                 self.enable_lut = false;
+                self.lut_domain_min = [0.0, 0.0, 0.0, 0.0];
+                self.lut_domain_max = [1.0, 1.0, 1.0, 0.0];
             }
         }
     }
@@ -1487,6 +1504,8 @@ impl eframe::App for ExrApp {
             if self.loaded_file.is_some() {
                 if let Some(data) = &self.exr_data {
                     self.viewer.enable_lut = self.enable_lut && self.lut_bg.is_some();
+                    self.viewer.lut_domain_min = self.lut_domain_min;
+                    self.viewer.lut_domain_max = self.lut_domain_max;
                     #[cfg(feature = "ocio")]
                     {
                         self.viewer.ocio_active = self.ocio_enabled && self.ocio_ready;
