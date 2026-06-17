@@ -288,6 +288,17 @@ pub struct OcioTargets {
     _display: wgpu::Texture,
 }
 
+impl Drop for OcioTargets {
+    fn drop(&mut self) {
+        // Explicitly destroy GPU textures so memory is released in the current
+        // submission cycle, not deferred to the next driver GC sweep. On a
+        // window-resize drag loop this prevents a memory spike (each resize
+        // creates ~83 MB of 4K Rgba16Float + display textures).
+        self._scene.destroy();
+        self._display.destroy();
+    }
+}
+
 impl OcioTargets {
     fn new(
         device: &wgpu::Device,

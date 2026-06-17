@@ -78,6 +78,10 @@ pub struct ExrApp {
     pub enable_lut: bool,
     #[serde(skip)]
     pub lut_bg: Option<std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>>,
+    /// The LUT texture, kept alongside `lut_bg` so it can be `destroy()`ed
+    /// explicitly when replaced (wgpu's lazy drop defers GPU memory release).
+    #[serde(skip)]
+    lut_texture: Option<eframe::egui_wgpu::wgpu::Texture>,
     pub lut_error: Option<String>,
     /// `.cube` LUT domain bounds (xyz + pad). Set in `reload_lut`, hydrated onto
     /// `ExrViewer` each frame so the GPU uniform remaps the lookup coordinate for
@@ -179,6 +183,7 @@ impl Default for ExrApp {
             lut_path: String::new(),
             enable_lut: false,
             lut_bg: None,
+            lut_texture: None,
             lut_error: None,
             lut_domain_min: [0.0, 0.0, 0.0, 0.0],
             lut_domain_max: [1.0, 1.0, 1.0, 0.0],
@@ -428,8 +433,17 @@ impl ExrApp {
                     if let Some(gpu_state) =
                         renderer.callback_resources.get::<crate::gpu::GpuState>()
                     {
-                        self.lut_bg =
-                            Some(gpu_state.create_lut_bind_group(&rs.device, &rs.queue, &lut));
+                        // Explicitly destroy the old LUT texture before
+                        // replacing it, so GPU memory is released in this
+                        // submission cycle rather than waiting for the next
+                        // driver GC sweep.
+                        if let Some(old_tex) = self.lut_texture.take() {
+                            old_tex.destroy();
+                        }
+                        let (bg, tex) =
+                            gpu_state.create_lut_bind_group(&rs.device, &rs.queue, &lut);
+                        self.lut_bg = Some(bg);
+                        self.lut_texture = Some(tex);
                         self.lut_error = None;
                         if auto_enable {
                             self.enable_lut = true;
@@ -444,6 +458,9 @@ impl ExrApp {
             Err(e) => {
                 self.lut_error = Some(e);
                 self.lut_bg = None;
+                if let Some(old_tex) = self.lut_texture.take() {
+                    old_tex.destroy();
+                }
                 self.enable_lut = false;
                 self.lut_domain_min = [0.0, 0.0, 0.0, 0.0];
                 self.lut_domain_max = [1.0, 1.0, 1.0, 0.0];

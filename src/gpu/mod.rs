@@ -567,7 +567,7 @@ impl GpuState {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         lut: &crate::color::cube::CubeLut,
-    ) -> Arc<wgpu::BindGroup> {
+    ) -> (Arc<wgpu::BindGroup>, wgpu::Texture) {
         let size = wgpu::Extent3d {
             width: lut.size as u32,
             height: lut.size as u32,
@@ -603,7 +603,7 @@ impl GpuState {
 
         let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
 
-        Arc::new(device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let bg = Arc::new(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("LUT Bind Group"),
             layout: &self.bind_group_layout_lut,
             entries: &[
@@ -616,7 +616,8 @@ impl GpuState {
                     resource: wgpu::BindingResource::Sampler(&self.lut_sampler),
                 },
             ],
-        }))
+        }));
+        (bg, tex)
     }
 }
 
