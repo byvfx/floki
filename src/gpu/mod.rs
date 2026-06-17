@@ -304,7 +304,17 @@ impl GpuState {
             layout: &bind_group_layout_uniform,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
-                resource: uniform_buffer.as_entire_binding(),
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &uniform_buffer,
+                    offset: 0,
+                    // Bind a single Uniforms-sized window; the dynamic offset
+                    // passed at `set_bind_group` slides this window across the
+                    // ring buffer. Must NOT use `as_entire_binding()` (size =
+                    // None) — wgpu requires that offset + bound_size <= buffer
+                    // size, and with the whole buffer bound any offset > 0
+                    // overruns.
+                    size: std::num::NonZeroU64::new(std::mem::size_of::<Uniforms>() as u64),
+                }),
             }],
         });
 
