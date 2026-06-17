@@ -54,8 +54,8 @@ impl ExrData {
         }))
         .map_err(|_| {
             "Failed to decode EXR: the decompressor panicked. The file may use an \
-             unsupported compression variant or trigger a known decoder bug in the \
-             exr/zune-inflate dependency."
+             unsupported compression variant, be corrupted, or trigger a bug in the \
+             exr crate's miniz_oxide decompressor."
                 .to_string()
         })?;
 
