@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Changing the OCIO config no longer produces a wgpu validation error (or
+  silent black frame) when the window has not been resized since the previous
+  config load. The cached scene bind group is now invalidated whenever the OCIO
+  pipeline is rebuilt, so it is always created against the current pipeline
+  layout.
+- Clicking **Browse** for a LUT, then immediately browsing a second path, no
+  longer auto-enables the LUT for the second load. The auto-enable flag is now
+  cleared when a superseded (stale) LUT result is discarded.
+- If the GPU or render state is unavailable when a LUT finishes loading, the
+  LUT is now correctly disabled (`Enable LUT` unchecked) rather than left
+  enabled with mismatched domain bounds — which previously caused the shader to
+  apply a non-identity coordinate remap while sampling the fallback identity
+  texture.
+
 ## [1.5.1] - 2026-06-16
 
 ### Performance
