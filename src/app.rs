@@ -137,15 +137,18 @@ pub struct ExrApp {
     #[serde(skip)]
     conversion_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 
-    // Async image loading: decode runs on a worker thread (see `open_file`),
-    // results arrive over `load_rx` and are applied in `update`/`ui`. The
-    // `loading_*` flags drive the in-canvas spinner and keep repaints flowing.
+    // Async image loading: a single dedicated worker thread processes load
+    // requests one at a time (see `open_file`). Using one worker instead of
+    // spawning a thread per file prevents multiple parallel EXR parses from
+    // exhausting memory on large files — each parse can be GBs of working set.
     #[serde(skip)]
     loading_a: bool,
     #[serde(skip)]
     loading_b: bool,
+    /// Job queue sender: send `(path, is_b)` to the single worker thread.
     #[serde(skip)]
     load_tx: Option<std::sync::mpsc::Sender<LoadResult>>,
+    /// Result receiver: the worker sends completed `LoadResult`s back here.
     #[serde(skip)]
     load_rx: Option<std::sync::mpsc::Receiver<LoadResult>>,
 
@@ -486,20 +489,36 @@ impl ExrApp {
         }
         self.error_msg = None;
 
-        // Lazily create the result channel (mirrors `conversion_receiver`).
+        // Lazily create the load channel + spawn a single dedicated worker
+        // thread. The worker processes jobs one at a time, so rapidly opening
+        // 5 files queues them instead of spawning 5 parallel GBs-of-RAM parses.
+        // Stale jobs are discarded by `apply_load_result`'s path check.
         if self.load_rx.is_none() {
-            let (tx, rx) = std::sync::mpsc::channel();
-            self.load_tx = Some(tx);
-            self.load_rx = Some(rx);
+            let (job_tx, job_rx) = std::sync::mpsc::channel::<LoadResult>();
+            let (result_tx, result_rx) = std::sync::mpsc::channel::<LoadResult>();
+            std::thread::spawn(move || {
+                for job in job_rx {
+                    let result = ExrData::load(&job.path);
+                    let _ = result_tx.send(LoadResult {
+                        path: job.path,
+                        is_b: job.is_b,
+                        result,
+                    });
+                }
+            });
+            self.load_tx = Some(job_tx);
+            self.load_rx = Some(result_rx);
         }
         let tx = self
             .load_tx
             .clone()
             .expect("load channel initialized above");
-        std::thread::spawn(move || {
-            let result = ExrData::load(&path);
-            // The receiver is dropped only on app exit; ignore a closed channel.
-            let _ = tx.send(LoadResult { path, is_b, result });
+        // Send a job request: the `result` field is a placeholder (Err) — the
+        // worker overwrites it with the actual load result before forwarding.
+        let _ = tx.send(LoadResult {
+            path,
+            is_b,
+            result: Err("pending".to_string()),
         });
     }
 
