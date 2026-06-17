@@ -150,7 +150,11 @@ fn fs_main(i: VOut) -> @location(0) vec4<f32> {
 "#;
 
 impl GpuState {
-    pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        target_format: wgpu::TextureFormat,
+    ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Exr Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
@@ -283,6 +287,30 @@ impl GpuState {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
+        // Explicitly zero the 1x1x1 LUT texel. wgpu does not guarantee
+        // zero-initialization on all backends (Vulkan leaves texture memory
+        // undefined); sampling garbage RGBA32Float (possibly NaN/Inf) into the
+        // exposure/LUT chain would silently corrupt the output when the LUT is
+        // disabled but the bind group is still bound.
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &default_lut_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[0u8; 16],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(16),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
         let default_lut_view = default_lut_tex.create_view(&wgpu::TextureViewDescriptor::default());
         let default_lut_bind_group =
             Arc::new(device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -300,7 +328,10 @@ impl GpuState {
                 ],
             }));
 
-        // Create a 1x1 black texture for default bind group
+        // Create a 1x1 black texture for default bind group. COPY_DST is needed
+        // to explicitly zero the texel — wgpu does not guarantee zero-initialization
+        // on all backends (Vulkan leaves it undefined), and sampling garbage
+        // RGBA32Float (possibly NaN/Inf) when image B is unset would corrupt output.
         let default_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Default Texture"),
             size: wgpu::Extent3d {
@@ -312,9 +343,28 @@ impl GpuState {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba32Float,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &default_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[0u8; 16],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(16),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
 
         let default_view = default_tex.create_view(&wgpu::TextureViewDescriptor::default());
 

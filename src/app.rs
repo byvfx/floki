@@ -207,7 +207,7 @@ impl ExrApp {
         app.render_state = cc.wgpu_render_state.clone();
 
         if let Some(rs) = &app.render_state {
-            let gpu_state = crate::gpu::GpuState::new(&rs.device, rs.target_format);
+            let gpu_state = crate::gpu::GpuState::new(&rs.device, &rs.queue, rs.target_format);
             rs.renderer.write().callback_resources.insert(gpu_state);
         }
 
