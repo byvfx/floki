@@ -75,12 +75,17 @@ pub struct GpuState {
     pub sampler: wgpu::Sampler,
     pub lut_sampler: wgpu::Sampler,
     /// Persistent uniform ring buffer (sized `UNIFORM_RING_SLOTS *
-    /// size_of::<Uniforms>()`). Per-draw uniform data is written via
+    /// uniform_stride`). Per-draw uniform data is written via
     /// `queue.write_buffer` at a dynamic offset, eliminating the per-frame
     /// `create_buffer_init` + `create_bind_group` that previously ran 1–4× per
     /// frame. The bind group is created once and rebound with a dynamic offset.
     pub uniform_buffer: wgpu::Buffer,
     pub uniform_bind_group: wgpu::BindGroup,
+    /// Stride per uniform slot in bytes, padded up to the device's
+    /// `min_uniform_buffer_offset_alignment` (typically 256). The raw
+    /// `Uniforms` struct is 128 bytes, but dynamic offsets must be aligned,
+    /// so each slot is padded.
+    pub uniform_stride: u32,
     /// Same shader/layout as `pipeline` but renders into an `Rgba32Float` offscreen target
     /// (the OCIO "pass 1" scene-linear buffer). Drive it with `srgb=0, gamma=1, enable_lut=0`
     /// so it emits linear color for the OCIO display transform.
@@ -160,9 +165,14 @@ fn fs_main(i: VOut) -> @location(0) vec4<f32> {
 "#;
 
 /// Number of uniform slots in the persistent ring buffer. Up to 4 draws per
-/// frame (A/B/diff/composite/side-by-side) — 16 gives ample headroom. The
-/// buffer is only 16 × 128 = 2 KB.
+/// frame (A/B/diff/composite/side-by-side) — 16 gives ample headroom. At
+/// 256-byte stride (worst-case alignment) the buffer is 4 KB.
 pub const UNIFORM_RING_SLOTS: u64 = 16;
+
+/// Round `size` up to the next multiple of `align` (must be a power of two).
+fn align_to(size: u32, align: u32) -> u32 {
+    (size + align - 1) & !(align - 1)
+}
 
 impl GpuState {
     pub fn new(
@@ -278,10 +288,14 @@ impl GpuState {
         // Persistent uniform ring buffer: one buffer + one bind group, reused
         // across all draws via dynamic offsets. Eliminates the per-draw
         // `create_buffer_init` + `create_bind_group` that previously ran 1–4×
-        // per frame.
+        // per frame. Each slot is padded to the device's
+        // `min_uniform_buffer_offset_alignment` (typically 256) so dynamic
+        // offsets are always valid.
+        let align = device.limits().min_uniform_buffer_offset_alignment;
+        let uniform_stride = align_to(std::mem::size_of::<Uniforms>() as u32, align);
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Uniform Ring Buffer"),
-            size: UNIFORM_RING_SLOTS * std::mem::size_of::<Uniforms>() as u64,
+            size: UNIFORM_RING_SLOTS * uniform_stride as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -551,6 +565,7 @@ impl GpuState {
             lut_sampler,
             uniform_buffer,
             uniform_bind_group,
+            uniform_stride,
             #[cfg(feature = "ocio")]
             pipeline_linear,
             #[cfg(feature = "ocio")]

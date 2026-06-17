@@ -1602,7 +1602,7 @@ impl ExrViewer {
         // `create_buffer_init` + `create_bind_group` allocation. The bind
         // group itself lives in `GpuState` and is fetched by the paint
         // callbacks via `callback_resources`.
-        let (uniform_buffer, active_lut_bg, default_tex_bg) = {
+        let (uniform_buffer, uniform_stride, active_lut_bg, default_tex_bg) = {
             let guard = render_state.renderer.read();
             let gpu_state = guard
                 .callback_resources
@@ -1610,6 +1610,7 @@ impl ExrViewer {
                 .unwrap();
             (
                 gpu_state.uniform_buffer.clone(),
+                gpu_state.uniform_stride,
                 lut_bg_opt
                     .clone()
                     .unwrap_or_else(|| gpu_state.default_lut_bind_group.clone()),
@@ -1665,11 +1666,14 @@ impl ExrViewer {
             // at the current offset, then bump the allocator. This replaces
             // the per-draw `create_buffer_init` + `create_bind_group` (two
             // wgpu object allocations + a staging copy per draw per frame).
+            // `uniform_stride` is padded to the device's
+            // `min_uniform_buffer_offset_alignment` (typically 256), so every
+            // dynamic offset is valid — the raw Uniforms struct (128 bytes)
+            // is written at the start of each padded slot.
             let offset = uniform_offset.get();
-            let uniform_size = std::mem::size_of::<crate::gpu::Uniforms>() as u32;
-            uniform_offset.set(offset + uniform_size);
+            uniform_offset.set(offset + uniform_stride);
             debug_assert!(
-                offset + uniform_size <= crate::gpu::UNIFORM_RING_SLOTS as u32 * uniform_size,
+                offset + uniform_stride <= crate::gpu::UNIFORM_RING_SLOTS as u32 * uniform_stride,
                 "uniform ring buffer overflow: too many draws this frame"
             );
             queue.write_buffer(&uniform_buffer, offset as u64, bytemuck::bytes_of(&u));
