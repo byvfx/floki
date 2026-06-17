@@ -15,5 +15,5 @@ pub mod exr_loader;
 mod color;
 mod gpu;
 mod render_math;
-mod tools;
+pub mod tools;
 mod viewer;

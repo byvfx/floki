@@ -1,10 +1,8 @@
+use floki::tools::run_conversion_task;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
-
-#[path = "../tools.rs"]
-mod tools;
 
 fn main() {
     env_logger::init();
@@ -26,7 +24,7 @@ fn main() {
     let (tx, rx) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
 
-    let summary = tools::run_conversion_task(input, output, tx, cancel);
+    let summary = run_conversion_task(input, output, tx, cancel);
 
     for (done, total, msg) in rx {
         println!("[{done}/{total}] {msg}");

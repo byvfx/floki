@@ -208,7 +208,7 @@ fn convert_exr(
                 channel.name = Text::from(new_name.as_str());
             }
         } else {
-            log::debug!(
+            log::warn!(
                 "{:?}: layer {} left unchanged (renaming would reorder channels)",
                 in_path,
                 layer_idx

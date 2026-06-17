@@ -100,6 +100,17 @@ impl OcioGpuPass {
             );
         }
 
+        // The OCIO convention requires set 1 (scene input texture + sampler);
+        // `render` indexes `group_layouts[1]` unconditionally. Assert at
+        // construction so a degenerate bundle fails here instead of panicking
+        // mid-frame on the first `render` call.
+        if group_layouts.len() < 2 {
+            return Err(
+                "OCIO bundle must have at least 2 bind groups (set 0 = uniforms, set 1 = scene)"
+                    .to_string(),
+            );
+        }
+
         // --- Pipeline ---
         let layout_refs: Vec<Option<&wgpu::BindGroupLayout>> =
             group_layouts.iter().map(Some).collect();
