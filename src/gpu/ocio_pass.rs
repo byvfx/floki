@@ -62,7 +62,7 @@ impl OcioGpuPass {
             .iter()
             .map(|b| b.group)
             .max()
-            .unwrap_or(1)
+            .unwrap_or(0)
             .max(1);
         let mut group_layouts = Vec::new();
         for g in 0..=max_group {
@@ -225,22 +225,17 @@ impl OcioGpuPass {
     /// Encode the OCIO pass: sample `input_view` (scene-linear) and write the display result
     /// into `output_view`. `scissor` (x, y, w, h in pixels) limits the (expensive) transform
     /// to the visible image region; `None` runs it over the whole target.
+    ///
+    /// `scene_bind_group` is the cached set-1 bind group (scene view + sampler)
+    /// owned by `OcioTargets` — built once by `init_scene_bind_group` and reused
+    /// across dirty frames instead of being recreated here each call.
     pub fn render(
         &self,
-        device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
-        input_view: &wgpu::TextureView,
         output_view: &wgpu::TextureView,
+        scene_bind_group: &wgpu::BindGroup,
         scissor: Option<[u32; 4]>,
     ) {
-        // Use the cached scene bind group if available; otherwise build it
-        // (and cache via interior mutability — the cache is populated on the
-        // first dirty frame after OcioTargets creation).
-        let cached = self
-            .scene_bind_group
-            .as_ref()
-            .expect("scene_bind_group must be initialized via set_scene_bind_group before render");
-
         let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("OCIO Display Pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -262,7 +257,7 @@ impl OcioGpuPass {
         }
         rp.set_pipeline(&self.pipeline);
         rp.set_bind_group(0, &self.set0_bind_group, &[]);
-        rp.set_bind_group(1, cached, &[]);
+        rp.set_bind_group(1, scene_bind_group, &[]);
         rp.draw(0..3, 0..1);
     }
 }
@@ -287,8 +282,9 @@ pub struct OcioTargets {
     blit_uniform_buffer: wgpu::Buffer,
     /// Cached scene-input bind group (set 1) for `OcioGpuPass::render`. The
     /// scene view is stable across dirty frames (only changes on resize, which
-    /// recreates `OcioTargets`), so this is built once in `set_scene_bind_group`
-    /// and reused — eliminates a per-dirty-frame `create_bind_group`.
+    /// recreates `OcioTargets`), so this is built once via
+    /// `OcioGpuPass::init_scene_bind_group` and reused — eliminates a
+    /// per-dirty-frame `create_bind_group`.
     scene_bind_group: Option<wgpu::BindGroup>,
     /// `render_sig` of the content currently in `display_view`; lets `prepare` skip the
     /// two passes when nothing changed. `None` after (re)creation forces a first render.
@@ -306,30 +302,40 @@ impl Drop for OcioTargets {
         self._scene.destroy();
         self._display.destroy();
     }
+}
 
-    /// Build and cache the scene-input bind group (set 1) on `targets`. Uses
-    /// `self.group_layouts[1]` + `self.scene_sampler` + `targets.scene_view`.
-    /// Called once after `OcioTargets` creation so `render` doesn't recreate
+impl OcioTargets {
+    /// Build and cache the scene-input bind group (set 1) from the OCIO pass's
+    /// group layout + scene sampler. Must be called once after creation (and
+    /// after any recreation) before `render` is called. This avoids recreating
     /// the bind group every dirty frame.
-    pub fn init_scene_bind_group(&self, device: &wgpu::Device, targets: &mut OcioTargets) {
-        targets.scene_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+    ///
+    /// Takes the layout + sampler by reference (wgpu types are cheaply
+    /// `Arc`-clonable, but borrowing avoids the clone) — the caller clones them
+    /// out of `OcioGpuPass` first to sidestep the `CallbackResources` borrow
+    /// conflict (can't hold `&OcioGpuPass` and `&mut OcioTargets` at once).
+    fn init_scene_bind_group(
+        &mut self,
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        sampler: &wgpu::Sampler,
+    ) {
+        self.scene_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("OCIO scene bind group (cached)"),
-            layout: &self.group_layouts[1],
+            layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&targets.scene_view),
+                    resource: wgpu::BindingResource::TextureView(&self.scene_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.scene_sampler),
+                    resource: wgpu::BindingResource::Sampler(sampler),
                 },
             ],
         }));
     }
-}
 
-impl OcioTargets {
     fn new(
         device: &wgpu::Device,
         blit_layout: &wgpu::BindGroupLayout,
@@ -492,15 +498,22 @@ impl eframe::egui_wgpu::CallbackTrait for OcioCallback {
         // If OcioTargets was just (re)created, initialize the cached scene
         // bind group now that we know OcioGpuPass exists. This avoids
         // recreating it every dirty frame in `render`.
+        //
+        // Clone the layout + sampler out of `OcioGpuPass` first (wgpu types are
+        // cheaply `Arc`-backed) so we don't hold an immutable borrow of
+        // `callback_resources` while taking a mutable one for `OcioTargets`.
         if callback_resources
             .get::<OcioTargets>()
             .unwrap()
             .scene_bind_group
             .is_none()
         {
-            let ocio = callback_resources.get::<OcioGpuPass>().unwrap();
+            let (layout, sampler) = {
+                let ocio = callback_resources.get::<OcioGpuPass>().unwrap();
+                (ocio.group_layouts[1].clone(), ocio.scene_sampler.clone())
+            };
             let targets = callback_resources.get_mut::<OcioTargets>().unwrap();
-            ocio.init_scene_bind_group(device, targets);
+            targets.init_scene_bind_group(device, &layout, &sampler);
         }
 
         // Skip the two passes when nothing affecting the render changed; `paint` re-blits the
@@ -575,10 +588,12 @@ impl eframe::egui_wgpu::CallbackTrait for OcioCallback {
                 })
                 .filter(|[_, _, sw, sh]| *sw > 0 && *sh > 0);
             ocio.render(
-                device,
                 &mut encoder,
-                &targets.scene_view,
                 &targets.display_view,
+                targets
+                    .scene_bind_group
+                    .as_ref()
+                    .expect("scene_bind_group initialized in prepare()"),
                 scissor,
             );
 
@@ -820,7 +835,21 @@ mod metal_tests {
 
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        pass.render(&device, &mut encoder, &input_view, &output_view, None);
+        let scene_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("test scene bg"),
+            layout: &pass.group_layouts[1],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&input_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&pass.scene_sampler),
+                },
+            ],
+        });
+        pass.render(&mut encoder, &output_view, &scene_bg, None);
         queue.submit([encoder.finish()]);
         let _ = device.poll(wgpu::PollType::wait_indefinitely());
     }

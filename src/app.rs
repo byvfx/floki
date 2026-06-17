@@ -1400,6 +1400,10 @@ impl eframe::App for ExrApp {
                                         .id_salt("swatches_scroll")
                                         .show(ui, |ui| {
                                             let mut to_remove = None;
+                                            let exp_mult =
+                                                crate::render_math::exposure_to_multiplier(
+                                                    self.viewer.exposure,
+                                                );
                                             for (i, swatch) in
                                                 self.viewer.swatches.iter().enumerate()
                                             {
@@ -1407,43 +1411,33 @@ impl eframe::App for ExrApp {
                                                     let [r, g, b, _a] = *swatch;
 
                                                     // Preview color patch using current sRGB mode and exposure/gamma
-                                                    let mut disp_r =
-                                                        r * self.viewer.exposure.exp2();
-                                                    let mut disp_g =
-                                                        g * self.viewer.exposure.exp2();
-                                                    let mut disp_b =
-                                                        b * self.viewer.exposure.exp2();
+                                                    let mut disp_r = r * exp_mult;
+                                                    let mut disp_g = g * exp_mult;
+                                                    let mut disp_b = b * exp_mult;
 
                                                     if self.viewer.gamma != 1.0 {
-                                                        let inv_gamma = 1.0 / self.viewer.gamma;
-                                                        disp_r = if disp_r > 0.0 {
-                                                            disp_r.powf(inv_gamma)
-                                                        } else {
-                                                            0.0
-                                                        };
-                                                        disp_g = if disp_g > 0.0 {
-                                                            disp_g.powf(inv_gamma)
-                                                        } else {
-                                                            0.0
-                                                        };
-                                                        disp_b = if disp_b > 0.0 {
-                                                            disp_b.powf(inv_gamma)
-                                                        } else {
-                                                            0.0
-                                                        };
+                                                        disp_r = crate::render_math::apply_gamma(
+                                                            disp_r,
+                                                            self.viewer.gamma,
+                                                        );
+                                                        disp_g = crate::render_math::apply_gamma(
+                                                            disp_g,
+                                                            self.viewer.gamma,
+                                                        );
+                                                        disp_b = crate::render_math::apply_gamma(
+                                                            disp_b,
+                                                            self.viewer.gamma,
+                                                        );
                                                     }
 
                                                     if self.viewer.srgb {
-                                                        disp_r =
-                                                        crate::viewer::ExrViewer::linear_to_srgb(
+                                                        disp_r = crate::render_math::linear_to_srgb(
                                                             disp_r,
                                                         );
-                                                        disp_g =
-                                                        crate::viewer::ExrViewer::linear_to_srgb(
+                                                        disp_g = crate::render_math::linear_to_srgb(
                                                             disp_g,
                                                         );
-                                                        disp_b =
-                                                        crate::viewer::ExrViewer::linear_to_srgb(
+                                                        disp_b = crate::render_math::linear_to_srgb(
                                                             disp_b,
                                                         );
                                                     }
@@ -1536,7 +1530,8 @@ impl eframe::App for ExrApp {
                                     }
                                     let max_val = max_val.max(1.0);
 
-                                    let mut shapes = vec![];
+                                    // Up to 512 bars (256 bins × A/B); reserve to avoid reallocation.
+                                    let mut shapes = Vec::with_capacity(512);
                                     let bar_width = rect.width() / 256.0;
 
                                     for (i, &count) in bins.iter().enumerate() {

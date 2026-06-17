@@ -22,6 +22,7 @@ impl CubeLut {
     }
 
     pub fn load<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        use smallvec::SmallVec;
         let file = File::open(path)?;
         let reader = io::BufReader::new(file);
 
@@ -38,7 +39,9 @@ impl CubeLut {
                 continue;
             }
 
-            let parts: Vec<&str> = line.split_whitespace().collect();
+            // SmallVec avoids a heap allocation per line — data rows have
+            // exactly 3 tokens, keyword lines have ≤4.
+            let parts: SmallVec<[&str; 4]> = line.split_whitespace().collect();
             if parts.is_empty() {
                 continue;
             }
@@ -47,19 +50,37 @@ impl CubeLut {
                 "TITLE" => continue, // Ignore title
                 "LUT_3D_SIZE" => {
                     size = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+                    // Pre-reserve now that size is known — avoids ~18 reallocations
+                    // on a 64³ LUT and ~21 on a 128³ LUT.
+                    let expected = size * size * size;
+                    if expected > 0 {
+                        data.reserve(expected);
+                    }
                 }
                 "DOMAIN_MIN" => {
                     if parts.len() >= 4 {
-                        domain_min[0] = parts[1].parse().unwrap_or(0.0);
-                        domain_min[1] = parts[2].parse().unwrap_or(0.0);
-                        domain_min[2] = parts[3].parse().unwrap_or(0.0);
+                        let (Ok(a), Ok(b), Ok(c)) =
+                            (parts[1].parse(), parts[2].parse(), parts[3].parse())
+                        else {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("Malformed DOMAIN_MIN line: {line}"),
+                            ));
+                        };
+                        domain_min = [a, b, c];
                     }
                 }
                 "DOMAIN_MAX" => {
                     if parts.len() >= 4 {
-                        domain_max[0] = parts[1].parse().unwrap_or(1.0);
-                        domain_max[1] = parts[2].parse().unwrap_or(1.0);
-                        domain_max[2] = parts[3].parse().unwrap_or(1.0);
+                        let (Ok(a), Ok(b), Ok(c)) =
+                            (parts[1].parse(), parts[2].parse(), parts[3].parse())
+                        else {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("Malformed DOMAIN_MAX line: {line}"),
+                            ));
+                        };
+                        domain_max = [a, b, c];
                     }
                 }
                 _ => {

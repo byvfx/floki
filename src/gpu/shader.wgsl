@@ -226,9 +226,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Gamma
     if uniforms.gamma != 1.0 {
         let inv_gamma = 1.0 / uniforms.gamma;
-        r = select(0.0, pow(r, inv_gamma), r > 0.0);
-        g = select(0.0, pow(g, inv_gamma), g > 0.0);
-        b = select(0.0, pow(b, inv_gamma), b > 0.0);
+        r = pow(max(r, 0.0), inv_gamma);
+        g = pow(max(g, 0.0), inv_gamma);
+        b = pow(max(b, 0.0), inv_gamma);
     }
 
     // LUT
