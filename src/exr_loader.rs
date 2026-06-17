@@ -6,6 +6,10 @@ pub struct ExrData {
     /// Displayable passes derived by grouping channels by their dotted name
     /// prefix. See [`LogicalLayer`].
     pub logical_layers: Vec<LogicalLayer>,
+    /// Truncated, comma-joined list of logical-layer names, computed once at
+    /// load time. Shown in the status bar; rebuilding it every frame for
+    /// Blender EXRs with 100+ layers was wasteful.
+    pub channels_str: String,
 }
 
 /// A displayable "layer" (render pass) derived from grouping a physical EXR
@@ -62,9 +66,11 @@ impl ExrData {
         match read_result {
             Ok(image) => {
                 let logical_layers = build_logical_layers(&image);
+                let channels_str = build_channels_str(&logical_layers);
                 Ok(Self {
                     image,
                     logical_layers,
+                    channels_str,
                 })
             }
             Err(e) => {
@@ -130,6 +136,25 @@ impl ExrData {
         let get = |o: Option<usize>| o.and_then(|i| list.get(i));
         Some((layer, get(ll.r), get(ll.g), get(ll.b), get(ll.a)))
     }
+}
+
+/// Build the truncated, comma-joined display string of logical-layer names.
+/// Computed once at load time and cached on `ExrData` so the status bar
+/// doesn't rebuild it every frame (Blender EXRs can have 100+ layers).
+fn build_channels_str(layers: &[LogicalLayer]) -> String {
+    let mut s = String::new();
+    for name in layers.iter().map(|l| l.name.as_str()) {
+        if !s.is_empty() {
+            s.push(',');
+        }
+        s.push_str(name);
+        if s.len() > 50 {
+            s.truncate(50);
+            s.push_str("...");
+            break;
+        }
+    }
+    s
 }
 
 /// Build the logical-layer list for a loaded image by grouping each physical

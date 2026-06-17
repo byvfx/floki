@@ -1063,6 +1063,7 @@ impl eframe::App for ExrApp {
                      data: Option<&ExrData>,
                      hover_pos: Option<(usize, usize)>,
                      val: Option<[f32; 4]>,
+                     physical_index: usize,
                      layer_name: &str| {
                         if let Some(d) = data {
                             // Scroll each row horizontally on its own. Wrapping the whole
@@ -1075,36 +1076,10 @@ impl eframe::App for ExrApp {
                                         let disp_w = d.image.attributes.display_window.size.x();
                                         let disp_h = d.image.attributes.display_window.size.y();
 
-                                        // Resolve the *physical* layer backing this logical
-                                        // layer. `physical_index` maps into `image.layer_data`;
-                                        // never index it with a logical-layer position.
-                                        let phys_idx = d
-                                            .logical_layers
-                                            .iter()
-                                            .find(|l| l.name == layer_name)
-                                            .map(|l| l.physical_index)
-                                            .unwrap_or(0);
+                                        let channels_str = &d.channels_str;
 
-                                        // Built fresh each frame (immediate mode),
-                                        // but stop once we pass the 50-char display
-                                        // cap so we don't allocate a Vec + join every
-                                        // layer name (Blender EXRs have 100+) only to
-                                        // truncate it away.
-                                        let mut channels_str = String::new();
-                                        for name in d.logical_layers.iter().map(|l| l.name.as_str())
+                                        if let Some(layer) = d.image.layer_data.get(physical_index)
                                         {
-                                            if !channels_str.is_empty() {
-                                                channels_str.push(',');
-                                            }
-                                            channels_str.push_str(name);
-                                            if channels_str.len() > 50 {
-                                                channels_str.truncate(50);
-                                                channels_str.push_str("...");
-                                                break;
-                                            }
-                                        }
-
-                                        if let Some(layer) = d.image.layer_data.get(phys_idx) {
                                             let data_window_min = layer.attributes.layer_position;
                                             let data_w = layer.size.0;
                                             let data_h = layer.size.1;
@@ -1213,12 +1188,12 @@ impl eframe::App for ExrApp {
                         }
                     };
 
-                let layer_name_a = self
+                let ll_a = self
                     .exr_data
                     .as_ref()
-                    .and_then(|d| d.logical_layers.get(self.viewer.active_layer))
-                    .map(|l| l.name.as_str())
-                    .unwrap_or("");
+                    .and_then(|d| d.logical_layers.get(self.viewer.active_layer));
+                let phys_idx_a = ll_a.map(|l| l.physical_index).unwrap_or(0);
+                let layer_name_a = ll_a.map(|l| l.name.as_str()).unwrap_or("");
 
                 draw_nuke_status_line(
                     ui,
@@ -1226,19 +1201,18 @@ impl eframe::App for ExrApp {
                     self.exr_data.as_ref(),
                     self.viewer.last_hover_pos_img,
                     self.viewer.last_sampled_val_a,
+                    phys_idx_a,
                     layer_name_a,
                 );
 
                 if let Some(exr_b) = &self.exr_data_b {
-                    let layer_name_b = exr_b
-                        .logical_layers
-                        .get(
-                            self.viewer
-                                .active_layer
-                                .min(exr_b.logical_layers.len().saturating_sub(1)),
-                        )
-                        .map(|l| l.name.as_str())
-                        .unwrap_or("");
+                    let ll_b = exr_b.logical_layers.get(
+                        self.viewer
+                            .active_layer
+                            .min(exr_b.logical_layers.len().saturating_sub(1)),
+                    );
+                    let phys_idx_b = ll_b.map(|l| l.physical_index).unwrap_or(0);
+                    let layer_name_b = ll_b.map(|l| l.name.as_str()).unwrap_or("");
 
                     draw_nuke_status_line(
                         ui,
@@ -1246,6 +1220,7 @@ impl eframe::App for ExrApp {
                         Some(exr_b),
                         self.viewer.last_hover_pos_img,
                         self.viewer.last_sampled_val_b,
+                        phys_idx_b,
                         layer_name_b,
                     );
                 }
