@@ -2045,19 +2045,25 @@ impl ExrViewer {
         let a_s = sample_channel_f32(a_chan);
         let has_alpha = a_chan.is_some();
 
-        for y in 0..height {
-            for x in 0..width {
-                let i = (y * width + x) * 4;
-                pixels[i] = pixel_val(r_s, r_chan, x, y, width);
-                pixels[i + 1] = pixel_val(g_s, g_chan, x, y, width);
-                pixels[i + 2] = pixel_val(b_s, b_chan, x, y, width);
-                pixels[i + 3] = if has_alpha {
-                    pixel_val(a_s, a_chan, x, y, width)
-                } else {
-                    1.0
-                };
-            }
-        }
+        // Pack rows in parallel (mirrors the CPU fallback's par_chunks_mut
+        // pattern). For a 4K layer this is ~8M iterations with 4 channel
+        // reads each — single-threaded was a noticeable stall on layer switch.
+        pixels
+            .par_chunks_mut(width * 4)
+            .enumerate()
+            .for_each(|(y, row)| {
+                for x in 0..width {
+                    let i = x * 4;
+                    row[i] = pixel_val(r_s, r_chan, x, y, width);
+                    row[i + 1] = pixel_val(g_s, g_chan, x, y, width);
+                    row[i + 2] = pixel_val(b_s, b_chan, x, y, width);
+                    row[i + 3] = if has_alpha {
+                        pixel_val(a_s, a_chan, x, y, width)
+                    } else {
+                        1.0
+                    };
+                }
+            });
 
         let device = &render_state.device;
         let queue = &render_state.queue;
@@ -2741,37 +2747,58 @@ impl ExrViewer {
             return;
         }
 
+        let log_histogram = self.log_histogram;
         let calc_bins = |data: &ExrData, layer_idx: usize| -> Option<[u32; 256]> {
-            let mut bins = [0u32; 256];
             let (layer, r_chan, g_chan, b_chan, _) = data.logical_channels(layer_idx)?;
             let width = layer.size.0;
             let height = layer.size.1;
 
-            for y in 0..height {
-                for x in 0..width {
-                    let r = sample_channel(r_chan, x, y, width);
-                    let g = sample_channel(g_chan, x, y, width);
-                    let b = sample_channel(b_chan, x, y, width);
+            // Hoist F32 slices (common case) for direct indexing.
+            let r_s = sample_channel_f32(r_chan);
+            let g_s = sample_channel_f32(g_chan);
+            let b_s = sample_channel_f32(b_chan);
 
-                    // Luminance
-                    let lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            // Parallelize per-row: each thread accumulates its own [u32; 256]
+            // bins, then reduce by summing. For a 4K layer this is ~8M
+            // iterations — single-threaded was a noticeable stall on every
+            // layer/log-scale change.
+            let bins = (0..height)
+                .into_par_iter()
+                .map(|y| {
+                    let mut local = [0u32; 256];
+                    for x in 0..width {
+                        let r = pixel_val(r_s, r_chan, x, y, width);
+                        let g = pixel_val(g_s, g_chan, x, y, width);
+                        let b = pixel_val(b_s, b_chan, x, y, width);
 
-                    let bin = if self.log_histogram {
-                        let ev = if lum <= 0.0 {
-                            -10.0
+                        let lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+
+                        let bin = if log_histogram {
+                            let ev = if lum <= 0.0 {
+                                -10.0
+                            } else {
+                                lum.log2().clamp(-10.0, 10.0)
+                            };
+                            ((ev + 10.0) / 20.0 * 255.0) as usize
                         } else {
-                            lum.log2().clamp(-10.0, 10.0)
+                            (lum.clamp(0.0, 1.0) * 255.0) as usize
                         };
-                        ((ev + 10.0) / 20.0 * 255.0) as usize
-                    } else {
-                        (lum.clamp(0.0, 1.0) * 255.0) as usize
-                    };
 
-                    if bin < 256 {
-                        bins[bin] += 1;
+                        if bin < 256 {
+                            local[bin] += 1;
+                        }
                     }
-                }
-            }
+                    local
+                })
+                .reduce(
+                    || [0u32; 256],
+                    |mut a, b| {
+                        for i in 0..256 {
+                            a[i] += b[i];
+                        }
+                        a
+                    },
+                );
             Some(bins)
         };
 
