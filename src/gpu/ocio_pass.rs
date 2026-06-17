@@ -375,7 +375,9 @@ impl OcioTargets {
 pub struct OcioPass1Draw {
     pub bg_a: Arc<wgpu::BindGroup>,
     pub bg_b: Arc<wgpu::BindGroup>,
-    pub uniform_bg: wgpu::BindGroup,
+    /// Dynamic offset into `GpuState::uniform_buffer` where this draw's
+    /// `Uniforms` data was written via `queue.write_buffer`.
+    pub uniform_offset: u32,
     pub lut_bg: Arc<wgpu::BindGroup>,
 }
 
@@ -497,7 +499,7 @@ impl eframe::egui_wgpu::CallbackTrait for OcioCallback {
                 for d in &self.draws {
                     rp.set_bind_group(0, d.bg_a.as_ref(), &[]);
                     rp.set_bind_group(1, d.bg_b.as_ref(), &[]);
-                    rp.set_bind_group(2, &d.uniform_bg, &[]);
+                    rp.set_bind_group(2, &gpu.uniform_bind_group, &[d.uniform_offset]);
                     rp.set_bind_group(3, d.lut_bg.as_ref(), &[]);
                     rp.draw(0..6, 0..1);
                 }

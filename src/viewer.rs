@@ -1492,7 +1492,6 @@ impl ExrViewer {
         let painter = ui.painter().with_clip_rect(rect.intersect(disp_rect));
 
         // GPU RENDER PATH
-        use eframe::egui_wgpu::wgpu::util::DeviceExt;
         let uniform_data = crate::gpu::Uniforms {
             rect_min: [image_rect.min.x, image_rect.min.y],
             rect_max: [image_rect.max.x, image_rect.max.y],
@@ -1526,24 +1525,29 @@ impl ExrViewer {
         };
 
         // Acquire the renderer read-lock ONCE per frame: clone out the
-        // cheap (Arc-backed) uniform bind-group layout and the active LUT
-        // bind group. `draw_gpu` then builds its per-draw buffer without
-        // re-locking or re-looking-up GpuState. A single shared uniform
-        // buffer is NOT viable: egui defers paint callbacks, so each of the
-        // (up to 4) draws per frame needs its own immutable uniform snapshot
-        // alive until paint time.
-        let (uniform_layout, active_lut_bg, default_tex_bg) = {
+        // persistent uniform ring buffer and the active LUT bind group.
+        // `draw_gpu` writes per-draw uniform data into the ring buffer via
+        // `queue.write_buffer` at a dynamic offset — no per-frame
+        // `create_buffer_init` + `create_bind_group` allocation. The bind
+        // group itself lives in `GpuState` and is fetched by the paint
+        // callbacks via `callback_resources`.
+        let (uniform_buffer, active_lut_bg, default_tex_bg) = {
             let guard = render_state.renderer.read();
             let gpu_state = guard
                 .callback_resources
                 .get::<crate::gpu::GpuState>()
                 .unwrap();
-            let layout = gpu_state.bind_group_layout_uniform.clone();
-            let lut = lut_bg_opt
-                .clone()
-                .unwrap_or_else(|| gpu_state.default_lut_bind_group.clone());
-            (layout, lut, gpu_state.default_tex_bind_group.clone())
+            (
+                gpu_state.uniform_buffer.clone(),
+                lut_bg_opt
+                    .clone()
+                    .unwrap_or_else(|| gpu_state.default_lut_bind_group.clone()),
+                gpu_state.default_tex_bind_group.clone(),
+            )
         };
+        // Per-frame ring allocator: bumped by each `draw_gpu` call. Up to ~4
+        // draws per frame fit well within the 16-slot ring (2 KB total).
+        let uniform_offset = std::cell::Cell::new(0u32);
         #[cfg(feature = "ocio")]
         let ocio_active = self.ocio_active;
         // Under OCIO, draw_gpu accumulates pass-1 draws here instead of emitting a
@@ -1584,25 +1588,20 @@ impl ExrViewer {
                 u.skip_checker = 1;
             }
 
-            let device = &render_state.device;
+            let queue = &render_state.queue;
 
-            let uniform_buffer =
-                device.create_buffer_init(&eframe::egui_wgpu::wgpu::util::BufferInitDescriptor {
-                    label: Some("Exr Uniform Buffer"),
-                    contents: bytemuck::bytes_of(&u),
-                    usage: eframe::egui_wgpu::wgpu::BufferUsages::UNIFORM
-                        | eframe::egui_wgpu::wgpu::BufferUsages::COPY_DST,
-                });
-
-            let uniform_bg =
-                device.create_bind_group(&eframe::egui_wgpu::wgpu::BindGroupDescriptor {
-                    label: Some("Exr Uniform Bind Group"),
-                    layout: &uniform_layout,
-                    entries: &[eframe::egui_wgpu::wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: uniform_buffer.as_entire_binding(),
-                    }],
-                });
+            // Write this draw's uniform data into the persistent ring buffer
+            // at the current offset, then bump the allocator. This replaces
+            // the per-draw `create_buffer_init` + `create_bind_group` (two
+            // wgpu object allocations + a staging copy per draw per frame).
+            let offset = uniform_offset.get();
+            let uniform_size = std::mem::size_of::<crate::gpu::Uniforms>() as u32;
+            uniform_offset.set(offset + uniform_size);
+            debug_assert!(
+                offset + uniform_size <= crate::gpu::UNIFORM_RING_SLOTS as u32 * uniform_size,
+                "uniform ring buffer overflow: too many draws this frame"
+            );
+            queue.write_buffer(&uniform_buffer, offset as u64, bytemuck::bytes_of(&u));
 
             let bg_b = bg_b_opt.unwrap_or_else(|| default_tex_bg.clone());
             let final_clip_rect = painter.clip_rect().intersect(clip_rect);
@@ -1637,7 +1636,7 @@ impl ExrViewer {
                     .push(crate::gpu::ocio_pass::OcioPass1Draw {
                         bg_a,
                         bg_b,
-                        uniform_bg,
+                        uniform_offset: offset,
                         lut_bg: active_lut_bg.clone(),
                     });
                 return;
@@ -1646,7 +1645,7 @@ impl ExrViewer {
             let callback = crate::gpu::ExrCallback {
                 bg_a,
                 bg_b,
-                uniform_bg,
+                uniform_offset: offset,
                 lut_bg: active_lut_bg.clone(),
             };
             painter.with_clip_rect(final_clip_rect).add(

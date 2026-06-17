@@ -65,12 +65,22 @@ pub struct BlitUniforms {
 pub struct GpuState {
     pub pipeline: wgpu::RenderPipeline,
     pub bind_group_layout_tex: wgpu::BindGroupLayout,
+    /// Kept on the struct for potential future use; the ring-buffer bind group
+    /// (`uniform_bind_group` below) is what the paint callbacks actually use.
+    #[allow(dead_code)]
     pub bind_group_layout_uniform: wgpu::BindGroupLayout,
     pub bind_group_layout_lut: wgpu::BindGroupLayout,
     pub default_tex_bind_group: Arc<wgpu::BindGroup>,
     pub default_lut_bind_group: Arc<wgpu::BindGroup>,
     pub sampler: wgpu::Sampler,
     pub lut_sampler: wgpu::Sampler,
+    /// Persistent uniform ring buffer (sized `UNIFORM_RING_SLOTS *
+    /// size_of::<Uniforms>()`). Per-draw uniform data is written via
+    /// `queue.write_buffer` at a dynamic offset, eliminating the per-frame
+    /// `create_buffer_init` + `create_bind_group` that previously ran 1–4× per
+    /// frame. The bind group is created once and rebound with a dynamic offset.
+    pub uniform_buffer: wgpu::Buffer,
+    pub uniform_bind_group: wgpu::BindGroup,
     /// Same shader/layout as `pipeline` but renders into an `Rgba32Float` offscreen target
     /// (the OCIO "pass 1" scene-linear buffer). Drive it with `srgb=0, gamma=1, enable_lut=0`
     /// so it emits linear color for the OCIO display transform.
@@ -149,6 +159,11 @@ fn fs_main(i: VOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// Number of uniform slots in the persistent ring buffer. Up to 4 draws per
+/// frame (A/B/diff/composite/side-by-side) — 16 gives ample headroom. The
+/// buffer is only 16 × 128 = 2 KB.
+pub const UNIFORM_RING_SLOTS: u64 = 16;
+
 impl GpuState {
     pub fn new(
         device: &wgpu::Device,
@@ -191,8 +206,10 @@ impl GpuState {
                     visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                        has_dynamic_offset: true,
+                        min_binding_size: std::num::NonZeroU64::new(
+                            std::mem::size_of::<Uniforms>() as u64,
+                        ),
                     },
                     count: None,
                 }],
@@ -256,6 +273,25 @@ impl GpuState {
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
             cache: None,
+        });
+
+        // Persistent uniform ring buffer: one buffer + one bind group, reused
+        // across all draws via dynamic offsets. Eliminates the per-draw
+        // `create_buffer_init` + `create_bind_group` that previously ran 1–4×
+        // per frame.
+        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Uniform Ring Buffer"),
+            size: UNIFORM_RING_SLOTS * std::mem::size_of::<Uniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Uniform Ring Bind Group"),
+            layout: &bind_group_layout_uniform,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            }],
         });
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -513,6 +549,8 @@ impl GpuState {
             default_lut_bind_group,
             sampler,
             lut_sampler,
+            uniform_buffer,
+            uniform_bind_group,
             #[cfg(feature = "ocio")]
             pipeline_linear,
             #[cfg(feature = "ocio")]
@@ -585,7 +623,9 @@ impl GpuState {
 pub struct ExrCallback {
     pub bg_a: Arc<wgpu::BindGroup>,
     pub bg_b: Arc<wgpu::BindGroup>,
-    pub uniform_bg: wgpu::BindGroup,
+    /// Dynamic offset into `GpuState::uniform_buffer` where this draw's
+    /// `Uniforms` data was written via `queue.write_buffer`.
+    pub uniform_offset: u32,
     pub lut_bg: Arc<wgpu::BindGroup>,
 }
 
@@ -623,7 +663,7 @@ impl eframe::egui_wgpu::CallbackTrait for ExrCallback {
         render_pass.set_pipeline(&gpu_state.pipeline);
         render_pass.set_bind_group(0, self.bg_a.as_ref(), &[]);
         render_pass.set_bind_group(1, self.bg_b.as_ref(), &[]);
-        render_pass.set_bind_group(2, &self.uniform_bg, &[]);
+        render_pass.set_bind_group(2, &gpu_state.uniform_bind_group, &[self.uniform_offset]);
         render_pass.set_bind_group(3, self.lut_bg.as_ref(), &[]);
         render_pass.draw(0..6, 0..1);
     }
