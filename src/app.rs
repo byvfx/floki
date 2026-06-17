@@ -34,6 +34,12 @@ struct LoadResult {
     result: Result<ExrData, String>,
 }
 
+/// Job sent to the dedicated EXR worker thread via `load_tx`.
+struct LoadJob {
+    path: PathBuf,
+    is_b: bool,
+}
+
 /// Result of an off-thread `.cube` LUT parse. The GPU bind group is created
 /// on the UI thread in [`ExrApp::apply_lut_load_result`] (wgpu device access);
 /// only the file I/O + parsing runs off-thread.
@@ -145,9 +151,9 @@ pub struct ExrApp {
     loading_a: bool,
     #[serde(skip)]
     loading_b: bool,
-    /// Job queue sender: send `(path, is_b)` to the single worker thread.
+    /// Job queue sender: send `LoadJob { path, is_b }` to the single worker thread.
     #[serde(skip)]
-    load_tx: Option<std::sync::mpsc::Sender<LoadResult>>,
+    load_tx: Option<std::sync::mpsc::Sender<LoadJob>>,
     /// Result receiver: the worker sends completed `LoadResult`s back here.
     #[serde(skip)]
     load_rx: Option<std::sync::mpsc::Receiver<LoadResult>>,
@@ -373,7 +379,16 @@ impl ExrApp {
             rs.target_format,
         ) {
             Ok(pass) => {
-                rs.renderer.write().callback_resources.insert(pass);
+                let mut renderer = rs.renderer.write();
+                renderer.callback_resources.insert(pass);
+                // Invalidate the cached OcioTargets so it is recreated on the
+                // next frame against the new pipeline's bind group layout.
+                // Without this, a stale scene_bind_group from the old layout
+                // would be used with the new pipeline → wgpu validation error.
+                renderer
+                    .callback_resources
+                    .remove::<crate::gpu::ocio_pass::OcioTargets>();
+                drop(renderer);
                 self.ocio_ready = true;
                 self.ocio_error = None;
             }
@@ -420,6 +435,9 @@ impl ExrApp {
     fn apply_lut_load_result(&mut self, res: LutLoadResult) {
         // Discard stale results from a superseded reload.
         if res.path != self.lut_path {
+            // Clear transient flags so stale results don't bleed into the next reload.
+            self.lut_loading = false;
+            self.lut_pending_auto_enable = false;
             return;
         }
         self.lut_loading = false;
@@ -427,10 +445,6 @@ impl ExrApp {
         self.lut_pending_auto_enable = false;
         match res.result {
             Ok(lut) => {
-                self.lut_domain_min =
-                    [lut.domain_min[0], lut.domain_min[1], lut.domain_min[2], 0.0];
-                self.lut_domain_max =
-                    [lut.domain_max[0], lut.domain_max[1], lut.domain_max[2], 0.0];
                 if let Some(rs) = &self.render_state {
                     let renderer = rs.renderer.read();
                     if let Some(gpu_state) =
@@ -448,14 +462,22 @@ impl ExrApp {
                         self.lut_bg = Some(bg);
                         self.lut_texture = Some(tex);
                         self.lut_error = None;
+                        // Only update domain bounds once the bind group is live;
+                        // moving them here keeps the shader state consistent.
+                        self.lut_domain_min =
+                            [lut.domain_min[0], lut.domain_min[1], lut.domain_min[2], 0.0];
+                        self.lut_domain_max =
+                            [lut.domain_max[0], lut.domain_max[1], lut.domain_max[2], 0.0];
                         if auto_enable {
                             self.enable_lut = true;
                         }
                     } else {
                         self.lut_error = Some("GPU state not found".to_string());
+                        self.enable_lut = false;
                     }
                 } else {
                     self.lut_error = Some("Render state not found".to_string());
+                    self.enable_lut = false;
                 }
             }
             Err(e) => {
@@ -494,7 +516,7 @@ impl ExrApp {
         // 5 files queues them instead of spawning 5 parallel GBs-of-RAM parses.
         // Stale jobs are discarded by `apply_load_result`'s path check.
         if self.load_rx.is_none() {
-            let (job_tx, job_rx) = std::sync::mpsc::channel::<LoadResult>();
+            let (job_tx, job_rx) = std::sync::mpsc::channel::<LoadJob>();
             let (result_tx, result_rx) = std::sync::mpsc::channel::<LoadResult>();
             std::thread::spawn(move || {
                 for job in job_rx {
@@ -513,13 +535,7 @@ impl ExrApp {
             .load_tx
             .clone()
             .expect("load channel initialized above");
-        // Send a job request: the `result` field is a placeholder (Err) — the
-        // worker overwrites it with the actual load result before forwarding.
-        let _ = tx.send(LoadResult {
-            path,
-            is_b,
-            result: Err("pending".to_string()),
-        });
+        let _ = tx.send(LoadJob { path, is_b });
     }
 
     /// Apply a completed [`LoadResult`] from the worker thread. Ignores stale
