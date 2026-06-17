@@ -5,12 +5,34 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 
+/// Aggregate result of a `run_conversion_task` call. The per-file progress
+/// messages still flow through the `mpsc` channel (the GUI relies on them for
+/// live updates); this struct is the return value so the `convert_dir` binary
+/// can set a correct exit code without parsing message strings.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ConversionSummary {
+    pub converted: usize,
+    pub failed: usize,
+    pub total: usize,
+    pub cancelled: bool,
+}
+
+impl ConversionSummary {
+    /// `true` if the run had no failures and was not cancelled.
+    // Only called from `src/bin/convert_dir.rs`, which re-includes this file
+    // via `#[path]` (separate compilation) — the lib crate doesn't see the use.
+    #[allow(dead_code)]
+    pub fn is_success(&self) -> bool {
+        !self.cancelled && self.failed == 0
+    }
+}
+
 pub fn run_conversion_task(
     input_dir: PathBuf,
     output_dir: PathBuf,
     sender: Sender<(usize, usize, String)>,
     cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) {
+) -> ConversionSummary {
     let mut files_to_process = Vec::new();
 
     // Read all .exr files in the input directory
@@ -29,7 +51,7 @@ pub fn run_conversion_task(
         Err(e) => {
             log::error!("Failed to read input directory {:?}: {}", input_dir, e);
             let _ = sender.send((0, 0, format!("Failed to read directory: {}", e)));
-            return;
+            return ConversionSummary::default();
         }
     }
 
@@ -37,13 +59,13 @@ pub fn run_conversion_task(
     if total == 0 {
         log::warn!("No EXR files found in {:?}", input_dir);
         let _ = sender.send((0, 0, "No EXR files found in directory.".to_string()));
-        return;
+        return ConversionSummary::default();
     }
 
     if let Err(e) = std::fs::create_dir_all(&output_dir) {
         log::error!("Failed to create output directory {:?}: {}", output_dir, e);
         let _ = sender.send((0, 0, format!("Failed to create output directory: {}", e)));
-        return;
+        return ConversionSummary::default();
     }
 
     log::info!(
@@ -105,6 +127,13 @@ pub fn run_conversion_task(
     log::info!("EXR convert finished: {}", final_msg);
     let count = if cancelled { done } else { total };
     let _ = sender.send((count, total, final_msg));
+
+    ConversionSummary {
+        converted,
+        failed,
+        total,
+        cancelled,
+    }
 }
 
 /// Maps an RGBA-style channel suffix to its canonical single letter, or `None`
@@ -373,12 +402,22 @@ mod tests {
 
         let (tx, rx) = channel();
         let cancel = Arc::new(AtomicBool::new(false));
-        run_conversion_task(
+        let summary = run_conversion_task(
             in_dir.path().to_path_buf(),
             out_dir.path().to_path_buf(),
             tx,
             cancel,
         );
+
+        // The returned summary is authoritative for success/failure.
+        assert!(
+            summary.is_success(),
+            "non-cancelled run with all files converting must succeed: {summary:?}"
+        );
+        assert_eq!(summary.converted, N, "all {N} files must be converted");
+        assert_eq!(summary.failed, 0, "no failures expected");
+        assert_eq!(summary.total, N, "total must match file count");
+        assert!(!summary.cancelled, "must not be cancelled");
 
         let msgs: Vec<(usize, usize, String)> = rx.iter().collect();
         assert!(!msgs.is_empty(), "must emit progress");
@@ -432,13 +471,21 @@ mod tests {
 
         let (tx, rx) = channel();
         let cancel = Arc::new(AtomicBool::new(true)); // cancelled before it starts
-        run_conversion_task(
+        let summary = run_conversion_task(
             in_dir.path().to_path_buf(),
             out_dir.path().to_path_buf(),
             tx,
             cancel,
         );
         let _drain: Vec<_> = rx.iter().collect();
+
+        // The summary must reflect cancellation.
+        assert!(summary.cancelled, "summary must report cancelled");
+        assert!(
+            !summary.is_success(),
+            "cancelled run must not be a success: {summary:?}"
+        );
+        assert_eq!(summary.total, 3, "total must still report the file count");
 
         let produced = std::fs::read_dir(out_dir.path())
             .unwrap()

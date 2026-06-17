@@ -26,9 +26,27 @@ fn main() {
     let (tx, rx) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
 
-    tools::run_conversion_task(input, output, tx, cancel);
+    let summary = tools::run_conversion_task(input, output, tx, cancel);
 
     for (done, total, msg) in rx {
         println!("[{done}/{total}] {msg}");
+    }
+
+    // Exit non-zero if any file failed or the run was cancelled, so CI/scripts
+    // can detect failure. The summary is authoritative (the channel messages are
+    // for human-readable progress only).
+    if !summary.is_success() {
+        eprintln!(
+            "Conversion did not fully succeed: {} converted, {} failed, {} total{}",
+            summary.converted,
+            summary.failed,
+            summary.total,
+            if summary.cancelled {
+                " (cancelled)"
+            } else {
+                ""
+            }
+        );
+        std::process::exit(1);
     }
 }
