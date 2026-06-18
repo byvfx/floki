@@ -1,5 +1,8 @@
 /target
 
+# macOS Finder metadata
+.DS_Store
+
 # EXR test assets / renders (large binaries)
 *.exr
 
