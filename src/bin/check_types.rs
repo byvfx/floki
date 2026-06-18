@@ -14,7 +14,10 @@ fn main() {
         .all_attributes()
         .from_file(path);
 
-    let disp = image.unwrap().attributes.display_window;
+    let disp = image
+        .expect("failed to load test.exr")
+        .attributes
+        .display_window;
     let _disp_pos = disp.position;
     let _disp_size = disp.size;
 }

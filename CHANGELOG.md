@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.3] - 2026-06-17
+
+### Fixed
+- The OCIO CPU display transform (and CPU composite path) now show nothing
+  rather than wrong colors when the transform fails: previously the
+  untransformed scene-linear buffer was clamped to [0,1] and displayed, silently
+  presenting incorrect color with no indication the transform never ran.
+
+### Changed
+- Internal: hardened a set of panic-prone `unwrap()`s across the GPU/CPU canvas
+  render paths (side-by-side draws, egui paint/prepare callbacks, and GPU
+  resource lookups) into clean early-returns. These crossed function-call
+  boundaries where the upholding invariant wasn't locally visible. No user-facing
+  behavior change in the normal case — the app degrades gracefully instead of
+  crashing if an invariant is ever violated.
+
 ## [1.5.2] - 2026-06-17
 
 ### Fixed
