@@ -465,7 +465,9 @@ impl eframe::egui_wgpu::CallbackTrait for OcioCallback {
             .is_none_or(|t| t.width != w || t.height != h);
         if need_new {
             let (blit_layout, blit_sampler) = {
-                let gpu = callback_resources.get::<GpuState>().unwrap();
+                let Some(gpu) = callback_resources.get::<GpuState>() else {
+                    return Vec::new();
+                };
                 (gpu.blit_layout.clone(), gpu.blit_sampler.clone())
             };
             let targets = OcioTargets::new(
@@ -482,7 +484,9 @@ impl eframe::egui_wgpu::CallbackTrait for OcioCallback {
         // Per-frame blit params (display window, overscan dim, checker) — written every
         // frame so `paint` (which has no queue) can just bind the existing buffer.
         {
-            let targets = callback_resources.get::<OcioTargets>().unwrap();
+            let Some(targets) = callback_resources.get::<OcioTargets>() else {
+                return Vec::new();
+            };
             queue.write_buffer(
                 &targets.blit_uniform_buffer,
                 0,
@@ -502,35 +506,39 @@ impl eframe::egui_wgpu::CallbackTrait for OcioCallback {
         // Clone the layout + sampler out of `OcioGpuPass` first (wgpu types are
         // cheaply `Arc`-backed) so we don't hold an immutable borrow of
         // `callback_resources` while taking a mutable one for `OcioTargets`.
-        if callback_resources
+        let scene_bg_missing = callback_resources
             .get::<OcioTargets>()
-            .unwrap()
-            .scene_bind_group
-            .is_none()
-        {
+            .is_some_and(|t| t.scene_bind_group.is_none());
+        if scene_bg_missing {
             let (layout, sampler) = {
-                let ocio = callback_resources.get::<OcioGpuPass>().unwrap();
+                let Some(ocio) = callback_resources.get::<OcioGpuPass>() else {
+                    return Vec::new();
+                };
                 (ocio.group_layouts[1].clone(), ocio.scene_sampler.clone())
             };
-            let targets = callback_resources.get_mut::<OcioTargets>().unwrap();
-            targets.init_scene_bind_group(device, &layout, &sampler);
+            if let Some(targets) = callback_resources.get_mut::<OcioTargets>() {
+                targets.init_scene_bind_group(device, &layout, &sampler);
+            }
         }
 
         // Skip the two passes when nothing affecting the render changed; `paint` re-blits the
         // cached display_view, so hover / menu / animation repaints stay cheap.
-        let dirty = callback_resources
-            .get::<OcioTargets>()
-            .unwrap()
-            .last_render_sig
-            != Some(self.render_sig);
+        let Some(targets) = callback_resources.get::<OcioTargets>() else {
+            return Vec::new();
+        };
+        let dirty = targets.last_render_sig != Some(self.render_sig);
         if !dirty {
             return Vec::new();
         }
 
         let cmd = {
-            let gpu = callback_resources.get::<GpuState>().unwrap();
-            let ocio = callback_resources.get::<OcioGpuPass>().unwrap();
-            let targets = callback_resources.get::<OcioTargets>().unwrap();
+            let (Some(gpu), Some(ocio), Some(targets)) = (
+                callback_resources.get::<GpuState>(),
+                callback_resources.get::<OcioGpuPass>(),
+                callback_resources.get::<OcioTargets>(),
+            ) else {
+                return Vec::new();
+            };
 
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("OCIO"),

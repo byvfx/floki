@@ -1403,7 +1403,12 @@ impl ExrViewer {
         let unclipped_painter = ui.painter().with_clip_rect(rect);
         let painter = ui.painter().with_clip_rect(rect.intersect(disp_rect));
 
-        let texture = &self.textures[self.active_layer];
+        // Defense-in-depth: the active-layer CPU texture is normally guaranteed
+        // present by `has_texture` in `ExrViewer::ui()`, but that invariant crosses
+        // a function-call boundary, so bail out cleanly rather than panicking here.
+        let Some(texture) = self.textures[self.active_layer].as_ref() else {
+            return;
+        };
         let draw_image = |painter: &egui::Painter,
                           tex: &egui::TextureHandle,
                           clip_rect: egui::Rect,
@@ -1421,7 +1426,7 @@ impl ExrViewer {
 
         let draw_all_cpu = |p: &egui::Painter, opac: f32| match self.compare_mode {
             CompareMode::SingleA => {
-                draw_image(p, texture.as_ref().unwrap(), rect, image_rect, opac);
+                draw_image(p, texture, rect, image_rect, opac);
             }
             CompareMode::SingleB => {
                 if let Some(tex_b) = exr_data_b.and_then(|d| {
@@ -1442,7 +1447,7 @@ impl ExrViewer {
                 let mut rect_b = rect;
                 rect_b.min.x = clamped_wipe_x;
 
-                draw_image(p, texture.as_ref().unwrap(), rect_a, image_rect, opac);
+                draw_image(p, texture, rect_a, image_rect, opac);
                 if let Some(tex_b) = exr_data_b.and_then(|d| {
                     self.textures_b[self
                         .active_layer
@@ -1469,11 +1474,11 @@ impl ExrViewer {
                         .min(d.logical_layers.len().saturating_sub(1))]
                     .as_ref()
                 });
-                if let Some(tex_b) = tex_b_opt {
-                    let mut image_size_b = tex_size_b.unwrap() * self.scale;
+                if let (Some(tex_b), Some(size_b)) = (tex_b_opt, tex_size_b) {
+                    let mut image_size_b = size_b * self.scale;
                     if self.normalize_side_by_side {
-                        let scale_b = (tex_size.y * self.scale) / tex_size_b.unwrap().y;
-                        image_size_b = tex_size_b.unwrap() * scale_b;
+                        let scale_b = (tex_size.y * self.scale) / size_b.y;
+                        image_size_b = size_b * scale_b;
                     }
                     let combined_width = image_size.x + image_size_b.x;
                     let combined_height = image_size.y.max(image_size_b.y);
@@ -1498,7 +1503,7 @@ impl ExrViewer {
                         combined_rect.center().y,
                     ));
 
-                    draw_image(p, texture.as_ref().unwrap(), rect, image_rect_a, opac);
+                    draw_image(p, texture, rect, image_rect_a, opac);
                     draw_image(p, tex_b, rect, image_rect_b, opac);
 
                     p.line_segment(
@@ -1509,7 +1514,7 @@ impl ExrViewer {
                         (2.0, egui::Color32::GRAY),
                     );
                 } else {
-                    draw_image(p, texture.as_ref().unwrap(), rect, image_rect, opac);
+                    draw_image(p, texture, rect, image_rect, opac);
                 }
             }
             CompareMode::DiffMatte => {
@@ -1604,10 +1609,11 @@ impl ExrViewer {
         // callbacks via `callback_resources`.
         let (uniform_buffer, uniform_stride, active_lut_bg, default_tex_bg) = {
             let guard = render_state.renderer.read();
-            let gpu_state = guard
-                .callback_resources
-                .get::<crate::gpu::GpuState>()
-                .unwrap();
+            // Defense-in-depth: GpuState is inserted at startup, but the lookup
+            // crosses a function boundary — bail cleanly rather than panic.
+            let Some(gpu_state) = guard.callback_resources.get::<crate::gpu::GpuState>() else {
+                return;
+            };
             (
                 gpu_state.uniform_buffer.clone(),
                 gpu_state.uniform_stride,
@@ -1828,11 +1834,11 @@ impl ExrViewer {
                             .min(d.logical_layers.len().saturating_sub(1))]
                         .clone()
                     });
-                    if let Some(bg_b) = bg_b_opt {
-                        let mut image_size_b = tex_size_b.unwrap() * self.scale;
+                    if let (Some(bg_b), Some(size_b)) = (bg_b_opt, tex_size_b) {
+                        let mut image_size_b = size_b * self.scale;
                         if self.normalize_side_by_side {
-                            let scale_b = (tex_size.y * self.scale) / tex_size_b.unwrap().y;
-                            image_size_b = tex_size_b.unwrap() * scale_b;
+                            let scale_b = (tex_size.y * self.scale) / size_b.y;
+                            image_size_b = size_b * scale_b;
                         }
                         let combined_width = image_size.x + image_size_b.x;
                         let combined_height = image_size.y.max(image_size_b.y);
@@ -2111,10 +2117,11 @@ impl ExrViewer {
         let view = texture.create_view(&eframe::egui_wgpu::wgpu::TextureViewDescriptor::default());
 
         let renderer_read = render_state.renderer.read();
+        // Defense-in-depth: GpuState is inserted at startup; return None rather
+        // than panic if the lookup ever fails.
         let gpu_state = renderer_read
             .callback_resources
-            .get::<crate::gpu::GpuState>()
-            .unwrap();
+            .get::<crate::gpu::GpuState>()?;
 
         let bind_group = device.create_bind_group(&eframe::egui_wgpu::wgpu::BindGroupDescriptor {
             label: Some("Exr Texture Bind Group"),
@@ -2324,7 +2331,12 @@ impl ExrViewer {
             });
 
         if let Err(e) = proc.apply_rgba(&mut buf, width, height) {
+            // Bail rather than display the untransformed buffer: clamping raw
+            // scene-linear values to [0,1] would show wrong colors with no
+            // indication the transform never ran. Returning None lets the
+            // caller fall back / show nothing instead of silent garbage.
             log::error!("OCIO CPU transform failed: {e}");
+            return None;
         }
 
         let mut pixels = vec![egui::Color32::BLACK; width * height];
@@ -2637,7 +2649,10 @@ impl ExrViewer {
             });
 
         if let Err(e) = proc.apply_rgba(&mut buf, width, height) {
+            // Fail closed (see generate_texture_ocio): show nothing rather than
+            // clamped, untransformed composite colors.
             log::error!("OCIO CPU composite transform failed: {e}");
+            return None;
         }
 
         let mut pixels = vec![egui::Color32::BLACK; width * height];

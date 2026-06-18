@@ -674,7 +674,11 @@ impl eframe::egui_wgpu::CallbackTrait for ExrCallback {
         render_pass: &mut wgpu::RenderPass<'static>,
         callback_resources: &eframe::egui_wgpu::CallbackResources,
     ) {
-        let gpu_state = callback_resources.get::<GpuState>().unwrap();
+        // egui's CallbackTrait::paint is infallible, so a panic here would crash
+        // the app — bail cleanly if GpuState is somehow absent.
+        let Some(gpu_state) = callback_resources.get::<GpuState>() else {
+            return;
+        };
 
         // egui_wgpu sets the viewport to the primitive's bounding box, which squishes our quad!
         // We override it to the full physical screen so our shader's screen-space math works perfectly.
