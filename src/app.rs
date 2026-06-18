@@ -623,9 +623,9 @@ impl ExrApp {
         if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
             let screen = ctx.content_rect();
             let cx = screen.center().x;
-            let target_b = ctx
-                .input(|i| i.pointer.hover_pos().or(i.pointer.latest_pos()))
-                .is_some_and(|p| p.x >= cx);
+            // The OS cursor moves during the drag even though winit delivers no
+            // events, so query it directly (see `live_dropped_right`).
+            let target_b = live_dropped_right(ctx).unwrap_or(false);
 
             let painter = ctx.layer_painter(egui::LayerId::new(
                 egui::Order::Foreground,
@@ -679,13 +679,7 @@ impl ExrApp {
         }
 
         // Handle files dropped this frame.
-        let (dropped, pointer, center_x) = ctx.input(|i| {
-            (
-                i.raw.dropped_files.clone(),
-                i.pointer.latest_pos(),
-                i.content_rect().center().x,
-            )
-        });
+        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         if dropped.is_empty() {
             return;
         }
@@ -694,11 +688,68 @@ impl ExrApp {
             .filter_map(|f| f.path)
             .filter(|p| is_exr_path(p))
             .collect();
-        let dropped_right = pointer.is_some_and(|p| p.x >= center_x);
+        let dropped_right = live_dropped_right(ctx).unwrap_or(false);
         for (path, is_b) in route_dropped_exrs(&exr_paths, dropped_right) {
             self.open_file(path, is_b);
         }
     }
+}
+
+/// Global OS cursor position in SCREEN-SPACE POINTS — the same space as
+/// `ViewportInfo::inner_rect` — queried directly from the OS rather than via
+/// winit events. During an external file drag winit delivers no cursor-move
+/// events, so egui's pointer is stale, but the OS cursor itself keeps moving.
+/// `None` on unsupported platforms.
+///
+/// Note the per-platform coordinate space: macOS `CGEvent` locations are already
+/// in points (global display space), whereas Windows `GetCursorPos` returns
+/// physical pixels, so only the Windows path divides by `pixels_per_point`.
+fn global_cursor_pos_points(pixels_per_point: f32) -> Option<egui::Pos2> {
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::Foundation::POINT;
+        use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+        let mut p = POINT::default();
+        // SAFETY: `GetCursorPos` writes a valid POINT; we pass a live pointer to it.
+        unsafe { GetCursorPos(&mut p).ok()? };
+        Some(egui::pos2(
+            p.x as f32 / pixels_per_point,
+            p.y as f32 / pixels_per_point,
+        ))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use core_graphics::event::CGEvent;
+        use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+        // A null-ish event created from a session source carries the *current*
+        // cursor location (the documented `CGEventCreate(NULL)` idiom). Already
+        // in screen-space points, so `pixels_per_point` is not needed here.
+        let _ = pixels_per_point;
+        let src = CGEventSource::new(CGEventSourceStateID::CombinedSessionState).ok()?;
+        let loc = CGEvent::new(src).ok()?.location();
+        Some(egui::pos2(loc.x as f32, loc.y as f32))
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let _ = pixels_per_point;
+        None
+    }
+}
+
+/// Whether `cursor_points` (screen-space points) is in the right half of
+/// `window_rect` (also screen-space points) — i.e. the drop targets Image B.
+/// Only X matters, so the cross-platform Y-origin difference is irrelevant.
+/// Pure / testable.
+fn cursor_targets_right(cursor_points: egui::Pos2, window_rect: egui::Rect) -> bool {
+    cursor_points.x >= window_rect.center().x
+}
+
+/// Live drop-target side this frame from the OS cursor + window rect, or `None`
+/// if either is unavailable (caller defaults to A / left).
+fn live_dropped_right(ctx: &egui::Context) -> Option<bool> {
+    let rect = ctx.input(|i| i.viewport().inner_rect)?;
+    let cursor = global_cursor_pos_points(ctx.pixels_per_point())?;
+    Some(cursor_targets_right(cursor, rect))
 }
 
 /// True if `path` has a (case-insensitive) `.exr` extension.
@@ -1901,5 +1952,34 @@ mod tests {
     #[test]
     fn route_empty_drop_is_noop() {
         assert!(route_dropped_exrs(&[], false).is_empty());
+    }
+
+    #[test]
+    fn cursor_targets_right_splits_on_window_center() {
+        // Window spanning screen-points x: 0..1000 (center 500).
+        let rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1000.0, 800.0));
+        assert!(!cursor_targets_right(egui::pos2(499.0, 10.0), rect));
+        assert!(cursor_targets_right(egui::pos2(501.0, 10.0), rect));
+        // Exactly at center counts as right (`>=`).
+        assert!(cursor_targets_right(egui::pos2(500.0, 10.0), rect));
+    }
+
+    #[test]
+    fn cursor_targets_right_uses_window_screen_center_not_origin() {
+        // Off-origin window (e.g. dragged to the right of the primary monitor):
+        // screen-points x 400..1400, center 900. Proves we compare against the
+        // window's *screen-space* center, so multi-monitor / moved windows work.
+        let rect = egui::Rect::from_min_max(egui::pos2(400.0, 0.0), egui::pos2(1400.0, 800.0));
+        assert!(!cursor_targets_right(egui::pos2(850.0, 0.0), rect));
+        assert!(cursor_targets_right(egui::pos2(950.0, 0.0), rect));
+    }
+
+    #[test]
+    fn cursor_targets_right_handles_negative_origin_monitor() {
+        // Secondary monitor to the left of primary: screen-points x -1920..-920,
+        // center -1420. Cursor at -1500 is left of center -> A.
+        let rect = egui::Rect::from_min_max(egui::pos2(-1920.0, 0.0), egui::pos2(-920.0, 800.0));
+        assert!(!cursor_targets_right(egui::pos2(-1500.0, 0.0), rect));
+        assert!(cursor_targets_right(egui::pos2(-1000.0, 0.0), rect));
     }
 }

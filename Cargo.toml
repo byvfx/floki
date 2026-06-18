@@ -44,6 +44,15 @@ approx = "0.5"          # float-tolerant assertions for color math
 pollster = "0.4"        # block on wgpu async in headless GPU tests
 criterion = "0.5"       # statistical benchmark harness (benches/)
 
+# Native global-cursor query for drag-and-drop A/B routing: winit discards the
+# drop position, so we read the OS cursor directly (see `global_cursor_pos_px`
+# in src/app.rs). Versions match what's already resolved in Cargo.lock.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.23"
+
 # EXR decode + logical-layer grouping benchmark (the `ExrData::load` hot path).
 # Runs synthetic fixtures everywhere; also benches real renders dropped into
 # `assets/perf/` (or $FLOKI_PERF_FIXTURES) — see assets/perf/README.md.
