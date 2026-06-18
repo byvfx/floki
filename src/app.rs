@@ -611,6 +611,84 @@ impl ExrApp {
         }
         self.error_msg = None;
     }
+
+    /// Load EXR files dragged onto the window. While files are dragged over the
+    /// window a left/right split overlay is drawn; on drop a single file routes
+    /// by position (right half → reference Image B) and multiple files load
+    /// first → A, second → B with the rest ignored. Non-EXR drops are ignored.
+    fn handle_drag_and_drop(&mut self, ctx: &egui::Context) {
+        // Hover preview while files are dragged in (before release).
+        if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+            let screen = ctx.content_rect();
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("dnd_overlay"),
+            ));
+            painter.rect_filled(screen, 0.0, egui::Color32::from_black_alpha(160));
+            let cx = screen.center().x;
+            painter.line_segment(
+                [
+                    egui::pos2(cx, screen.top()),
+                    egui::pos2(cx, screen.bottom()),
+                ],
+                (2.0, egui::Color32::from_white_alpha(180)),
+            );
+            let font = egui::FontId::proportional(28.0);
+            painter.text(
+                egui::pos2(screen.left() + screen.width() * 0.25, screen.center().y),
+                egui::Align2::CENTER_CENTER,
+                "Drop for A",
+                font.clone(),
+                egui::Color32::WHITE,
+            );
+            painter.text(
+                egui::pos2(screen.left() + screen.width() * 0.75, screen.center().y),
+                egui::Align2::CENTER_CENTER,
+                "Drop for B (reference)",
+                font,
+                egui::Color32::WHITE,
+            );
+        }
+
+        // Handle files dropped this frame.
+        let (dropped, pointer, center_x) = ctx.input(|i| {
+            (
+                i.raw.dropped_files.clone(),
+                i.pointer.latest_pos(),
+                i.content_rect().center().x,
+            )
+        });
+        if dropped.is_empty() {
+            return;
+        }
+        let exr_paths: Vec<PathBuf> = dropped
+            .into_iter()
+            .filter_map(|f| f.path)
+            .filter(|p| is_exr_path(p))
+            .collect();
+        let dropped_right = pointer.is_some_and(|p| p.x >= center_x);
+        for (path, is_b) in route_dropped_exrs(&exr_paths, dropped_right) {
+            self.open_file(path, is_b);
+        }
+    }
+}
+
+/// True if `path` has a (case-insensitive) `.exr` extension.
+fn is_exr_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("exr"))
+}
+
+/// Map dropped EXR paths to `(path, is_b)` load requests. A single file routes
+/// by drop position (`dropped_right` → Image B); multiple files load first → A,
+/// second → B, and any extras are ignored.
+fn route_dropped_exrs(paths: &[PathBuf], dropped_right: bool) -> Vec<(PathBuf, bool)> {
+    match paths {
+        [] => Vec::new(),
+        [single] => vec![(single.clone(), dropped_right)],
+        [a, b, ..] => vec![(a.clone(), false), (b.clone(), true)],
+    }
 }
 
 impl eframe::App for ExrApp {
@@ -622,6 +700,9 @@ impl eframe::App for ExrApp {
         // Apply the persisted theme preference. Idempotent per frame; `System`
         // tracks the OS light/dark setting via egui's input each frame.
         ui.ctx().set_theme(self.theme);
+
+        // Load EXR files dragged onto the window (and draw the drag-over overlay).
+        self.handle_drag_and_drop(ui.ctx());
 
         // Drain completed async image loads (collect first so the `load_rx`
         // borrow ends before the `&mut self` apply call).
@@ -1745,5 +1826,52 @@ mod tests {
             "both loading flags cleared (A discards any in-flight B)"
         );
         assert!(app.error_msg.is_none());
+    }
+
+    #[test]
+    fn is_exr_path_is_case_insensitive_and_extension_only() {
+        assert!(is_exr_path(std::path::Path::new("/a/b/shot.exr")));
+        assert!(is_exr_path(std::path::Path::new("SHOT.EXR")));
+        assert!(is_exr_path(std::path::Path::new("render.Exr")));
+        assert!(!is_exr_path(std::path::Path::new("note.txt")));
+        assert!(!is_exr_path(std::path::Path::new("exr"))); // bare name, no extension
+        assert!(!is_exr_path(std::path::Path::new("archive.exr.zip")));
+    }
+
+    #[test]
+    fn route_single_drop_uses_position() {
+        let p = vec![PathBuf::from("a.exr")];
+        assert_eq!(
+            route_dropped_exrs(&p, false),
+            vec![(PathBuf::from("a.exr"), false)],
+            "left half loads as A"
+        );
+        assert_eq!(
+            route_dropped_exrs(&p, true),
+            vec![(PathBuf::from("a.exr"), true)],
+            "right half loads as B"
+        );
+    }
+
+    #[test]
+    fn route_multi_drop_is_a_then_b_rest_ignored() {
+        let paths = vec![
+            PathBuf::from("a.exr"),
+            PathBuf::from("b.exr"),
+            PathBuf::from("c.exr"),
+        ];
+        // Position is ignored once there are 2+ files: first → A, second → B.
+        assert_eq!(
+            route_dropped_exrs(&paths, true),
+            vec![
+                (PathBuf::from("a.exr"), false),
+                (PathBuf::from("b.exr"), true),
+            ],
+        );
+    }
+
+    #[test]
+    fn route_empty_drop_is_noop() {
+        assert!(route_dropped_exrs(&[], false).is_empty());
     }
 }
