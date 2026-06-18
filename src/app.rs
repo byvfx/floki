@@ -617,15 +617,38 @@ impl ExrApp {
     /// by position (right half → reference Image B) and multiple files load
     /// first → A, second → B with the rest ignored. Non-EXR drops are ignored.
     fn handle_drag_and_drop(&mut self, ctx: &egui::Context) {
-        // Hover preview while files are dragged in (before release).
+        // Hover preview while files are dragged in (before release). The cursor
+        // position updates during the drag, so highlight the half it's currently
+        // over — the half that will receive the drop — to make A vs B obvious.
         if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
             let screen = ctx.content_rect();
+            let cx = screen.center().x;
+            let target_b = ctx
+                .input(|i| i.pointer.hover_pos().or(i.pointer.latest_pos()))
+                .is_some_and(|p| p.x >= cx);
+
             let painter = ctx.layer_painter(egui::LayerId::new(
                 egui::Order::Foreground,
                 egui::Id::new("dnd_overlay"),
             ));
-            painter.rect_filled(screen, 0.0, egui::Color32::from_black_alpha(160));
-            let cx = screen.center().x;
+            let left = egui::Rect::from_min_max(screen.min, egui::pos2(cx, screen.max.y));
+            let right = egui::Rect::from_min_max(egui::pos2(cx, screen.min.y), screen.max);
+            let active = if target_b { right } else { left };
+
+            // Dim the whole window, then brighten the active half so it reads as
+            // the live drop target.
+            painter.rect_filled(screen, 0.0, egui::Color32::from_black_alpha(150));
+            painter.rect_filled(
+                active,
+                0.0,
+                egui::Color32::from_rgba_unmultiplied(40, 90, 160, 70),
+            );
+            painter.rect_stroke(
+                active,
+                0.0,
+                egui::Stroke::new(3.0, egui::Color32::from_rgb(90, 160, 240)),
+                egui::StrokeKind::Inside,
+            );
             painter.line_segment(
                 [
                     egui::pos2(cx, screen.top()),
@@ -633,21 +656,26 @@ impl ExrApp {
                 ],
                 (2.0, egui::Color32::from_white_alpha(180)),
             );
+
             let font = egui::FontId::proportional(28.0);
+            let bright = egui::Color32::WHITE;
+            let dim = egui::Color32::from_white_alpha(110);
             painter.text(
                 egui::pos2(screen.left() + screen.width() * 0.25, screen.center().y),
                 egui::Align2::CENTER_CENTER,
                 "Drop for A",
                 font.clone(),
-                egui::Color32::WHITE,
+                if target_b { dim } else { bright },
             );
             painter.text(
                 egui::pos2(screen.left() + screen.width() * 0.75, screen.center().y),
                 egui::Align2::CENTER_CENTER,
                 "Drop for B (reference)",
                 font,
-                egui::Color32::WHITE,
+                if target_b { bright } else { dim },
             );
+            // Keep repainting so the highlight tracks the cursor smoothly.
+            ctx.request_repaint();
         }
 
         // Handle files dropped this frame.
