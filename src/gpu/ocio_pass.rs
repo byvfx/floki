@@ -415,7 +415,9 @@ impl eframe::egui_wgpu::CallbackTrait for OcioCallback {
             .is_none_or(|t| t.width != w || t.height != h);
         if need_new {
             let (blit_layout, blit_sampler) = {
-                let gpu = callback_resources.get::<GpuState>().unwrap();
+                let Some(gpu) = callback_resources.get::<GpuState>() else {
+                    return Vec::new();
+                };
                 (gpu.blit_layout.clone(), gpu.blit_sampler.clone())
             };
             let targets = OcioTargets::new(
@@ -432,7 +434,9 @@ impl eframe::egui_wgpu::CallbackTrait for OcioCallback {
         // Per-frame blit params (display window, overscan dim, checker) — written every
         // frame so `paint` (which has no queue) can just bind the existing buffer.
         {
-            let targets = callback_resources.get::<OcioTargets>().unwrap();
+            let Some(targets) = callback_resources.get::<OcioTargets>() else {
+                return Vec::new();
+            };
             queue.write_buffer(
                 &targets.blit_uniform_buffer,
                 0,
@@ -447,19 +451,22 @@ impl eframe::egui_wgpu::CallbackTrait for OcioCallback {
 
         // Skip the two passes when nothing affecting the render changed; `paint` re-blits the
         // cached display_view, so hover / menu / animation repaints stay cheap.
-        let dirty = callback_resources
-            .get::<OcioTargets>()
-            .unwrap()
-            .last_render_sig
-            != Some(self.render_sig);
+        let Some(targets) = callback_resources.get::<OcioTargets>() else {
+            return Vec::new();
+        };
+        let dirty = targets.last_render_sig != Some(self.render_sig);
         if !dirty {
             return Vec::new();
         }
 
         let cmd = {
-            let gpu = callback_resources.get::<GpuState>().unwrap();
-            let ocio = callback_resources.get::<OcioGpuPass>().unwrap();
-            let targets = callback_resources.get::<OcioTargets>().unwrap();
+            let (Some(gpu), Some(ocio), Some(targets)) = (
+                callback_resources.get::<GpuState>(),
+                callback_resources.get::<OcioGpuPass>(),
+                callback_resources.get::<OcioTargets>(),
+            ) else {
+                return Vec::new();
+            };
 
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("OCIO"),

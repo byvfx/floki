@@ -2,15 +2,18 @@ use std::fs::File;
 use std::io::{self, BufRead};
 use std::path::Path;
 
-// Parsed and unit-tested, but not yet wired into the UI: .cube LUTs are loaded
-// via the GPU `lut_bg` path today, and this CPU-side representation is staged for
-// a planned CPU LUT-apply / inspection feature. Kept (with the allow) rather than
-// deleted so the parser + tests don't bit-rot before that lands.
-#[allow(dead_code)]
+// CPU-side .cube LUT: loaded by `ExrApp::reload_lut` and uploaded to the GPU via
+// `GpuState::create_lut_bind_group` (the `lut_bg` path). The parsed representation
+// also backs a future CPU LUT-apply / inspection path.
 #[derive(Debug)]
 pub struct CubeLut {
     pub size: usize,
+    // Parsed from the .cube DOMAIN_MIN/MAX lines but not yet consumed: the GPU
+    // upload assumes the default [0,1] domain. Kept for the planned CPU LUT-apply
+    // path, which will need them to remap input coordinates.
+    #[allow(dead_code)]
     pub domain_min: [f32; 3],
+    #[allow(dead_code)]
     pub domain_max: [f32; 3],
     pub data: Vec<[f32; 4]>, // Stored as RGBA to easily upload to GPU Rgba32Float format
 }
