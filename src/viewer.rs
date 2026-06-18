@@ -637,15 +637,17 @@ impl ExrViewer {
         }
         match self.compare_mode {
             CompareMode::Wipe => {
-                // All sliders use inline `.text(...)` labels on the same side for a
-                // consistent row; the two center sliders are named (not bare X/Y
-                // suffixes) so the wipe-center handle is self-describing.
-                ui.add(egui::Slider::new(&mut self.wipe_center[0], 0.0..=1.0).text("Center X"));
-                ui.add(egui::Slider::new(&mut self.wipe_center[1], 0.0..=1.0).text("Center Y"));
-                ui.add(egui::Slider::new(&mut self.wipe_angle, -180.0..=180.0).text("Angle (°)"));
-                ui.add(
-                    egui::Slider::new(&mut self.wipe_line_opacity, 0.0..=1.0).text("Line Opacity"),
-                );
+                // Each slider gets a left-side `ui.label(...)` (matching the
+                // `Blend:` style below) for a consistent row; the two center
+                // sliders are named so the wipe-center handle is self-describing.
+                ui.label("Center X");
+                ui.add(egui::Slider::new(&mut self.wipe_center[0], 0.0..=1.0));
+                ui.label("Center Y");
+                ui.add(egui::Slider::new(&mut self.wipe_center[1], 0.0..=1.0));
+                ui.label("Angle °");
+                ui.add(egui::Slider::new(&mut self.wipe_angle, -180.0..=180.0));
+                ui.label("Line Opacity");
+                ui.add(egui::Slider::new(&mut self.wipe_line_opacity, 0.0..=1.0));
             }
             CompareMode::DiffMatte => {
                 ui.add(egui::Slider::new(&mut self.diff_multiplier, 0.0..=100.0).text("Diff Gain"));
