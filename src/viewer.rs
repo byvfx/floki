@@ -637,17 +637,11 @@ impl ExrViewer {
         }
         match self.compare_mode {
             CompareMode::Wipe => {
-                ui.label("Wipe Center:");
-                ui.add(
-                    egui::Slider::new(&mut self.wipe_center[0], 0.0..=1.0)
-                        .suffix(" X")
-                        .show_value(false),
-                );
-                ui.add(
-                    egui::Slider::new(&mut self.wipe_center[1], 0.0..=1.0)
-                        .suffix(" Y")
-                        .show_value(false),
-                );
+                // All sliders use inline `.text(...)` labels on the same side for a
+                // consistent row; the two center sliders are named (not bare X/Y
+                // suffixes) so the wipe-center handle is self-describing.
+                ui.add(egui::Slider::new(&mut self.wipe_center[0], 0.0..=1.0).text("Center X"));
+                ui.add(egui::Slider::new(&mut self.wipe_center[1], 0.0..=1.0).text("Center Y"));
                 ui.add(egui::Slider::new(&mut self.wipe_angle, -180.0..=180.0).text("Angle (°)"));
                 ui.add(
                     egui::Slider::new(&mut self.wipe_line_opacity, 0.0..=1.0).text("Line Opacity"),
