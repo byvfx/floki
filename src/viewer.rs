@@ -30,6 +30,7 @@
 //! when B is replaced.
 
 use crate::exr_loader::ExrData;
+use crate::gradient::{Colormap, DiffMetric, Gradient};
 use eframe::egui;
 use rayon::prelude::*;
 
@@ -206,6 +207,11 @@ struct CanvasLayout {
     is_side_by_side: bool,
 }
 
+/// Cache key for the CPU `diff_texture`: `(layer, gain, colormap, metric, floor)`.
+/// Compared by value (`Colormap` is `PartialEq`) to invalidate the cached diff
+/// when any control that affects its pixels changes.
+type DiffCacheKey = (usize, f32, Colormap, DiffMetric, f32);
+
 /// All canvas state for one A/B pair: view transform, tone controls, the active
 /// [`CompareMode`], the texture caches described in the module docs, plus
 /// sampling/histogram/contact-sheet state. Driven each frame by [`Self::ui`].
@@ -215,7 +221,27 @@ pub struct ExrViewer {
     gpu_textures: Vec<Option<std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>>>,
     gpu_textures_b: Vec<Option<std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>>>,
     diff_texture: Option<egui::TextureHandle>,
-    last_diff_params: (usize, f32), // (layer_index, diff_multiplier)
+    /// Cache key for `diff_texture`: layer + every control that changes the diff
+    /// pixels (gain, colormap identity, metric, noise floor).
+    last_diff_params: DiffCacheKey,
+    /// Diff visualization controls (see issue #15). The active colormap, the
+    /// magnitude metric, and the noise floor. Hydrated from `ExrApp` each frame so
+    /// they persist across sessions; mutated here by the mode-param UI.
+    pub diff_colormap: Colormap,
+    pub diff_metric: DiffMetric,
+    pub diff_floor: f32,
+    /// User-saved named gradients (the preset library shared with the gradient
+    /// editor). Round-tripped through `ExrApp` for persistence.
+    pub custom_gradients: Vec<(String, Gradient)>,
+    /// Baked 256-entry colormap LUT bytes + the colormap they were baked from, so
+    /// the GPU texture is re-uploaded only when the active gradient changes.
+    /// Transient (rebuilt on demand).
+    colormap_lut: Vec<u8>,
+    colormap_sig: Option<Colormap>,
+    /// Transient gradient-editor window state.
+    gradient_editor_open: bool,
+    editing_gradient: Gradient,
+    new_preset_name: String,
     composite_texture: Option<egui::TextureHandle>,
     last_composite_params: (usize, BlendMode), // (layer_index, blend_mode)
     pub blink_state: bool,
@@ -288,7 +314,16 @@ impl Default for ExrViewer {
             gpu_textures: Vec::new(),
             gpu_textures_b: Vec::new(),
             diff_texture: None,
-            last_diff_params: (0, 0.0),
+            last_diff_params: (0, 0.0, Colormap::BlackBody, DiffMetric::MaxChannel, 0.0),
+            diff_colormap: Colormap::BlackBody,
+            diff_metric: DiffMetric::MaxChannel,
+            diff_floor: 0.0,
+            custom_gradients: Vec::new(),
+            colormap_lut: Vec::new(),
+            colormap_sig: None,
+            gradient_editor_open: false,
+            editing_gradient: Colormap::BlackBody.gradient(),
+            new_preset_name: String::new(),
             composite_texture: None,
             last_composite_params: (0, BlendMode::Over),
             blink_state: false,
@@ -651,6 +686,56 @@ impl ExrViewer {
             }
             CompareMode::DiffMatte => {
                 ui.add(egui::Slider::new(&mut self.diff_multiplier, 0.0..=100.0).text("Diff Gain"));
+                ui.separator();
+
+                ui.label("Colormap");
+                let mut pick: Option<Colormap> = None;
+                egui::ComboBox::from_id_salt("diff_colormap_select")
+                    .selected_text(self.diff_colormap.label())
+                    .show_ui(ui, |ui| {
+                        for cm in Colormap::PRESETS {
+                            if ui
+                                .selectable_label(self.diff_colormap == cm, cm.label())
+                                .clicked()
+                            {
+                                pick = Some(cm);
+                            }
+                        }
+                        if !self.custom_gradients.is_empty() {
+                            ui.separator();
+                            for (name, g) in &self.custom_gradients {
+                                let selected = matches!(&self.diff_colormap, Colormap::Custom(cur) if cur == g);
+                                if ui.selectable_label(selected, name).clicked() {
+                                    pick = Some(Colormap::Custom(g.clone()));
+                                }
+                            }
+                        }
+                    });
+                if let Some(cm) = pick {
+                    self.diff_colormap = cm;
+                }
+
+                ui.label("Metric");
+                egui::ComboBox::from_id_salt("diff_metric_select")
+                    .selected_text(self.diff_metric.label())
+                    .show_ui(ui, |ui| {
+                        for m in DiffMetric::ALL {
+                            ui.selectable_value(&mut self.diff_metric, m, m.label());
+                        }
+                    });
+
+                ui.label("Floor");
+                ui.add(egui::Slider::new(&mut self.diff_floor, 0.0..=0.25));
+
+                // Legend / scale bar. Per-channel RGB has no colormap, so skip it.
+                if self.diff_metric != DiffMetric::PerChannelRGB {
+                    self.diff_legend(ui);
+                }
+
+                if ui.button("Edit gradient…").clicked() {
+                    self.editing_gradient = self.diff_colormap.gradient();
+                    self.gradient_editor_open = true;
+                }
             }
             CompareMode::SideBySide => {
                 ui.checkbox(&mut self.normalize_side_by_side, "Normalize Size");
@@ -673,6 +758,161 @@ impl ExrViewer {
             }
             CompareMode::SingleA | CompareMode::SingleB => {}
         }
+    }
+
+    /// Draw the diff colormap legend: a horizontal bar sampling the active
+    /// gradient left→right, captioned with the diff magnitude `0 → 1/gain` that
+    /// spans black→saturated. The legend is a visualization aid; it is not
+    /// interactive.
+    fn diff_legend(&self, ui: &mut egui::Ui) {
+        let grad = self.diff_colormap.gradient();
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(120.0, 14.0), egui::Sense::hover());
+        if ui.is_rect_visible(rect) {
+            let painter = ui.painter_at(rect);
+            let n = rect.width().round().max(1.0) as usize;
+            let denom = (n.saturating_sub(1)).max(1) as f32;
+            for i in 0..n {
+                let c = grad.sample(i as f32 / denom);
+                let x = rect.left() + i as f32;
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(x, rect.top()),
+                        egui::pos2(x + 1.0, rect.bottom()),
+                    ),
+                    0.0,
+                    egui::Color32::from_rgb(
+                        (c[0] * 255.0 + 0.5) as u8,
+                        (c[1] * 255.0 + 0.5) as u8,
+                        (c[2] * 255.0 + 0.5) as u8,
+                    ),
+                );
+            }
+            painter.rect_stroke(
+                rect,
+                0.0,
+                egui::Stroke::new(1.0, egui::Color32::from_gray(90)),
+                egui::StrokeKind::Inside,
+            );
+        }
+        // `m` saturates at diff magnitude `1/gain` (the noise floor only shifts
+        // where black ends, not where white begins).
+        if self.diff_multiplier > 0.0 {
+            ui.label(format!("0 – {:.3}", 1.0 / self.diff_multiplier))
+                .on_hover_text("Diff magnitude spanned by the colormap (0 → saturated).");
+        }
+    }
+
+    /// Modal-ish gradient editor (a floating [`egui::Window`]). Lets the user
+    /// add/remove/move/recolor stops on a working copy and either apply it as the
+    /// active diff colormap or save it as a named preset in `custom_gradients`.
+    /// Rendered once per frame from [`Self::ui`] when `gradient_editor_open`.
+    fn gradient_editor_window(&mut self, ctx: &egui::Context) {
+        if !self.gradient_editor_open {
+            return;
+        }
+        let mut open = self.gradient_editor_open;
+        let mut apply = false;
+        let mut save = false;
+        egui::Window::new("Gradient editor")
+            .open(&mut open)
+            .resizable(false)
+            .show(ctx, |ui| {
+                // Preview bar of the working gradient.
+                let grad = Gradient::new(self.editing_gradient.stops.clone());
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(240.0, 18.0), egui::Sense::hover());
+                if ui.is_rect_visible(rect) {
+                    let painter = ui.painter_at(rect);
+                    let n = rect.width().round().max(1.0) as usize;
+                    let denom = (n.saturating_sub(1)).max(1) as f32;
+                    for i in 0..n {
+                        let c = grad.sample(i as f32 / denom);
+                        let x = rect.left() + i as f32;
+                        painter.rect_filled(
+                            egui::Rect::from_min_max(
+                                egui::pos2(x, rect.top()),
+                                egui::pos2(x + 1.0, rect.bottom()),
+                            ),
+                            0.0,
+                            egui::Color32::from_rgb(
+                                (c[0] * 255.0 + 0.5) as u8,
+                                (c[1] * 255.0 + 0.5) as u8,
+                                (c[2] * 255.0 + 0.5) as u8,
+                            ),
+                        );
+                    }
+                }
+                ui.separator();
+
+                // Per-stop rows: position slider, colour picker, delete.
+                let mut remove: Option<usize> = None;
+                let mut dirty = false;
+                let len = self.editing_gradient.stops.len();
+                for (i, stop) in self.editing_gradient.stops.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        if ui.add(egui::Slider::new(&mut stop.t, 0.0..=1.0)).changed() {
+                            dirty = true;
+                        }
+                        if ui.color_edit_button_rgb(&mut stop.color).changed() {
+                            dirty = true;
+                        }
+                        // Keep at least two stops so the gradient stays meaningful.
+                        if len > 2 && ui.button("✕").clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                }
+                if let Some(i) = remove {
+                    self.editing_gradient.stops.remove(i);
+                    dirty = true;
+                }
+                if ui.button("＋ Add stop").clicked() {
+                    self.editing_gradient
+                        .stops
+                        .push(crate::gradient::GradientStop::new(0.5, [0.5, 0.5, 0.5]));
+                    dirty = true;
+                }
+                // Re-sort by position if any stop moved (sampling assumes sorted).
+                if dirty {
+                    self.editing_gradient =
+                        Gradient::new(std::mem::take(&mut self.editing_gradient.stops));
+                }
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Preset name");
+                    ui.text_edit_singleline(&mut self.new_preset_name);
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Apply").clicked() {
+                        apply = true;
+                    }
+                    let can_save = !self.new_preset_name.trim().is_empty();
+                    if ui
+                        .add_enabled(can_save, egui::Button::new("Save as preset"))
+                        .clicked()
+                    {
+                        save = true;
+                    }
+                });
+            });
+
+        if apply {
+            self.diff_colormap = Colormap::Custom(self.editing_gradient.clone());
+        }
+        if save {
+            let name = self.new_preset_name.trim().to_string();
+            let grad = self.editing_gradient.clone();
+            // Replace an existing preset of the same name, else append.
+            if let Some(slot) = self.custom_gradients.iter_mut().find(|(n, _)| n == &name) {
+                slot.1 = grad.clone();
+            } else {
+                self.custom_gradients.push((name, grad.clone()));
+            }
+            self.diff_colormap = Colormap::Custom(grad);
+            self.new_preset_name.clear();
+        }
+        self.gradient_editor_open = open;
     }
 
     /// Render the contextual mode-param row with a vertical slide in/out. The
@@ -917,6 +1157,7 @@ impl ExrViewer {
             self.primary_row(ui, exr_data, exr_data_b.is_some(), layer_count);
             self.animated_mode_param_row(ui);
         });
+        self.gradient_editor_window(ui.ctx());
 
         let layer_count_b = exr_data_b.map(|d| d.logical_layers.len()).unwrap_or(0);
         self.sync_texture_caches(layer_count, layer_count_b);
@@ -964,10 +1205,16 @@ impl ExrViewer {
                         self.textures_b[layer_b] = self.generate_texture(ui.ctx(), data_b, layer_b);
                     }
                 }
+                let diff_key: DiffCacheKey = (
+                    self.active_layer,
+                    self.diff_multiplier,
+                    self.diff_colormap.clone(),
+                    self.diff_metric,
+                    self.diff_floor,
+                );
                 if let Some(exr_b) = exr_data_b
                     && self.compare_mode == CompareMode::DiffMatte
-                    && (self.diff_texture.is_none()
-                        || self.last_diff_params != (self.active_layer, self.diff_multiplier))
+                    && (self.diff_texture.is_none() || self.last_diff_params != diff_key)
                 {
                     let layer_b = self
                         .active_layer
@@ -979,7 +1226,7 @@ impl ExrViewer {
                         self.active_layer,
                         layer_b,
                     );
-                    self.last_diff_params = (self.active_layer, self.diff_multiplier);
+                    self.last_diff_params = diff_key;
                 }
                 if let Some(exr_b) = exr_data_b
                     && self.compare_mode == CompareMode::Composite
@@ -1563,6 +1810,21 @@ impl ExrViewer {
         let unclipped_painter = ui.painter().with_clip_rect(rect);
         let painter = ui.painter().with_clip_rect(rect.intersect(disp_rect));
 
+        // Re-bake + upload the diff colormap LUT only when the active colormap
+        // changes. The GPU texture is updated in place (stable handle), so no bind
+        // group rebuild is needed — see `GpuState::write_colormap`.
+        if self.colormap_sig.as_ref() != Some(&self.diff_colormap) {
+            self.colormap_lut = self
+                .diff_colormap
+                .gradient()
+                .bake(crate::gradient::COLORMAP_LUT_SIZE);
+            self.colormap_sig = Some(self.diff_colormap.clone());
+            let guard = render_state.renderer.read();
+            if let Some(gpu_state) = guard.callback_resources.get::<crate::gpu::GpuState>() {
+                gpu_state.write_colormap(&render_state.queue, &self.colormap_lut);
+            }
+        }
+
         // GPU RENDER PATH
         let uniform_data = crate::gpu::Uniforms {
             rect_min: [image_rect.min.x, image_rect.min.y],
@@ -1589,8 +1851,8 @@ impl ExrViewer {
             wipe_center: self.wipe_center,
             wipe_angle: self.wipe_angle.to_radians(),
             skip_checker: 0,
-            _pad0: 0,
-            _pad1: 0,
+            diff_metric: self.diff_metric.as_u32(),
+            diff_floor: self.diff_floor,
             _pad2: 0,
             lut_domain_min: self.lut_domain_min,
             lut_domain_max: self.lut_domain_max,
@@ -2373,10 +2635,16 @@ impl ExrViewer {
 
         let mut pixels = vec![egui::Color32::BLACK; width * height];
 
-        // VFX-style diff: per-pixel difference magnitude mapped to a black-body heat ramp
-        // (identical = black; hotter = larger difference). Display-space false color,
-        // matching the GPU diff branch in shader.wgsl. `diff_multiplier` sets sensitivity.
-        let diff_multiplier = self.diff_multiplier;
+        // VFX-style diff: per-pixel difference reduced per `diff_metric`, gained,
+        // noise-floored, then mapped through the active colormap gradient. Display-
+        // space false color — must stay in lockstep with the `is_diff_mode` branch
+        // in gpu/shader.wgsl (the GPU path is what's normally on screen; this CPU
+        // path serves thumbnails / GPU-less fallback).
+        let gain = self.diff_multiplier;
+        let nfloor = self.diff_floor;
+        let denom = (1.0 - nfloor).max(1e-3);
+        let metric = self.diff_metric;
+        let grad = self.diff_colormap.gradient();
         let (aw, ah) = (layer_a.size.0, layer_a.size.1);
         let (bw, bh) = (layer_b.size.0, layer_b.size.1);
 
@@ -2385,21 +2653,32 @@ impl ExrViewer {
             .enumerate()
             .for_each(|(y, row)| {
                 for (x, px) in row.iter_mut().enumerate() {
-                    let dr = (sample_channel_bounded(r_chan_a, x, y, aw, ah)
-                        - sample_channel_bounded(r_chan_b, x, y, bw, bh))
-                    .abs();
-                    let dg = (sample_channel_bounded(g_chan_a, x, y, aw, ah)
-                        - sample_channel_bounded(g_chan_b, x, y, bw, bh))
-                    .abs();
-                    let db = (sample_channel_bounded(b_chan_a, x, y, aw, ah)
-                        - sample_channel_bounded(b_chan_b, x, y, bw, bh))
-                    .abs();
-                    let m = (dr.max(dg).max(db) * diff_multiplier).clamp(0.0, 1.0);
-                    let (hr, hg, hb) = Self::heat_ramp(m);
+                    let sr = sample_channel_bounded(r_chan_a, x, y, aw, ah)
+                        - sample_channel_bounded(r_chan_b, x, y, bw, bh);
+                    let sg = sample_channel_bounded(g_chan_a, x, y, aw, ah)
+                        - sample_channel_bounded(g_chan_b, x, y, bw, bh);
+                    let sb = sample_channel_bounded(b_chan_a, x, y, aw, ah)
+                        - sample_channel_bounded(b_chan_b, x, y, bw, bh);
+                    let remap = |raw: f32| ((raw * gain - nfloor) / denom).clamp(0.0, 1.0);
+                    let (cr, cg, cb) = match metric {
+                        DiffMetric::PerChannelRGB => {
+                            (remap(sr.abs()), remap(sg.abs()), remap(sb.abs()))
+                        }
+                        DiffMetric::Luminance => {
+                            let m = remap((0.2126 * sr + 0.7152 * sg + 0.0722 * sb).abs());
+                            let c = grad.sample(m);
+                            (c[0], c[1], c[2])
+                        }
+                        DiffMetric::MaxChannel => {
+                            let m = remap(sr.abs().max(sg.abs()).max(sb.abs()));
+                            let c = grad.sample(m);
+                            (c[0], c[1], c[2])
+                        }
+                    };
                     *px = egui::Color32::from_rgb(
-                        (hr * 255.0) as u8,
-                        (hg * 255.0) as u8,
-                        (hb * 255.0) as u8,
+                        (cr * 255.0 + 0.5) as u8,
+                        (cg * 255.0 + 0.5) as u8,
+                        (cb * 255.0 + 0.5) as u8,
                     );
                 }
             });
@@ -2724,17 +3003,6 @@ impl ExrViewer {
     /// working while the math lives in one tested place.
     pub fn linear_to_srgb(l: f32) -> f32 {
         crate::render_math::linear_to_srgb(l)
-    }
-
-    /// Black-body heat ramp for the diff visualization: 0 → black, ramping through
-    /// red → yellow → white as the (already gained + clamped) magnitude `m` ∈ `[0,1]`
-    /// rises. Kept in lockstep with the `heat` ramp in the GPU diff branch (shader.wgsl).
-    fn heat_ramp(m: f32) -> (f32, f32, f32) {
-        (
-            (m * 3.0).clamp(0.0, 1.0),
-            (m * 3.0 - 1.0).clamp(0.0, 1.0),
-            (m * 3.0 - 2.0).clamp(0.0, 1.0),
-        )
     }
 
     /// Invalidate the cached histogram so the next [`Self::calculate_histogram`] call

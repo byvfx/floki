@@ -27,8 +27,12 @@ struct Uniforms {
     // composited in display space *after* the OCIO transform. Keep in lockstep with
     // `Uniforms.skip_checker` in src/gpu/mod.rs.
     skip_checker: u32,
-    _pad0: u32,
-    _pad1: u32,
+    // Diff visualization controls (only read when is_diff_mode == 1). Source of
+    // truth for `diff_metric`: `DiffMetric::as_u32` in src/gradient.rs
+    // (MaxChannel=0, Luminance=1, PerChannelRGB=2). `diff_floor` is a noise floor
+    // subtracted from the gained magnitude. Keep in lockstep with src/gpu/mod.rs.
+    diff_metric: u32,
+    diff_floor: f32,
     _pad2: u32,
     // .cube LUT domain bounds (xyz + pad). The lookup coordinate is remapped from
     // [domain_min, domain_max] to [0, 1] before sampling the 3D LUT texture, so
@@ -48,6 +52,11 @@ struct Uniforms {
 
 @group(3) @binding(0) var lut_tex: texture_3d<f32>;
 @group(3) @binding(1) var lut_samp: sampler;
+// 256x1 diff colormap LUT (display-space false colour). Shares group(3) with the
+// 3D look LUT because we are already at the 4-bind-group limit. Updated in place
+// via `queue.write_texture` when the active gradient changes (see src/gpu/mod.rs).
+@group(3) @binding(2) var colormap_tex: texture_2d<f32>;
+@group(3) @binding(3) var colormap_samp: sampler;
 
 @vertex
 fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
@@ -98,19 +107,32 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     var a = color_a.a;
 
     if uniforms.is_diff_mode == 1u {
-        // VFX-style diff: the magnitude of the per-channel difference, mapped to a
-        // black-body heat ramp (identical = black; hotter = larger difference). This is
-        // a false-color visualization, so it is emitted directly in display space and is
-        // NOT color-managed — the viewer routes diff through this pipeline even under
-        // OCIO. `diff_multiplier` sets sensitivity. Keep the ramp in lockstep with
-        // `heat_ramp` in src/viewer.rs (CPU diff parity).
-        let d = max(abs(r - color_b.r), max(abs(g - color_b.g), abs(b - color_b.b)));
-        let m = clamp(d * uniforms.diff_multiplier, 0.0, 1.0);
-        let heat = vec3<f32>(
-            clamp(m * 3.0, 0.0, 1.0),
-            clamp(m * 3.0 - 1.0, 0.0, 1.0),
-            clamp(m * 3.0 - 2.0, 0.0, 1.0),
-        );
+        // VFX-style diff: the per-pixel difference reduced to a magnitude per
+        // `diff_metric`, gained by `diff_multiplier`, noise-floored by `diff_floor`,
+        // and mapped through the `colormap_tex` ramp. This is a false-color
+        // visualization, emitted directly in display space and NOT color-managed —
+        // the viewer routes diff through this pipeline even under OCIO. Keep the
+        // metric/floor math in lockstep with `generate_diff_texture` in src/viewer.rs.
+        let dr = abs(r - color_b.r);
+        let dg = abs(g - color_b.g);
+        let db = abs(b - color_b.b);
+        let gain = uniforms.diff_multiplier;
+        let nfloor = uniforms.diff_floor;
+        let denom = max(1.0 - nfloor, 1e-3);
+        if uniforms.diff_metric == 2u {
+            // Per-channel RGB: show each channel's gained |Δ| directly (no colormap).
+            let mr = clamp((dr * gain - nfloor) / denom, 0.0, 1.0);
+            let mg = clamp((dg * gain - nfloor) / denom, 0.0, 1.0);
+            let mb = clamp((db * gain - nfloor) / denom, 0.0, 1.0);
+            return vec4<f32>(mr, mg, mb, uniforms.opacity);
+        }
+        var d = max(dr, max(dg, db));
+        if uniforms.diff_metric == 1u {
+            // Rec.709 luminance-weighted magnitude.
+            d = abs(0.2126 * (r - color_b.r) + 0.7152 * (g - color_b.g) + 0.0722 * (b - color_b.b));
+        }
+        let m = clamp((d * gain - nfloor) / denom, 0.0, 1.0);
+        let heat = textureSample(colormap_tex, colormap_samp, vec2<f32>(m, 0.5)).rgb;
         return vec4<f32>(heat, uniforms.opacity);
     }
 
