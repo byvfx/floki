@@ -340,6 +340,7 @@ impl OcioTargets {
         device: &wgpu::Device,
         blit_layout: &wgpu::BindGroupLayout,
         blit_sampler: &wgpu::Sampler,
+        bg_gradient_view: &wgpu::TextureView,
         width: u32,
         height: u32,
         display_format: wgpu::TextureFormat,
@@ -398,6 +399,10 @@ impl OcioTargets {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: blit_uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(bg_gradient_view),
                 },
             ],
         });
@@ -464,16 +469,22 @@ impl eframe::egui_wgpu::CallbackTrait for OcioCallback {
             .get::<OcioTargets>()
             .is_none_or(|t| t.width != w || t.height != h);
         if need_new {
-            let (blit_layout, blit_sampler) = {
+            let (blit_layout, blit_sampler, bg_gradient_view) = {
                 let Some(gpu) = callback_resources.get::<GpuState>() else {
                     return Vec::new();
                 };
-                (gpu.blit_layout.clone(), gpu.blit_sampler.clone())
+                (
+                    gpu.blit_layout.clone(),
+                    gpu.blit_sampler.clone(),
+                    gpu.bg_gradient_texture
+                        .create_view(&wgpu::TextureViewDescriptor::default()),
+                )
             };
             let targets = OcioTargets::new(
                 device,
                 &blit_layout,
                 &blit_sampler,
+                &bg_gradient_view,
                 w,
                 h,
                 self.display_format,
@@ -974,13 +985,19 @@ mod metal_tests {
             display_min: [0.0, 0.0],
             display_max: [3.0, 1.0],
             screen_size: [3.0, 1.0],
-            checker_dark: 0.1,
-            checker_light: 0.2,
-            checker_size: 3.0,
-            checker_enabled: 1.0,
             overscan_factor: 0.5,
-            _pad0: 0.0,
+            bg_mode: 0.0, // checkerboard
+            bg_checker_size: 3.0,
+            bg_grad_angle: 0.0,
+            _pad_a: 0.0,
+            _pad_b: 0.0,
+            bg_checker_dark: [0.1, 0.1, 0.1, 0.0],
+            bg_checker_light: [0.2, 0.2, 0.2, 0.0],
+            bg_solid: [0.1, 0.1, 0.1, 0.0],
         };
+        let bg_grad_view = gpu
+            .bg_gradient_texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
         let ubuf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("blit-uniforms"),
             size: std::mem::size_of::<crate::gpu::BlitUniforms>() as u64,
@@ -1008,6 +1025,10 @@ mod metal_tests {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: ubuf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&bg_grad_view),
                 },
             ],
         });
