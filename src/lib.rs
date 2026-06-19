@@ -12,6 +12,7 @@
 pub mod app;
 pub mod exr_loader;
 
+mod annotation;
 mod background;
 mod color;
 mod gpu;
