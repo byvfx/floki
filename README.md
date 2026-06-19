@@ -1,6 +1,6 @@
 # Floki
 
-[![Rust](https://img.shields.io/badge/Rust-1.70+-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/Rust-1.85+-orange.svg)](https://www.rust-lang.org)
 [![egui](https://img.shields.io/badge/GUI-egui-blue)](https://github.com/emilk/egui)
 [![wgpu](https://img.shields.io/badge/wgpu-Native-green.svg)](https://wgpu.rs)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -50,6 +50,7 @@ Comparison controls follow a two-tier toolbar: the everyday controls stay on a s
 * **Immediate-Mode UI:** Built on `egui` for a responsive, minimal-overhead interface.
 * **Light / Dark / System Themes:** Switch the interface theme from the **Theme** menu; the `System` option tracks your OS light/dark setting live. Your choice persists across sessions.
 * **Recent Files for A & B:** `File ▸ Open Recent A` / `Open Recent B` reload a recent EXR straight into the main or reference slot.
+* **Drag & Drop Loading:** Drop an EXR onto the window to load it — the left half loads it as Image A, the right half as the reference Image B, with a live overlay highlighting which side will receive the drop. Drop two files at once to fill A and B together.
 * **Persistent State:** Remembers your UI layout, recent files list, theme, and preferences across sessions.
 * **Software Tone Mapping:** Apply Exposure, Gamma, and sRGB transforms instantly without altering the underlying raw data.
 
@@ -71,6 +72,7 @@ Comparison controls follow a two-tier toolbar: the everyday controls stay on a s
 | `Shift + Click` | Sample pixel and save to swatch palette |
 | `Scroll Wheel` | Zoom in/out at cursor |
 | `Click + Drag` | Pan Image |
+| `Drag & Drop` | Load EXR — drop on left half → Image A, right half → Image B |
 
 ---
 

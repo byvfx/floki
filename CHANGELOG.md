@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-06-18
+
+### Added
+- **Drag-and-drop loading.** Drop an EXR onto the window to load it — the left
+  half loads it as Image A, the right half as the reference Image B. While you
+  drag, a live overlay highlights the half that will receive the drop. Dropping
+  two files at once loads the first as A and the second as B. (Because the
+  windowing layer discards the OS drop position, floki queries the system cursor
+  directly so the left/right split works on macOS and Windows.)
+
+### Fixed
+- Wipe compare-mode controls now use consistent left-aligned labels across all
+  four sliders (Center X, Center Y, Angle, Line Opacity); the previously
+  unlabeled center slider is now named.
+
 ## [1.5.3] - 2026-06-17
 
 ### Fixed
