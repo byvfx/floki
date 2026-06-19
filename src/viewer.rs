@@ -29,6 +29,7 @@
 //! on an OCIO-state change and via [`ExrViewer::invalidate_reference_textures`]
 //! when B is replaced.
 
+use crate::annotation::{Annotation, AnnotationKind, AnnotationTool};
 use crate::exr_loader::ExrData;
 use crate::gradient::{Colormap, DiffMetric, Gradient};
 use eframe::egui;
@@ -339,6 +340,21 @@ pub struct ExrViewer {
     /// snapshot feature (#19) to crop the framebuffer screenshot to the image
     /// area. Transient.
     pub last_canvas_rect: Option<egui::Rect>,
+
+    /// Annotation overlay (#45) — all transient (per-session, never persisted).
+    /// Shapes are stored in image space so they track pan/zoom.
+    pub annotations: Vec<Annotation>,
+    pub anno_tool: AnnotationTool,
+    pub anno_color: egui::Color32,
+    pub anno_width: f32,
+    pub show_annotation_bar: bool,
+    /// Shape being dragged out right now (committed on release).
+    anno_in_progress: Option<Annotation>,
+    /// Undo/redo stacks of whole-`annotations` snapshots.
+    anno_undo: Vec<Vec<Annotation>>,
+    anno_redo: Vec<Vec<Annotation>>,
+    /// Active text placement: `(image-space anchor, buffer)` while typing.
+    anno_text_edit: Option<([f32; 2], String)>,
 }
 
 impl Default for ExrViewer {
@@ -409,6 +425,15 @@ impl Default for ExrViewer {
             last_sampled_val_b: None,
             row2_full_height: 0.0,
             last_canvas_rect: None,
+            annotations: Vec::new(),
+            anno_tool: AnnotationTool::None,
+            anno_color: egui::Color32::RED,
+            anno_width: 3.0,
+            show_annotation_bar: false,
+            anno_in_progress: None,
+            anno_undo: Vec::new(),
+            anno_redo: Vec::new(),
+            anno_text_edit: None,
         }
     }
 }
@@ -427,16 +452,21 @@ impl ExrViewer {
         // while the input lock is held — defer it until after the closure.
         let mut fullscreen_changed = false;
 
+        // When a text field wants keyboard input (e.g. the annotation text field or
+        // a preset-name box), suppress the single-key viewer shortcuts so typing
+        // "r" doesn't isolate the red channel. F11 / Esc stay live.
+        let editing = ui.ctx().egui_wants_keyboard_input();
+
         ui.input(|i| {
-            if i.key_pressed(egui::Key::Num1) {
+            if !editing && i.key_pressed(egui::Key::Num1) {
                 self.compare_mode = CompareMode::SingleA;
                 self.blink_state = false;
             }
-            if has_b && i.key_pressed(egui::Key::Num2) {
+            if !editing && has_b && i.key_pressed(egui::Key::Num2) {
                 self.compare_mode = CompareMode::SingleB;
                 self.blink_state = false;
             }
-            if has_b && i.key_pressed(egui::Key::Space) {
+            if !editing && has_b && i.key_pressed(egui::Key::Space) {
                 self.blink_state = !self.blink_state;
             }
 
@@ -445,21 +475,27 @@ impl ExrViewer {
                 self.fullscreen = !self.fullscreen;
                 fullscreen_changed = true;
             }
-            if self.fullscreen && i.key_pressed(egui::Key::Escape) {
-                self.fullscreen = false;
-                fullscreen_changed = true;
+            // Esc first cancels any in-flight annotation tool/draw/text (#45),
+            // then falls through to exiting fullscreen.
+            if i.key_pressed(egui::Key::Escape) {
+                if self.cancel_annotation() {
+                    // consumed by annotation
+                } else if self.fullscreen {
+                    self.fullscreen = false;
+                    fullscreen_changed = true;
+                }
             }
 
             // Reset exposure (E) / gamma (Shift+G). Gamma deliberately uses
             // Shift+G because plain `G` isolates the green channel below.
-            if i.key_pressed(egui::Key::E) {
+            if !editing && i.key_pressed(egui::Key::E) {
                 self.reset_exposure();
             }
-            if i.modifiers.shift && i.key_pressed(egui::Key::G) {
+            if !editing && i.modifiers.shift && i.key_pressed(egui::Key::G) {
                 self.reset_gamma();
             }
 
-            if !self.show_contact_sheet {
+            if !editing && !self.show_contact_sheet {
                 if i.key_pressed(egui::Key::F) {
                     self.first_frame = true;
                 }
@@ -674,6 +710,17 @@ impl ExrViewer {
                 ui.separator();
                 if ui.button("Frame (F)").clicked() {
                     self.first_frame = true;
+                }
+                // Annotation overlay toggle (#45).
+                if ui
+                    .toggle_value(&mut self.show_annotation_bar, "✎ Annotate")
+                    .on_hover_text("Mark up the view (arrows / box / pen / text) before a snapshot")
+                    .clicked()
+                    && !self.show_annotation_bar
+                {
+                    // Hiding the toolbar also drops the active tool so canvas drags
+                    // pan again.
+                    self.anno_tool = AnnotationTool::None;
                 }
 
                 // Layer (pass) selection
@@ -1108,6 +1155,250 @@ impl ExrViewer {
         }
     }
 
+    // ----- Annotation overlay (#45) ------------------------------------------
+
+    /// Push the current annotations onto the undo stack and clear redo. Call
+    /// before any mutation (add / clear).
+    fn push_anno_undo(&mut self) {
+        self.anno_undo.push(self.annotations.clone());
+        self.anno_redo.clear();
+    }
+
+    fn undo_annotation(&mut self) {
+        if let Some(prev) = self.anno_undo.pop() {
+            self.anno_redo
+                .push(std::mem::replace(&mut self.annotations, prev));
+        }
+    }
+
+    fn redo_annotation(&mut self) {
+        if let Some(next) = self.anno_redo.pop() {
+            self.anno_undo
+                .push(std::mem::replace(&mut self.annotations, next));
+        }
+    }
+
+    fn clear_annotations(&mut self) {
+        if !self.annotations.is_empty() {
+            self.push_anno_undo();
+            self.annotations.clear();
+        }
+    }
+
+    /// Cancel whatever annotation interaction is in flight (active tool, the
+    /// in-progress drag, and any open text field). Bound to `Esc`.
+    pub fn cancel_annotation(&mut self) -> bool {
+        let was_active = self.anno_tool.is_active()
+            || self.anno_in_progress.is_some()
+            || self.anno_text_edit.is_some();
+        self.anno_tool = AnnotationTool::None;
+        self.anno_in_progress = None;
+        self.anno_text_edit = None;
+        was_active
+    }
+
+    /// Commit the in-progress text label (if non-empty) to the annotation list.
+    fn commit_text_edit(&mut self) {
+        if let Some((pos, text)) = self.anno_text_edit.take()
+            && !text.trim().is_empty()
+        {
+            self.push_anno_undo();
+            self.annotations.push(Annotation {
+                kind: AnnotationKind::Text { pos, text },
+                color: self.anno_color,
+                width: self.anno_width,
+            });
+        }
+    }
+
+    /// Translate canvas drags/clicks into annotation shapes. Coordinates are
+    /// converted to image space so shapes track pan/zoom.
+    fn handle_annotation_input(
+        &mut self,
+        response: &egui::Response,
+        image_rect: egui::Rect,
+        scale: f32,
+    ) {
+        let scale = scale.max(1e-6);
+        let to_img = |pos: egui::Pos2| {
+            [
+                (pos.x - image_rect.min.x) / scale,
+                (pos.y - image_rect.min.y) / scale,
+            ]
+        };
+
+        match self.anno_tool {
+            AnnotationTool::Text => {
+                if response.clicked()
+                    && let Some(p) = response.interact_pointer_pos()
+                {
+                    // Commit any open field first, then start a new one.
+                    self.commit_text_edit();
+                    self.anno_text_edit = Some((to_img(p), String::new()));
+                }
+            }
+            AnnotationTool::Arrow | AnnotationTool::Rect | AnnotationTool::Freehand => {
+                if response.drag_started() {
+                    if let Some(p) = response.interact_pointer_pos() {
+                        let a = to_img(p);
+                        let kind = match self.anno_tool {
+                            AnnotationTool::Arrow => AnnotationKind::Arrow { a, b: a },
+                            AnnotationTool::Rect => AnnotationKind::Rect { a, b: a },
+                            _ => AnnotationKind::Freehand { points: vec![a] },
+                        };
+                        self.anno_in_progress = Some(Annotation {
+                            kind,
+                            color: self.anno_color,
+                            width: self.anno_width,
+                        });
+                    }
+                } else if response.dragged()
+                    && let (Some(p), Some(ann)) = (
+                        response.interact_pointer_pos(),
+                        self.anno_in_progress.as_mut(),
+                    )
+                {
+                    let cur = to_img(p);
+                    match &mut ann.kind {
+                        AnnotationKind::Arrow { b, .. } | AnnotationKind::Rect { b, .. } => {
+                            *b = cur
+                        }
+                        AnnotationKind::Freehand { points } => points.push(cur),
+                        AnnotationKind::Text { .. } => {}
+                    }
+                }
+                if response.drag_stopped()
+                    && let Some(ann) = self.anno_in_progress.take()
+                {
+                    self.push_anno_undo();
+                    self.annotations.push(ann);
+                }
+            }
+            AnnotationTool::None => {}
+        }
+    }
+
+    /// Paint all committed annotations plus the in-progress shape. Text labels are
+    /// drawn here too; the editable text field is a separate popup.
+    fn draw_annotations(&self, painter: &egui::Painter, image_rect: egui::Rect, scale: f32) {
+        for ann in &self.annotations {
+            Self::draw_one_annotation(painter, ann, image_rect, scale);
+        }
+        if let Some(ann) = &self.anno_in_progress {
+            Self::draw_one_annotation(painter, ann, image_rect, scale);
+        }
+    }
+
+    fn draw_one_annotation(
+        painter: &egui::Painter,
+        ann: &Annotation,
+        image_rect: egui::Rect,
+        scale: f32,
+    ) {
+        let to_screen = |p: [f32; 2]| image_rect.min + egui::vec2(p[0] * scale, p[1] * scale);
+        let stroke = egui::Stroke::new(ann.width, ann.color);
+        match &ann.kind {
+            AnnotationKind::Arrow { a, b } => {
+                let (a, b) = (to_screen(*a), to_screen(*b));
+                painter.line_segment([a, b], stroke);
+                let dir = b - a;
+                let len = dir.length();
+                if len > 1.0 {
+                    let n = dir / len;
+                    let head = (len * 0.3).min(14.0);
+                    let back = b - n * head;
+                    let perp = egui::vec2(-n.y, n.x) * head * 0.5;
+                    painter.line_segment([b, back + perp], stroke);
+                    painter.line_segment([b, back - perp], stroke);
+                }
+            }
+            AnnotationKind::Rect { a, b } => {
+                let r = egui::Rect::from_two_pos(to_screen(*a), to_screen(*b));
+                painter.rect_stroke(r, 0.0, stroke, egui::StrokeKind::Middle);
+            }
+            AnnotationKind::Freehand { points } => {
+                if points.len() >= 2 {
+                    let pts: Vec<egui::Pos2> = points.iter().map(|p| to_screen(*p)).collect();
+                    painter.add(egui::Shape::line(pts, stroke));
+                }
+            }
+            AnnotationKind::Text { pos, text } => {
+                painter.text(
+                    to_screen(*pos),
+                    egui::Align2::LEFT_TOP,
+                    text,
+                    egui::FontId::proportional(16.0),
+                    ann.color,
+                );
+            }
+        }
+    }
+
+    /// The editable text field shown at the click point while placing a `Text`
+    /// annotation. Enter commits, `Esc` cancels (handled in `handle_hotkeys`).
+    fn annotation_text_popup(&mut self, ui: &mut egui::Ui, image_rect: egui::Rect, scale: f32) {
+        let Some((pos, _)) = self.anno_text_edit.as_ref() else {
+            return;
+        };
+        let screen = image_rect.min + egui::vec2(pos[0] * scale, pos[1] * scale);
+        let mut commit = false;
+        egui::Area::new(ui.id().with("anno_text_edit"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen)
+            .show(ui.ctx(), |ui| {
+                if let Some((_, buf)) = self.anno_text_edit.as_mut() {
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(buf)
+                            .hint_text("label…")
+                            .desired_width(160.0),
+                    );
+                    // Auto-focus on open (buffer empty); keeps focus once typing.
+                    if buf.is_empty() {
+                        resp.request_focus();
+                    }
+                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        commit = true;
+                    }
+                }
+            });
+        if commit {
+            self.commit_text_edit();
+        }
+    }
+
+    /// The annotation toolbar row: tool selection, colour, stroke width, undo/redo,
+    /// clear. Shown under the mode-param row while `show_annotation_bar`.
+    fn annotation_toolbar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("Annotate:");
+            for tool in AnnotationTool::DRAW_TOOLS {
+                ui.selectable_value(&mut self.anno_tool, tool, tool.label());
+            }
+            ui.separator();
+            ui.color_edit_button_srgba(&mut self.anno_color);
+            ui.add(egui::Slider::new(&mut self.anno_width, 1.0..=12.0).text("Width"));
+            ui.separator();
+            if ui
+                .add_enabled(!self.anno_undo.is_empty(), egui::Button::new("Undo"))
+                .clicked()
+            {
+                self.undo_annotation();
+            }
+            if ui
+                .add_enabled(!self.anno_redo.is_empty(), egui::Button::new("Redo"))
+                .clicked()
+            {
+                self.redo_annotation();
+            }
+            if ui
+                .add_enabled(!self.annotations.is_empty(), egui::Button::new("Clear all"))
+                .clicked()
+            {
+                self.clear_annotations();
+            }
+        });
+    }
+
     /// Render the contextual mode-param row with a vertical slide in/out. The
     /// row's natural height is captured each frame into `row2_full_height`; the
     /// visible slice is `full_height * t`, where `t` eases 0→1 as the row appears
@@ -1349,6 +1640,9 @@ impl ExrViewer {
         egui::Panel::top("viewer_controls").show_inside(ui, |ui| {
             self.primary_row(ui, exr_data, exr_data_b.is_some(), layer_count);
             self.animated_mode_param_row(ui);
+            if self.show_annotation_bar {
+                self.annotation_toolbar(ui);
+            }
         });
         self.gradient_editor_window(ui.ctx());
         self.background_window(ui.ctx());
@@ -1480,8 +1774,9 @@ impl ExrViewer {
                     }
                 }
 
-                // Handle Panning
-                if response.dragged() {
+                // Handle Panning — suppressed while an annotation tool is active so
+                // its drag draws a shape instead of moving the image (#45).
+                if response.dragged() && !self.anno_tool.is_active() {
                     self.translation += response.drag_delta();
                 }
 
@@ -1513,6 +1808,13 @@ impl ExrViewer {
                 ) * self.scale;
 
                 let image_rect = egui::Rect::from_min_size(disp_rect.min + data_offset, image_size);
+
+                // Annotation drawing (#45) consumes the canvas drag/click when a tool
+                // is active (pan is suppressed above). Coordinates map through
+                // `image_rect`/`scale` so shapes anchor to image pixels.
+                if self.anno_tool.is_active() {
+                    self.handle_annotation_input(&response, image_rect, self.scale);
+                }
 
                 // The display-window overlays below paint unclipped; the draw paths
                 // recompute their own display-clipped painter from `layout`.
@@ -1573,6 +1875,12 @@ impl ExrViewer {
                 } else {
                     self.draw_canvas_cpu(ui, &layout, exr_data_b);
                 }
+
+                // Annotation overlay on top of the image (and its in-progress shape).
+                // Painted by egui, so it is included in the snapshot screenshot (#19).
+                let anno_painter = ui.painter().with_clip_rect(rect);
+                self.draw_annotations(&anno_painter, image_rect, self.scale);
+                self.annotation_text_popup(ui, image_rect, self.scale);
 
                 // Draw data window bounding box over the image
                 if (is_overscanned || is_cropped) && !is_side_by_side {
@@ -3413,6 +3721,7 @@ mod gui_tests {
     //! drives the full [`ExrViewer::ui`] CPU path (`render_state = None`) across
     //! every compare mode to guard the render/extraction seams.
     use super::{ChannelMode, CompareMode, ExrViewer};
+    use crate::annotation::{Annotation, AnnotationKind, AnnotationTool};
     use crate::exr_loader::ExrData;
     use eframe::egui;
     use egui_kittest::Harness;
@@ -3677,5 +3986,52 @@ mod gui_tests {
         h.run();
         h.state_mut().viewer.compare_mode = CompareMode::SideBySide;
         h.run();
+    }
+
+    #[test]
+    fn annotation_undo_redo_and_clear() {
+        let mut v = ExrViewer::default();
+        let mk = |x: f32| Annotation {
+            kind: AnnotationKind::Rect {
+                a: [0.0, 0.0],
+                b: [x, x],
+            },
+            color: egui::Color32::RED,
+            width: 3.0,
+        };
+        // Two committed shapes (mirrors handle_annotation_input's commit path).
+        v.push_anno_undo();
+        v.annotations.push(mk(1.0));
+        v.push_anno_undo();
+        v.annotations.push(mk(2.0));
+        assert_eq!(v.annotations.len(), 2);
+
+        v.undo_annotation();
+        v.undo_annotation();
+        assert_eq!(v.annotations.len(), 0);
+        v.redo_annotation();
+        v.redo_annotation();
+        assert_eq!(v.annotations.len(), 2);
+
+        // A fresh edit after undo clears the redo stack.
+        v.undo_annotation();
+        v.push_anno_undo();
+        v.annotations.push(mk(9.0));
+        assert!(v.anno_redo.is_empty());
+
+        // Clear-all is itself undoable.
+        v.clear_annotations();
+        assert!(v.annotations.is_empty());
+        v.undo_annotation();
+        assert!(!v.annotations.is_empty());
+    }
+
+    #[test]
+    fn cancel_annotation_resets_active_tool() {
+        let mut v = ExrViewer::default();
+        assert!(!v.cancel_annotation(), "nothing active → not consumed");
+        v.anno_tool = AnnotationTool::Arrow;
+        assert!(v.cancel_annotation(), "active tool → consumed");
+        assert_eq!(v.anno_tool, AnnotationTool::None);
     }
 }
