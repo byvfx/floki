@@ -44,6 +44,19 @@ pub struct Uniforms {
     /// lockstep with `Uniforms.lut_domain_min/max` in `shader.wgsl`.
     pub lut_domain_min: [f32; 4],
     pub lut_domain_max: [f32; 4],
+    /// Customizable viewport background (issue #18). Linear-space colours (xyz;
+    /// w unused), composited where image alpha < 1 — see `background_color` in
+    /// `shader.wgsl`. `bg_mode` encodes `background::BackgroundMode`
+    /// (Checkerboard=0, Solid=1, Gradient=2). The gradient ramp itself is a 256×1
+    /// LUT (`bg_gradient_texture`), sampled along `bg_grad_angle`. Defaults
+    /// reproduce the historical grey checker. Keep in lockstep with `shader.wgsl`.
+    pub bg_checker_dark: [f32; 4],
+    pub bg_checker_light: [f32; 4],
+    pub bg_solid: [f32; 4],
+    pub bg_mode: u32,
+    pub bg_grad_angle: f32,
+    pub bg_checker_size: f32,
+    pub _pad3: u32,
 }
 
 /// Uniforms for the OCIO blit pass: composites the transparency checkerboard in
@@ -58,12 +71,21 @@ pub struct BlitUniforms {
     pub display_min: [f32; 2],
     pub display_max: [f32; 2],
     pub screen_size: [f32; 2],
-    pub checker_dark: f32,
-    pub checker_light: f32,
-    pub checker_size: f32,
-    pub checker_enabled: f32,
     pub overscan_factor: f32,
-    pub _pad0: f32,
+    /// Customizable viewport background (issue #18), composited here in *display*
+    /// space (post-OCIO, not colour-managed). `bg_mode`: Checkerboard=0, Solid=1,
+    /// Gradient=2 (`background::BackgroundMode::as_u32`, stored as f32 to keep this
+    /// an all-f32 / 16-byte-aligned struct). The gradient ramp is the shared
+    /// `bg_gradient_texture` (group(0) binding 4 in the blit). Keep in lockstep
+    /// with the `BlitUniforms` mirror in `BLIT_SHADER`.
+    pub bg_mode: f32,
+    pub bg_checker_size: f32,
+    pub bg_grad_angle: f32,
+    pub _pad_a: f32,
+    pub _pad_b: f32,
+    pub bg_checker_dark: [f32; 4],
+    pub bg_checker_light: [f32; 4],
+    pub bg_solid: [f32; 4],
 }
 
 pub struct GpuState {
@@ -85,6 +107,10 @@ pub struct GpuState {
     /// the black-body ramp (the default colormap) so diff renders correctly before
     /// any update.
     pub colormap_texture: wgpu::Texture,
+    /// Persistent `256x1` RGBA8 background gradient LUT (issue #18), updated in
+    /// place via [`GpuState::write_bg_gradient`]. Shares group(3) and the colormap
+    /// sampler. Seeded with the default dark→light grey ramp.
+    pub bg_gradient_texture: wgpu::Texture,
     /// Persistent uniform ring buffer (sized `UNIFORM_RING_SLOTS *
     /// uniform_stride`). Per-draw uniform data is written via
     /// `queue.write_buffer` at a dynamic offset, eliminating the per-frame
@@ -127,17 +153,46 @@ struct BlitUniforms {
     display_min: vec2<f32>,
     display_max: vec2<f32>,
     screen_size: vec2<f32>,
-    checker_dark: f32,
-    checker_light: f32,
-    checker_size: f32,
-    checker_enabled: f32,
     overscan_factor: f32,
-    _pad0: f32,
+    bg_mode: f32,
+    bg_checker_size: f32,
+    bg_grad_angle: f32,
+    _pad_a: f32,
+    _pad_b: f32,
+    bg_checker_dark: vec4<f32>,
+    bg_checker_light: vec4<f32>,
+    bg_solid: vec4<f32>,
 };
 @group(0) @binding(0) var t: texture_2d<f32>;       // OCIO display-transformed color
 @group(0) @binding(1) var s: sampler;
 @group(0) @binding(2) var scene_t: texture_2d<f32>; // pre-OCIO scene-linear (for alpha/coverage)
 @group(0) @binding(3) var<uniform> bu: BlitUniforms;
+@group(0) @binding(4) var bg_grad_t: texture_2d<f32>; // shared 256x1 background gradient LUT
+
+// Display-space background colour. Mirrors `background_color` in shader.wgsl and
+// `Background::sample_linear` in src/background.rs (kept in lockstep). `screen_pt`
+// is in screen pixels (checker tiling); `guv` is normalized across the display
+// window (gradient direction).
+fn blit_background(screen_pt: vec2<f32>, guv: vec2<f32>) -> vec3<f32> {
+    if bu.bg_mode > 1.5 {
+        let a = radians(bu.bg_grad_angle);
+        let d = vec2<f32>(cos(a), sin(a));
+        let pmin = min(d.x, 0.0) + min(d.y, 0.0);
+        let pmax = max(d.x, 0.0) + max(d.y, 0.0);
+        let p = guv.x * d.x + guv.y * d.y;
+        let tt = clamp((p - pmin) / max(pmax - pmin, 1e-4), 0.0, 1.0);
+        return textureSampleLevel(bg_grad_t, s, vec2<f32>(tt, 0.5), 0.0).rgb;
+    }
+    if bu.bg_mode > 0.5 {
+        return bu.bg_solid.rgb;
+    }
+    let size = max(bu.bg_checker_size, 1.0);
+    let cx = floor(screen_pt.x / size);
+    let cy = floor(screen_pt.y / size);
+    let is_dark = (i32(cx) + i32(cy)) % 2 == 0;
+    return select(bu.bg_checker_light.rgb, bu.bg_checker_dark.rgb, is_dark);
+}
+
 @fragment
 fn fs_main(i: VOut) -> @location(0) vec4<f32> {
     // Pass 1 clears the scene target's alpha to a negative sentinel; the image quad(s)
@@ -151,16 +206,14 @@ fn fs_main(i: VOut) -> @location(0) vec4<f32> {
     let disp = textureSample(t, s, i.uv);
     let a = clamp(scene_a, 0.0, 1.0);
 
-    // Display-space checkerboard (16-point cells), composited AFTER OCIO so the grey
-    // checker is not color-managed.
+    // Background (checker / solid / gradient), composited AFTER OCIO in display
+    // space so neutral grey stays neutral (not colour-managed).
     var rgb = disp.rgb;
-    if bu.checker_enabled > 0.5 {
+    {
         let screen_pt = i.uv * bu.screen_size;
-        let cx = u32(screen_pt.x / bu.checker_size);
-        let cy = u32(screen_pt.y / bu.checker_size);
-        let is_dark = (cx + cy) % 2u == 0u;
-        let bg = select(bu.checker_light, bu.checker_dark, is_dark);
-        rgb = rgb + vec3<f32>(bg) * (1.0 - a);
+        let guv = (screen_pt - bu.display_min) / max(bu.display_max - bu.display_min, vec2<f32>(1.0));
+        let bg = blit_background(screen_pt, guv);
+        rgb = rgb + bg * (1.0 - a);
     }
 
     // Overscan dim: multiply by the dim factor where the pixel is outside the display
@@ -274,6 +327,18 @@ impl GpuState {
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                         count: None,
                     },
+                    // 256x1 background gradient LUT (issue #18); reuses the
+                    // colormap/LUT filtering sampler at binding 3.
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
                 ],
             });
 
@@ -362,24 +427,28 @@ impl GpuState {
             ..Default::default()
         });
 
-        // Persistent 256x1 diff colormap LUT, seeded with the default (black-body)
-        // ramp. Updated in place via `write_colormap`; `lut_sampler` (linear,
-        // clamp-to-edge) doubles as the colormap sampler.
-        let colormap_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Diff Colormap LUT"),
-            size: wgpu::Extent3d {
-                width: crate::gradient::COLORMAP_LUT_SIZE as u32,
-                height: 1,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        write_colormap_texture(
+        // Persistent 256x1 LUTs (diff colormap + background gradient), each seeded
+        // with its default ramp and updated in place via `write_colormap` /
+        // `write_bg_gradient`. `lut_sampler` (linear, clamp-to-edge) doubles as
+        // their sampler.
+        let make_lut_texture = |label: &str| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width: crate::gradient::COLORMAP_LUT_SIZE as u32,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            })
+        };
+        let colormap_texture = make_lut_texture("Diff Colormap LUT");
+        write_lut_row(
             queue,
             &colormap_texture,
             &crate::gradient::Colormap::BlackBody
@@ -387,6 +456,15 @@ impl GpuState {
                 .bake(crate::gradient::COLORMAP_LUT_SIZE),
         );
         let colormap_view = colormap_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let bg_gradient_texture = make_lut_texture("Background Gradient LUT");
+        write_lut_row(
+            queue,
+            &bg_gradient_texture,
+            &crate::background::default_gradient().bake(crate::gradient::COLORMAP_LUT_SIZE),
+        );
+        let bg_gradient_view =
+            bg_gradient_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let default_lut_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Default LUT"),
@@ -447,6 +525,10 @@ impl GpuState {
                     wgpu::BindGroupEntry {
                         binding: 3,
                         resource: wgpu::BindingResource::Sampler(&lut_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(&bg_gradient_view),
                     },
                 ],
             }));
@@ -586,6 +668,18 @@ impl GpuState {
                         },
                         count: None,
                     },
+                    // Shared 256x1 background gradient LUT (sampled with the
+                    // non-filtering blit sampler at binding 1).
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
                 ],
             });
             let blit_pl_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -637,6 +731,7 @@ impl GpuState {
             sampler,
             lut_sampler,
             colormap_texture,
+            bg_gradient_texture,
             uniform_buffer,
             uniform_bind_group,
             uniform_stride,
@@ -695,6 +790,9 @@ impl GpuState {
         let colormap_view = self
             .colormap_texture
             .create_view(&wgpu::TextureViewDescriptor::default());
+        let bg_gradient_view = self
+            .bg_gradient_texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
 
         let bg = Arc::new(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("LUT Bind Group"),
@@ -708,8 +806,9 @@ impl GpuState {
                     binding: 1,
                     resource: wgpu::BindingResource::Sampler(&self.lut_sampler),
                 },
-                // The shared diff colormap LUT travels with every group(3) bind
-                // group; it's updated in place so this view stays valid.
+                // The shared diff colormap + background gradient LUTs travel with
+                // every group(3) bind group; both are updated in place so these
+                // views stay valid.
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: wgpu::BindingResource::TextureView(&colormap_view),
@@ -717,6 +816,10 @@ impl GpuState {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: wgpu::BindingResource::Sampler(&self.lut_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&bg_gradient_view),
                 },
             ],
         }));
@@ -728,13 +831,19 @@ impl GpuState {
     /// [`crate::gradient::Gradient::bake`]). Cheap (~1 KB) — called only when the
     /// active gradient changes.
     pub fn write_colormap(&self, queue: &wgpu::Queue, rgba: &[u8]) {
-        write_colormap_texture(queue, &self.colormap_texture, rgba);
+        write_lut_row(queue, &self.colormap_texture, rgba);
+    }
+
+    /// Upload a freshly baked background gradient into its persistent texture.
+    /// Same contract as [`Self::write_colormap`].
+    pub fn write_bg_gradient(&self, queue: &wgpu::Queue, rgba: &[u8]) {
+        write_lut_row(queue, &self.bg_gradient_texture, rgba);
     }
 }
 
-/// Write a baked `COLORMAP_LUT_SIZE × 1` RGBA8 colormap row into `tex`. Shared by
-/// `GpuState::new` (initial seed) and [`GpuState::write_colormap`] (updates).
-fn write_colormap_texture(queue: &wgpu::Queue, tex: &wgpu::Texture, rgba: &[u8]) {
+/// Write a baked `COLORMAP_LUT_SIZE × 1` RGBA8 LUT row into `tex`. Shared by the
+/// colormap and background-gradient textures (seed + updates).
+fn write_lut_row(queue: &wgpu::Queue, tex: &wgpu::Texture, rgba: &[u8]) {
     let width = crate::gradient::COLORMAP_LUT_SIZE as u32;
     queue.write_texture(
         wgpu::TexelCopyTextureInfo {
@@ -826,7 +935,7 @@ mod tests {
             "Uniforms size ({size}) must be a multiple of 16"
         );
         assert_eq!(
-            size, 128,
+            size, 192,
             "Uniforms layout changed — update shader.wgsl to match"
         );
     }
@@ -843,7 +952,7 @@ mod tests {
             "BlitUniforms size ({size}) must be a multiple of 16"
         );
         assert_eq!(
-            size, 48,
+            size, 96,
             "BlitUniforms layout changed — update BLIT_SHADER to match"
         );
     }
@@ -875,6 +984,13 @@ mod tests {
             _pad2: 0,
             lut_domain_min: [-0.5, -0.5, -0.5, 0.0],
             lut_domain_max: [1.5, 1.5, 1.5, 0.0],
+            bg_checker_dark: [0.1, 0.1, 0.1, 0.0],
+            bg_checker_light: [0.2, 0.2, 0.2, 0.0],
+            bg_solid: [0.18, 0.18, 0.18, 0.0],
+            bg_mode: 2,
+            bg_grad_angle: 90.0,
+            bg_checker_size: 16.0,
+            _pad3: 0,
         };
         let bytes = bytemuck::bytes_of(&u);
         assert_eq!(bytes.len(), std::mem::size_of::<Uniforms>());

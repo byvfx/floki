@@ -85,6 +85,14 @@ pub struct ExrApp {
     #[serde(default)]
     custom_gradients: Vec<(String, crate::gradient::Gradient)>,
 
+    /// Persisted viewport background (issue #18) + its named preset library.
+    /// Live state lives on [`ExrViewer`]; round-tripped each frame like the diff
+    /// controls. Default reproduces the legacy grey checker.
+    #[serde(default)]
+    background: crate::background::Background,
+    #[serde(default)]
+    background_presets: Vec<(String, crate::background::Background)>,
+
     #[serde(skip)]
     show_help: bool,
     #[serde(skip)]
@@ -203,6 +211,8 @@ impl Default for ExrApp {
             diff_metric: crate::gradient::DiffMetric::default(),
             diff_floor: 0.0,
             custom_gradients: Vec::new(),
+            background: crate::background::Background::default(),
+            background_presets: Vec::new(),
             show_help: false,
             show_settings: false,
             render_state: None,
@@ -1233,6 +1243,10 @@ impl eframe::App for ExrApp {
 
                     ui.menu_button("View", |ui| {
                         ui.checkbox(&mut self.viewer.show_contact_sheet, "Contact Sheet");
+                        if ui.button("Viewport Background...").clicked() {
+                            self.viewer.show_background_window = true;
+                            ui.close();
+                        }
                     });
 
                     ui.menu_button("Settings", |ui| {
@@ -1796,6 +1810,8 @@ impl eframe::App for ExrApp {
                     self.viewer.diff_metric = self.diff_metric;
                     self.viewer.diff_floor = self.diff_floor;
                     self.viewer.custom_gradients = std::mem::take(&mut self.custom_gradients);
+                    self.viewer.background = self.background.clone();
+                    self.viewer.background_presets = std::mem::take(&mut self.background_presets);
                     self.viewer.ui(
                         ui,
                         data,
@@ -1807,6 +1823,8 @@ impl eframe::App for ExrApp {
                     self.diff_metric = self.viewer.diff_metric;
                     self.diff_floor = self.viewer.diff_floor;
                     self.custom_gradients = std::mem::take(&mut self.viewer.custom_gradients);
+                    self.background = self.viewer.background.clone();
+                    self.background_presets = std::mem::take(&mut self.viewer.background_presets);
                 } else if self.loading_a {
                     // A requested but its decode hasn't landed yet (no prior image
                     // to keep showing) — show progress instead of a blank canvas.

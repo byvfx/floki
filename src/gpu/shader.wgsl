@@ -40,6 +40,18 @@ struct Uniforms {
     // Keep in lockstep with `Uniforms.lut_domain_min/max` in src/gpu/mod.rs.
     lut_domain_min: vec4<f32>,
     lut_domain_max: vec4<f32>,
+    // Customizable viewport background (issue #18). Linear-space colours (xyz),
+    // composited where image alpha < 1. `bg_mode`: Checkerboard=0, Solid=1,
+    // Gradient=2 (source of truth: `background::BackgroundMode::as_u32`). The
+    // gradient ramp is `bg_gradient_tex`, sampled along `bg_grad_angle`. Keep in
+    // lockstep with `Uniforms` in src/gpu/mod.rs.
+    bg_checker_dark: vec4<f32>,
+    bg_checker_light: vec4<f32>,
+    bg_solid: vec4<f32>,
+    bg_mode: u32,
+    bg_grad_angle: f32,
+    bg_checker_size: f32,
+    _pad3: u32,
 };
 
 @group(0) @binding(0) var tex_a: texture_2d<f32>;
@@ -57,6 +69,32 @@ struct Uniforms {
 // via `queue.write_texture` when the active gradient changes (see src/gpu/mod.rs).
 @group(3) @binding(2) var colormap_tex: texture_2d<f32>;
 @group(3) @binding(3) var colormap_samp: sampler;
+// 256x1 background gradient LUT (issue #18), updated in place like the colormap.
+@group(3) @binding(4) var bg_gradient_tex: texture_2d<f32>;
+
+// Linear background colour at screen pixel `screen_pos` (for the checker) /
+// normalized `uv` (for the gradient). Keep in lockstep with `Background` in
+// src/background.rs and the blit shader in src/gpu/mod.rs.
+fn background_color(screen_pos: vec2<f32>, uv: vec2<f32>) -> vec3<f32> {
+    if uniforms.bg_mode == 1u {
+        return uniforms.bg_solid.rgb;
+    }
+    if uniforms.bg_mode == 2u {
+        let a = radians(uniforms.bg_grad_angle);
+        let d = vec2<f32>(cos(a), sin(a));
+        let pmin = min(d.x, 0.0) + min(d.y, 0.0);
+        let pmax = max(d.x, 0.0) + max(d.y, 0.0);
+        let p = uv.x * d.x + uv.y * d.y;
+        let t = clamp((p - pmin) / max(pmax - pmin, 1e-4), 0.0, 1.0);
+        return textureSampleLevel(bg_gradient_tex, colormap_samp, vec2<f32>(t, 0.5), 0.0).rgb;
+    }
+    // Checkerboard.
+    let size = max(uniforms.bg_checker_size, 1.0);
+    let cx = floor(screen_pos.x / size);
+    let cy = floor(screen_pos.y / size);
+    let is_dark = (i32(cx) + i32(cy)) % 2 == 0;
+    return select(uniforms.bg_checker_light.rgb, uniforms.bg_checker_dark.rgb, is_dark);
+}
 
 @vertex
 fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
@@ -216,21 +254,18 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     g *= exp_mult;
     b *= exp_mult;
     
-    // Background Checkerboard compositing
-    // In screen space we can do a checkerboard.
-    // Skipped under OCIO (skip_checker==1): the checker is composited in display
+    // Background compositing (checkerboard / solid / gradient — see `background_color`).
+    // Composited in scene-linear space, then tone-mapped with the image below.
+    // Skipped under OCIO (skip_checker==1): the background is composited in display
     // space after the OCIO transform (in the blit pass) so neutral grey stays neutral.
     if uniforms.skip_checker == 0u {
         let screen_pos = mix(uniforms.rect_min, uniforms.rect_max, in.uv);
-        let check_x = u32(screen_pos.x / 16.0);
-        let check_y = u32(screen_pos.y / 16.0);
-        let is_dark = (check_x + check_y) % 2u == 0u;
-        let bg_linear = select(0.2, 0.1, is_dark);
+        let bg = background_color(screen_pos, in.uv);
 
         let a_clamp = clamp(a, 0.0, 1.0);
-        r = r + bg_linear * (1.0 - a_clamp);
-        g = g + bg_linear * (1.0 - a_clamp);
-        b = b + bg_linear * (1.0 - a_clamp);
+        r = r + bg.r * (1.0 - a_clamp);
+        g = g + bg.g * (1.0 - a_clamp);
+        b = b + bg.b * (1.0 - a_clamp);
     }
 
     // Display transform chain: gamma → LUT → sRGB.
