@@ -611,6 +611,163 @@ impl ExrApp {
         }
         self.error_msg = None;
     }
+
+    /// Load EXR files dragged onto the window. While files are dragged over the
+    /// window a left/right split overlay is drawn; on drop a single file routes
+    /// by position (right half → reference Image B) and multiple files load
+    /// first → A, second → B with the rest ignored. Non-EXR drops are ignored.
+    fn handle_drag_and_drop(&mut self, ctx: &egui::Context) {
+        // Hover preview while files are dragged in (before release). The cursor
+        // position updates during the drag, so highlight the half it's currently
+        // over — the half that will receive the drop — to make A vs B obvious.
+        if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+            let screen = ctx.content_rect();
+            let cx = screen.center().x;
+            // The OS cursor moves during the drag even though winit delivers no
+            // events, so query it directly (see `live_dropped_right`).
+            let target_b = live_dropped_right(ctx).unwrap_or(false);
+
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("dnd_overlay"),
+            ));
+            let left = egui::Rect::from_min_max(screen.min, egui::pos2(cx, screen.max.y));
+            let right = egui::Rect::from_min_max(egui::pos2(cx, screen.min.y), screen.max);
+            let active = if target_b { right } else { left };
+
+            // Dim the whole window, then brighten the active half so it reads as
+            // the live drop target.
+            painter.rect_filled(screen, 0.0, egui::Color32::from_black_alpha(150));
+            painter.rect_filled(
+                active,
+                0.0,
+                egui::Color32::from_rgba_unmultiplied(40, 90, 160, 70),
+            );
+            painter.rect_stroke(
+                active,
+                0.0,
+                egui::Stroke::new(3.0, egui::Color32::from_rgb(90, 160, 240)),
+                egui::StrokeKind::Inside,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(cx, screen.top()),
+                    egui::pos2(cx, screen.bottom()),
+                ],
+                (2.0, egui::Color32::from_white_alpha(180)),
+            );
+
+            let font = egui::FontId::proportional(28.0);
+            let bright = egui::Color32::WHITE;
+            let dim = egui::Color32::from_white_alpha(110);
+            painter.text(
+                egui::pos2(screen.left() + screen.width() * 0.25, screen.center().y),
+                egui::Align2::CENTER_CENTER,
+                "Drop for A",
+                font.clone(),
+                if target_b { dim } else { bright },
+            );
+            painter.text(
+                egui::pos2(screen.left() + screen.width() * 0.75, screen.center().y),
+                egui::Align2::CENTER_CENTER,
+                "Drop for B (reference)",
+                font,
+                if target_b { bright } else { dim },
+            );
+            // Keep repainting so the highlight tracks the cursor smoothly.
+            ctx.request_repaint();
+        }
+
+        // Handle files dropped this frame.
+        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+        if dropped.is_empty() {
+            return;
+        }
+        let exr_paths: Vec<PathBuf> = dropped
+            .into_iter()
+            .filter_map(|f| f.path)
+            .filter(|p| is_exr_path(p))
+            .collect();
+        let dropped_right = live_dropped_right(ctx).unwrap_or(false);
+        for (path, is_b) in route_dropped_exrs(&exr_paths, dropped_right) {
+            self.open_file(path, is_b);
+        }
+    }
+}
+
+/// Global OS cursor position in SCREEN-SPACE POINTS — the same space as
+/// `ViewportInfo::inner_rect` — queried directly from the OS rather than via
+/// winit events. During an external file drag winit delivers no cursor-move
+/// events, so egui's pointer is stale, but the OS cursor itself keeps moving.
+/// `None` on unsupported platforms.
+///
+/// Note the per-platform coordinate space: macOS `CGEvent` locations are already
+/// in points (global display space), whereas Windows `GetCursorPos` returns
+/// physical pixels, so only the Windows path divides by `pixels_per_point`.
+fn global_cursor_pos_points(pixels_per_point: f32) -> Option<egui::Pos2> {
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::Foundation::POINT;
+        use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+        let mut p = POINT::default();
+        // SAFETY: `GetCursorPos` writes a valid POINT; we pass a live pointer to it.
+        unsafe { GetCursorPos(&mut p).ok()? };
+        Some(egui::pos2(
+            p.x as f32 / pixels_per_point,
+            p.y as f32 / pixels_per_point,
+        ))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use core_graphics::event::CGEvent;
+        use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+        // A null-ish event created from a session source carries the *current*
+        // cursor location (the documented `CGEventCreate(NULL)` idiom). Already
+        // in screen-space points, so `pixels_per_point` is not needed here.
+        let _ = pixels_per_point;
+        let src = CGEventSource::new(CGEventSourceStateID::CombinedSessionState).ok()?;
+        let loc = CGEvent::new(src).ok()?.location();
+        Some(egui::pos2(loc.x as f32, loc.y as f32))
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let _ = pixels_per_point;
+        None
+    }
+}
+
+/// Whether `cursor_points` (screen-space points) is in the right half of
+/// `window_rect` (also screen-space points) — i.e. the drop targets Image B.
+/// Only X matters, so the cross-platform Y-origin difference is irrelevant.
+/// Pure / testable.
+fn cursor_targets_right(cursor_points: egui::Pos2, window_rect: egui::Rect) -> bool {
+    cursor_points.x >= window_rect.center().x
+}
+
+/// Live drop-target side this frame from the OS cursor + window rect, or `None`
+/// if either is unavailable (caller defaults to A / left).
+fn live_dropped_right(ctx: &egui::Context) -> Option<bool> {
+    let rect = ctx.input(|i| i.viewport().inner_rect)?;
+    let cursor = global_cursor_pos_points(ctx.pixels_per_point())?;
+    Some(cursor_targets_right(cursor, rect))
+}
+
+/// True if `path` has a (case-insensitive) `.exr` extension.
+fn is_exr_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("exr"))
+}
+
+/// Map dropped EXR paths to `(path, is_b)` load requests. A single file routes
+/// by drop position (`dropped_right` → Image B); multiple files load first → A,
+/// second → B, and any extras are ignored.
+fn route_dropped_exrs(paths: &[PathBuf], dropped_right: bool) -> Vec<(PathBuf, bool)> {
+    match paths {
+        [] => Vec::new(),
+        [single] => vec![(single.clone(), dropped_right)],
+        [a, b, ..] => vec![(a.clone(), false), (b.clone(), true)],
+    }
 }
 
 impl eframe::App for ExrApp {
@@ -622,6 +779,9 @@ impl eframe::App for ExrApp {
         // Apply the persisted theme preference. Idempotent per frame; `System`
         // tracks the OS light/dark setting via egui's input each frame.
         ui.ctx().set_theme(self.theme);
+
+        // Load EXR files dragged onto the window (and draw the drag-over overlay).
+        self.handle_drag_and_drop(ui.ctx());
 
         // Drain completed async image loads (collect first so the `load_rx`
         // borrow ends before the `&mut self` apply call).
@@ -1745,5 +1905,81 @@ mod tests {
             "both loading flags cleared (A discards any in-flight B)"
         );
         assert!(app.error_msg.is_none());
+    }
+
+    #[test]
+    fn is_exr_path_is_case_insensitive_and_extension_only() {
+        assert!(is_exr_path(std::path::Path::new("/a/b/shot.exr")));
+        assert!(is_exr_path(std::path::Path::new("SHOT.EXR")));
+        assert!(is_exr_path(std::path::Path::new("render.Exr")));
+        assert!(!is_exr_path(std::path::Path::new("note.txt")));
+        assert!(!is_exr_path(std::path::Path::new("exr"))); // bare name, no extension
+        assert!(!is_exr_path(std::path::Path::new("archive.exr.zip")));
+    }
+
+    #[test]
+    fn route_single_drop_uses_position() {
+        let p = vec![PathBuf::from("a.exr")];
+        assert_eq!(
+            route_dropped_exrs(&p, false),
+            vec![(PathBuf::from("a.exr"), false)],
+            "left half loads as A"
+        );
+        assert_eq!(
+            route_dropped_exrs(&p, true),
+            vec![(PathBuf::from("a.exr"), true)],
+            "right half loads as B"
+        );
+    }
+
+    #[test]
+    fn route_multi_drop_is_a_then_b_rest_ignored() {
+        let paths = vec![
+            PathBuf::from("a.exr"),
+            PathBuf::from("b.exr"),
+            PathBuf::from("c.exr"),
+        ];
+        // Position is ignored once there are 2+ files: first → A, second → B.
+        assert_eq!(
+            route_dropped_exrs(&paths, true),
+            vec![
+                (PathBuf::from("a.exr"), false),
+                (PathBuf::from("b.exr"), true),
+            ],
+        );
+    }
+
+    #[test]
+    fn route_empty_drop_is_noop() {
+        assert!(route_dropped_exrs(&[], false).is_empty());
+    }
+
+    #[test]
+    fn cursor_targets_right_splits_on_window_center() {
+        // Window spanning screen-points x: 0..1000 (center 500).
+        let rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1000.0, 800.0));
+        assert!(!cursor_targets_right(egui::pos2(499.0, 10.0), rect));
+        assert!(cursor_targets_right(egui::pos2(501.0, 10.0), rect));
+        // Exactly at center counts as right (`>=`).
+        assert!(cursor_targets_right(egui::pos2(500.0, 10.0), rect));
+    }
+
+    #[test]
+    fn cursor_targets_right_uses_window_screen_center_not_origin() {
+        // Off-origin window (e.g. dragged to the right of the primary monitor):
+        // screen-points x 400..1400, center 900. Proves we compare against the
+        // window's *screen-space* center, so multi-monitor / moved windows work.
+        let rect = egui::Rect::from_min_max(egui::pos2(400.0, 0.0), egui::pos2(1400.0, 800.0));
+        assert!(!cursor_targets_right(egui::pos2(850.0, 0.0), rect));
+        assert!(cursor_targets_right(egui::pos2(950.0, 0.0), rect));
+    }
+
+    #[test]
+    fn cursor_targets_right_handles_negative_origin_monitor() {
+        // Secondary monitor to the left of primary: screen-points x -1920..-920,
+        // center -1420. Cursor at -1500 is left of center -> A.
+        let rect = egui::Rect::from_min_max(egui::pos2(-1920.0, 0.0), egui::pos2(-920.0, 800.0));
+        assert!(!cursor_targets_right(egui::pos2(-1500.0, 0.0), rect));
+        assert!(cursor_targets_right(egui::pos2(-1000.0, 0.0), rect));
     }
 }
