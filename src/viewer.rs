@@ -766,8 +766,7 @@ impl ExrViewer {
     /// interactive.
     fn diff_legend(&self, ui: &mut egui::Ui) {
         let grad = self.diff_colormap.gradient();
-        let (rect, _) =
-            ui.allocate_exact_size(egui::vec2(120.0, 14.0), egui::Sense::hover());
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(120.0, 14.0), egui::Sense::hover());
         if ui.is_rect_visible(rect) {
             let painter = ui.painter_at(rect);
             let n = rect.width().round().max(1.0) as usize;
