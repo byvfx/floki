@@ -30,8 +30,12 @@ pub struct Uniforms {
     /// alpha (the OCIO path composites the checker in display space afterwards).
     /// Keep in lockstep with `Uniforms.skip_checker` in `shader.wgsl`.
     pub skip_checker: u32,
-    pub _pad0: u32,
-    pub _pad1: u32,
+    /// Diff visualization controls (only read by the shader when `is_diff_mode`).
+    /// `diff_metric` encodes `gradient::DiffMetric` (MaxChannel=0, Luminance=1,
+    /// PerChannelRGB=2); `diff_floor` is a noise floor subtracted from the gained
+    /// magnitude. Keep in lockstep with `Uniforms` in `shader.wgsl`.
+    pub diff_metric: u32,
+    pub diff_floor: f32,
     pub _pad2: u32,
     /// `.cube` LUT domain bounds (xyz + pad). The lookup coordinate is remapped
     /// from `[domain_min, domain_max]` to `[0, 1]` before sampling the 3D LUT
@@ -74,6 +78,13 @@ pub struct GpuState {
     pub default_lut_bind_group: Arc<wgpu::BindGroup>,
     pub sampler: wgpu::Sampler,
     pub lut_sampler: wgpu::Sampler,
+    /// Persistent `256x1` RGBA8 diff colormap LUT. Bound into every group(3)
+    /// bind group (alongside the 3D look LUT) and updated *in place* via
+    /// [`GpuState::write_colormap`] when the active gradient changes — the texture
+    /// handle is stable, so the bind groups never need rebuilding. Initialised to
+    /// the black-body ramp (the default colormap) so diff renders correctly before
+    /// any update.
+    pub colormap_texture: wgpu::Texture,
     /// Persistent uniform ring buffer (sized `UNIFORM_RING_SLOTS *
     /// uniform_stride`). Per-draw uniform data is written via
     /// `queue.write_buffer` at a dynamic offset, eliminating the per-frame
@@ -245,6 +256,24 @@ impl GpuState {
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                         count: None,
                     },
+                    // 256x1 diff colormap LUT (+ filtering sampler). Shares this
+                    // group because we are at the 4-bind-group limit.
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
                 ],
             });
 
@@ -333,6 +362,32 @@ impl GpuState {
             ..Default::default()
         });
 
+        // Persistent 256x1 diff colormap LUT, seeded with the default (black-body)
+        // ramp. Updated in place via `write_colormap`; `lut_sampler` (linear,
+        // clamp-to-edge) doubles as the colormap sampler.
+        let colormap_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Diff Colormap LUT"),
+            size: wgpu::Extent3d {
+                width: crate::gradient::COLORMAP_LUT_SIZE as u32,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        write_colormap_texture(
+            queue,
+            &colormap_texture,
+            &crate::gradient::Colormap::BlackBody
+                .gradient()
+                .bake(crate::gradient::COLORMAP_LUT_SIZE),
+        );
+        let colormap_view = colormap_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
         let default_lut_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Default LUT"),
             size: wgpu::Extent3d {
@@ -383,6 +438,14 @@ impl GpuState {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&lut_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&colormap_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
                         resource: wgpu::BindingResource::Sampler(&lut_sampler),
                     },
                 ],
@@ -573,6 +636,7 @@ impl GpuState {
             default_lut_bind_group,
             sampler,
             lut_sampler,
+            colormap_texture,
             uniform_buffer,
             uniform_bind_group,
             uniform_stride,
@@ -628,6 +692,9 @@ impl GpuState {
         );
 
         let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let colormap_view = self
+            .colormap_texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
 
         let bg = Arc::new(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("LUT Bind Group"),
@@ -641,10 +708,53 @@ impl GpuState {
                     binding: 1,
                     resource: wgpu::BindingResource::Sampler(&self.lut_sampler),
                 },
+                // The shared diff colormap LUT travels with every group(3) bind
+                // group; it's updated in place so this view stays valid.
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&colormap_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&self.lut_sampler),
+                },
             ],
         }));
         (bg, tex)
     }
+
+    /// Upload a freshly baked diff colormap into the persistent colormap texture.
+    /// `rgba` must be `COLORMAP_LUT_SIZE * 4` bytes (the output of
+    /// [`crate::gradient::Gradient::bake`]). Cheap (~1 KB) — called only when the
+    /// active gradient changes.
+    pub fn write_colormap(&self, queue: &wgpu::Queue, rgba: &[u8]) {
+        write_colormap_texture(queue, &self.colormap_texture, rgba);
+    }
+}
+
+/// Write a baked `COLORMAP_LUT_SIZE × 1` RGBA8 colormap row into `tex`. Shared by
+/// `GpuState::new` (initial seed) and [`GpuState::write_colormap`] (updates).
+fn write_colormap_texture(queue: &wgpu::Queue, tex: &wgpu::Texture, rgba: &[u8]) {
+    let width = crate::gradient::COLORMAP_LUT_SIZE as u32;
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        rgba,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(width * 4),
+            rows_per_image: Some(1),
+        },
+        wgpu::Extent3d {
+            width,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+    );
 }
 
 pub struct ExrCallback {
@@ -760,8 +870,8 @@ mod tests {
             wipe_center: [0.5, 0.5],
             wipe_angle: 0.0,
             skip_checker: 1,
-            _pad0: 0,
-            _pad1: 0,
+            diff_metric: 1,
+            diff_floor: 0.05,
             _pad2: 0,
             lut_domain_min: [-0.5, -0.5, -0.5, 0.0],
             lut_domain_max: [1.5, 1.5, 1.5, 0.0],

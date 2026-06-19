@@ -14,6 +14,7 @@ pub mod exr_loader;
 
 mod color;
 mod gpu;
+mod gradient;
 mod render_math;
 pub mod tools;
 mod viewer;

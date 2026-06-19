@@ -71,6 +71,20 @@ pub struct ExrApp {
     recent_files: Vec<PathBuf>,
     theme: ThemeChoice,
 
+    /// Persisted Diff/Matte visualization controls (issue #15). The live state
+    /// lives on [`ExrViewer`] (where the UI mutates it); these mirror it for
+    /// persistence and are round-tripped each frame around `viewer.ui`. Defaults
+    /// reproduce the legacy behaviour (black-body / max-channel / no floor).
+    #[serde(default)]
+    diff_colormap: crate::gradient::Colormap,
+    #[serde(default)]
+    diff_metric: crate::gradient::DiffMetric,
+    #[serde(default)]
+    diff_floor: f32,
+    /// User-saved named gradients (the preset library shared with the editor).
+    #[serde(default)]
+    custom_gradients: Vec<(String, crate::gradient::Gradient)>,
+
     #[serde(skip)]
     show_help: bool,
     #[serde(skip)]
@@ -185,6 +199,10 @@ impl Default for ExrApp {
             viewer: ExrViewer::default(),
             recent_files: Vec::new(),
             theme: ThemeChoice::default(),
+            diff_colormap: crate::gradient::Colormap::default(),
+            diff_metric: crate::gradient::DiffMetric::default(),
+            diff_floor: 0.0,
+            custom_gradients: Vec::new(),
             show_help: false,
             show_settings: false,
             render_state: None,
@@ -1770,6 +1788,14 @@ impl eframe::App for ExrApp {
                             None
                         };
                     }
+                    // Diff controls: push the persisted state into the viewer, let
+                    // the mode-param UI mutate it during `ui`, then read it back so
+                    // `save` persists the latest. Kept identical both ways, so no
+                    // value is lost across frames.
+                    self.viewer.diff_colormap = self.diff_colormap.clone();
+                    self.viewer.diff_metric = self.diff_metric;
+                    self.viewer.diff_floor = self.diff_floor;
+                    self.viewer.custom_gradients = std::mem::take(&mut self.custom_gradients);
                     self.viewer.ui(
                         ui,
                         data,
@@ -1777,6 +1803,10 @@ impl eframe::App for ExrApp {
                         self.render_state.as_ref(),
                         self.lut_bg.clone(),
                     );
+                    self.diff_colormap = self.viewer.diff_colormap.clone();
+                    self.diff_metric = self.viewer.diff_metric;
+                    self.diff_floor = self.viewer.diff_floor;
+                    self.custom_gradients = std::mem::take(&mut self.viewer.custom_gradients);
                 } else if self.loading_a {
                     // A requested but its decode hasn't landed yet (no prior image
                     // to keep showing) — show progress instead of a blank canvas.
