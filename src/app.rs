@@ -93,6 +93,18 @@ pub struct ExrApp {
     #[serde(default)]
     background_presets: Vec<(String, crate::background::Background)>,
 
+    /// Snapshot to clipboard (issue #19): when true, each snapshot also writes a
+    /// timestamped PNG to `~/.floki/snapshots/`. The clipboard copy always happens.
+    #[serde(default)]
+    save_snapshots: bool,
+    /// A framebuffer screenshot has been requested and we're awaiting its
+    /// `Event::Screenshot` reply (transient).
+    #[serde(skip)]
+    snapshot_pending: bool,
+    /// Last snapshot outcome, shown briefly in the status bar (transient).
+    #[serde(skip)]
+    snapshot_status: Option<String>,
+
     #[serde(skip)]
     show_help: bool,
     #[serde(skip)]
@@ -213,6 +225,9 @@ impl Default for ExrApp {
             custom_gradients: Vec::new(),
             background: crate::background::Background::default(),
             background_presets: Vec::new(),
+            save_snapshots: false,
+            snapshot_pending: false,
+            snapshot_status: None,
             show_help: false,
             show_settings: false,
             render_state: None,
@@ -460,6 +475,75 @@ impl ExrApp {
     /// GPU bind group, capture the domain bounds, and update `lut_bg` /
     /// `lut_error` / `enable_lut`. Ignores stale results (a newer reload of a
     /// different path superseded this one).
+    /// Snapshot to clipboard (#19): drive the hotkey trigger and consume the
+    /// `Event::Screenshot` reply. Called once per frame from [`Self::ui`].
+    fn process_snapshot(&mut self, ctx: &egui::Context) {
+        // Cmd/Ctrl+Shift+S requests a snapshot (S avoids the viewer's plain R/G/B/A/C
+        // channel keys). The menu button calls `request_snapshot` directly.
+        let hotkey =
+            ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::S));
+        if hotkey {
+            self.request_snapshot(ctx);
+        }
+
+        // The screenshot is produced at the end of the requesting frame and the
+        // reply lands as an event on a later frame; grab the most recent one.
+        if !self.snapshot_pending {
+            return;
+        }
+        let image = ctx.input(|i| {
+            i.raw.events.iter().rev().find_map(|e| match e {
+                egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                _ => None,
+            })
+        });
+        if let Some(image) = image {
+            self.snapshot_pending = false;
+            self.finish_snapshot(&image, ctx.pixels_per_point());
+        }
+    }
+
+    /// Ask egui to capture the next rendered frame. Idempotent while a capture is
+    /// already in flight.
+    fn request_snapshot(&mut self, ctx: &egui::Context) {
+        if self.snapshot_pending {
+            return;
+        }
+        if self.viewer.last_canvas_rect.is_none() {
+            self.snapshot_status = Some("Snapshot: no image loaded".to_string());
+            return;
+        }
+        self.snapshot_pending = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
+        ctx.request_repaint();
+    }
+
+    /// Crop the captured framebuffer to the image canvas, copy it to the clipboard,
+    /// and (when enabled) save a timestamped PNG. Records a status string.
+    fn finish_snapshot(&mut self, image: &egui::ColorImage, pixels_per_point: f32) {
+        let Some(rect) = self.viewer.last_canvas_rect else {
+            return;
+        };
+        let cropped = crate::snapshot::crop_to_rect(image, rect, pixels_per_point);
+
+        let mut parts = Vec::new();
+        match crate::snapshot::copy_to_clipboard(&cropped) {
+            Ok(()) => parts.push("copied to clipboard".to_string()),
+            Err(e) => parts.push(format!("clipboard failed: {e}")),
+        }
+        if self.save_snapshots {
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            match crate::snapshot::save_png(&cropped, secs) {
+                Ok(path) => parts.push(format!("saved {}", path.display())),
+                Err(e) => parts.push(format!("save failed: {e}")),
+            }
+        }
+        self.snapshot_status = Some(format!("Snapshot: {}", parts.join(", ")));
+    }
+
     fn apply_lut_load_result(&mut self, res: LutLoadResult) {
         // Discard stale results from a superseded reload.
         if res.path != self.lut_path {
@@ -842,6 +926,10 @@ impl eframe::App for ExrApp {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(50));
         }
+
+        // Snapshot to clipboard (#19): request a framebuffer screenshot on the
+        // hotkey and consume the reply when it arrives.
+        self.process_snapshot(ui.ctx());
 
         if self.show_help {
             egui::Window::new("Help & Shortcuts")
@@ -1247,6 +1335,19 @@ impl eframe::App for ExrApp {
                             self.viewer.show_background_window = true;
                             ui.close();
                         }
+                        ui.separator();
+                        if ui
+                            .button("Snapshot to Clipboard")
+                            .on_hover_text(
+                                "Copy the current view to the clipboard (Cmd/Ctrl+Shift+S)",
+                            )
+                            .clicked()
+                        {
+                            self.request_snapshot(ui.ctx());
+                            ui.close();
+                        }
+                        ui.checkbox(&mut self.save_snapshots, "Also save to ~/.floki/snapshots")
+                            .on_hover_text("Write a timestamped PNG alongside the clipboard copy");
                     });
 
                     ui.menu_button("Settings", |ui| {
@@ -1284,6 +1385,9 @@ impl eframe::App for ExrApp {
         // window when Image B is loaded) is added first, it expands the parent UI's
         // bottom edge past the window and the bottom panel anchors off-screen.
         egui::Panel::bottom("status_bar").show_inside(ui, |ui| {
+            if let Some(status) = &self.snapshot_status {
+                ui.label(egui::RichText::new(status).weak());
+            }
             ui.vertical(|ui| {
                 let draw_nuke_status_line =
                     |ui: &mut egui::Ui,

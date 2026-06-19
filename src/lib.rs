@@ -17,5 +17,6 @@ mod color;
 mod gpu;
 mod gradient;
 mod render_math;
+mod snapshot;
 pub mod tools;
 mod viewer;

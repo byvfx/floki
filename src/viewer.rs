@@ -334,6 +334,11 @@ pub struct ExrViewer {
     /// frame it renders so the slide-in animation knows how far to grow. Transient
     /// runtime state — not persisted.
     row2_full_height: f32,
+
+    /// The image canvas rect (egui points) from the last frame, used by the
+    /// snapshot feature (#19) to crop the framebuffer screenshot to the image
+    /// area. Transient.
+    pub last_canvas_rect: Option<egui::Rect>,
 }
 
 impl Default for ExrViewer {
@@ -403,6 +408,7 @@ impl Default for ExrViewer {
             last_sampled_val_a: None,
             last_sampled_val_b: None,
             row2_full_height: 0.0,
+            last_canvas_rect: None,
         }
     }
 }
@@ -1444,6 +1450,10 @@ impl ExrViewer {
             if has_texture {
                 let (rect, response) =
                     ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
+
+                // Record the canvas rect (egui points) so the snapshot (#19) can
+                // crop the framebuffer screenshot to just the image area.
+                self.last_canvas_rect = Some(rect);
 
                 if self.first_frame {
                     let scale_x = rect.width() / tex_size.x;
