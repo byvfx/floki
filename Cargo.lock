@@ -1499,6 +1499,7 @@ name = "floki"
 version = "1.6.0"
 dependencies = [
  "approx",
+ "arboard",
  "bytemuck",
  "core-graphics",
  "criterion",
@@ -1509,6 +1510,8 @@ dependencies = [
  "env_logger",
  "exr",
  "floki-ocio",
+ "home",
+ "image",
  "log",
  "pollster",
  "rayon",
