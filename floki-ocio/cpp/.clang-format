@@ -1,0 +1,19 @@
+# Matches the hand-written style of shim.{cpp,h}: 4-space indent, pointer-left,
+# attached braces, access specifiers at the class column, un-indented namespaces,
+# indented case labels, and long calls broken one-argument-per-line.
+BasedOnStyle: LLVM
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 100
+AccessModifierOffset: -4
+PointerAlignment: Left
+NamespaceIndentation: None
+BreakBeforeBraces: Attach
+AllowShortFunctionsOnASingleLine: All
+AlignAfterOpenBracket: AlwaysBreak
+BinPackArguments: false
+BinPackParameters: true
+IndentCaseLabels: true
+PenaltyReturnTypeOnItsOwnLine: 1000
+SortIncludes: false
