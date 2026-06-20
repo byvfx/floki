@@ -22,6 +22,7 @@ impl ConversionSummary {
     // Only called from `src/bin/convert_dir.rs`, which re-includes this file
     // via `#[path]` (separate compilation) — the lib crate doesn't see the use.
     #[allow(dead_code)]
+    #[must_use]
     pub fn is_success(&self) -> bool {
         !self.cancelled && self.failed == 0
     }

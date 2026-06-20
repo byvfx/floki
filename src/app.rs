@@ -286,6 +286,7 @@ impl Default for ExrApp {
 impl ExrApp {
     /// Build the app: restore persisted state (or [`Default`]), then re-apply
     /// the saved theme and re-establish OCIO/LUT state for the loaded settings.
+    #[must_use]
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let mut app: Self = if let Some(storage) = cc.storage {
             eframe::get_value(storage, eframe::APP_KEY).unwrap_or_default()
@@ -527,11 +528,7 @@ impl ExrApp {
     /// and (when enabled) save a timestamped PNG. Records a status string.
     fn finish_snapshot(&mut self, image: &egui::ColorImage, pixels_per_point: f32) {
         // Crop to the active image area (#52), falling back to the full canvas.
-        let Some(rect) = self
-            .viewer
-            .last_image_rect
-            .or(self.viewer.last_canvas_rect)
-        else {
+        let Some(rect) = self.viewer.last_image_rect.or(self.viewer.last_canvas_rect) else {
             return;
         };
         let cropped = crate::snapshot::crop_to_rect(image, rect, pixels_per_point);
@@ -905,6 +902,24 @@ impl eframe::App for ExrApp {
         // Load EXR files dragged onto the window (and draw the drag-over overlay).
         self.handle_drag_and_drop(ui.ctx());
 
+        self.poll_async_loads(ui.ctx());
+
+        // Snapshot to clipboard (#19): request a framebuffer screenshot on the
+        // hotkey and consume the reply when it arrives.
+        self.process_snapshot(ui.ctx());
+
+        self.draw_help_window(ui.ctx());
+        self.draw_tools_window(ui.ctx());
+        self.draw_color_management_window(ui.ctx());
+        self.draw_menu_bar(ui);
+        self.draw_status_bar(ui);
+        self.draw_side_panel(ui);
+        self.draw_central_canvas(ui);
+    }
+}
+
+impl ExrApp {
+    fn poll_async_loads(&mut self, ctx: &egui::Context) {
         // Drain completed async image loads (collect first so the `load_rx`
         // borrow ends before the `&mut self` apply call).
         let mut loaded = Vec::new();
@@ -918,8 +933,7 @@ impl eframe::App for ExrApp {
         }
         if self.loading_a || self.loading_b {
             // egui is reactive; keep polling the worker until the decode lands.
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(50));
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
 
         // Drain completed async LUT loads.
@@ -933,18 +947,15 @@ impl eframe::App for ExrApp {
             self.apply_lut_load_result(res);
         }
         if self.lut_loading {
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(50));
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
+    }
 
-        // Snapshot to clipboard (#19): request a framebuffer screenshot on the
-        // hotkey and consume the reply when it arrives.
-        self.process_snapshot(ui.ctx());
-
+    fn draw_help_window(&mut self, ctx: &egui::Context) {
         if self.show_help {
             egui::Window::new("Help & Shortcuts")
                 .open(&mut self.show_help)
-                .show(ui.ctx(), |ui| {
+                .show(ctx, |ui| {
                     ui.heading("Keyboard Shortcuts");
                     ui.label("1 - View Image A");
                     ui.label("2 - View Image B (when reference loaded)");
@@ -978,9 +989,11 @@ impl eframe::App for ExrApp {
                     ui.hyperlink("https://github.com/byvfx/floki");
                 });
         }
+    }
 
+    fn draw_tools_window(&mut self, ctx: &egui::Context) {
         if self.show_tools_window {
-            egui::Window::new("EXR Header Converter").open(&mut self.show_tools_window).show(ui.ctx(), |ui| {
+            egui::Window::new("EXR Header Converter").open(&mut self.show_tools_window).show(ctx, |ui| {
                 ui.heading("Batch Convert EXR Headers");
                 ui.label("This tool processes all EXR files in a directory and renames their channels to standard RGBA format.");
                 ui.add_space(10.0);
@@ -1080,7 +1093,9 @@ impl eframe::App for ExrApp {
                     }
             });
         }
+    }
 
+    fn draw_color_management_window(&mut self, ctx: &egui::Context) {
         if self.show_settings {
             // `.open(&mut self.show_settings)` holds a field borrow for the whole
             // closure, so we can't call the whole-`self` `reload_lut` inside it.
@@ -1098,7 +1113,7 @@ impl eframe::App for ExrApp {
             let ocio_colorspaces = self.ocio_colorspaces.clone();
             egui::Window::new("Color Management")
                 .open(&mut self.show_settings)
-                .show(ui.ctx(), |ui| {
+                .show(ctx, |ui| {
                     ui.heading("Settings");
                     ui.add_space(5.0);
 
@@ -1253,7 +1268,9 @@ impl eframe::App for ExrApp {
                 self.rebuild_ocio_pass();
             }
         }
+    }
 
+    fn draw_menu_bar(&mut self, ui: &mut egui::Ui) {
         // Full-screen mode (#2) hides the menu bar and side panel for a clean,
         // distraction-free viewport. ESC / F11 (handled in the viewer) restores.
         if !self.viewer.fullscreen {
@@ -1389,7 +1406,9 @@ impl eframe::App for ExrApp {
                 });
             });
         }
+    }
 
+    fn draw_status_bar(&mut self, ui: &mut egui::Ui) {
         // Status bar must be added BEFORE the side panel. egui allocates panel space
         // in call order; if the side panel (whose content can grow taller than the
         // window when Image B is loaded) is added first, it expands the parent UI's
@@ -1414,7 +1433,11 @@ impl eframe::App for ExrApp {
                     fmt_bytes(sample.sys_total),
                 );
                 if let (Some(used), Some(budget)) = (sample.gpu_used, sample.gpu_budget) {
-                    text.push_str(&format!(" · VRAM {}/{}", fmt_bytes(used), fmt_bytes(budget)));
+                    text.push_str(&format!(
+                        " · VRAM {}/{}",
+                        fmt_bytes(used),
+                        fmt_bytes(budget)
+                    ));
                 }
                 // Wrap the right-aligned label in a `horizontal` row first: a bare
                 // right_to_left(Center) layout inside this auto-sized bottom panel would
@@ -1598,7 +1621,9 @@ impl eframe::App for ExrApp {
                 }
             });
         });
+    }
 
+    fn draw_side_panel(&mut self, ui: &mut egui::Ui) {
         if !self.viewer.fullscreen {
             egui::Panel::left("side_panel")
                 .resizable(true)
@@ -1930,7 +1955,9 @@ impl eframe::App for ExrApp {
                     });
                 });
         }
+    }
 
+    fn draw_central_canvas(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default().show_inside(ui, |ui| {
             if self.loaded_file.is_some() {
                 if let Some(data) = &self.exr_data {

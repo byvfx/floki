@@ -183,6 +183,10 @@ pub struct OcioConfig {
 
 impl OcioConfig {
     /// Load a config from a file, a built-in name, or `$OCIO`.
+    ///
+    /// # Errors
+    /// Returns [`OcioError::NotCompiled`] when built without an OCIO backend feature, or
+    /// [`OcioError::Load`] if the config cannot be found, read, or parsed.
     pub fn load(src: ConfigSource<'_>) -> Result<Self> {
         #[cfg(feature = "_native")]
         {
@@ -196,6 +200,7 @@ impl OcioConfig {
     }
 
     /// All color spaces declared in the config.
+    #[must_use]
     pub fn color_spaces(&self) -> Vec<ColorSpace> {
         #[cfg(feature = "_native")]
         {
@@ -208,6 +213,7 @@ impl OcioConfig {
     }
 
     /// All displays (each carrying its views and default view).
+    #[must_use]
     pub fn displays(&self) -> Vec<Display> {
         #[cfg(feature = "_native")]
         {
@@ -220,6 +226,7 @@ impl OcioConfig {
     }
 
     /// The config's default display name.
+    #[must_use]
     pub fn default_display(&self) -> String {
         #[cfg(feature = "_native")]
         {
@@ -232,6 +239,7 @@ impl OcioConfig {
     }
 
     /// The color space bound to the `scene_linear` role, if any.
+    #[must_use]
     pub fn scene_linear_colorspace(&self) -> Option<String> {
         #[cfg(feature = "_native")]
         {
@@ -244,6 +252,11 @@ impl OcioConfig {
     }
 
     /// Build a GPU shader bundle for the given input→display/view transform.
+    ///
+    /// # Errors
+    /// Returns [`OcioError::NotCompiled`] when built without an OCIO backend feature,
+    /// [`OcioError::Transform`] if the transform cannot be built from the config, or
+    /// [`OcioError::Transpile`] if the generated shader cannot be translated.
     pub fn build_gpu_shader(&self, req: &DisplayTransformRequest) -> Result<GpuShaderBundle> {
         #[cfg(feature = "_native")]
         {
@@ -257,6 +270,10 @@ impl OcioConfig {
     }
 
     /// Build a CPU processor for the given input→display/view transform.
+    ///
+    /// # Errors
+    /// Returns [`OcioError::NotCompiled`] when built without an OCIO backend feature, or
+    /// [`OcioError::Transform`] if the transform cannot be built from the config.
     pub fn build_cpu_processor(&self, req: &DisplayTransformRequest) -> Result<CpuProcessor> {
         #[cfg(feature = "_native")]
         {
@@ -288,6 +305,10 @@ pub struct CpuProcessor {
 
 impl CpuProcessor {
     /// Apply the transform to interleaved RGBA f32 pixels, in place.
+    ///
+    /// # Errors
+    /// Returns [`OcioError::BufferSize`] if `pixels.len()` is not `width * height * 4`, or
+    /// [`OcioError::NotCompiled`] when built without an OCIO backend feature.
     pub fn apply_rgba(&self, pixels: &mut [f32], width: usize, height: usize) -> Result<()> {
         let expected = width.saturating_mul(height).saturating_mul(4);
         if pixels.len() != expected {

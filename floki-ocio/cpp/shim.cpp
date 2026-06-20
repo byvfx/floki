@@ -55,9 +55,7 @@ rust::Vec<DisplayInfo> OcioConfig::displays() const {
     return out;
 }
 
-rust::String OcioConfig::default_display() const {
-    return to_rust(cfg_->getDefaultDisplay());
-}
+rust::String OcioConfig::default_display() const { return to_rust(cfg_->getDefaultDisplay()); }
 
 rust::String OcioConfig::scene_linear_colorspace() const {
     OCIO::ConstColorSpaceRcPtr cs = cfg_->getColorSpace(OCIO::ROLE_SCENE_LINEAR);
@@ -142,9 +140,7 @@ OcioShaderData OcioConfig::build_gpu_shader(
         t.depth = edgelen;
         t.channels = 3;
         t.interpolation = static_cast<std::uint8_t>(interp);
-        copy_values(values,
-                    static_cast<std::size_t>(edgelen) * edgelen * edgelen * 3,
-                    t.data);
+        copy_values(values, static_cast<std::size_t>(edgelen) * edgelen * edgelen * 3, t.data);
         out.textures.push_back(std::move(t));
     }
 
@@ -164,8 +160,7 @@ OcioShaderData OcioConfig::build_gpu_shader(
         desc->getTextureValues(i, values);
 
         const bool is_2d = dims == OCIO::GpuShaderDesc::TEXTURE_2D;
-        const std::uint8_t channels =
-            channel == OCIO::GpuShaderDesc::TEXTURE_RGB_CHANNEL ? 3 : 1;
+        const std::uint8_t channels = channel == OCIO::GpuShaderDesc::TEXTURE_RGB_CHANNEL ? 3 : 1;
         const unsigned eff_height = is_2d ? height : 1;
 
         OcioTexture t;
@@ -177,9 +172,7 @@ OcioShaderData OcioConfig::build_gpu_shader(
         t.depth = 1;
         t.channels = channels;
         t.interpolation = static_cast<std::uint8_t>(interp);
-        copy_values(values,
-                    static_cast<std::size_t>(width) * eff_height * channels,
-                    t.data);
+        copy_values(values, static_cast<std::size_t>(width) * eff_height * channels, t.data);
         out.textures.push_back(std::move(t));
     }
 
@@ -189,10 +182,7 @@ OcioShaderData OcioConfig::build_gpu_shader(
 void OcioCpuProcessor::apply_rgba(
     rust::Slice<float> pixels, std::size_t width, std::size_t height) const {
     OCIO::PackedImageDesc img(
-        pixels.data(),
-        static_cast<long>(width),
-        static_cast<long>(height),
-        4 /* channels: RGBA */);
+        pixels.data(), static_cast<long>(width), static_cast<long>(height), 4 /* channels: RGBA */);
     cpu_->apply(img);
 }
 
