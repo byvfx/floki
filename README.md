@@ -29,7 +29,7 @@ Powered by `egui`, `wgpu`, and the pure-Rust `exr` crate, it allows you to insta
 Load a Reference Image (Image B) to unlock advanced visual diffing:
 * **Wipe:** Split-screen slider for boundary checks — with adjustable center, rotation angle, and divider-line opacity for wipes at any orientation.
 * **Side-by-Side:** View Image A and Image B glued together in a continuous panorama. They share the same camera for synchronized panning and zooming.
-* **Diff Matte:** Renders `|A - B| * multiplier` to easily spot fractional floating-point discrepancies in your render pipelines.
+* **Diff Matte:** Renders the magnitude of `A − B` as a false-colour heat map to spot fractional floating-point discrepancies in your render pipelines. Choose the colormap (black-body, grayscale, turbo, viridis, magma, inferno) or build a custom multi-stop gradient in the editor; select the magnitude metric (max channel, Rec.709 luminance, or per-channel RGB); set a noise-floor threshold to ignore sub-threshold noise; and read values off the on-screen legend.
 * **Composite:** Blend A over B directly in-viewport with selectable blend modes (Over, Under, Add, Multiply, Screen).
 * **Blink Mode:** Press `Spacebar` to strobe between Image A and Image B at an adjustable interval.
 
@@ -42,6 +42,13 @@ Comparison controls follow a two-tier toolbar: the everyday controls stay on a s
 
 ### Color Management
 * **3D LUT Support:** Load Adobe `.cube` 3D LUTs and apply them in real time on the GPU as a display transform, alongside the built-in Exposure/Gamma/sRGB controls (OCIO config path is also configurable).
+
+### Customizable Viewport Background
+* **Background Modes:** Replace the default transparency checkerboard with a checkerboard (custom cell colours and size), a solid colour, or a multi-stop gradient at any angle — set from **View ▸ Viewport Background**. Save named presets that persist across sessions. The background composites consistently across the GPU, CPU, and OCIO paths.
+
+### Snapshot & Review
+* **Snapshot to Clipboard:** Copy exactly what's on screen to the system clipboard with `Cmd/Ctrl + Shift + S` (or **View ▸ Snapshot to Clipboard**) — background, compare mode, OCIO, and annotations all included. Optionally also save a timestamped PNG to `~/.floki/snapshots/`.
+* **Annotation Overlay:** Mark up the view with arrows, boxes, a freehand pen, and text labels (adjustable colour and stroke width) before snapshotting. Annotations anchor to image pixels so they track pan/zoom, support undo/redo and clear-all, and are flattened into the snapshot automatically.
 
 ### Batch Tooling
 * **EXR Header Converter:** Bulk-rename channels across an entire directory to standard RGBA — available both as an in-app Tools window and a headless `convert_dir` CLI, parallelized across CPU cores via `rayon` with live progress and cancellation.
@@ -69,6 +76,8 @@ Comparison controls follow a two-tier toolbar: the everyday controls stay on a s
 | `1` | View Image A (when B is loaded) |
 | `2` | View Image B (when B is loaded) |
 | `Space` | Toggle Blink Mode (Strobes between A and B) |
+| `Cmd/Ctrl + Shift + S` | Snapshot the current view to the clipboard |
+| `Esc` | Cancel the active annotation tool (or exit fullscreen) |
 | `Shift + Click` | Sample pixel and save to swatch palette |
 | `Scroll Wheel` | Zoom in/out at cursor |
 | `Click + Drag` | Pan Image |
