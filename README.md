@@ -66,6 +66,7 @@ Comparison controls follow a two-tier toolbar: the everyday controls stay on a s
 * **Drag & Drop Loading:** Drop an EXR onto the window to load it — the left half loads it as Image A, the right half as the reference Image B, with a live overlay highlighting which side will receive the drop. Drop two files at once to fill A and B together.
 * **Persistent State:** Remembers your UI layout, recent files list, theme, and preferences across sessions.
 * **Software Tone Mapping:** Apply Exposure, Gamma, and sRGB transforms instantly without altering the underlying raw data.
+* **Resource Monitor:** A discrete status-bar readout tracks floki's own memory footprint and system RAM, plus live GPU **VRAM** usage on macOS — handy when loading heavy EXRs or sequences. It samples about once a second and tucks into the bottom-right. (The VRAM figure is macOS/Metal only for now; Windows and Linux show RAM.)
 
 ---
 
@@ -175,6 +176,7 @@ standalone `floki-ocio` crate that wraps OpenColorIO.
 **App shell**
 - **`main.rs`** — entry point and `eframe` / `wgpu` initialization.
 - **`app.rs`** — the top-level `eframe::App`: window and menus, async EXR + LUT loading, snapshot capture, persistence, and the panel layout that hosts the viewer.
+- **`resource_monitor.rs`** — throttled RAM / GPU-VRAM sampler feeding the status-bar readout.
 
 **Image data**
 - **`exr_loader.rs`** — threaded OpenEXR decode and logical-layer grouping via the `exr` crate (the load hot path the benches exercise).

@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.1] - 2026-06-20
+
+### Added
+- **Resource monitor.** A discrete status-bar readout shows floki's own memory
+  footprint and system RAM, plus live GPU **VRAM** usage on macOS (Metal) — handy
+  when loading heavy EXRs or sequences. It samples about once a second and tucks
+  into the bottom-right. Windows and Linux show RAM only for now.
+
+### Fixed
+- **Snapshots crop to the active image area.** Saved snapshots and clipboard
+  copies now contain just the displayed image (the display window, clamped to the
+  visible canvas) instead of the entire viewer canvas including the surrounding
+  background. Side-by-side still captures the full canvas. (#52)
+
 ## [1.7.0] - 2026-06-19
 
 ### Added
