@@ -1068,7 +1068,7 @@ impl ExrViewer {
                     }
                     BackgroundMode::Gradient => {
                         // Preview bar of the current gradient.
-                        self.gradient_preview_bar(ui, &self.background.gradient.clone());
+                        Self::gradient_preview_bar(ui, &self.background.gradient.clone());
                         ui.horizontal(|ui| {
                             ui.label("Angle");
                             ui.add(
@@ -1137,7 +1137,7 @@ impl ExrViewer {
 
     /// Paint a small horizontal bar previewing `grad` left→right. Shared by the
     /// gradient editor and the background window.
-    fn gradient_preview_bar(&self, ui: &mut egui::Ui, grad: &Gradient) {
+    fn gradient_preview_bar(ui: &mut egui::Ui, grad: &Gradient) {
         let (rect, _) = ui.allocate_exact_size(egui::vec2(240.0, 18.0), egui::Sense::hover());
         if ui.is_rect_visible(rect) {
             let painter = ui.painter_at(rect);
@@ -1676,7 +1676,7 @@ impl ExrViewer {
             if let Some(rs) = render_state {
                 if self.gpu_textures[self.active_layer].is_none() {
                     self.gpu_textures[self.active_layer] =
-                        self.generate_gpu_texture(rs, exr_data, self.active_layer);
+                        Self::generate_gpu_texture(rs, exr_data, self.active_layer);
                 }
                 if let Some(data_b) = exr_data_b {
                     let layer_b = self
@@ -1684,7 +1684,7 @@ impl ExrViewer {
                         .min(data_b.logical_layers.len().saturating_sub(1));
                     if self.gpu_textures_b[layer_b].is_none() {
                         self.gpu_textures_b[layer_b] =
-                            self.generate_gpu_texture(rs, data_b, layer_b);
+                            Self::generate_gpu_texture(rs, data_b, layer_b);
                     }
                 }
             } else {
@@ -1811,8 +1811,11 @@ impl ExrViewer {
 
                 // Record what the snapshot should crop to (#52): the active image area
                 // rather than the whole canvas (which includes the background).
-                self.last_image_rect =
-                    Some(crate::snapshot::active_area_rect(rect, disp_rect, is_side_by_side));
+                self.last_image_rect = Some(crate::snapshot::active_area_rect(
+                    rect,
+                    disp_rect,
+                    is_side_by_side,
+                ));
 
                 let data_offset = egui::vec2(
                     (data_window_min.0 - disp_window.position.x()) as f32,
@@ -2805,8 +2808,8 @@ impl ExrViewer {
                         draws,
                         display_format,
                         blit_uniforms,
-                        render_sig,
                         scissor_pts,
+                        render_sig,
                     };
                     slot_painter.set(
                         slot,
@@ -2836,7 +2839,6 @@ impl ExrViewer {
     /// compare mode, so this one generator serves all modes; results are cached
     /// per layer in `gpu_textures` / `gpu_textures_b`. See the module-level docs.
     fn generate_gpu_texture(
-        &self,
         render_state: &eframe::egui_wgpu::RenderState,
         exr_data: &ExrData,
         layer_index: usize,
