@@ -341,6 +341,12 @@ pub struct ExrViewer {
     /// area. Transient.
     pub last_canvas_rect: Option<egui::Rect>,
 
+    /// The displayed image rect (egui points) from the last frame — the display
+    /// window clamped to the canvas. The snapshot (#19, #52) crops to this so the
+    /// saved frame is just the active image, not the surrounding background.
+    /// `None` falls back to `last_canvas_rect`. Transient.
+    pub last_image_rect: Option<egui::Rect>,
+
     /// Annotation overlay (#45) — all transient (per-session, never persisted).
     /// Shapes are stored in image space so they track pan/zoom.
     pub annotations: Vec<Annotation>,
@@ -425,6 +431,7 @@ impl Default for ExrViewer {
             last_sampled_val_b: None,
             row2_full_height: 0.0,
             last_canvas_rect: None,
+            last_image_rect: None,
             annotations: Vec::new(),
             anno_tool: AnnotationTool::None,
             anno_color: egui::Color32::RED,
@@ -1801,6 +1808,11 @@ impl ExrViewer {
                     rect.center() + self.translation - disp_size / 2.0,
                     disp_size,
                 );
+
+                // Record what the snapshot should crop to (#52): the active image area
+                // rather than the whole canvas (which includes the background).
+                self.last_image_rect =
+                    Some(crate::snapshot::active_area_rect(rect, disp_rect, is_side_by_side));
 
                 let data_offset = egui::vec2(
                     (data_window_min.0 - disp_window.position.x()) as f32,

@@ -526,7 +526,12 @@ impl ExrApp {
     /// Crop the captured framebuffer to the image canvas, copy it to the clipboard,
     /// and (when enabled) save a timestamped PNG. Records a status string.
     fn finish_snapshot(&mut self, image: &egui::ColorImage, pixels_per_point: f32) {
-        let Some(rect) = self.viewer.last_canvas_rect else {
+        // Crop to the active image area (#52), falling back to the full canvas.
+        let Some(rect) = self
+            .viewer
+            .last_image_rect
+            .or(self.viewer.last_canvas_rect)
+        else {
             return;
         };
         let cropped = crate::snapshot::crop_to_rect(image, rect, pixels_per_point);

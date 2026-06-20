@@ -11,6 +11,23 @@
 use eframe::egui::ColorImage;
 use std::path::PathBuf;
 
+/// The on-screen region a snapshot should crop to (#52): the display window
+/// (`disp_rect`) clamped to the visible `canvas`, so the saved frame is just the
+/// active image and not the surrounding background. In side-by-side, two images
+/// span the whole canvas with geometry computed in the draw paths, so the full
+/// canvas is used instead.
+pub fn active_area_rect(
+    canvas: eframe::egui::Rect,
+    disp_rect: eframe::egui::Rect,
+    side_by_side: bool,
+) -> eframe::egui::Rect {
+    if side_by_side {
+        canvas
+    } else {
+        disp_rect.intersect(canvas)
+    }
+}
+
 /// Crop `img` (physical-pixel framebuffer) to the on-screen `rect` (egui points),
 /// scaling by `pixels_per_point` and clamping to the image bounds. Returns the
 /// whole image if the resulting region is empty (defensive — the canvas rect is
@@ -134,6 +151,52 @@ mod tests {
         );
         let out = crop_to_rect(&img, rect, 2.0);
         assert_eq!(out.size, [4, 4]);
+    }
+
+    #[test]
+    fn active_area_is_display_window_when_fitted() {
+        // 100x100 canvas, a 40x40 display window centered in it (background all around):
+        // the snapshot crops to the display window, not the whole canvas.
+        let canvas = eframe::egui::Rect::from_min_size(
+            eframe::egui::pos2(0.0, 0.0),
+            eframe::egui::vec2(100.0, 100.0),
+        );
+        let disp = eframe::egui::Rect::from_min_size(
+            eframe::egui::pos2(30.0, 30.0),
+            eframe::egui::vec2(40.0, 40.0),
+        );
+        let out = active_area_rect(canvas, disp, false);
+        assert_eq!(out, disp);
+    }
+
+    #[test]
+    fn active_area_clamps_to_canvas_when_zoomed_past_edges() {
+        // Zoomed in: the display window extends beyond the canvas, so the visible
+        // crop is clamped to the canvas.
+        let canvas = eframe::egui::Rect::from_min_size(
+            eframe::egui::pos2(0.0, 0.0),
+            eframe::egui::vec2(100.0, 100.0),
+        );
+        let disp = eframe::egui::Rect::from_min_size(
+            eframe::egui::pos2(-50.0, -50.0),
+            eframe::egui::vec2(300.0, 300.0),
+        );
+        let out = active_area_rect(canvas, disp, false);
+        assert_eq!(out, canvas);
+    }
+
+    #[test]
+    fn active_area_uses_full_canvas_in_side_by_side() {
+        let canvas = eframe::egui::Rect::from_min_size(
+            eframe::egui::pos2(0.0, 0.0),
+            eframe::egui::vec2(100.0, 100.0),
+        );
+        let disp = eframe::egui::Rect::from_min_size(
+            eframe::egui::pos2(30.0, 30.0),
+            eframe::egui::vec2(40.0, 40.0),
+        );
+        let out = active_area_rect(canvas, disp, true);
+        assert_eq!(out, canvas);
     }
 
     #[test]
