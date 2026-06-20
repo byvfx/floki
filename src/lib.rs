@@ -17,6 +17,7 @@ mod background;
 mod color;
 mod gpu;
 mod gradient;
+mod proxy;
 mod render_math;
 mod resource_monitor;
 mod snapshot;

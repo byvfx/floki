@@ -731,6 +731,10 @@ impl ExrApp {
         } else {
             let layer_count = data.logical_layers.len();
             self.exr_data = Some(data);
+            // The full-res A decode has landed: drop the slot-A first-paint proxy
+            // (#58). The viewer's zoom/pan session state is preserved so the
+            // handoff from proxy to full-res is visually continuous.
+            self.viewer.clear_proxy();
             // Clamp the active layer to the new image's last valid index. A
             // sequence normally has identical structure frame-to-frame, but guard
             // against a frame with fewer layers so the per-layer texture index
@@ -754,6 +758,25 @@ impl ExrApp {
     /// preserving session state for per-frame playback (#7).
     fn reset_viewer_session(&mut self) {
         self.viewer = ExrViewer::default();
+    }
+
+    /// Set the slot-A first-paint proxy (#58/#33): upload a low-res
+    /// [`ProxyImage`] so the viewport shows the image immediately while the
+    /// full-res decode is still in flight. Call this from the decode worker as
+    /// soon as a low-res read is available (the #33 decode path); the full
+    /// decode later calls [`Self::swap_image_data`], which clears the proxy.
+    /// No-op if the slot-A full image is already loaded.
+    ///
+    /// `#[allow(dead_code)]`: the producer is the #33 decode path (not yet
+    /// landed); `draw_proxy` in the loading branch consumes it once set.
+    #[allow(dead_code)]
+    fn set_proxy(&mut self, ctx: &egui::Context, proxy: crate::proxy::ProxyImage) {
+        if self.exr_data.is_some() {
+            // Full-res already landed; a late proxy would be a step backwards.
+            return;
+        }
+        self.viewer.set_proxy(ctx, proxy);
+        ctx.request_repaint();
     }
 
     /// Explicitly release a loaded image and its resources without restarting.
@@ -2047,19 +2070,29 @@ impl ExrApp {
                     self.background_presets = std::mem::take(&mut self.viewer.background_presets);
                 } else if self.loading_a {
                     // A requested but its decode hasn't landed yet (no prior image
-                    // to keep showing) — show progress instead of a blank canvas.
-                    let name = self
-                        .loaded_file
-                        .as_ref()
-                        .and_then(|p| p.file_name())
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    ui.centered_and_justified(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label(format!("Loading {name}…"));
+                    // to keep showing). If a low-res first-paint proxy (#58) is
+                    // available, render it; otherwise show a spinner.
+                    if self.viewer.has_proxy() {
+                        // Hydrate the same per-frame viewer state the full `ui`
+                        // path uses, so the proxy renders with the user's tone /
+                        // LUT / OCIO-toggled settings (OCIO itself isn't applied
+                        // to the proxy — see `set_proxy`'s OCIO note).
+                        self.viewer.enable_lut = false; // proxy is a pre-baked CPU texture
+                        self.viewer.draw_proxy(ui);
+                    } else {
+                        let name = self
+                            .loaded_file
+                            .as_ref()
+                            .and_then(|p| p.file_name())
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        ui.centered_and_justified(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(format!("Loading {name}…"));
+                            });
                         });
-                    });
+                    }
                 }
             } else {
                 ui.centered_and_justified(|ui| {
@@ -2348,6 +2381,93 @@ mod tests {
         assert_eq!(app.viewer.exposure, 0.0, "exposure reset");
         assert!(app.viewer.swatches.is_empty(), "swatches cleared");
         assert!(app.viewer.annotations.is_empty(), "annotations cleared");
+    }
+
+    #[test]
+    fn swap_image_data_clears_proxy_when_full_decode_lands() {
+        // The #58↔#55 contract: a proxy is shown during the async decode, then
+        // `swap_image_data` (the full-res landing) clears it. The viewer's
+        // zoom/pan session state is preserved across the handoff.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.exr");
+        write_rgba_exr(&path);
+        let data = ExrData::load(&path).unwrap();
+        let proxy = crate::proxy::ProxyImage::from_exr_data_downsampled(&data, 0, 1).unwrap();
+
+        let mut app = ExrApp {
+            loaded_file: Some(path.clone()),
+            loading_a: true, // full decode in flight
+            ..Default::default()
+        };
+        // Simulate the decode worker delivering a proxy first. `set_proxy` needs
+        // an egui ctx to load the texture; borrow one from a throwaway harness
+        // (state callback gives `&egui::Context` directly). Recover `app` via
+        // `std::mem::take` (ExrApp: Default).
+        {
+            use egui_kittest::Harness;
+            let mut h = Harness::new_ui_state(
+                |ui, app: &mut ExrApp| {
+                    app.set_proxy(
+                        ui.ctx(),
+                        crate::proxy::ProxyImage {
+                            pixels: proxy.pixels.clone(),
+                            ..proxy.clone()
+                        },
+                    );
+                },
+                app,
+            );
+            // `set_proxy` calls `ctx.request_repaint`, so use `run_steps(1)`
+            // instead of `run()` (which would loop on the repaint request).
+            h.run_steps(1);
+            app = std::mem::take(h.state_mut());
+        }
+        assert!(app.viewer.has_proxy(), "proxy set during load");
+        app.viewer.scale = 2.5; // user panned/zoomed while the proxy showed
+
+        // Full decode lands → swap clears the proxy, preserves view state.
+        app.swap_image_data(data, false);
+
+        assert!(
+            !app.viewer.has_proxy(),
+            "proxy cleared once full data lands"
+        );
+        assert_eq!(app.viewer.scale, 2.5, "zoom preserved across handoff");
+        assert!(app.exr_data.is_some(), "full data applied");
+    }
+
+    #[test]
+    fn set_proxy_is_noop_when_full_data_already_loaded() {
+        // A late proxy arriving after the full decode must not clobber full-res.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.exr");
+        write_rgba_exr(&path);
+        let data = ExrData::load(&path).unwrap();
+        let proxy = crate::proxy::ProxyImage::from_exr_data_downsampled(&data, 0, 1).unwrap();
+
+        let mut app = ExrApp {
+            exr_data: Some(data), // already loaded
+            ..Default::default()
+        };
+        use egui_kittest::Harness;
+        let mut h = Harness::new_ui_state(
+            |ui, app: &mut ExrApp| {
+                app.set_proxy(
+                    ui.ctx(),
+                    crate::proxy::ProxyImage {
+                        pixels: proxy.pixels.clone(),
+                        ..proxy.clone()
+                    },
+                );
+            },
+            app,
+        );
+        h.run_steps(1);
+        app = std::mem::take(h.state_mut());
+        assert!(
+            !app.viewer.has_proxy(),
+            "late proxy ignored when full data present"
+        );
     }
 
     #[test]
