@@ -38,6 +38,11 @@ pub struct LogicalLayer {
 }
 
 impl ExrData {
+    /// Decode an EXR file and group its channels into logical layers.
+    ///
+    /// # Errors
+    /// Returns `Err` with a human-readable message if the file cannot be read or parsed,
+    /// or if decoding panics (caught via `catch_unwind`).
     pub fn load(path: impl AsRef<Path>) -> std::result::Result<Self, String> {
         let path_ref = path.as_ref();
 
@@ -110,6 +115,7 @@ impl ExrData {
     }
 
     /// `(width, height)` of the physical layer backing the given logical layer.
+    #[must_use]
     pub fn logical_size(&self, idx: usize) -> Option<(usize, usize)> {
         let ll = self.logical_layers.get(idx)?;
         let layer = self.image.layer_data.get(ll.physical_index)?;
@@ -120,6 +126,7 @@ impl ExrData {
     /// channels it maps to. Channels are looked up by the indices recorded at
     /// load time, so no per-call name matching is needed.
     #[allow(clippy::type_complexity)]
+    #[must_use]
     pub fn logical_channels(
         &self,
         idx: usize,
