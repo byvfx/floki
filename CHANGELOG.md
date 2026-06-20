@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.2] - 2026-06-20
+
+### Changed
+- **Internal maintainability only — no user-facing changes.** Acted on the
+  remaining items from the June 2026 codebase audit: broke up the ~1100-line
+  `ExrApp::ui` per-frame entry point into focused per-panel methods, documented
+  the `floki-ocio` public API (`#[must_use]` + `# Errors`), added a
+  `.clang-format` for the C++ OCIO shim, and cleared a batch of lint findings
+  (signature cleanups, struct field order). Behaviour is unchanged; the full
+  test suite and `clippy -D warnings` pass.
+
 ## [1.7.1] - 2026-06-20
 
 ### Added
