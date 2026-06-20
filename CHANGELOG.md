@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Internal: split image-data swap from viewer session-state reset (#55).**
+  Extracted `swap_image_data` (replaces the pixel source for A or B while
+  preserving zoom, pan, compare mode, channel mode, annotations, swatches, and
+  tone/OCIO/LUT state) and `reset_viewer_session` (the full reset used on an
+  explicit open / new session) as named seams. The open path still resets the
+  viewer and drops B exactly as before; the new swap path is the contract
+  image-sequence playback (#7) will use for per-frame loads so a frame change
+  doesn't wipe the user's view. Also clamps `active_layer` to the new image's
+  layer count on swap so a frame with fewer passes can't index out of bounds.
+  No user-facing change.
+
 ## [1.7.2] - 2026-06-20
 
 ### Changed
