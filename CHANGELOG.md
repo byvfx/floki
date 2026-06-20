@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-06-19
+
+### Added
+- **Diff heat-map visualization controls.** The Diff/Matte view's fixed black-body
+  ramp is now configurable: choose a colormap (black-body, grayscale, turbo,
+  viridis, magma, inferno) or build a custom multi-stop gradient in the editor;
+  pick the magnitude metric (max channel, Rec.709 luminance, or per-channel RGB);
+  set a noise-floor threshold; and read the gain-to-colour mapping off a legend.
+  The colormap is shared by the GPU and CPU paths through a reusable gradient
+  module.
+- **Customizable viewport background.** The transparency backdrop can now be a
+  checkerboard (configurable cell colours and size), a solid colour, or a
+  multi-stop gradient at any angle, set from **View ▸ Viewport Background**. Named
+  presets are saved and persist across sessions, and the background composites
+  consistently across the GPU, CPU, and OCIO paths.
+- **Snapshot to clipboard.** Copy the current view to the system clipboard with
+  **Cmd/Ctrl+Shift+S** (or **View ▸ Snapshot to Clipboard**). The capture is
+  exactly what's on screen — background, compare mode, OCIO, and any annotations.
+  An optional toggle also writes a timestamped PNG to `~/.floki/snapshots/`.
+- **Annotation overlay.** Mark up the view before snapshotting with arrows, boxes,
+  a freehand pen, and text labels, each with adjustable colour and stroke width.
+  Annotations anchor to image pixels (so they track pan/zoom), support undo/redo
+  and clear-all, and are flattened into the snapshot automatically.
+
+All four features reproduce prior behaviour by default, so existing workflows are
+unchanged.
+
 ## [1.6.0] - 2026-06-18
 
 ### Added
