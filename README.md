@@ -9,7 +9,7 @@
 
 Powered by `egui`, `wgpu`, and the pure-Rust `exr` crate, it allows you to instantly view dense pixel data, isolate color channels, explore unbounded floating-point histograms, and perform pixel-perfect A/B diffing natively on your GPU.
 
-![Floki viewer](assets/floki-1.4.png)
+![Floki viewer](assets/floki_1-7-0_base.png)
 
 ---
 
@@ -34,6 +34,12 @@ Load a Reference Image (Image B) to unlock advanced visual diffing:
 * **Blink Mode:** Press `Spacebar` to strobe between Image A and Image B at an adjustable interval.
 
 Comparison controls follow a two-tier toolbar: the everyday controls stay on a single row, while the active mode's parameters slide into a contextual second row only when needed.
+
+![Wipe compare mode](assets/floki_1-7-0_wipe.png)
+*Wipe compare mode — drag the divider at any angle to check Image A against Image B.*
+
+![Side-by-side compare mode](assets/floki_1-7-0_side_by_side.png)
+*Side-by-side — Image A and Image B share one camera for synchronized panning and zooming.*
 
 ### Image Analysis
 * **Dynamic Luminance Histogram:** Real-time histogram mapped to Exposure Values (EV stops). Effortlessly spot floating-point highlights over `1.0` using the Logarithmic view.
