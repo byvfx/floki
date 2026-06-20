@@ -42,6 +42,9 @@ rayon = "1.12.0"
 arboard = "3.6"
 image = { version = "0.25", default-features = false, features = ["png"] }
 home = "0.5"
+# Bottom-bar resource monitor (#51): system + per-process memory. Default features off so
+# we only pull the memory/process collectors, not disk/network/components/users.
+sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 
 [dev-dependencies]
 tempfile = "3"          # scoped temp dirs/files for test fixtures (auto-cleanup)
@@ -58,6 +61,10 @@ windows = { version = "0.62", features = ["Win32_Foundation", "Win32_UI_WindowsA
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = "0.23"
+# Per-app GPU memory for the resource monitor (#51): read the wgpu Metal device's
+# currentAllocatedSize / recommendedMaxWorkingSetSize via the MTLDevice protocol.
+# Version matches wgpu-hal's transitive objc2-metal in Cargo.lock.
+objc2-metal = { version = "0.3", default-features = false, features = ["MTLDevice"] }
 
 # EXR decode + logical-layer grouping benchmark (the `ExrData::load` hot path).
 # Runs synthetic fixtures everywhere; also benches real renders dropped into

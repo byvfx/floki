@@ -105,6 +105,10 @@ pub struct ExrApp {
     #[serde(skip)]
     snapshot_status: Option<String>,
 
+    /// Throttled RAM/GPU-memory sampler for the bottom-bar readout (#51).
+    #[serde(skip)]
+    resource_monitor: crate::resource_monitor::ResourceMonitor,
+
     #[serde(skip)]
     show_help: bool,
     #[serde(skip)]
@@ -228,6 +232,7 @@ impl Default for ExrApp {
             save_snapshots: false,
             snapshot_pending: false,
             snapshot_status: None,
+            resource_monitor: crate::resource_monitor::ResourceMonitor::default(),
             show_help: false,
             show_settings: false,
             render_state: None,
@@ -1388,6 +1393,36 @@ impl eframe::App for ExrApp {
             if let Some(status) = &self.snapshot_status {
                 ui.label(egui::RichText::new(status).weak());
             }
+
+            // Discrete RAM/GPU readout, right-aligned (#51). `sample()` is throttled
+            // internally, so this is cheap per frame; request a slow repaint so the
+            // numbers keep ticking while the app is otherwise idle.
+            if let Some(rs) = &self.render_state {
+                let sample = self.resource_monitor.sample(&rs.device);
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_secs(1));
+                use crate::resource_monitor::fmt_bytes;
+                let mut text = format!(
+                    "RAM {} · sys {}/{}",
+                    fmt_bytes(sample.proc_bytes),
+                    fmt_bytes(sample.sys_used),
+                    fmt_bytes(sample.sys_total),
+                );
+                if let (Some(used), Some(budget)) = (sample.gpu_used, sample.gpu_budget) {
+                    text.push_str(&format!(" · GPU {}/{}", fmt_bytes(used), fmt_bytes(budget)));
+                }
+                // Wrap the right-aligned label in a `horizontal` row first: a bare
+                // right_to_left(Center) layout inside this auto-sized bottom panel would
+                // grab the full available height to center within, feeding back and
+                // growing the panel on every repaint. The horizontal row pins the band to
+                // one line before we right-align inside it.
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(egui::RichText::new(text).weak());
+                    });
+                });
+            }
+
             ui.vertical(|ui| {
                 let draw_nuke_status_line =
                     |ui: &mut egui::Ui,
