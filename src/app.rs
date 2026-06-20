@@ -1399,7 +1399,7 @@ impl eframe::App for ExrApp {
                 ui.label(egui::RichText::new(status).weak());
             }
 
-            // Discrete RAM/GPU readout, right-aligned (#51). `sample()` is throttled
+            // Discrete RAM/VRAM readout, right-aligned (#51). `sample()` is throttled
             // internally, so this is cheap per frame; request a slow repaint so the
             // numbers keep ticking while the app is otherwise idle.
             if let Some(rs) = &self.render_state {
@@ -1414,7 +1414,7 @@ impl eframe::App for ExrApp {
                     fmt_bytes(sample.sys_total),
                 );
                 if let (Some(used), Some(budget)) = (sample.gpu_used, sample.gpu_budget) {
-                    text.push_str(&format!(" · GPU {}/{}", fmt_bytes(used), fmt_bytes(budget)));
+                    text.push_str(&format!(" · VRAM {}/{}", fmt_bytes(used), fmt_bytes(budget)));
                 }
                 // Wrap the right-aligned label in a `horizontal` row first: a bare
                 // right_to_left(Center) layout inside this auto-sized bottom panel would
