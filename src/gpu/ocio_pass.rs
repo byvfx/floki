@@ -470,9 +470,10 @@ impl eframe::egui_wgpu::CallbackTrait for OcioCallback {
             .is_none_or(|t| t.width != w || t.height != h);
         if need_new {
             let (blit_layout, blit_sampler, bg_gradient_view) = {
-                let Some(gpu) = callback_resources.get::<GpuState>() else {
+                let Some(gpu) = callback_resources.get::<std::sync::Arc<GpuState>>() else {
                     return Vec::new();
                 };
+                let gpu = gpu.as_ref();
                 (
                     gpu.blit_layout.clone(),
                     gpu.blit_sampler.clone(),
@@ -544,7 +545,9 @@ impl eframe::egui_wgpu::CallbackTrait for OcioCallback {
 
         let cmd = {
             let (Some(gpu), Some(ocio), Some(targets)) = (
-                callback_resources.get::<GpuState>(),
+                callback_resources
+                    .get::<std::sync::Arc<GpuState>>()
+                    .map(std::sync::Arc::as_ref),
                 callback_resources.get::<OcioGpuPass>(),
                 callback_resources.get::<OcioTargets>(),
             ) else {
@@ -631,9 +634,10 @@ impl eframe::egui_wgpu::CallbackTrait for OcioCallback {
         render_pass: &mut wgpu::RenderPass<'static>,
         callback_resources: &eframe::egui_wgpu::CallbackResources,
     ) {
-        let Some(gpu) = callback_resources.get::<GpuState>() else {
+        let Some(gpu) = callback_resources.get::<std::sync::Arc<GpuState>>() else {
             return;
         };
+        let gpu = gpu.as_ref();
         let Some(targets) = callback_resources.get::<OcioTargets>() else {
             return;
         };

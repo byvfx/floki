@@ -114,8 +114,14 @@ pub struct ExrApp {
     #[serde(skip)]
     show_settings: bool,
 
+    /// App-owned GPU core (#54): the single home for the persistent `GpuState`
+    /// and the OCIO pass publisher. `None` in the CPU-only path (no wgpu
+    /// device) and during `Default::default()` / before `new(cc)` wires it up.
+    /// Replaces the former direct `callback_resources` ownership; the app is
+    /// now the source of truth, with egui holding `Arc` clones for its paint
+    /// callbacks.
     #[serde(skip)]
-    pub render_state: Option<eframe::egui_wgpu::RenderState>,
+    pub gpu_resources: Option<crate::gpu::GpuResources>,
 
     ocio_path: String,
     lut_path: String,
@@ -235,7 +241,7 @@ impl Default for ExrApp {
             resource_monitor: crate::resource_monitor::ResourceMonitor::default(),
             show_help: false,
             show_settings: false,
-            render_state: None,
+            gpu_resources: None,
             ocio_path: String::new(),
             lut_path: String::new(),
             enable_lut: false,
@@ -294,12 +300,10 @@ impl ExrApp {
             Self::default()
         };
 
-        app.render_state = cc.wgpu_render_state.clone();
-
-        if let Some(rs) = &app.render_state {
-            let gpu_state = crate::gpu::GpuState::new(&rs.device, &rs.queue, rs.target_format);
-            rs.renderer.write().callback_resources.insert(gpu_state);
-        }
+        app.gpu_resources = cc
+            .wgpu_render_state
+            .clone()
+            .map(crate::gpu::GpuResources::new);
 
         // `lut_bg` is a GPU handle and can't persist, but `enable_lut`/`lut_path`
         // do. Without rebuilding the bind group here, a restart leaves the LUT
@@ -417,10 +421,11 @@ impl ExrApp {
         };
         // CPU processor for thumbnails / fallback (best-effort; GPU path is primary).
         self.ocio_cpu = cfg.build_cpu_processor(&req).ok().map(std::rc::Rc::new);
-        let Some(rs) = &self.render_state else {
+        let Some(gpu) = &self.gpu_resources else {
             self.ocio_ready = false;
             return;
         };
+        let rs = gpu.render_state();
         match crate::gpu::ocio_pass::OcioGpuPass::from_bundle(
             &rs.device,
             &rs.queue,
@@ -428,16 +433,10 @@ impl ExrApp {
             rs.target_format,
         ) {
             Ok(pass) => {
-                let mut renderer = rs.renderer.write();
-                renderer.callback_resources.insert(pass);
-                // Invalidate the cached OcioTargets so it is recreated on the
-                // next frame against the new pipeline's bind group layout.
-                // Without this, a stale scene_bind_group from the old layout
-                // would be used with the new pipeline → wgpu validation error.
-                renderer
-                    .callback_resources
-                    .remove::<crate::gpu::ocio_pass::OcioTargets>();
-                drop(renderer);
+                // Publish the new pass + invalidate the cached OcioTargets in
+                // one named call (the old inline `insert` + `remove::<OcioTargets>()`
+                // pair lived here with a scary comment about stale layouts — #54).
+                gpu.publish_ocio_pass(pass);
                 self.ocio_ready = true;
                 self.ocio_error = None;
             }
@@ -564,35 +563,28 @@ impl ExrApp {
         self.lut_pending_auto_enable = false;
         match res.result {
             Ok(lut) => {
-                if let Some(rs) = &self.render_state {
-                    let renderer = rs.renderer.read();
-                    if let Some(gpu_state) =
-                        renderer.callback_resources.get::<crate::gpu::GpuState>()
-                    {
-                        // Explicitly destroy the old LUT texture before
-                        // replacing it, so GPU memory is released in this
-                        // submission cycle rather than waiting for the next
-                        // driver GC sweep.
-                        if let Some(old_tex) = self.lut_texture.take() {
-                            old_tex.destroy();
-                        }
-                        let (bg, tex) =
-                            gpu_state.create_lut_bind_group(&rs.device, &rs.queue, &lut);
-                        self.lut_bg = Some(bg);
-                        self.lut_texture = Some(tex);
-                        self.lut_error = None;
-                        // Only update domain bounds once the bind group is live;
-                        // moving them here keeps the shader state consistent.
-                        self.lut_domain_min =
-                            [lut.domain_min[0], lut.domain_min[1], lut.domain_min[2], 0.0];
-                        self.lut_domain_max =
-                            [lut.domain_max[0], lut.domain_max[1], lut.domain_max[2], 0.0];
-                        if auto_enable {
-                            self.enable_lut = true;
-                        }
-                    } else {
-                        self.lut_error = Some("GPU state not found".to_string());
-                        self.enable_lut = false;
+                if let Some(gpu) = &self.gpu_resources {
+                    let gpu_state = gpu.gpu_state.clone();
+                    let rs = gpu.render_state();
+                    // Explicitly destroy the old LUT texture before
+                    // replacing it, so GPU memory is released in this
+                    // submission cycle rather than waiting for the next
+                    // driver GC sweep.
+                    if let Some(old_tex) = self.lut_texture.take() {
+                        old_tex.destroy();
+                    }
+                    let (bg, tex) = gpu_state.create_lut_bind_group(&rs.device, &rs.queue, &lut);
+                    self.lut_bg = Some(bg);
+                    self.lut_texture = Some(tex);
+                    self.lut_error = None;
+                    // Only update domain bounds once the bind group is live;
+                    // moving them here keeps the shader state consistent.
+                    self.lut_domain_min =
+                        [lut.domain_min[0], lut.domain_min[1], lut.domain_min[2], 0.0];
+                    self.lut_domain_max =
+                        [lut.domain_max[0], lut.domain_max[1], lut.domain_max[2], 0.0];
+                    if auto_enable {
+                        self.enable_lut = true;
                     }
                 } else {
                     self.lut_error = Some("Render state not found".to_string());
@@ -1515,8 +1507,8 @@ impl ExrApp {
             // Discrete RAM/VRAM readout, right-aligned (#51). `sample()` is throttled
             // internally, so this is cheap per frame; request a slow repaint so the
             // numbers keep ticking while the app is otherwise idle.
-            if let Some(rs) = &self.render_state {
-                let sample = self.resource_monitor.sample(&rs.device);
+            if let Some(gpu) = &self.gpu_resources {
+                let sample = self.resource_monitor.sample(&gpu.render_state().device);
                 ui.ctx()
                     .request_repaint_after(std::time::Duration::from_secs(1));
                 use crate::resource_monitor::fmt_bytes;
@@ -2081,7 +2073,7 @@ impl ExrApp {
                         ui,
                         data,
                         self.exr_data_b.as_ref(),
-                        self.render_state.as_ref(),
+                        self.gpu_resources.as_ref(),
                         self.lut_bg.clone(),
                     );
                     self.diff_colormap = self.viewer.diff_colormap.clone();
@@ -2403,6 +2395,20 @@ mod tests {
         assert_eq!(app.viewer.exposure, 0.0, "exposure reset");
         assert!(app.viewer.swatches.is_empty(), "swatches cleared");
         assert!(app.viewer.annotations.is_empty(), "annotations cleared");
+    }
+
+    #[test]
+    fn gpu_resources_is_none_in_default_and_cpu_path() {
+        // #54: the GPU core is app-owned on `ExrApp::gpu_resources`. Without a
+        // wgpu render surface (Default / headless tests / CPU-only builds),
+        // it stays `None` and the viewer takes the CPU path — the contract the
+        // headless test suite relies on. (A device-backed `GpuResources` can't
+        // be constructed without a wgpu device, so we assert the None branch.)
+        let app = ExrApp::default();
+        assert!(
+            app.gpu_resources.is_none(),
+            "gpu_resources is None without a render surface"
+        );
     }
 
     #[test]

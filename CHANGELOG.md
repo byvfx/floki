@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Internal: decouple GPU core from `egui_wgpu::Renderer` ownership (#54).**
+  Introduces an app-owned `GpuResources` (`src/gpu/resources.rs`) as the single
+  home for the persistent `GpuState`; the application is now the source of
+  truth, with egui's `callback_resources` holding only an `Arc<GpuState>` clone
+  for the `CallbackTrait` paint callbacks. The viewer and app read `GpuState`
+  directly off `GpuResources` instead of a per-frame `renderer.read()` typemap
+  lookup. OCIO pass/targets still live in `callback_resources` (the OCIO
+  callback's `prepare` mutates `OcioTargets` through the typemap), but their
+  lifecycle is centralized behind `GpuResources::publish_ocio_pass` /
+  `invalidate_ocio_targets`, replacing the hand-rolled `insert` +
+  `remove::<OcioTargets>()` footgun in `rebuild_ocio_pass`. Prerequisite for
+  the Qt port (#44) and clean resource management for #7 / #24 / #33. No
+  user-facing change.
+
 ### Added
 - **Internal: render-side proxy first-paint path (#58).** Adds a low-res
   `ProxyImage` (standalone RGBA32Float buffer + full image dimensions) and a

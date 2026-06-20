@@ -5,6 +5,10 @@ use std::sync::Arc;
 #[cfg(feature = "ocio")]
 pub mod ocio_pass;
 
+pub mod resources;
+
+pub use resources::GpuResources;
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct Uniforms {
@@ -895,9 +899,10 @@ impl eframe::egui_wgpu::CallbackTrait for ExrCallback {
     ) {
         // egui's CallbackTrait::paint is infallible, so a panic here would crash
         // the app — bail cleanly if GpuState is somehow absent.
-        let Some(gpu_state) = callback_resources.get::<GpuState>() else {
+        let Some(gpu_state) = callback_resources.get::<Arc<GpuState>>() else {
             return;
         };
+        let gpu_state = gpu_state.as_ref();
 
         // egui_wgpu sets the viewport to the primitive's bounding box, which squishes our quad!
         // We override it to the full physical screen so our shader's screen-space math works perfectly.
