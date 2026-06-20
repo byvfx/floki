@@ -162,12 +162,35 @@ Useful levels (prefix the target with `floki=` to filter out noisy `wgpu`/`efram
 
 ## Architecture
 
-- **`main.rs`**: Application entry point and `eframe` initialization.
-- **`app.rs`**: Core application state, menu bars, persistence logic, and layout scaffolding.
-- **`exr_loader.rs`**: Background threading and parsing of `OpenEXR` data structures using the `exr` crate.
-- **`gpu/mod.rs`**: Hardware-accelerated drawing backend leveraging `wgpu` pipelines and WGSL shaders.
-- **`viewer.rs`**: The heavy lifter. Handles canvas drawing, image scaling, pixel sampling, UI interaction, and falling back between GPU and CPU paths.
-- **`tools.rs`**: The multi-threaded EXR Header Converter (batch channel renaming via `rayon`), with progress reporting and `RUST_LOG` logging.
+A birds-eye view of the workspace. The app ships as a single binary backed by a
+library crate (so benches and integration tests can reach the internals), plus a
+standalone `floki-ocio` crate that wraps OpenColorIO.
+
+**App shell**
+- **`main.rs`** — entry point and `eframe` / `wgpu` initialization.
+- **`app.rs`** — the top-level `eframe::App`: window and menus, async EXR + LUT loading, snapshot capture, persistence, and the panel layout that hosts the viewer.
+
+**Image data**
+- **`exr_loader.rs`** — threaded OpenEXR decode and logical-layer grouping via the `exr` crate (the load hot path the benches exercise).
+
+**Viewer & rendering**
+- **`viewer.rs`** — the heavy lifter: canvas pan/zoom, the six compare modes, pixel sampling, histograms, contact sheets, and dispatch between the GPU and CPU render paths.
+- **`gpu/`** — the `wgpu` backend: `mod.rs` (pipelines, uniforms, bind groups), `shader.wgsl` (the display / compare / diff / background fragment shader), and `ocio_pass.rs` (the two-pass OCIO display transform and blit).
+- **`render_math.rs`** — shared tone-mapping math (exposure / gamma / sRGB), unit-tested in one place.
+
+**Visualization & overlays**
+- **`gradient.rs`** — reusable multi-stop gradients and the diff colormaps (shared by the heat map and the gradient background).
+- **`background.rs`** — the customizable viewport background (checker / solid / gradient), sampled identically across every render path.
+- **`annotation.rs`** — the transient arrow / box / pen / text overlay model.
+- **`snapshot.rs`** — framebuffer-screenshot capture plus the clipboard / PNG helpers.
+
+**Color management**
+- **`color/cube.rs`** — Adobe `.cube` 3D-LUT parsing.
+- **`floki-ocio/`** — a standalone crate wrapping OpenColorIO over FFI, with a GLSL→WGSL shader transpiler; linked only under the `ocio` / `ocio-vendored` features.
+
+**Tooling & CLI**
+- **`tools.rs`** — the multi-threaded EXR Header Converter (batch channel renaming via `rayon`) with progress reporting and `RUST_LOG` logging.
+- **`bin/`** — headless helpers: `convert_dir` (batch rename), `inspect_exr`, and `check_types`.
 
 ## License
 
