@@ -116,24 +116,24 @@ pub enum Colormap {
 
 impl Colormap {
     /// The built-in presets, in UI order (excludes `Custom`).
-    pub const PRESETS: [Colormap; 6] = [
-        Colormap::BlackBody,
-        Colormap::Grayscale,
-        Colormap::Turbo,
-        Colormap::Viridis,
-        Colormap::Magma,
-        Colormap::Inferno,
+    pub const PRESETS: [Self; 6] = [
+        Self::BlackBody,
+        Self::Grayscale,
+        Self::Turbo,
+        Self::Viridis,
+        Self::Magma,
+        Self::Inferno,
     ];
 
     pub fn label(&self) -> &'static str {
         match self {
-            Colormap::BlackBody => "Black-body",
-            Colormap::Grayscale => "Grayscale",
-            Colormap::Turbo => "Turbo",
-            Colormap::Viridis => "Viridis",
-            Colormap::Magma => "Magma",
-            Colormap::Inferno => "Inferno",
-            Colormap::Custom(_) => "Custom",
+            Self::BlackBody => "Black-body",
+            Self::Grayscale => "Grayscale",
+            Self::Turbo => "Turbo",
+            Self::Viridis => "Viridis",
+            Self::Magma => "Magma",
+            Self::Inferno => "Inferno",
+            Self::Custom(_) => "Custom",
         }
     }
 
@@ -143,17 +143,17 @@ impl Colormap {
     /// false-colour diff overlay.
     pub fn gradient(&self) -> Gradient {
         match self {
-            Colormap::BlackBody => Gradient::new(vec![
+            Self::BlackBody => Gradient::new(vec![
                 GradientStop::new(0.0, [0.0, 0.0, 0.0]),
                 GradientStop::new(1.0 / 3.0, [1.0, 0.0, 0.0]),
                 GradientStop::new(2.0 / 3.0, [1.0, 1.0, 0.0]),
                 GradientStop::new(1.0, [1.0, 1.0, 1.0]),
             ]),
-            Colormap::Grayscale => Gradient::new(vec![
+            Self::Grayscale => Gradient::new(vec![
                 GradientStop::new(0.0, [0.0, 0.0, 0.0]),
                 GradientStop::new(1.0, [1.0, 1.0, 1.0]),
             ]),
-            Colormap::Turbo => Gradient::new(vec![
+            Self::Turbo => Gradient::new(vec![
                 GradientStop::new(0.0, rgb8(48, 18, 59)),
                 GradientStop::new(0.143, rgb8(65, 105, 225)),
                 GradientStop::new(0.286, rgb8(32, 196, 205)),
@@ -163,7 +163,7 @@ impl Colormap {
                 GradientStop::new(0.857, rgb8(231, 73, 17)),
                 GradientStop::new(1.0, rgb8(122, 4, 3)),
             ]),
-            Colormap::Viridis => Gradient::new(vec![
+            Self::Viridis => Gradient::new(vec![
                 GradientStop::new(0.0, rgb8(68, 1, 84)),
                 GradientStop::new(0.13, rgb8(72, 40, 120)),
                 GradientStop::new(0.25, rgb8(62, 74, 137)),
@@ -174,7 +174,7 @@ impl Colormap {
                 GradientStop::new(0.88, rgb8(110, 206, 88)),
                 GradientStop::new(1.0, rgb8(253, 231, 37)),
             ]),
-            Colormap::Magma => Gradient::new(vec![
+            Self::Magma => Gradient::new(vec![
                 GradientStop::new(0.0, rgb8(0, 0, 4)),
                 GradientStop::new(0.13, rgb8(24, 15, 62)),
                 GradientStop::new(0.25, rgb8(69, 16, 119)),
@@ -185,7 +185,7 @@ impl Colormap {
                 GradientStop::new(0.88, rgb8(253, 149, 103)),
                 GradientStop::new(1.0, rgb8(252, 253, 191)),
             ]),
-            Colormap::Inferno => Gradient::new(vec![
+            Self::Inferno => Gradient::new(vec![
                 GradientStop::new(0.0, rgb8(0, 0, 4)),
                 GradientStop::new(0.13, rgb8(27, 12, 65)),
                 GradientStop::new(0.25, rgb8(74, 12, 107)),
@@ -196,7 +196,7 @@ impl Colormap {
                 GradientStop::new(0.88, rgb8(251, 155, 6)),
                 GradientStop::new(1.0, rgb8(252, 255, 164)),
             ]),
-            Colormap::Custom(g) => g.clone(),
+            Self::Custom(g) => g.clone(),
         }
     }
 }
@@ -221,25 +221,21 @@ impl DiffMetric {
     /// `PerChannelRGB=2`). Single source of truth for the shader mapping.
     pub fn as_u32(self) -> u32 {
         match self {
-            DiffMetric::MaxChannel => 0,
-            DiffMetric::Luminance => 1,
-            DiffMetric::PerChannelRGB => 2,
+            Self::MaxChannel => 0,
+            Self::Luminance => 1,
+            Self::PerChannelRGB => 2,
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
-            DiffMetric::MaxChannel => "Max Channel",
-            DiffMetric::Luminance => "Luminance",
-            DiffMetric::PerChannelRGB => "Per-channel RGB",
+            Self::MaxChannel => "Max Channel",
+            Self::Luminance => "Luminance",
+            Self::PerChannelRGB => "Per-channel RGB",
         }
     }
 
-    pub const ALL: [DiffMetric; 3] = [
-        DiffMetric::MaxChannel,
-        DiffMetric::Luminance,
-        DiffMetric::PerChannelRGB,
-    ];
+    pub const ALL: [Self; 3] = [Self::MaxChannel, Self::Luminance, Self::PerChannelRGB];
 }
 
 #[cfg(test)]

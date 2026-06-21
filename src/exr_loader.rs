@@ -101,8 +101,7 @@ impl ExrData {
                                 })
                                 .collect();
                             return Err(format!(
-                                "Not a valid EXR file (magic number missing).\nFirst 4 bytes: [{}] ('{}')\nMake sure this is actually an OpenEXR file and not a renamed PNG, JPG, or corrupted file.",
-                                hex_str, ascii_str
+                                "Not a valid EXR file (magic number missing).\nFirst 4 bytes: [{hex_str}] ('{ascii_str}')\nMake sure this is actually an OpenEXR file and not a renamed PNG, JPG, or corrupted file."
                             ));
                         }
                     }
@@ -353,7 +352,7 @@ fn group_channels(names: &[String]) -> Vec<RawGroup> {
 /// Combine a physical layer name with a channel-prefix into one full group key.
 fn combine_key(phys: Option<&str>, group_key: &str) -> String {
     match (phys, group_key.is_empty()) {
-        (Some(p), false) => format!("{}.{}", p, group_key),
+        (Some(p), false) => format!("{p}.{group_key}"),
         (Some(p), true) => p.to_string(),
         (None, false) => group_key.to_string(),
         (None, true) => String::new(),

@@ -35,25 +35,21 @@ impl BackgroundMode {
     /// `Gradient=2`). Single source of truth for the shader mapping.
     pub fn as_u32(self) -> u32 {
         match self {
-            BackgroundMode::Checkerboard => 0,
-            BackgroundMode::Solid => 1,
-            BackgroundMode::Gradient => 2,
+            Self::Checkerboard => 0,
+            Self::Solid => 1,
+            Self::Gradient => 2,
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
-            BackgroundMode::Checkerboard => "Checkerboard",
-            BackgroundMode::Solid => "Solid",
-            BackgroundMode::Gradient => "Gradient",
+            Self::Checkerboard => "Checkerboard",
+            Self::Solid => "Solid",
+            Self::Gradient => "Gradient",
         }
     }
 
-    pub const ALL: [BackgroundMode; 3] = [
-        BackgroundMode::Checkerboard,
-        BackgroundMode::Solid,
-        BackgroundMode::Gradient,
-    ];
+    pub const ALL: [Self; 3] = [Self::Checkerboard, Self::Solid, Self::Gradient];
 }
 
 /// Full viewport-background configuration. Linear-space colours; see the module

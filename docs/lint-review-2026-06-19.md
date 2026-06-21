@@ -46,6 +46,10 @@ The single biggest maintainability issue. Notable offenders:
 
 - `src/app.rs:895` — `ExrApp::ui` is **962 lines**. The eframe update entry point has
   accreted all per-frame orchestration. **#1 refactor target.**
+  > **✅ DONE (2026-06).** `ExrApp::ui` is now ~22 lines (`app.rs:983`), delegating to
+  > `draw_*` helpers (`draw_menu_bar`, `draw_side_panel`, `draw_central_canvas`, …). The lone
+  > remaining oversized fn is `GpuState::new` (`gpu/mod.rs:246-751`, ~506 lines) —
+  > tracked in [#66](https://github.com/byvfx/floki/issues/66).
 - `src/gpu/mod.rs:242` — `GpuState::new` is **445 lines** (pipeline / shader / layout
   construction).
 - `src/gpu/ocio_pass.rs:881` — **224 lines**; `src/viewer.rs:1624` — **230 lines**;
@@ -178,7 +182,8 @@ Issues / gaps:
 
 ## Suggested priority (by maintainability ROI)
 
-1. **Break up `ExrApp::ui` (962 lines)** and `GpuState::new` (445 lines). Highest payoff.
+1. ~~**Break up `ExrApp::ui` (962 lines)**~~ (done — see item 1 above) and **`GpuState::new`**
+   (now ~506 lines, [#66](https://github.com/byvfx/floki/issues/66)). Highest payoff.
 2. **Audit the `cast_*` truncations in `viewer.rs` pixel / dim math** — potential real
    bugs, not just lint.
 3. **Add `#[must_use]` + `# Errors` docs to the `floki-ocio` public API** — cheap, raises

@@ -25,3 +25,13 @@ ocio-build:
 ocio-test:
     git submodule update --init --recursive
     cargo test --features ocio-vendored
+
+# Apply the auto-fixable pedantic/style lints (use_self, uninlined_format_args, etc.),
+# then reformat. Zero-behavior-risk cleanup; run `cargo test` afterwards. See issue #68.
+lint-fix:
+    cargo clippy --fix --allow-dirty --allow-staged --all-targets -- \
+        -W clippy::use_self \
+        -W clippy::uninlined_format_args \
+        -W clippy::redundant_clone \
+        -W clippy::format_push_string
+    cargo fmt

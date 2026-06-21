@@ -135,11 +135,11 @@ impl ChannelMode {
     /// Changing a value here requires the matching change in the shader.
     pub fn as_u32(self) -> u32 {
         match self {
-            ChannelMode::RGB => 0,
-            ChannelMode::R => 1,
-            ChannelMode::G => 2,
-            ChannelMode::B => 3,
-            ChannelMode::A => 4,
+            Self::RGB => 0,
+            Self::R => 1,
+            Self::G => 2,
+            Self::B => 3,
+            Self::A => 4,
         }
     }
 }
@@ -177,21 +177,21 @@ impl BlendMode {
     /// Changing a value here requires the matching change in the shader.
     pub fn as_u32(self) -> u32 {
         match self {
-            BlendMode::Over => 0,
-            BlendMode::Under => 1,
-            BlendMode::Add => 2,
-            BlendMode::Multiply => 3,
-            BlendMode::Screen => 4,
+            Self::Over => 0,
+            Self::Under => 1,
+            Self::Add => 2,
+            Self::Multiply => 3,
+            Self::Screen => 4,
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
-            BlendMode::Over => "Over",
-            BlendMode::Under => "Under",
-            BlendMode::Add => "Add",
-            BlendMode::Multiply => "Multiply",
-            BlendMode::Screen => "Screen",
+            Self::Over => "Over",
+            Self::Under => "Under",
+            Self::Add => "Add",
+            Self::Multiply => "Multiply",
+            Self::Screen => "Screen",
         }
     }
 }
@@ -1522,7 +1522,7 @@ impl ExrViewer {
         exr_data: &ExrData,
         exr_data_b: Option<&ExrData>,
     ) {
-        let draw_sheet = |viewer: &mut ExrViewer,
+        let draw_sheet = |viewer: &mut Self,
                           ui: &mut egui::Ui,
                           data: &crate::exr_loader::ExrData,
                           is_a: bool| {
@@ -1596,7 +1596,7 @@ impl ExrViewer {
                                         cell_rect.top() + thumb_box + label_height * 0.5,
                                     ),
                                     egui::Align2::CENTER_CENTER,
-                                    format!("{}: {}", i, name),
+                                    format!("{i}: {name}"),
                                     egui::FontId::proportional(14.0),
                                     ui.visuals().strong_text_color(),
                                 );
@@ -1857,7 +1857,7 @@ impl ExrViewer {
                     unclipped_painter.text(
                         disp_rect.right_top() - egui::vec2(0.0, 5.0),
                         egui::Align2::RIGHT_BOTTOM,
-                        format!("{},{}", top_right_x, top_right_y),
+                        format!("{top_right_x},{top_right_y}"),
                         egui::FontId::proportional(12.0),
                         egui::Color32::GRAY,
                     );
@@ -1874,7 +1874,7 @@ impl ExrViewer {
                 };
 
                 if let Some(gpu) = gpu_resources {
-                    self.draw_canvas_gpu(ui, &layout, exr_data_b, gpu, lut_bg_opt.clone());
+                    self.draw_canvas_gpu(ui, &layout, exr_data_b, gpu, lut_bg_opt);
                 } else {
                     self.draw_canvas_cpu(ui, &layout, exr_data_b);
                 }
@@ -2048,7 +2048,7 @@ impl ExrViewer {
                     .resizable(false)
                     .collapsible(false)
                     .show(ui.ctx(), |ui| {
-                        ui.label(format!("x={} y={}", x, y));
+                        ui.label(format!("x={x} y={y}"));
 
                         if let Some(val_a) = val_a_opt {
                             ui.horizontal(|ui| {
@@ -2074,11 +2074,8 @@ impl ExrViewer {
                             });
                             let (h, s, v, l) = rgb_to_hsvl(val_a[0], val_a[1], val_a[2]);
                             ui.label(
-                                egui::RichText::new(format!(
-                                    "H:{:.0} S:{:.2} V:{:.2} L:{:.5}",
-                                    h, s, v, l
-                                ))
-                                .color(egui::Color32::LIGHT_GRAY),
+                                egui::RichText::new(format!("H:{h:.0} S:{s:.2} V:{v:.2} L:{l:.5}"))
+                                    .color(egui::Color32::LIGHT_GRAY),
                             );
                         }
 
@@ -2102,11 +2099,8 @@ impl ExrViewer {
                             });
                             let (h, s, v, l) = rgb_to_hsvl(val_b[0], val_b[1], val_b[2]);
                             ui.label(
-                                egui::RichText::new(format!(
-                                    "H:{:.0} S:{:.2} V:{:.2} L:{:.5}",
-                                    h, s, v, l
-                                ))
-                                .color(egui::Color32::LIGHT_GRAY),
+                                egui::RichText::new(format!("H:{h:.0} S:{s:.2} V:{v:.2} L:{l:.5}"))
+                                    .color(egui::Color32::LIGHT_GRAY),
                             );
                         }
 
@@ -2403,9 +2397,7 @@ impl ExrViewer {
             (
                 gpu_state.uniform_buffer.clone(),
                 gpu_state.uniform_stride,
-                lut_bg_opt
-                    .clone()
-                    .unwrap_or_else(|| gpu_state.default_lut_bind_group.clone()),
+                lut_bg_opt.unwrap_or_else(|| gpu_state.default_lut_bind_group.clone()),
                 gpu_state.default_tex_bind_group.clone(),
             )
         };
@@ -2570,7 +2562,7 @@ impl ExrViewer {
                             .min(d.logical_layers.len().saturating_sub(1))]
                         .clone()
                     }) {
-                        draw_gpu(p, bg_b.clone(), None, rect, image_rect, false, false, opac);
+                        draw_gpu(p, bg_b, None, rect, image_rect, false, false, opac);
                     }
                 }
                 CompareMode::Wipe => {
@@ -2657,16 +2649,7 @@ impl ExrViewer {
                             false,
                             opac,
                         );
-                        draw_gpu(
-                            p,
-                            bg_b.clone(),
-                            None,
-                            rect,
-                            image_rect_b,
-                            false,
-                            false,
-                            opac,
-                        );
+                        draw_gpu(p, bg_b, None, rect, image_rect_b, false, false, opac);
                         p.line_segment(
                             [
                                 egui::pos2(image_rect_b.min.x, combined_rect.min.y),
@@ -2689,7 +2672,7 @@ impl ExrViewer {
                         draw_gpu(
                             p,
                             bg_a.clone(),
-                            Some(bg_b.clone()),
+                            Some(bg_b),
                             rect,
                             image_rect,
                             true,
@@ -2709,7 +2692,7 @@ impl ExrViewer {
                         draw_gpu(
                             p,
                             bg_a.clone(),
-                            Some(bg_b.clone()),
+                            Some(bg_b),
                             rect,
                             image_rect,
                             false,
