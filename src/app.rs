@@ -731,13 +731,13 @@ impl ExrApp {
         } else {
             let layer_count = data.logical_layers.len();
             self.exr_data = Some(data);
-            // Clamp the active layer to the new image's layer count. A sequence
-            // normally has identical structure frame-to-frame, but guard against
-            // a frame with fewer layers so the per-layer texture index stays
-            // valid (sync_texture_caches resizes the cache but does not clamp).
-            if self.viewer.active_layer >= layer_count {
-                self.viewer.active_layer = 0;
-            }
+            // Clamp the active layer to the new image's last valid index. A
+            // sequence normally has identical structure frame-to-frame, but guard
+            // against a frame with fewer layers so the per-layer texture index
+            // stays valid (sync_texture_caches resizes the cache but does not
+            // clamp). A true clamp (not reset-to-0) keeps the user's selection
+            // when the new image still has that index in range.
+            self.viewer.active_layer = self.viewer.active_layer.min(layer_count.saturating_sub(1));
             self.viewer.invalidate_active_textures();
             self.viewer.invalidate_histogram();
             self.viewer.last_sampled_val_a = None;
