@@ -2,7 +2,7 @@ use crate::exr_loader::ExrData;
 use crate::viewer::ExrViewer;
 use eframe::egui;
 use rfd::FileDialog;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// User theme preference, persisted across sessions. Maps to egui's
 /// [`egui::ThemePreference`]; `System` follows the OS light/dark setting.
@@ -38,6 +38,19 @@ struct LoadResult {
 struct LoadJob {
     path: PathBuf,
     is_b: bool,
+}
+
+/// Message from the decode worker to the UI thread, delivered over `load_rx`. A
+/// slot-A load first sends a `Proxy` (a fast low-res first paint, #33) when one
+/// is available, then always sends `Loaded` with the full decode.
+enum LoadMsg {
+    Proxy {
+        path: PathBuf,
+        proxy: crate::proxy::ProxyImage,
+    },
+    // Boxed: `LoadResult` holds a full `ExrData` inline, dwarfing the `Proxy`
+    // variant (`large_enum_variant`).
+    Loaded(Box<LoadResult>),
 }
 
 /// Result of an off-thread `.cube` LUT parse. The GPU bind group is created
@@ -200,7 +213,7 @@ pub struct ExrApp {
     load_tx: Option<std::sync::mpsc::Sender<LoadJob>>,
     /// Result receiver: the worker sends completed `LoadResult`s back here.
     #[serde(skip)]
-    load_rx: Option<std::sync::mpsc::Receiver<LoadResult>>,
+    load_rx: Option<std::sync::mpsc::Receiver<LoadMsg>>,
 
     // Async LUT loading: .cube parsing runs on a worker thread (see
     // `reload_lut`); the parsed CubeLut arrives over `lut_load_rx` and the
@@ -628,15 +641,28 @@ impl ExrApp {
         // Stale jobs are discarded by `apply_load_result`'s path check.
         if self.load_rx.is_none() {
             let (job_tx, job_rx) = std::sync::mpsc::channel::<LoadJob>();
-            let (result_tx, result_rx) = std::sync::mpsc::channel::<LoadResult>();
+            let (result_tx, result_rx) = std::sync::mpsc::channel::<LoadMsg>();
             std::thread::spawn(move || {
                 for job in job_rx {
+                    // Slot-A first-paint proxy (#33): a fast low-res read so the
+                    // image appears before the full decode lands. Slot B is a
+                    // reference (no first paint needed). `from_exr_fast_read`
+                    // returns None for small / tiled / deep files, leaving the
+                    // spinner-then-full path unchanged.
+                    if !job.is_b
+                        && let Some(proxy) = crate::proxy::ProxyImage::from_exr_fast_read(&job.path)
+                    {
+                        let _ = result_tx.send(LoadMsg::Proxy {
+                            path: job.path.clone(),
+                            proxy,
+                        });
+                    }
                     let result = ExrData::load(&job.path);
-                    let _ = result_tx.send(LoadResult {
+                    let _ = result_tx.send(LoadMsg::Loaded(Box::new(LoadResult {
                         path: job.path,
                         is_b: job.is_b,
                         result,
-                    });
+                    })));
                 }
             });
             self.load_tx = Some(job_tx);
@@ -762,16 +788,22 @@ impl ExrApp {
         self.viewer = ExrViewer::default();
     }
 
+    /// Apply a worker-produced first-paint proxy (#33) to slot A. Dropped if the
+    /// open was superseded (a newer open of a different file) or the full-res
+    /// decode already landed — in both cases a late proxy would be a regression.
+    fn apply_proxy(&mut self, ctx: &egui::Context, path: &Path, proxy: crate::proxy::ProxyImage) {
+        if self.loaded_file.as_deref() != Some(path) || self.exr_data.is_some() {
+            return;
+        }
+        self.set_proxy(ctx, proxy);
+    }
+
     /// Set the slot-A first-paint proxy (#58/#33): upload a low-res
     /// [`ProxyImage`] so the viewport shows the image immediately while the
-    /// full-res decode is still in flight. Call this from the decode worker as
-    /// soon as a low-res read is available (the #33 decode path); the full
-    /// decode later calls [`Self::swap_image_data`], which clears the proxy.
-    /// No-op if the slot-A full image is already loaded.
-    ///
-    /// `#[allow(dead_code)]`: the producer is the #33 decode path (not yet
-    /// landed); `draw_proxy` in the loading branch consumes it once set.
-    #[allow(dead_code)]
+    /// full-res decode is still in flight. Called from [`Self::apply_proxy`] when
+    /// the worker's fast low-res read (#33) arrives; the full decode later calls
+    /// [`Self::swap_image_data`], which clears the proxy. No-op if the slot-A
+    /// full image is already loaded.
     fn set_proxy(&mut self, ctx: &egui::Context, proxy: crate::proxy::ProxyImage) {
         if self.exr_data.is_some() {
             // Full-res already landed; a late proxy would be a step backwards.
@@ -1006,16 +1038,20 @@ impl eframe::App for ExrApp {
 
 impl ExrApp {
     fn poll_async_loads(&mut self, ctx: &egui::Context) {
-        // Drain completed async image loads (collect first so the `load_rx`
-        // borrow ends before the `&mut self` apply call).
-        let mut loaded = Vec::new();
+        // Drain async image messages (collect first so the `load_rx` borrow ends
+        // before the `&mut self` apply calls). A slot-A load delivers a `Proxy`
+        // first (when available), then `Loaded` with the full decode.
+        let mut msgs = Vec::new();
         if let Some(rx) = &self.load_rx {
-            while let Ok(res) = rx.try_recv() {
-                loaded.push(res);
+            while let Ok(msg) = rx.try_recv() {
+                msgs.push(msg);
             }
         }
-        for res in loaded {
-            self.apply_load_result(res);
+        for msg in msgs {
+            match msg {
+                LoadMsg::Proxy { path, proxy } => self.apply_proxy(ctx, &path, proxy),
+                LoadMsg::Loaded(res) => self.apply_load_result(*res),
+            }
         }
         if self.loading_a || self.loading_b {
             // egui is reactive; keep polling the worker until the decode lands.
