@@ -46,7 +46,11 @@ fn rgb3_to_vec4(c: [f32; 3]) -> [f32; 4] {
 /// enum dispatch. This function is the fallback for F16/U32 channels and the
 /// single source of truth for the sampling logic (previously duplicated 8× as
 /// inline `get_val` closures).
-fn sample_channel(
+/// Read one float component from a channel at `(x, y)`, handling F32 (fast
+/// path), F16, and U32 `FlatSamples`. Returns 0.0 for a missing channel.
+/// `pub(crate)` so the proxy downsample path ([`crate::proxy`]) reuses the
+/// single tested implementation instead of duplicating the enum match.
+pub(crate) fn sample_channel(
     chan: Option<&exr::image::AnyChannel<exr::image::FlatSamples>>,
     x: usize,
     y: usize,
@@ -361,6 +365,18 @@ pub struct ExrViewer {
     anno_redo: Vec<Vec<Annotation>>,
     /// Active text placement: `(image-space anchor, buffer)` while typing.
     anno_text_edit: Option<([f32; 2], String)>,
+
+    /// Low-res first-paint proxy for slot A (#58/#33): shown while the full
+    /// `ExrData` decode is in flight. A tone-baked `egui::TextureHandle`
+    /// (exposure/gamma/sRGB + background, mirroring the CPU `generate_texture`
+    /// path) so `painter.image` renders a correctly tone-mapped preview. The
+    /// full-res GPU path takes over when the decode lands and
+    /// [`crate::app::ExrApp::swap_image_data`] clears this. Transient.
+    proxy_texture: Option<egui::TextureHandle>,
+    /// Full-resolution pixel dimensions of the proxy's source image, used for
+    /// viewport layout so the proxy lands in the same rect the full-res render
+    /// will occupy (the proxy texture itself is lower-res and upscaled).
+    proxy_full_size: Option<egui::Vec2>,
 }
 
 impl Default for ExrViewer {
@@ -441,6 +457,8 @@ impl Default for ExrViewer {
             anno_undo: Vec::new(),
             anno_redo: Vec::new(),
             anno_text_edit: None,
+            proxy_texture: None,
+            proxy_full_size: None,
         }
     }
 }
@@ -1756,37 +1774,7 @@ impl ExrViewer {
                 // crop the framebuffer screenshot to just the image area.
                 self.last_canvas_rect = Some(rect);
 
-                if self.first_frame {
-                    let scale_x = rect.width() / tex_size.x;
-                    let scale_y = rect.height() / tex_size.y;
-                    self.scale = scale_x.min(scale_y).min(1.0); // Fit but don't scale up past 1.0 initially
-                    self.translation = egui::Vec2::ZERO;
-                    self.first_frame = false;
-                }
-
-                // Handle Zoom: pinch / ctrl+scroll via zoom_delta(), plus the plain
-                // mouse wheel via smooth_scroll_delta (which zoom_delta() does NOT report).
-                if response.hovered() {
-                    let (zoom_delta, scroll_y) =
-                        ui.input(|i| (i.zoom_delta(), i.smooth_scroll_delta.y));
-                    let wheel_zoom = (scroll_y * 0.004).exp();
-                    let total_zoom = zoom_delta * wheel_zoom;
-                    if total_zoom != 1.0
-                        && let Some(pos) = response.hover_pos()
-                    {
-                        // Zoom around the cursor
-                        let offset = pos - rect.center() - self.translation;
-                        self.translation -= offset * (total_zoom - 1.0);
-                        self.scale = (self.scale * total_zoom).clamp(0.01, 100.0);
-                    }
-                }
-
-                // Handle Panning — suppressed while an annotation tool is active so
-                // its drag draws a shape instead of moving the image (#45).
-                if response.dragged() && !self.anno_tool.is_active() {
-                    self.translation += response.drag_delta();
-                }
-
+                self.handle_canvas_interaction(ui, rect, &response, tex_size);
                 // Render Image
                 let image_size = tex_size * self.scale;
 
@@ -3592,6 +3580,207 @@ impl ExrViewer {
         self.composite_texture = None;
     }
 
+    /// Clear the slot-A proxy (first-paint) texture. Called when the full-res
+    /// `ExrData` lands ([`crate::app::ExrApp::swap_image_data`]) or the session
+    /// resets — the proxy is no longer needed once full-res pixels are
+    /// available.
+    pub fn clear_proxy(&mut self) {
+        self.proxy_texture = None;
+        self.proxy_full_size = None;
+    }
+
+    /// Upload a low-res [`ProxyImage`] as the slot-A first-paint texture (#58).
+    /// Bakes the exposure/gamma/sRGB + background tone pipeline into an
+    /// `egui::TextureHandle` (mirroring the CPU `generate_texture` path) so the
+    /// proxy renders correctly tone-mapped via `painter.image`. The full image
+    /// dimensions are stored for layout. Idempotent: a repeat call replaces the
+    /// previous upload.
+    ///
+    /// **OCIO note:** the proxy uses the non-OCIO tone pipeline even when OCIO
+    /// is active. The proxy is a transient stand-in replaced near-instantly by
+    /// the full OCIO render; an OCIO-accurate proxy is a follow-up refinement.
+    ///
+    /// `#[allow(dead_code)]`: wired to [`crate::app::ExrApp::set_proxy`], which
+    /// #33's decode path calls from the worker thread once a low-res read lands.
+    #[allow(dead_code)]
+    pub fn set_proxy(&mut self, ctx: &egui::Context, proxy: crate::proxy::ProxyImage) {
+        // Drop the previous upload first so its GPU memory is released before the
+        // new texture is created, avoiding a transient double-allocation (egui's
+        // lazy drop would otherwise defer it past the new upload).
+        self.proxy_texture = None;
+        self.proxy_full_size = Some(egui::vec2(
+            proxy.full_width as f32,
+            proxy.full_height as f32,
+        ));
+        self.proxy_texture = Self::generate_texture_proxy(self, ctx, &proxy);
+    }
+
+    /// Whether a slot-A proxy texture is currently uploaded.
+    pub fn has_proxy(&self) -> bool {
+        self.proxy_texture.is_some()
+    }
+
+    /// Apply the canvas zoom/pan interaction for one frame from `response`:
+    /// first-frame fit-to-view, cursor-centered wheel/pinch zoom, and drag pan
+    /// (suppressed while an annotation tool is active). Extracted from
+    /// [`Self::ui`] so the proxy first-paint path ([`Self::draw_proxy`]) shares
+    /// the exact same interaction model — the handoff from proxy to full-res is
+    /// visually continuous because zoom/pan state is identical.
+    fn handle_canvas_interaction(
+        &mut self,
+        ui: &egui::Ui,
+        rect: egui::Rect,
+        response: &egui::Response,
+        tex_size: egui::Vec2,
+    ) {
+        if self.first_frame {
+            let scale_x = rect.width() / tex_size.x;
+            let scale_y = rect.height() / tex_size.y;
+            self.scale = scale_x.min(scale_y).min(1.0); // Fit but don't scale up past 1.0 initially
+            self.translation = egui::Vec2::ZERO;
+            self.first_frame = false;
+        }
+
+        // Handle Zoom: pinch / ctrl+scroll via zoom_delta(), plus the plain
+        // mouse wheel via smooth_scroll_delta (which zoom_delta() does NOT report).
+        if response.hovered() {
+            let (zoom_delta, scroll_y) = ui.input(|i| (i.zoom_delta(), i.smooth_scroll_delta.y));
+            let wheel_zoom = (scroll_y * 0.004).exp();
+            let total_zoom = zoom_delta * wheel_zoom;
+            if total_zoom != 1.0
+                && let Some(pos) = response.hover_pos()
+            {
+                // Zoom around the cursor
+                let offset = pos - rect.center() - self.translation;
+                self.translation -= offset * (total_zoom - 1.0);
+                self.scale = (self.scale * total_zoom).clamp(0.01, 100.0);
+            }
+        }
+
+        // Handle Panning — suppressed while an annotation tool is active so
+        // its drag draws a shape instead of moving the image (#45).
+        if response.dragged() && !self.anno_tool.is_active() {
+            self.translation += response.drag_delta();
+        }
+    }
+
+    /// First-paint render path: paint the slot-A proxy texture while the full
+    /// `ExrData` decode is in flight (#58/#33). Lays out the image at the
+    /// proxy's *full* dimensions (so the rect matches the upcoming full-res
+    /// render) and applies the same zoom/pan interaction as [`Self::ui`], so
+    /// the handoff to full-res is continuous. No panels / contact-sheet /
+    /// compare modes — those need a full `ExrData`; the proxy is a stand-in
+    /// until it arrives. Used by [`crate::app::ExrApp::draw_central_canvas`] in
+    /// the loading branch when a proxy is available.
+    pub fn draw_proxy(&mut self, ui: &mut egui::Ui) {
+        let Some(tex_size) = self.proxy_full_size else {
+            return;
+        };
+        if self.proxy_texture.is_none() {
+            return;
+        }
+
+        let (rect, response) =
+            ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
+        self.last_canvas_rect = Some(rect);
+        self.handle_canvas_interaction(ui, rect, &response, tex_size);
+
+        let image_size = tex_size * self.scale;
+        let image_rect = egui::Rect::from_min_size(
+            rect.center() + self.translation - image_size / 2.0,
+            image_size,
+        );
+        self.last_image_rect = Some(image_rect);
+
+        // Paint the tone-baked proxy texture, upscaled via linear filtering into
+        // the full image rect. egui uploads the texture to the GPU itself, so this
+        // works on both the CPU and GPU render paths (the full-res wgpu path takes
+        // over once the decode lands).
+        if let Some(tex) = self.proxy_texture.as_ref() {
+            ui.painter().with_clip_rect(rect).image(
+                tex.id(),
+                image_rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        }
+    }
+
+    /// Build a tone-baked `egui::TextureHandle` from a low-res [`ProxyImage`],
+    /// applying exposure/gamma/sRGB + background composite (mirroring the CPU
+    /// [`Self::generate_texture`] path, minus channel-select — the proxy is
+    /// already RGBA). Used by [`Self::set_proxy`]. The proxy's pixels are raw
+    /// scene-linear RGBA32Float.
+    #[allow(dead_code)]
+    fn generate_texture_proxy(
+        &self,
+        ctx: &egui::Context,
+        proxy: &crate::proxy::ProxyImage,
+    ) -> Option<egui::TextureHandle> {
+        let width = proxy.proxy_width;
+        let height = proxy.proxy_height;
+        if width == 0 || height == 0 {
+            return None;
+        }
+        let mut pixels = vec![egui::Color32::BLACK; width * height];
+
+        let exp_mult = crate::render_math::exposure_to_multiplier(self.exposure);
+        let bg_cfg = &self.background;
+        let gamma = self.gamma;
+        let apply_gamma = self.gamma != 1.0;
+        let apply_srgb = self.srgb;
+        let src = &proxy.pixels;
+
+        pixels
+            .par_chunks_mut(width)
+            .enumerate()
+            .for_each(|(y, row)| {
+                for (x, px) in row.iter_mut().enumerate() {
+                    let o = (y * width + x) * 4;
+                    let mut r = src[o];
+                    let mut g = src[o + 1];
+                    let mut b = src[o + 2];
+                    let a = src[o + 3];
+
+                    // Apply exposure
+                    r *= exp_mult;
+                    g *= exp_mult;
+                    b *= exp_mult;
+
+                    // Composite over the viewport background (pre-multiplied).
+                    let bg = bg_cfg.sample_linear(x as f32, y as f32, width as f32, height as f32);
+                    let a_clamp = a.clamp(0.0, 1.0);
+                    r += bg[0] * (1.0 - a_clamp);
+                    g += bg[1] * (1.0 - a_clamp);
+                    b += bg[2] * (1.0 - a_clamp);
+
+                    if apply_gamma {
+                        r = crate::render_math::apply_gamma(r, gamma);
+                        g = crate::render_math::apply_gamma(g, gamma);
+                        b = crate::render_math::apply_gamma(b, gamma);
+                    }
+                    if apply_srgb {
+                        r = Self::linear_to_srgb(r);
+                        g = Self::linear_to_srgb(g);
+                        b = Self::linear_to_srgb(b);
+                    }
+
+                    *px = egui::Color32::from_rgb(
+                        (r.clamp(0.0, 1.0) * 255.0) as u8,
+                        (g.clamp(0.0, 1.0) * 255.0) as u8,
+                        (b.clamp(0.0, 1.0) * 255.0) as u8,
+                    );
+                }
+            });
+
+        let color_image = egui::ColorImage {
+            size: [width, height],
+            source_size: egui::vec2(width as f32, height as f32),
+            pixels,
+        };
+        Some(ctx.load_texture("exr_proxy", color_image, egui::TextureOptions::LINEAR))
+    }
+
     pub fn calculate_histogram(&mut self, exr_data: &ExrData, exr_data_b: Option<&ExrData>) {
         let key = (self.active_layer, self.log_histogram);
         if self.histogram_key == Some(key) {
@@ -4014,6 +4203,112 @@ mod gui_tests {
         h.run();
         h.state_mut().viewer.compare_mode = CompareMode::SideBySide;
         h.run();
+    }
+
+    #[test]
+    fn draw_proxy_renders_without_panicking_and_records_rects() {
+        // The first-paint path (#58): with no full ExrData, `draw_proxy` lays
+        // out the canvas at the proxy's *full* dimensions and paints the
+        // tone-baked proxy texture. Drives the CPU path headlessly (no wgpu).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.exr");
+        write_rgba_exr(&path);
+        let data = ExrData::load(&path).unwrap();
+        // 4×4 full → 2×2 proxy.
+        // (write_rgba_exr writes a 2×2; use a richer fixture for downsample.)
+        let _ = data;
+
+        // Build a synthetic proxy directly so the test doesn't depend on the
+        // downsample seam (covered separately in `proxy::tests`).
+        let proxy = crate::proxy::ProxyImage {
+            full_width: 8,
+            full_height: 4,
+            proxy_width: 2,
+            proxy_height: 1,
+            pixels: vec![0.5, 0.5, 0.5, 1.0, 0.5, 0.5, 0.5, 1.0],
+        };
+
+        struct S {
+            viewer: ExrViewer,
+            proxy: Option<crate::proxy::ProxyImage>,
+        }
+        let mut h = Harness::new_ui_state(
+            |ui, s: &mut S| {
+                if let Some(p) = s.proxy.take() {
+                    s.viewer.set_proxy(ui.ctx(), p);
+                }
+                s.viewer.draw_proxy(ui);
+            },
+            S {
+                viewer: ExrViewer::default(),
+                proxy: Some(proxy),
+            },
+        );
+        h.run();
+        assert!(h.state().viewer.has_proxy(), "proxy uploaded");
+        assert_eq!(
+            h.state().viewer.proxy_full_size,
+            Some(egui::vec2(8.0, 4.0)),
+            "full dims stored for layout"
+        );
+        assert!(
+            h.state().viewer.last_canvas_rect.is_some(),
+            "canvas rect recorded"
+        );
+        assert!(
+            h.state().viewer.last_image_rect.is_some(),
+            "image rect recorded"
+        );
+
+        // first_frame fit should have fired (scale set to fit the 8×4 image).
+        assert!(!h.state().viewer.first_frame, "first_frame fit ran");
+    }
+
+    #[test]
+    fn draw_proxy_noop_without_proxy_set() {
+        // Calling draw_proxy before set_proxy must not panic / allocate.
+        struct S {
+            viewer: ExrViewer,
+        }
+        let mut h = Harness::new_ui_state(
+            |ui, s: &mut S| {
+                s.viewer.draw_proxy(ui);
+            },
+            S {
+                viewer: ExrViewer::default(),
+            },
+        );
+        h.run();
+        assert!(!h.state().viewer.has_proxy());
+        assert!(h.state().viewer.last_canvas_rect.is_none());
+    }
+
+    #[test]
+    fn clear_proxy_drops_proxy_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.exr");
+        write_rgba_exr(&path);
+        let data = ExrData::load(&path).unwrap();
+        let proxy = crate::proxy::ProxyImage::from_exr_data_downsampled(&data, 0, 1).unwrap();
+
+        // Use a kittest ctx to load the texture (set_proxy needs an egui ctx).
+        let mut h = Harness::new_ui_state(
+            |ui, v: &mut ExrViewer| {
+                v.set_proxy(
+                    ui.ctx(),
+                    crate::proxy::ProxyImage {
+                        pixels: proxy.pixels.clone(),
+                        ..proxy.clone()
+                    },
+                );
+            },
+            ExrViewer::default(),
+        );
+        h.run_steps(1);
+        assert!(h.state().has_proxy());
+        h.state_mut().clear_proxy();
+        assert!(!h.state().has_proxy(), "proxy cleared");
+        assert_eq!(h.state().proxy_full_size, None, "full-size hint cleared");
     }
 
     #[test]

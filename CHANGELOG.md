@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Internal: render-side proxy first-paint path (#58).** Adds a low-res
+  `ProxyImage` (standalone RGBA32Float buffer + full image dimensions) and a
+  viewer proxy texture slot with a tone-baked upload (exposure/gamma/sRGB +
+  background, mirroring the CPU `generate_texture` path). While the full-res
+  `ExrData` decode is in flight, the loading branch renders the proxy instead
+  of a spinner; when the full decode lands, `swap_image_data` (#55) clears the
+  proxy and the viewport swaps to full-res with zoom/pan preserved. The proxy
+  uses the non-OCIO tone pipeline even when OCIO is active (transient stand-in;
+  OCIO-accurate proxy is a follow-up). The decode-side producer (a true low-res
+  EXR read) is #33 — `ExrApp::set_proxy` is the seam it will call from the
+  worker. No user-facing change yet (nothing produces a proxy).
+
 ### Changed
 - **Internal: split image-data swap from viewer session-state reset (#55).**
   Extracted `swap_image_data` (replaces the pixel source for A or B while
