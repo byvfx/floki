@@ -61,7 +61,9 @@ impl ProxyImage {
         let (layer, r_chan, g_chan, b_chan, a_chan) = data.logical_channels(layer_index)?;
         let full_width = layer.size.0;
         let full_height = layer.size.1;
-        if full_width == 0 || full_height == 0 {
+        // `max_dim` is the downsample divisor below (`div_ceil(max_dim)`); guard
+        // zero here so a 0 from any caller returns `None` instead of panicking.
+        if full_width == 0 || full_height == 0 || max_dim == 0 {
             return None;
         }
 
@@ -215,5 +217,16 @@ mod tests {
         write_gradient_exr(&path);
         let data = ExrData::load(&path).unwrap();
         assert!(ProxyImage::from_exr_data_downsampled(&data, 99, 2).is_none());
+    }
+
+    #[test]
+    fn zero_max_dim_returns_none() {
+        // `max_dim` is the downsample divisor; 0 must return None, not panic on
+        // the `div_ceil(0)` divide-by-zero.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grad.exr");
+        write_gradient_exr(&path);
+        let data = ExrData::load(&path).unwrap();
+        assert!(ProxyImage::from_exr_data_downsampled(&data, 0, 0).is_none());
     }
 }

@@ -684,13 +684,23 @@ impl ExrApp {
                     // source while preserving the viewer's session state.
                     self.swap_image_data(data, true);
                 } else {
-                    self.exr_data = Some(data);
                     // An explicit open of a new A starts a fresh session: drop the
-                    // reference (meaningless on its own) and reset the viewer.
+                    // reference (meaningless on its own) in both paths below.
                     self.exr_data_b = None; // Reset B when A changes
                     self.loaded_file_b = None;
                     self.loading_b = false; // A discards any in-flight B load
-                    self.reset_viewer_session();
+                    if self.viewer.has_proxy() {
+                        // A proxy painted first and already established the fresh
+                        // view (and the user may have panned/zoomed it); swap to
+                        // full-res preserving that view so the handoff is
+                        // continuous. swap_image_data clears the proxy.
+                        self.swap_image_data(data, false);
+                    } else {
+                        // No proxy: the full decode is this image's first paint —
+                        // reset the viewer so it fits the new image.
+                        self.exr_data = Some(data);
+                        self.reset_viewer_session();
+                    }
                 }
                 self.error_msg = None;
             }
@@ -775,6 +785,18 @@ impl ExrApp {
             // Full-res already landed; a late proxy would be a step backwards.
             return;
         }
+        if !self.viewer.has_proxy() {
+            // First proxy for this open: establish the fresh-session view so the
+            // proxy fits-to-view and doesn't inherit the previous image's
+            // zoom/pan. Gated on has_proxy so a progressive proxy update (#33)
+            // doesn't wipe the user's interaction. The full-res handoff
+            // (apply_load_result) then preserves whatever view the user adjusts.
+            self.reset_viewer_session();
+        }
+        // Bake the persisted background into the proxy texture (the viewer was
+        // just reset above, so its background is the default until synced) to
+        // avoid a background jump when the full-res render takes over.
+        self.viewer.background = self.background.clone();
         self.viewer.set_proxy(ctx, proxy);
         ctx.request_repaint();
     }
@@ -2434,6 +2456,63 @@ mod tests {
         );
         assert_eq!(app.viewer.scale, 2.5, "zoom preserved across handoff");
         assert!(app.exr_data.is_some(), "full data applied");
+    }
+
+    #[test]
+    fn a_success_with_proxy_preserves_view_and_clears_proxy() {
+        // End-to-end seam (#58/#55): the real load-completion path
+        // (`apply_load_result`) must take the swap branch when a proxy is showing
+        // so the proxy→full-res handoff preserves the user's view, while still
+        // dropping the now-meaningless reference B (an explicit new-A open).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.exr");
+        write_rgba_exr(&path);
+        let data = ExrData::load(&path).unwrap();
+        let data_b = ExrData::load(&path).unwrap();
+        let proxy = crate::proxy::ProxyImage::from_exr_data_downsampled(&data, 0, 1).unwrap();
+
+        let mut app = ExrApp {
+            loaded_file: Some(path.clone()),
+            loaded_file_b: Some(PathBuf::from("b.exr")),
+            exr_data_b: Some(data_b),
+            loading_a: true, // full decode in flight
+            loading_b: true,
+            ..Default::default()
+        };
+        // Decode worker delivers a proxy first (needs an egui ctx to upload).
+        {
+            use egui_kittest::Harness;
+            let mut h = Harness::new_ui_state(
+                |ui, app: &mut ExrApp| {
+                    app.set_proxy(
+                        ui.ctx(),
+                        crate::proxy::ProxyImage {
+                            pixels: proxy.pixels.clone(),
+                            ..proxy.clone()
+                        },
+                    );
+                },
+                app,
+            );
+            h.run_steps(1);
+            app = std::mem::take(h.state_mut());
+        }
+        assert!(app.viewer.has_proxy(), "proxy set during load");
+        app.viewer.scale = 2.5; // user panned/zoomed on the proxy
+
+        // Full decode lands through the real completion path.
+        app.apply_load_result(LoadResult {
+            path,
+            is_b: false,
+            result: Ok(data),
+        });
+
+        assert!(app.exr_data.is_some(), "A data applied");
+        assert!(!app.viewer.has_proxy(), "proxy cleared on handoff");
+        assert_eq!(app.viewer.scale, 2.5, "view preserved across handoff");
+        assert!(app.exr_data_b.is_none(), "B dropped on explicit new-A open");
+        assert!(app.loaded_file_b.is_none(), "B path cleared");
+        assert!(!app.loading_a && !app.loading_b, "loading flags cleared");
     }
 
     #[test]

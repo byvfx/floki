@@ -3604,8 +3604,10 @@ impl ExrViewer {
     /// #33's decode path calls from the worker thread once a low-res read lands.
     #[allow(dead_code)]
     pub fn set_proxy(&mut self, ctx: &egui::Context, proxy: crate::proxy::ProxyImage) {
-        // Drop the previous upload so its GPU memory can be released before the
-        // new one is created (wgpu/egui's lazy drop would otherwise defer it).
+        // Drop the previous upload first so its GPU memory is released before the
+        // new texture is created, avoiding a transient double-allocation (egui's
+        // lazy drop would otherwise defer it past the new upload).
+        self.proxy_texture = None;
         self.proxy_full_size = Some(egui::vec2(
             proxy.full_width as f32,
             proxy.full_height as f32,
