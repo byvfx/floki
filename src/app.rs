@@ -680,21 +680,17 @@ impl ExrApp {
         match res.result {
             Ok(data) => {
                 if res.is_b {
-                    self.exr_data_b = Some(data);
-                    // The texture caches only rebuild on a layer-count change, so a new B
-                    // with the same layer count would keep showing the previous image.
-                    // Force the reference textures (and the B-dependent diff/composite) to
-                    // regenerate from the new data.
-                    self.viewer.invalidate_reference_textures();
-                    // B isn't part of the histogram cache key — refresh it so the
-                    // B histogram appears without waiting for a layer change.
-                    self.viewer.invalidate_histogram();
+                    // B is a reference slot, not a new session: swap the pixel
+                    // source while preserving the viewer's session state.
+                    self.swap_image_data(data, true);
                 } else {
                     self.exr_data = Some(data);
+                    // An explicit open of a new A starts a fresh session: drop the
+                    // reference (meaningless on its own) and reset the viewer.
                     self.exr_data_b = None; // Reset B when A changes
                     self.loaded_file_b = None;
                     self.loading_b = false; // A discards any in-flight B load
-                    self.viewer = ExrViewer::default(); // Reset viewer state
+                    self.reset_viewer_session();
                 }
                 self.error_msg = None;
             }
@@ -705,6 +701,59 @@ impl ExrApp {
                 self.error_msg = Some(e.to_string());
             }
         }
+    }
+
+    /// Replace the pixel source for slot A or B **without** resetting viewer
+    /// session state (zoom, pan, compare mode, channel mode, annotations,
+    /// swatches, tone/OCIO/LUT controls). This is the per-frame path for
+    /// image-sequence playback (#7): a new frame lands but the user's view is
+    /// preserved.
+    ///
+    /// Invalidates only image-derived caches (textures, histogram, sampled
+    /// values) and clamps `active_layer` to the new image's layer count. The
+    /// *other* slot (e.g. a fixed reference B while A plays a sequence) is left
+    /// untouched - swapping A does not drop B, unlike an explicit open.
+    ///
+    /// Contrast [`Self::reset_viewer_session`], used for an explicit open / new
+    /// session, which drops B and resets the entire viewer.
+    fn swap_image_data(&mut self, data: ExrData, is_b: bool) {
+        if is_b {
+            self.exr_data_b = Some(data);
+            // The texture caches only rebuild on a layer-count change, so a new B
+            // with the same layer count would keep showing the previous image.
+            // Force the reference textures (and the B-dependent diff/composite)
+            // to regenerate from the new data.
+            self.viewer.invalidate_reference_textures();
+            // B isn't part of the histogram cache key - refresh it so the
+            // B histogram appears without waiting for a layer change.
+            self.viewer.invalidate_histogram();
+            self.viewer.last_sampled_val_b = None;
+        } else {
+            let layer_count = data.logical_layers.len();
+            self.exr_data = Some(data);
+            // Clamp the active layer to the new image's last valid index. A
+            // sequence normally has identical structure frame-to-frame, but guard
+            // against a frame with fewer layers so the per-layer texture index
+            // stays valid (sync_texture_caches resizes the cache but does not
+            // clamp). A true clamp (not reset-to-0) keeps the user's selection
+            // when the new image still has that index in range.
+            self.viewer.active_layer = self.viewer.active_layer.min(layer_count.saturating_sub(1));
+            self.viewer.invalidate_active_textures();
+            self.viewer.invalidate_histogram();
+            self.viewer.last_sampled_val_a = None;
+            self.viewer.last_hover_pos_img = None;
+        }
+        self.error_msg = None;
+    }
+
+    /// Reset the entire viewer to defaults - the "new session" path for an
+    /// explicit open / new sequence. Drops zoom, pan, compare mode, channel
+    /// mode, annotations, swatches, and tone/OCIO/LUT view state. The caller is
+    /// responsible for clearing the image slots (e.g. dropping B when A
+    /// changes). Contrast [`Self::swap_image_data`], which replaces pixels while
+    /// preserving session state for per-frame playback (#7).
+    fn reset_viewer_session(&mut self) {
+        self.viewer = ExrViewer::default();
     }
 
     /// Explicitly release a loaded image and its resources without restarting.
@@ -726,7 +775,7 @@ impl ExrApp {
             self.loaded_file = None;
             self.exr_data_b = None;
             self.loaded_file_b = None;
-            self.viewer = ExrViewer::default();
+            self.reset_viewer_session();
         }
         self.error_msg = None;
     }
@@ -2049,6 +2098,33 @@ mod tests {
             .expect("write rgba exr fixture");
     }
 
+    /// A multi-pass EXR with `n_passes` logical layers (`pass0`, `pass1`, ...),
+    /// each RGBA, in a single physical layer. Exercises logical-layer grouping
+    /// (Blender-style prefixed channels) so `active_layer` clamping is testable.
+    fn write_multi_pass_exr(path: &std::path::Path, n_passes: usize) {
+        const W: usize = 2;
+        const H: usize = 2;
+        let mut list = smallvec::SmallVec::new();
+        for p in 0..n_passes {
+            for name in ["R", "G", "B", "A"] {
+                list.push(AnyChannel::new(
+                    Text::from(format!("pass{p}.{name}").as_str()),
+                    FlatSamples::F32(vec![0.5; W * H]),
+                ));
+            }
+        }
+        let layer = Layer::new(
+            (W, H),
+            LayerAttributes::default(),
+            Encoding::FAST_LOSSLESS,
+            AnyChannels::sort(list),
+        );
+        Image::from_layer(layer)
+            .write()
+            .to_file(path)
+            .expect("write multi-pass exr fixture");
+    }
+
     #[test]
     fn stale_load_result_is_ignored() {
         // A result for a path the user has since navigated away from must not
@@ -2125,6 +2201,153 @@ mod tests {
             "both loading flags cleared (A discards any in-flight B)"
         );
         assert!(app.error_msg.is_none());
+    }
+
+    #[test]
+    fn swap_image_data_a_preserves_viewer_state_and_b() {
+        // The per-frame playback path (#7): a new A frame lands but the user's
+        // view (zoom, pan, exposure, channel mode, swatches, annotations) and
+        // the reference B must be preserved. Contrast the open path above,
+        // which resets the viewer and drops B.
+        let dir = tempfile::tempdir().unwrap();
+        let path_a0 = dir.path().join("a0.exr");
+        let path_a1 = dir.path().join("a1.exr");
+        let path_b = dir.path().join("b.exr");
+        write_rgba_exr(&path_a0);
+        write_rgba_exr(&path_a1);
+        write_rgba_exr(&path_b);
+        let a1 = ExrData::load(&path_a1).unwrap();
+        let b = ExrData::load(&path_b).unwrap();
+
+        let mut app = ExrApp {
+            exr_data: Some(ExrData::load(&path_a0).unwrap()),
+            exr_data_b: Some(b),
+            ..Default::default()
+        };
+        // Simulate a user mid-session: non-default view + annotation + swatch.
+        app.viewer.scale = 3.5;
+        app.viewer.translation = egui::Vec2::new(12.0, -7.0);
+        app.viewer.exposure = 1.25;
+        app.viewer.channel_mode = crate::viewer::ChannelMode::R;
+        app.viewer.swatches.push([0.1, 0.2, 0.3, 1.0]);
+        app.viewer.annotations.push(crate::annotation::Annotation {
+            kind: crate::annotation::AnnotationKind::Rect {
+                a: [1.0, 1.0],
+                b: [5.0, 5.0],
+            },
+            color: egui::Color32::RED,
+            width: 2.0,
+        });
+
+        app.swap_image_data(a1, false);
+
+        assert!(app.exr_data.is_some(), "new A applied");
+        assert!(
+            app.exr_data_b.is_some(),
+            "B preserved across A frame swap (unlike the open path)"
+        );
+        assert_eq!(app.viewer.scale, 3.5, "zoom preserved");
+        assert_eq!(
+            app.viewer.translation,
+            egui::Vec2::new(12.0, -7.0),
+            "pan preserved"
+        );
+        assert_eq!(app.viewer.exposure, 1.25, "exposure preserved");
+        assert_eq!(
+            app.viewer.channel_mode,
+            crate::viewer::ChannelMode::R,
+            "channel mode preserved"
+        );
+        assert_eq!(app.viewer.swatches.len(), 1, "swatches preserved");
+        assert_eq!(app.viewer.annotations.len(), 1, "annotations preserved");
+        assert!(app.error_msg.is_none());
+    }
+
+    #[test]
+    fn swap_image_data_b_preserves_a_and_viewer_state() {
+        // Swapping B is a reference refresh: A and the user's view are untouched.
+        let dir = tempfile::tempdir().unwrap();
+        let path_a = dir.path().join("a.exr");
+        let path_b0 = dir.path().join("b0.exr");
+        let path_b1 = dir.path().join("b1.exr");
+        write_rgba_exr(&path_a);
+        write_rgba_exr(&path_b0);
+        write_rgba_exr(&path_b1);
+        let b1 = ExrData::load(&path_b1).unwrap();
+
+        let mut app = ExrApp {
+            exr_data: Some(ExrData::load(&path_a).unwrap()),
+            exr_data_b: Some(ExrData::load(&path_b0).unwrap()),
+            ..Default::default()
+        };
+        app.viewer.scale = 2.0;
+        app.viewer.exposure = -0.5;
+
+        app.swap_image_data(b1, true);
+
+        assert!(app.exr_data.is_some(), "A untouched");
+        assert!(app.exr_data_b.is_some(), "new B applied");
+        assert_eq!(app.viewer.scale, 2.0, "zoom preserved");
+        assert_eq!(app.viewer.exposure, -0.5, "exposure preserved");
+    }
+
+    #[test]
+    fn swap_image_data_clamps_active_layer_to_new_layer_count() {
+        // A sequence normally has identical layer structure frame-to-frame, but
+        // guard against a frame with fewer passes so `active_layer` stays a valid
+        // index into the per-layer texture cache (which would otherwise panic).
+        let dir = tempfile::tempdir().unwrap();
+        let path_3pass = dir.path().join("three.exr");
+        let path_1pass = dir.path().join("one.exr");
+        write_multi_pass_exr(&path_3pass, 3);
+        write_multi_pass_exr(&path_1pass, 1);
+        let one = ExrData::load(&path_1pass).unwrap();
+
+        let mut app = ExrApp {
+            exr_data: Some(ExrData::load(&path_3pass).unwrap()),
+            ..Default::default()
+        };
+        assert_eq!(app.exr_data.as_ref().unwrap().logical_layers.len(), 3);
+        app.viewer.active_layer = 2; // valid for 3 passes, invalid for 1
+
+        app.swap_image_data(one, false);
+
+        assert_eq!(
+            app.exr_data.as_ref().unwrap().logical_layers.len(),
+            1,
+            "new (smaller) A applied"
+        );
+        assert_eq!(
+            app.viewer.active_layer, 0,
+            "active_layer clamped to a valid index for the new layer count"
+        );
+    }
+
+    #[test]
+    fn reset_viewer_session_clears_view_state() {
+        // The open/new-session path: the viewer is fully reset. The caller is
+        // responsible for the image slots (here we only exercise the viewer reset).
+        let mut app = ExrApp::default();
+        app.viewer.scale = 4.0;
+        app.viewer.translation = egui::Vec2::new(99.0, 99.0);
+        app.viewer.exposure = 2.0;
+        app.viewer.swatches.push([0.0; 4]);
+        app.viewer.annotations.push(crate::annotation::Annotation {
+            kind: crate::annotation::AnnotationKind::Rect {
+                a: [0.0, 0.0],
+                b: [1.0, 1.0],
+            },
+            color: egui::Color32::RED,
+            width: 1.0,
+        });
+
+        app.reset_viewer_session();
+
+        assert_eq!(app.viewer.scale, 1.0, "zoom reset");
+        assert_eq!(app.viewer.translation, egui::Vec2::ZERO, "pan reset");
+        assert_eq!(app.viewer.exposure, 0.0, "exposure reset");
+        assert!(app.viewer.swatches.is_empty(), "swatches cleared");
+        assert!(app.viewer.annotations.is_empty(), "annotations cleared");
     }
 
     #[test]

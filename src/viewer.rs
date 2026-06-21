@@ -3578,6 +3578,20 @@ impl ExrViewer {
         self.composite_texture = None;
     }
 
+    /// Drop every cached image-A texture so the viewport rebuilds from the newly
+    /// swapped data - the A-side counterpart of [`Self::invalidate_reference_textures`].
+    /// The texture caches otherwise only refresh when the layer *count* changes, so
+    /// swapping a different A with the same layer count (e.g. the next frame in an
+    /// image sequence, #7) would keep showing the stale image. Clears the GPU bind
+    /// groups, the CPU thumbnails, and the cached diff/composite textures (which both
+    /// depend on A). Used by [`crate::app::ExrApp::swap_image_data`].
+    pub fn invalidate_active_textures(&mut self) {
+        self.textures.fill(None);
+        self.gpu_textures.fill(None);
+        self.diff_texture = None;
+        self.composite_texture = None;
+    }
+
     pub fn calculate_histogram(&mut self, exr_data: &ExrData, exr_data_b: Option<&ExrData>) {
         let key = (self.active_layer, self.log_histogram);
         if self.histogram_key == Some(key) {
