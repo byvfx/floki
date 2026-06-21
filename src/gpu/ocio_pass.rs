@@ -759,6 +759,7 @@ mod metal_tests {
             input_colorspace,
             display,
             view,
+            bake_lut_size: 0,
         }
     }
 

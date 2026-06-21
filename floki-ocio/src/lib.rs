@@ -77,6 +77,12 @@ pub struct DisplayTransformRequest {
     pub display: String,
     /// View name on that display, e.g. `"ACES 1.0 - SDR Video"`.
     pub view: String,
+    /// Bake the display transform to a 3D LUT of this edge length (e.g. `33` or `65`), so the
+    /// GPU shader becomes a cheap `texture3D` lookup (fronted by a log2 shaper) instead of the
+    /// full analytic ACES ALU. `0` (the default) keeps the analytic shader; values `< 2` are
+    /// treated as `0`. Baking trades a small, fixed amount of LUT-interpolation error for a
+    /// large per-pixel speedup — useful for smooth pan/zoom on weak GPUs.
+    pub bake_lut_size: u32,
 }
 
 // ---------------------------------------------------------------------------

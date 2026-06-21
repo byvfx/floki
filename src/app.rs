@@ -61,6 +61,12 @@ struct LutLoadResult {
     result: Result<crate::color::cube::CubeLut, String>,
 }
 
+/// Edge length of the baked OCIO 3D LUT (#24). 65³ keeps saturated-highlight error well under
+/// 0.02 vs the analytic ACES transform (33³ measured ~0.04 there); ~4.4 MB as RGBA f32, a
+/// trivial VRAM cost for a viewer.
+#[cfg(feature = "ocio")]
+const OCIO_BAKE_LUT_SIZE: u32 = 65;
+
 /// Top-level application state and the [`eframe::App`] implementation. Owns the
 /// loaded A/B images, the `ExrViewer` canvas, OCIO/LUT colour state, and the
 /// menu/tool UI. Fields marked `#[serde(skip)]` are runtime-only (images, GPU
@@ -166,6 +172,12 @@ pub struct ExrApp {
     #[cfg(feature = "ocio")]
     #[serde(default)]
     pub ocio_enabled: bool,
+    /// Bake the OCIO display transform to a 3D LUT (#24): trades a tiny amount of accuracy for
+    /// a cheap per-pixel texture lookup instead of the analytic ACES ALU — smoother pan/zoom
+    /// on weak GPUs. Off by default (analytic is the reference).
+    #[cfg(feature = "ocio")]
+    #[serde(default)]
+    pub ocio_bake_lut: bool,
     #[cfg(feature = "ocio")]
     #[serde(skip)]
     ocio_config: Option<floki_ocio::OcioConfig>,
@@ -271,6 +283,8 @@ impl Default for ExrApp {
             ocio_input_cs: String::new(),
             #[cfg(feature = "ocio")]
             ocio_enabled: false,
+            #[cfg(feature = "ocio")]
+            ocio_bake_lut: false,
             #[cfg(feature = "ocio")]
             ocio_config: None,
             #[cfg(feature = "ocio")]
@@ -423,6 +437,11 @@ impl ExrApp {
             input_colorspace: self.ocio_input_cs.clone(),
             display: self.ocio_display.clone(),
             view: self.ocio_view.clone(),
+            bake_lut_size: if self.ocio_bake_lut {
+                OCIO_BAKE_LUT_SIZE
+            } else {
+                0
+            },
         };
         let bundle = match cfg.build_gpu_shader(&req) {
             Ok(b) => b,
@@ -1339,6 +1358,21 @@ impl ExrApp {
                                     }
                                 });
                             ui.checkbox(&mut self.ocio_enabled, "Enable OCIO");
+                            if ui
+                                .checkbox(
+                                    &mut self.ocio_bake_lut,
+                                    "Bake to 3D LUT (faster, slight accuracy trade-off)",
+                                )
+                                .on_hover_text(
+                                    "Replace the per-pixel ACES math with a baked 3D-LUT \
+                                     lookup. Much cheaper on weak GPUs; visually \
+                                     indistinguishable for SDR. Off uses the exact analytic \
+                                     transform.",
+                                )
+                                .changed()
+                            {
+                                ocio_rebuild_requested = true;
+                            }
                         }
                         if let Some(err) = &self.ocio_error {
                             ui.label(egui::RichText::new(err).color(egui::Color32::RED));
