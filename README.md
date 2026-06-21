@@ -17,7 +17,7 @@ Powered by `egui`, `wgpu`, and the pure-Rust `exr` crate, it allows you to insta
 
 ### Hardware-Accelerated Rendering
 * **Vulkan/Metal/DX12 Backend:** All image exposure scaling, gamma correction, sRGB mapping, and A/B difference matte compositing are executed via custom WGSL shaders on the GPU.
-* **CPU Fallback:** Automatically drops down to multithreaded CPU rendering if a graphics card or driver is unavailable.
+* **GPU-Required Pipeline:** All rendering runs on the GPU via `wgpu` (Vulkan/Metal/DX12); a working GPU and driver are required to launch. *(An internal CPU render path exists for contact-sheet thumbnails and headless tests — it is not a runtime fallback for a missing GPU.)*
 
 ### Deep Inspection
 * **Precision Pixel Sampling:** Hover over any pixel to reveal exact floating-point values (R, G, B, A) regardless of bit-depth (F16, F32, U32).
@@ -182,7 +182,7 @@ standalone `floki-ocio` crate that wraps OpenColorIO.
 - **`exr_loader.rs`** — threaded OpenEXR decode and logical-layer grouping via the `exr` crate (the load hot path the benches exercise).
 
 **Viewer & rendering**
-- **`viewer.rs`** — the heavy lifter: canvas pan/zoom, the six compare modes, pixel sampling, histograms, contact sheets, and dispatch between the GPU and CPU render paths.
+- **`viewer.rs`** — the heavy lifter: canvas pan/zoom, the six compare modes, pixel sampling, histograms, contact sheets, and the GPU render path (plus a CPU path used for contact-sheet thumbnails and headless tests, not as a missing-GPU fallback).
 - **`gpu/`** — the `wgpu` backend: `mod.rs` (pipelines, uniforms, bind groups), `shader.wgsl` (the display / compare / diff / background fragment shader), and `ocio_pass.rs` (the two-pass OCIO display transform and blit).
 - **`render_math.rs`** — shared tone-mapping math (exposure / gamma / sRGB), unit-tested in one place.
 

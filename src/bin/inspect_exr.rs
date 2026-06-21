@@ -1,11 +1,11 @@
 use exr::prelude::*;
 
 fn inspect_file(path: &str) {
-    println!("Inspecting: {}", path);
+    println!("Inspecting: {path}");
     match MetaData::read_from_file(path, false) {
         Ok(meta) => {
             for (i, header) in meta.headers.iter().enumerate() {
-                println!("  Header {}:", i);
+                println!("  Header {i}:");
                 println!("    Layer Name: {:?}", header.own_attributes.layer_name);
                 println!("    Data Window: {:?}", header.data_window());
                 println!(
@@ -24,7 +24,7 @@ fn inspect_file(path: &str) {
             }
         }
         Err(e) => {
-            println!("Error: {}", e);
+            println!("Error: {e}");
         }
     }
     println!("--------------------------------------------------");

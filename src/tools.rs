@@ -50,31 +50,26 @@ pub fn run_conversion_task(
             }
         }
         Err(e) => {
-            log::error!("Failed to read input directory {:?}: {}", input_dir, e);
-            let _ = sender.send((0, 0, format!("Failed to read directory: {}", e)));
+            log::error!("Failed to read input directory {input_dir:?}: {e}");
+            let _ = sender.send((0, 0, format!("Failed to read directory: {e}")));
             return ConversionSummary::default();
         }
     }
 
     let total = files_to_process.len();
     if total == 0 {
-        log::warn!("No EXR files found in {:?}", input_dir);
+        log::warn!("No EXR files found in {input_dir:?}");
         let _ = sender.send((0, 0, "No EXR files found in directory.".to_string()));
         return ConversionSummary::default();
     }
 
     if let Err(e) = std::fs::create_dir_all(&output_dir) {
-        log::error!("Failed to create output directory {:?}: {}", output_dir, e);
-        let _ = sender.send((0, 0, format!("Failed to create output directory: {}", e)));
+        log::error!("Failed to create output directory {output_dir:?}: {e}");
+        let _ = sender.send((0, 0, format!("Failed to create output directory: {e}")));
         return ConversionSummary::default();
     }
 
-    log::info!(
-        "EXR convert: {} file(s) from {:?} -> {:?}",
-        total,
-        input_dir,
-        output_dir
-    );
+    log::info!("EXR convert: {total} file(s) from {input_dir:?} -> {output_dir:?}");
 
     // Shared monotonic counter: files convert in parallel and finish out of
     // order, but progress must only ever move forward. Each file emits exactly
@@ -97,13 +92,13 @@ pub fn run_conversion_task(
 
             let msg = match convert_exr(&path, &out_path, &cancel_flag) {
                 Ok(_) => {
-                    log::debug!("converted {}", file_name);
-                    format!("Converted: {}", file_name)
+                    log::debug!("converted {file_name}");
+                    format!("Converted: {file_name}")
                 }
                 Err(e) => {
                     errors.fetch_add(1, Ordering::Relaxed);
-                    log::error!("convert failed for {}: {}", file_name, e);
-                    format!("Error on {}: {}", file_name, e)
+                    log::error!("convert failed for {file_name}: {e}");
+                    format!("Error on {file_name}: {e}")
                 }
             };
             let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
@@ -118,14 +113,15 @@ pub fn run_conversion_task(
     let cancelled = cancel_flag.load(Ordering::Relaxed);
 
     let mut final_msg = if cancelled {
-        format!("Cancelled — {} of {} files converted", converted, total)
+        format!("Cancelled — {converted} of {total} files converted")
     } else {
-        format!("Complete — {} of {} files converted", converted, total)
+        format!("Complete — {converted} of {total} files converted")
     };
     if failed > 0 {
-        final_msg.push_str(&format!(" ({} failed)", failed));
+        use std::fmt::Write as _;
+        let _ = write!(final_msg, " ({failed} failed)");
     }
-    log::info!("EXR convert finished: {}", final_msg);
+    log::info!("EXR convert finished: {final_msg}");
     let count = if cancelled { done } else { total };
     let _ = sender.send((count, total, final_msg));
 
@@ -176,7 +172,7 @@ fn convert_exr(
         } else if let Some(name) = &layer.own_attributes.layer_name {
             name.to_string()
         } else {
-            let name = format!("layer_{}", layer_idx);
+            let name = format!("layer_{layer_idx}");
             layer.own_attributes.layer_name = Some(Text::from(name.as_str()));
             name
         };
@@ -194,7 +190,7 @@ fn convert_exr(
                 let name = c.name.to_string();
                 let suffix = name.rsplit('.').next().unwrap_or(&name);
                 match canonical_rgba(suffix) {
-                    Some(canon) => format!("{}.{}", prefix, canon),
+                    Some(canon) => format!("{prefix}.{canon}"),
                     None => name,
                 }
             })
@@ -211,9 +207,7 @@ fn convert_exr(
             }
         } else {
             log::warn!(
-                "{:?}: layer {} left unchanged (renaming would reorder channels)",
-                in_path,
-                layer_idx
+                "{in_path:?}: layer {layer_idx} left unchanged (renaming would reorder channels)"
             );
         }
     }

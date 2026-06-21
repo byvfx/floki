@@ -17,9 +17,9 @@ pub enum ThemeChoice {
 impl From<ThemeChoice> for egui::ThemePreference {
     fn from(choice: ThemeChoice) -> Self {
         match choice {
-            ThemeChoice::Dark => egui::ThemePreference::Dark,
-            ThemeChoice::Light => egui::ThemePreference::Light,
-            ThemeChoice::System => egui::ThemePreference::System,
+            ThemeChoice::Dark => Self::Dark,
+            ThemeChoice::Light => Self::Light,
+            ThemeChoice::System => Self::System,
         }
     }
 }
@@ -471,7 +471,7 @@ impl ExrApp {
         self.lut_error = None;
         std::thread::spawn(move || {
             let result = crate::color::cube::CubeLut::load(&path)
-                .map_err(|e| format!("Failed to load LUT: {}", e));
+                .map_err(|e| format!("Failed to load LUT: {e}"));
             let _ = tx.send(LutLoadResult { path, result });
         });
     }
@@ -700,7 +700,7 @@ impl ExrApp {
                 if !res.is_b {
                     self.exr_data = None;
                 }
-                self.error_msg = Some(e.to_string());
+                self.error_msg = Some(e);
             }
         }
     }
@@ -1158,7 +1158,7 @@ impl ExrApp {
                             let frac = (done as f32 / total as f32).clamp(0.0, 1.0);
                             ui.add(
                                 egui::ProgressBar::new(frac)
-                                    .text(format!("{}/{}", done, total)),
+                                    .text(format!("{done}/{total}")),
                             );
                         }
                     ui.label(&self.conversion_status);
@@ -1174,7 +1174,7 @@ impl ExrApp {
                 } else if let Some((done, total)) = self.conversion_progress
                     && total > 0 {
                         let frac = (done as f32 / total as f32).clamp(0.0, 1.0);
-                        ui.add(egui::ProgressBar::new(frac).text(format!("{}/{}", done, total)));
+                        ui.add(egui::ProgressBar::new(frac).text(format!("{done}/{total}")));
                         ui.label(&self.conversion_status);
                     }
             });
@@ -1519,11 +1519,8 @@ impl ExrApp {
                     fmt_bytes(sample.sys_total),
                 );
                 if let (Some(used), Some(budget)) = (sample.gpu_used, sample.gpu_budget) {
-                    text.push_str(&format!(
-                        " · VRAM {}/{}",
-                        fmt_bytes(used),
-                        fmt_bytes(budget)
-                    ));
+                    use std::fmt::Write as _;
+                    let _ = write!(text, " · VRAM {}/{}", fmt_bytes(used), fmt_bytes(budget));
                 }
                 // Wrap the right-aligned label in a `horizontal` row first: a bare
                 // right_to_left(Center) layout inside this auto-sized bottom panel would
@@ -1586,8 +1583,7 @@ impl ExrApp {
                                         if let (Some((x, y)), Some(v)) = (hover_pos, val) {
                                             ui.label(
                                                 egui::RichText::new(format!(
-                                                    "x={} y={} {}",
-                                                    x, y, layer_name
+                                                    "x={x} y={y} {layer_name}"
                                                 ))
                                                 .strong()
                                                 .color(egui::Color32::WHITE),
@@ -1650,16 +1646,14 @@ impl ExrApp {
 
                                             ui.label(
                                                 egui::RichText::new(format!(
-                                                    "H:{:.0} S:{:.2} V:{:.2} L:{:.5}",
-                                                    h, s, val_v, l
+                                                    "H:{h:.0} S:{s:.2} V:{val_v:.2} L:{l:.5}"
                                                 ))
                                                 .color(egui::Color32::LIGHT_GRAY),
                                             );
                                         } else {
                                             ui.label(
                                                 egui::RichText::new(format!(
-                                                    "x=-- y=-- {}",
-                                                    layer_name
+                                                    "x=-- y=-- {layer_name}"
                                                 ))
                                                 .color(egui::Color32::DARK_GRAY),
                                             );
@@ -1721,7 +1715,7 @@ impl ExrApp {
                         ui.heading("EXR Info");
                         ui.separator();
                         if let Some(err) = &self.error_msg {
-                            ui.colored_label(egui::Color32::RED, format!("Error: {}", err));
+                            ui.colored_label(egui::Color32::RED, format!("Error: {err}"));
                             ui.separator();
                         }
 
@@ -1750,7 +1744,7 @@ impl ExrApp {
                                     ui.add_space(5.0);
 
                                     egui::CollapsingHeader::new("Image Metadata")
-                                        .id_salt(format!("image_metadata_header_{}", idx))
+                                        .id_salt(format!("image_metadata_header_{idx}"))
                                         .default_open(false)
                                         .show(ui, |ui| {
                                             let attrs = &exr_data.image.attributes;
@@ -1770,15 +1764,14 @@ impl ExrApp {
                                                 ui.add_space(5.0);
                                                 egui::CollapsingHeader::new("Custom Attributes")
                                                     .id_salt(format!(
-                                                        "image_custom_attrs_header_{}",
-                                                        idx
+                                                        "image_custom_attrs_header_{idx}"
                                                     ))
                                                     .default_open(false)
                                                     .show(ui, |ui| {
                                                         for (name, val) in attrs.other.iter() {
                                                             ui.horizontal_wrapped(|ui| {
-                                                                ui.strong(format!("{}: ", name));
-                                                                ui.label(format!("{:?}", val));
+                                                                ui.strong(format!("{name}: "));
+                                                                ui.label(format!("{val:?}"));
                                                             });
                                                         }
                                                     });
@@ -1821,8 +1814,7 @@ impl ExrApp {
                                                     ui.add_space(5.0);
                                                     egui::CollapsingHeader::new("Layer Attributes")
                                                         .id_salt(format!(
-                                                            "layer_attrs_header_{}_{}",
-                                                            idx, i
+                                                            "layer_attrs_header_{idx}_{i}"
                                                         ))
                                                         .default_open(false)
                                                         .show(ui, |ui| {
@@ -1830,11 +1822,8 @@ impl ExrApp {
                                                                 layer.attributes.other.iter()
                                                             {
                                                                 ui.horizontal_wrapped(|ui| {
-                                                                    ui.strong(format!(
-                                                                        "{}: ",
-                                                                        name
-                                                                    ));
-                                                                    ui.label(format!("{:?}", val));
+                                                                    ui.strong(format!("{name}: "));
+                                                                    ui.label(format!("{val:?}"));
                                                                 });
                                                             }
                                                         });
@@ -1924,12 +1913,10 @@ impl ExrApp {
                                                     // Display values
                                                     ui.vertical(|ui| {
                                                         ui.label(format!(
-                                                            "Float: {:.4}, {:.4}, {:.4}",
-                                                            r, g, b
+                                                            "Float: {r:.4}, {g:.4}, {b:.4}"
                                                         ));
                                                         ui.label(format!(
-                                                            "8-bit: {}, {}, {}",
-                                                            r_u8, g_u8, b_u8
+                                                            "8-bit: {r_u8}, {g_u8}, {b_u8}"
                                                         ));
                                                         // HSV mapping
                                                         let max = r.max(g).max(b);
@@ -1949,8 +1936,7 @@ impl ExrApp {
                                                             if max == 0.0 { 0.0 } else { c / max };
                                                         let v = max;
                                                         ui.label(format!(
-                                                            "HSV: {:.1}°, {:.2}, {:.2}",
-                                                            h, s, v
+                                                            "HSV: {h:.1}°, {s:.2}, {v:.2}"
                                                         ));
                                                     });
 
@@ -2423,7 +2409,7 @@ mod tests {
         let proxy = crate::proxy::ProxyImage::from_exr_data_downsampled(&data, 0, 1).unwrap();
 
         let mut app = ExrApp {
-            loaded_file: Some(path.clone()),
+            loaded_file: Some(path),
             loading_a: true, // full decode in flight
             ..Default::default()
         };

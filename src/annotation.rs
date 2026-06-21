@@ -46,24 +46,19 @@ pub enum AnnotationTool {
 impl AnnotationTool {
     pub fn label(self) -> &'static str {
         match self {
-            AnnotationTool::None => "Off",
-            AnnotationTool::Arrow => "Arrow",
-            AnnotationTool::Rect => "Box",
-            AnnotationTool::Freehand => "Pen",
-            AnnotationTool::Text => "Text",
+            Self::None => "Off",
+            Self::Arrow => "Arrow",
+            Self::Rect => "Box",
+            Self::Freehand => "Pen",
+            Self::Text => "Text",
         }
     }
 
     /// The tools shown as selectable buttons in the toolbar (excludes `None`,
     /// which is the "Off" toggle).
-    pub const DRAW_TOOLS: [AnnotationTool; 4] = [
-        AnnotationTool::Arrow,
-        AnnotationTool::Rect,
-        AnnotationTool::Freehand,
-        AnnotationTool::Text,
-    ];
+    pub const DRAW_TOOLS: [Self; 4] = [Self::Arrow, Self::Rect, Self::Freehand, Self::Text];
 
     pub fn is_active(self) -> bool {
-        self != AnnotationTool::None
+        self != Self::None
     }
 }

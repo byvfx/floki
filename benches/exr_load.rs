@@ -142,7 +142,7 @@ fn bench_local(c: &mut Criterion) {
             .to_string();
         // Sanity-load once so a bad fixture fails loudly rather than mid-measure.
         if let Err(e) = ExrData::load(path) {
-            eprintln!("exr_load/local: skipping {} — load failed: {e}", label);
+            eprintln!("exr_load/local: skipping {label} — load failed: {e}");
             continue;
         }
         group.bench_function(label, |b| {
