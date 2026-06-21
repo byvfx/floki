@@ -34,10 +34,11 @@ public:
     rust::String scene_linear_colorspace() const;
 
     std::unique_ptr<OcioCpuProcessor> build_cpu_processor(
-        rust::Str input_cs, rust::Str display, rust::Str view) const;
+        rust::Str input_cs, rust::Str display, rust::Str view, std::uint32_t lut_size) const;
 
     OcioShaderData build_gpu_shader(
-        rust::Str input_cs, rust::Str display, rust::Str view, std::uint8_t language) const;
+        rust::Str input_cs, rust::Str display, rust::Str view, std::uint8_t language,
+        std::uint32_t lut_size) const;
 
 private:
     OCIO::ConstConfigRcPtr cfg_;

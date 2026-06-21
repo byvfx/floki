@@ -66,7 +66,12 @@ impl Config {
 
     pub fn build_cpu_processor(&self, req: &DisplayTransformRequest) -> Result<Processor> {
         self.inner
-            .build_cpu_processor(&req.input_colorspace, &req.display, &req.view)
+            .build_cpu_processor(
+                &req.input_colorspace,
+                &req.display,
+                &req.view,
+                req.bake_lut_size,
+            )
             .map(|inner| Processor { inner })
             .map_err(|e| OcioError::Transform(e.what().to_string()))
     }
@@ -76,7 +81,13 @@ impl Config {
         // (the 4.0 target declares samplers without layout prefixes, so it patches cleanly).
         let data = self
             .inner
-            .build_gpu_shader(&req.input_colorspace, &req.display, &req.view, 0)
+            .build_gpu_shader(
+                &req.input_colorspace,
+                &req.display,
+                &req.view,
+                0,
+                req.bake_lut_size,
+            )
             .map_err(|e| OcioError::Transform(e.what().to_string()))?;
 
         let transpiled = crate::transpile::transpile(&data)?;
@@ -182,7 +193,7 @@ mod dump_tests {
 
             for (lang, label) in [(0u8, "GLSL_4_0"), (1u8, "GLSL_VK_4_6")] {
                 let data = match crate::ffi::bridge::load_config(1, cfg_name)
-                    .and_then(|c| c.build_gpu_shader(&input, &display, &view, lang))
+                    .and_then(|c| c.build_gpu_shader(&input, &display, &view, lang, 0))
                 {
                     Ok(d) => d,
                     Err(e) => {

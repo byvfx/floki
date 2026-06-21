@@ -12,6 +12,87 @@ std::string to_std(rust::Str s) { return std::string(s.data(), s.size()); }
 // const char* (possibly null) -> rust::String.
 rust::String to_rust(const char* s) { return s ? rust::String(s) : rust::String(); }
 
+// Log2-shaper stop range for baked-LUT allocation: maps HDR scene-linear into [0,1] for the
+// 3D LUT domain. Concentrated on the range a display transform actually resolves — below
+// ~2^-10 is display-black and above ~2^8 clips to display-white, so spending grid samples
+// outside this band just coarsens the midtones/highlights where accuracy matters. Values
+// outside clamp to the LUT edge (black / white), which is the correct display behaviour.
+constexpr float kShaperMinStop = -10.0f;
+constexpr float kShaperMaxStop = 8.0f;
+
+// Build the (input -> display/view) DisplayViewTransform.
+OCIO::DisplayViewTransformRcPtr make_display_view(rust::Str input_cs, rust::Str display,
+                                                  rust::Str view) {
+    OCIO::DisplayViewTransformRcPtr t = OCIO::DisplayViewTransform::Create();
+    t->setSrc(to_std(input_cs).c_str());
+    t->setDisplay(to_std(display).c_str());
+    t->setView(to_std(view).c_str());
+    return t;
+}
+
+// Bake the display transform to a [log2-shaper -> 3D LUT] GroupTransform. The LUT is filled
+// by evaluating [shaper(inverse) -> display] on the grid, so at runtime shaper(forward) then
+// the LUT reproduces the display transform by construction (the shaper cancels) — trading the
+// analytic ACES ALU for one texture lookup. `lut_size` is the grid edge length (e.g. 33/65).
+OCIO::GroupTransformRcPtr make_baked_display_transform(const OCIO::ConstConfigRcPtr& cfg,
+                                                       rust::Str input_cs, rust::Str display,
+                                                       rust::Str view, std::uint32_t lut_size) {
+    const float vars[2] = {kShaperMinStop, kShaperMaxStop};
+
+    // Forward shaper applied at runtime: scene-linear -> shaped [0,1].
+    OCIO::AllocationTransformRcPtr shaper = OCIO::AllocationTransform::Create();
+    shaper->setAllocation(OCIO::ALLOCATION_LG2);
+    shaper->setVars(2, vars);
+
+    // Fill pipeline: shaped [0,1] -> (inverse shaper) -> scene-linear -> display.
+    OCIO::AllocationTransformRcPtr shaper_inv = OCIO::AllocationTransform::Create();
+    shaper_inv->setAllocation(OCIO::ALLOCATION_LG2);
+    shaper_inv->setVars(2, vars);
+    shaper_inv->setDirection(OCIO::TRANSFORM_DIR_INVERSE);
+
+    OCIO::GroupTransformRcPtr fill = OCIO::GroupTransform::Create();
+    fill->appendTransform(shaper_inv);
+    fill->appendTransform(make_display_view(input_cs, display, view));
+    OCIO::ConstCPUProcessorRcPtr fill_cpu = cfg->getProcessor(fill)->getDefaultCPUProcessor();
+
+    // Evaluate the fill pipeline at each grid point to populate the 3D LUT.
+    OCIO::Lut3DTransformRcPtr lut = OCIO::Lut3DTransform::Create();
+    lut->setGridSize(lut_size);
+    // Tetrahedral interpolation tracks the curved ACES tone mapping far better than trilinear
+    // at the same grid size; the GPU consumer already supports it.
+    lut->setInterpolation(OCIO::INTERP_TETRAHEDRAL);
+    const float denom = static_cast<float>(lut_size - 1);
+    for (std::uint32_t ir = 0; ir < lut_size; ++ir) {
+        for (std::uint32_t ig = 0; ig < lut_size; ++ig) {
+            for (std::uint32_t ib = 0; ib < lut_size; ++ib) {
+                float rgb[3] = {
+                    static_cast<float>(ir) / denom,
+                    static_cast<float>(ig) / denom,
+                    static_cast<float>(ib) / denom,
+                };
+                fill_cpu->applyRGB(rgb);
+                lut->setValue(ir, ig, ib, rgb[0], rgb[1], rgb[2]);
+            }
+        }
+    }
+
+    OCIO::GroupTransformRcPtr group = OCIO::GroupTransform::Create();
+    group->appendTransform(shaper);
+    group->appendTransform(lut);
+    return group;
+}
+
+// Processor for either the analytic display transform (lut_size < 2) or the baked LUT.
+OCIO::ConstProcessorRcPtr make_display_processor(const OCIO::ConstConfigRcPtr& cfg,
+                                                 rust::Str input_cs, rust::Str display,
+                                                 rust::Str view, std::uint32_t lut_size) {
+    if (lut_size >= 2) {
+        return cfg->getProcessor(
+            make_baked_display_transform(cfg, input_cs, display, view, lut_size));
+    }
+    return cfg->getProcessor(make_display_view(input_cs, display, view));
+}
+
 } // namespace
 
 rust::Vec<ColorSpaceInfo> OcioConfig::color_spaces() const {
@@ -63,13 +144,9 @@ rust::String OcioConfig::scene_linear_colorspace() const {
 }
 
 std::unique_ptr<OcioCpuProcessor> OcioConfig::build_cpu_processor(
-    rust::Str input_cs, rust::Str display, rust::Str view) const {
-    OCIO::DisplayViewTransformRcPtr transform = OCIO::DisplayViewTransform::Create();
-    transform->setSrc(to_std(input_cs).c_str());
-    transform->setDisplay(to_std(display).c_str());
-    transform->setView(to_std(view).c_str());
-
-    OCIO::ConstProcessorRcPtr proc = cfg_->getProcessor(transform);
+    rust::Str input_cs, rust::Str display, rust::Str view, std::uint32_t lut_size) const {
+    OCIO::ConstProcessorRcPtr proc =
+        make_display_processor(cfg_, input_cs, display, view, lut_size);
     OCIO::ConstCPUProcessorRcPtr cpu = proc->getDefaultCPUProcessor();
     return std::make_unique<OcioCpuProcessor>(std::move(cpu));
 }
@@ -100,13 +177,10 @@ void copy_values(const float* values, std::size_t count, rust::Vec<float>& out) 
 } // namespace
 
 OcioShaderData OcioConfig::build_gpu_shader(
-    rust::Str input_cs, rust::Str display, rust::Str view, std::uint8_t language) const {
-    OCIO::DisplayViewTransformRcPtr transform = OCIO::DisplayViewTransform::Create();
-    transform->setSrc(to_std(input_cs).c_str());
-    transform->setDisplay(to_std(display).c_str());
-    transform->setView(to_std(view).c_str());
-
-    OCIO::ConstProcessorRcPtr proc = cfg_->getProcessor(transform);
+    rust::Str input_cs, rust::Str display, rust::Str view, std::uint8_t language,
+    std::uint32_t lut_size) const {
+    OCIO::ConstProcessorRcPtr proc =
+        make_display_processor(cfg_, input_cs, display, view, lut_size);
     OCIO::ConstGPUProcessorRcPtr gpu = proc->getDefaultGPUProcessor();
 
     OCIO::GpuShaderDescRcPtr desc = OCIO::GpuShaderDesc::CreateShaderDesc();

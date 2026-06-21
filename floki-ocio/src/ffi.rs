@@ -64,21 +64,27 @@ pub mod bridge {
         /// Color space bound to the `scene_linear` role, or empty if none.
         fn scene_linear_colorspace(self: &OcioConfig) -> String;
 
+        /// `lut_size`: 0 = analytic transform; `>= 2` bakes the display transform to a 3D LUT
+        /// of that edge length (fronted by a log2 shaper) so the processor is a texture lookup.
         fn build_cpu_processor(
             self: &OcioConfig,
             input_cs: &str,
             display: &str,
             view: &str,
+            lut_size: u32,
         ) -> Result<UniquePtr<OcioCpuProcessor>>;
 
         /// Extract the OCIO-generated GPU shader + LUT textures. `language`:
         /// 0 = GLSL 4.0 (combined samplers), 1 = GLSL for Vulkan 4.6 (explicit bindings).
+        /// `lut_size`: 0 = analytic shader; `>= 2` bakes the transform to a 3D LUT of that
+        /// edge length so the emitted shader is a cheap `texture3D` lookup + log2 shaper.
         fn build_gpu_shader(
             self: &OcioConfig,
             input_cs: &str,
             display: &str,
             view: &str,
             language: u8,
+            lut_size: u32,
         ) -> Result<OcioShaderData>;
 
         /// Apply the transform in place to interleaved RGBA f32 (`pixels.len() == w*h*4`).
