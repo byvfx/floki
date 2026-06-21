@@ -5,9 +5,23 @@ All notable changes to Floki are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.8.0] - 2026-06-21
 
 ### Added
+- **Instant first paint for large EXRs (#33).** Opening a big EXR now shows a
+  low-resolution proxy in tens of milliseconds — the 669 MB redSea render goes
+  from a ~1.3 s blank wait to a ~30 ms first paint (~43×) — then sharpens to
+  full resolution once the decode finishes, with zoom/pan preserved across the
+  handoff. The proxy comes from a fast subsampled read (decompressing only every
+  Nth scanline block, so the work is bounded regardless of resolution) on the
+  decode worker; tiled/deep images and small files fall back to the existing
+  spinner-then-full path. Builds on the #58 render path and the #55 swap seam.
+- **OCIO: bake the display transform to a 3D LUT (#24).** A new **Bake to 3D
+  LUT** toggle under **Color Management** replaces the per-pixel analytic ACES
+  math (~875-line shader, 15 `pow()`) with a cheap 3D-LUT lookup, for much
+  smoother pan/zoom on weaker GPUs. Off by default — the analytic transform
+  stays the accuracy reference — and visually indistinguishable for SDR when on
+  (65³ tetrahedral LUT fronted by a log2 shaper). The setting persists.
 - **Internal: render-side proxy first-paint path (#58).** Adds a low-res
   `ProxyImage` (standalone RGBA32Float buffer + full image dimensions) and a
   viewer proxy texture slot with a tone-baked upload (exposure/gamma/sRGB +
@@ -44,6 +58,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   doesn't wipe the user's view. Also clamps `active_layer` to the new image's
   layer count on swap so a frame with fewer passes can't index out of bounds.
   No user-facing change.
+
+### Fixed
+- **Docs: corrected the README's CPU-fallback claim (#63).** The README stated
+  the app "automatically drops down to multithreaded CPU rendering if a graphics
+  card or driver is unavailable" — it does not; floki requires a working GPU to
+  launch (the internal CPU path is for contact-sheet thumbnails and headless
+  tests). The docs now describe the GPU requirement. Shipped alongside an
+  internal auto-fixable lint cleanup and annotations marking the June 2026 audit
+  items as completed (#73).
+
+### Notes
+- **macOS: the downloaded binary is not yet code-signed or notarized (#64).** On
+  first launch macOS Gatekeeper will report *"floki cannot be opened because the
+  developer cannot be verified."* Clear the quarantine flag with
+  `xattr -d com.apple.quarantine ./floki` (or right-click the binary → **Open**
+  the first time). Signing/notarization is tracked as #64.
 
 ## [1.7.2] - 2026-06-20
 
