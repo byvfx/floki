@@ -1651,7 +1651,7 @@ impl ExrViewer {
         ui: &mut egui::Ui,
         exr_data: &ExrData,
         exr_data_b: Option<&ExrData>,
-        render_state: Option<&eframe::egui_wgpu::RenderState>,
+        gpu_resources: Option<&crate::gpu::GpuResources>,
         lut_bg_opt: Option<std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>>,
     ) {
         self.handle_hotkeys(ui, exr_data_b.is_some());
@@ -1691,10 +1691,10 @@ impl ExrViewer {
                 }
             }
 
-            if let Some(rs) = render_state {
+            if let Some(gpu) = gpu_resources {
                 if self.gpu_textures[self.active_layer].is_none() {
                     self.gpu_textures[self.active_layer] =
-                        Self::generate_gpu_texture(rs, exr_data, self.active_layer);
+                        Self::generate_gpu_texture(gpu, exr_data, self.active_layer);
                 }
                 if let Some(data_b) = exr_data_b {
                     let layer_b = self
@@ -1702,7 +1702,7 @@ impl ExrViewer {
                         .min(data_b.logical_layers.len().saturating_sub(1));
                     if self.gpu_textures_b[layer_b].is_none() {
                         self.gpu_textures_b[layer_b] =
-                            Self::generate_gpu_texture(rs, data_b, layer_b);
+                            Self::generate_gpu_texture(gpu, data_b, layer_b);
                     }
                 }
             } else {
@@ -1761,7 +1761,7 @@ impl ExrViewer {
             }
 
             // Draw texture
-            let has_texture = if render_state.is_some() {
+            let has_texture = if gpu_resources.is_some() {
                 self.gpu_textures[self.active_layer].is_some()
             } else {
                 self.textures[self.active_layer].is_some()
@@ -1873,8 +1873,8 @@ impl ExrViewer {
                     is_side_by_side,
                 };
 
-                if let Some(rs) = render_state {
-                    self.draw_canvas_gpu(ui, &layout, exr_data_b, rs, lut_bg_opt.clone());
+                if let Some(gpu) = gpu_resources {
+                    self.draw_canvas_gpu(ui, &layout, exr_data_b, gpu, lut_bg_opt.clone());
                 } else {
                     self.draw_canvas_cpu(ui, &layout, exr_data_b);
                 }
@@ -2304,9 +2304,10 @@ impl ExrViewer {
         ui: &egui::Ui,
         layout: &CanvasLayout,
         exr_data_b: Option<&ExrData>,
-        render_state: &eframe::egui_wgpu::RenderState,
+        gpu_resources: &crate::gpu::GpuResources,
         lut_bg_opt: Option<std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>>,
     ) {
+        let render_state = gpu_resources.render_state();
         let CanvasLayout {
             rect,
             disp_rect,
@@ -2339,14 +2340,14 @@ impl ExrViewer {
             self.bg_gradient_sig = Some(self.background.gradient.clone());
         }
         if colormap_dirty || bg_gradient_dirty {
-            let guard = render_state.renderer.read();
-            if let Some(gpu_state) = guard.callback_resources.get::<crate::gpu::GpuState>() {
-                if colormap_dirty {
-                    gpu_state.write_colormap(&render_state.queue, &self.colormap_lut);
-                }
-                if bg_gradient_dirty {
-                    gpu_state.write_bg_gradient(&render_state.queue, &self.bg_gradient_lut);
-                }
+            // GpuState is app-owned (#54) — read it directly off
+            // `GpuResources` instead of the per-frame renderer typemap lookup.
+            let gpu_state = gpu_resources.gpu_state.as_ref();
+            if colormap_dirty {
+                gpu_state.write_colormap(&render_state.queue, &self.colormap_lut);
+            }
+            if bg_gradient_dirty {
+                gpu_state.write_bg_gradient(&render_state.queue, &self.bg_gradient_lut);
             }
         }
 
@@ -2390,20 +2391,15 @@ impl ExrViewer {
             _pad3: 0,
         };
 
-        // Acquire the renderer read-lock ONCE per frame: clone out the
-        // persistent uniform ring buffer and the active LUT bind group.
-        // `draw_gpu` writes per-draw uniform data into the ring buffer via
-        // `queue.write_buffer` at a dynamic offset — no per-frame
-        // `create_buffer_init` + `create_bind_group` allocation. The bind
-        // group itself lives in `GpuState` and is fetched by the paint
-        // callbacks via `callback_resources`.
+        // Acquire the persistent uniform ring buffer + the active LUT bind group
+        // from the app-owned `GpuState` (#54). No per-frame renderer typemap
+        // lookup: `GpuState` lives on `GpuResources`. `draw_gpu` writes per-draw
+        // uniform data into the ring buffer via `queue.write_buffer` at a
+        // dynamic offset — no per-frame `create_buffer_init` + `create_bind_group`
+        // allocation. The bind group itself lives in `GpuState` and is fetched by
+        // the paint callbacks via `callback_resources`.
+        let gpu_state = gpu_resources.gpu_state.as_ref();
         let (uniform_buffer, uniform_stride, active_lut_bg, default_tex_bg) = {
-            let guard = render_state.renderer.read();
-            // Defense-in-depth: GpuState is inserted at startup, but the lookup
-            // crosses a function boundary — bail cleanly rather than panic.
-            let Some(gpu_state) = guard.callback_resources.get::<crate::gpu::GpuState>() else {
-                return;
-            };
             (
                 gpu_state.uniform_buffer.clone(),
                 gpu_state.uniform_stride,
@@ -2827,10 +2823,11 @@ impl ExrViewer {
     /// compare mode, so this one generator serves all modes; results are cached
     /// per layer in `gpu_textures` / `gpu_textures_b`. See the module-level docs.
     fn generate_gpu_texture(
-        render_state: &eframe::egui_wgpu::RenderState,
+        gpu_resources: &crate::gpu::GpuResources,
         exr_data: &ExrData,
         layer_index: usize,
     ) -> Option<std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>> {
+        let render_state = gpu_resources.render_state();
         let (layer, r_chan, g_chan, b_chan, a_chan) = exr_data.logical_channels(layer_index)?;
         let width = layer.size.0;
         let height = layer.size.1;
@@ -2908,12 +2905,9 @@ impl ExrViewer {
 
         let view = texture.create_view(&eframe::egui_wgpu::wgpu::TextureViewDescriptor::default());
 
-        let renderer_read = render_state.renderer.read();
-        // Defense-in-depth: GpuState is inserted at startup; return None rather
-        // than panic if the lookup ever fails.
-        let gpu_state = renderer_read
-            .callback_resources
-            .get::<crate::gpu::GpuState>()?;
+        // GpuState is app-owned (#54) — read it directly off `GpuResources`
+        // instead of the renderer typemap lookup.
+        let gpu_state = gpu_resources.gpu_state.as_ref();
 
         let bind_group = device.create_bind_group(&eframe::egui_wgpu::wgpu::BindGroupDescriptor {
             label: Some("Exr Texture Bind Group"),
