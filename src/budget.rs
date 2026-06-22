@@ -32,7 +32,11 @@ pub const FALLBACK_VRAM_BUDGET: u64 = 1 << 30;
 /// layer only.
 #[must_use]
 pub fn t2_frame_bytes(width: usize, height: usize) -> u64 {
-    (width as u64) * (height as u64) * 16
+    // Saturating so a pathological/huge dimension can't wrap to a *small* size
+    // (which would over-allocate); an overflow becomes "too big to fit" -> 0 frames.
+    (width as u64)
+        .saturating_mul(height as u64)
+        .saturating_mul(16)
 }
 
 /// Apply an integer-percent headroom to a budget. Integer math keeps results

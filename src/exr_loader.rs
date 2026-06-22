@@ -154,17 +154,19 @@ impl ExrData {
     /// `Vec::len`, it does not walk samples.
     #[must_use]
     pub fn approx_bytes(&self) -> usize {
+        // Saturating so a malformed/huge image can't wrap to a tiny figure and
+        // under-budget the cache; it pins at usize::MAX (treated as "won't fit").
         self.image
             .layer_data
             .iter()
             .flat_map(|layer| layer.channel_data.list.iter())
             .map(|channel| match &channel.sample_data {
                 // OpenEXR sample sizes are fixed by the format: half=2, float=4, uint=4.
-                FlatSamples::F16(s) => s.len() * 2,
-                FlatSamples::F32(s) => s.len() * 4,
-                FlatSamples::U32(s) => s.len() * 4,
+                FlatSamples::F16(s) => s.len().saturating_mul(2),
+                FlatSamples::F32(s) => s.len().saturating_mul(4),
+                FlatSamples::U32(s) => s.len().saturating_mul(4),
             })
-            .sum()
+            .fold(0usize, usize::saturating_add)
     }
 }
 
