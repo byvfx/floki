@@ -14,10 +14,14 @@ pub mod exr_loader;
 
 mod annotation;
 mod background;
-// Pure ring-cache budget math (#56). The decode-ahead scheduler that calls it
-// lands in Phase 3; until then only its own tests exercise it.
+// Pure ring-cache budget math (#56). `max_t1` sizes the T1 ring (Phase 3);
+// `max_t2` waits for the T2 pre-upload in Phase 4, hence the module-wide allow.
 #[allow(dead_code)]
 mod budget;
+// T1 ring cache for sequence playback (#56). The core (get/insert/evict) is used
+// now; `resident` feeds the Phase 4 scheduler and `Slot::B` the Phase 5 A/B work.
+#[allow(dead_code)]
+mod cache;
 mod color;
 mod gpu;
 mod gradient;
@@ -26,6 +30,10 @@ mod playback;
 mod proxy;
 mod render_math;
 mod resource_monitor;
+// Pure decode want-list scheduler (#57). Consumed by the decode-ahead worker in
+// Phase 4; until then only its own tests exercise it.
+#[allow(dead_code)]
+mod scheduler;
 // Pure image-sequence detection (#7), consumed by playback/app.
 pub mod sequence;
 mod snapshot;

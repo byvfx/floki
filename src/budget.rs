@@ -77,6 +77,21 @@ pub fn max_t1(sample: &Sample, frame_bytes: usize) -> usize {
     usize::try_from(available / frame_bytes as u64).unwrap_or(usize::MAX)
 }
 
+/// Total T1 ring capacity (frames) for a live cache: like [`max_t1`] but counts
+/// the cache's own resident bytes (`cache_bytes`) as *not* using budget, so the
+/// figure is the total the ring may hold rather than how many more would fit.
+/// This keeps the capacity stable as the ring fills (otherwise `sys_used` would
+/// include the cache and the budget would chase its own tail), while still
+/// shrinking when *other* memory pressure rises. Recompute periodically.
+#[must_use]
+pub fn t1_capacity(sample: &Sample, frame_bytes: usize, cache_bytes: u64) -> usize {
+    let adjusted = Sample {
+        sys_used: sample.sys_used.saturating_sub(cache_bytes),
+        ..*sample
+    };
+    max_t1(&adjusted, frame_bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,6 +156,22 @@ mod tests {
         // 1 GB/frame -> 10 frames.
         let s = sample(20_000_000_000, 4_000_000_000, None, None);
         assert_eq!(max_t1(&s, 1_000_000_000), 10);
+    }
+
+    #[test]
+    fn t1_capacity_is_stable_as_the_cache_fills() {
+        // 20 GB total, 70% headroom = 14 GB; 1 GB/frame. With 2 GB of *other*
+        // usage the ring may hold 12 frames — and that figure is unchanged
+        // whether the cache currently holds 0 or 5 of those frames.
+        let frame = 1_000_000_000usize;
+        let empty = sample(20_000_000_000, 2_000_000_000, None, None);
+        assert_eq!(t1_capacity(&empty, frame, 0), 12);
+        let half_full = sample(20_000_000_000, 2_000_000_000 + 5 * frame as u64, None, None);
+        assert_eq!(
+            t1_capacity(&half_full, frame, 5 * frame as u64),
+            12,
+            "capacity doesn't chase the cache's own growth"
+        );
     }
 
     #[test]

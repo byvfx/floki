@@ -34,6 +34,10 @@ struct LoadResult {
     /// True for an image-sequence frame (#7): apply via `swap_image_data` to
     /// preserve the viewer session, rather than starting a fresh session.
     seq_frame: bool,
+    /// Playback frame number (meaningful only when `seq_frame`); the cache key.
+    frame: u32,
+    /// Supersession epoch at issue time (#57).
+    epoch: u64,
     result: Result<ExrData, String>,
 }
 
@@ -44,6 +48,11 @@ struct LoadJob {
     /// True when this is a playback frame: skip the first-paint proxy and apply
     /// as a session-preserving swap on arrival (#7).
     seq_frame: bool,
+    /// Playback frame number (meaningful only when `seq_frame`); the cache key.
+    frame: u32,
+    /// Supersession epoch at issue time (#57); the result is dropped if it no
+    /// longer matches `Playback::epoch` on arrival.
+    epoch: u64,
 }
 
 /// Message from the decode worker to the UI thread, delivered over `load_rx`. A
@@ -100,6 +109,19 @@ pub struct ExrApp {
     /// / pacing); the loaded sequence, playhead, and clock reset on each open.
     #[serde(default)]
     playback: crate::playback::Playback,
+
+    /// T1 ring cache of decoded frames (#56): a scrub-back or loop replay is an
+    /// instant cache hit. Cleared on each new sequence.
+    #[serde(skip)]
+    frame_cache: crate::cache::FrameCache,
+    /// Resident-frame budget for `frame_cache`, recomputed from the RAM budget
+    /// (`budget::max_t1`) each status tick once a frame's size is measured.
+    #[serde(skip)]
+    frame_cache_cap: usize,
+    /// One frame's measured `approx_bytes()`, captured on the first decode (a
+    /// sequence is homogeneous). Sizes the cache budget.
+    #[serde(skip)]
+    frame_bytes: Option<usize>,
 
     recent_files: Vec<PathBuf>,
     theme: ThemeChoice,
@@ -267,6 +289,11 @@ impl Default for ExrApp {
             error_msg: None,
             viewer: ExrViewer::default(),
             playback: crate::playback::Playback::default(),
+            frame_cache: crate::cache::FrameCache::new(),
+            // Conservative starting budget until the first frame is measured and
+            // `budget::max_t1` recomputes it from real RAM headroom.
+            frame_cache_cap: 8,
+            frame_bytes: None,
             recent_files: Vec::new(),
             theme: ThemeChoice::default(),
             diff_colormap: crate::gradient::Colormap::default(),
@@ -678,6 +705,8 @@ impl ExrApp {
             path,
             is_b,
             seq_frame: false,
+            frame: 0,
+            epoch: self.playback.epoch,
         });
     }
 
@@ -711,6 +740,8 @@ impl ExrApp {
                         path: job.path,
                         is_b: job.is_b,
                         seq_frame: job.seq_frame,
+                        frame: job.frame,
+                        epoch: job.epoch,
                         result,
                     })));
                 }
@@ -723,12 +754,15 @@ impl ExrApp {
             .expect("load channel initialized above")
     }
 
-    // --- Image-sequence playback (#7, Phase 2) -------------------------------
+    // --- Image-sequence playback (#7) ----------------------------------------
 
     /// Evaluate sequence mode for a freshly opened slot-A `path`: enter playback
     /// over the detected siblings (placing the playhead on the opened frame), or
-    /// clear playback for a lone image.
+    /// clear playback for a lone image. Either way the frame cache is dropped —
+    /// it is keyed by frame number, which a different sequence reuses.
     fn detect_sequence(&mut self, path: &std::path::Path) {
+        self.frame_cache.clear();
+        self.frame_bytes = None;
         match crate::sequence::detect_from_file(path) {
             Some(seq) => {
                 let start = seq.number_of(path).unwrap_or(seq.range.0);
@@ -738,9 +772,10 @@ impl ExrApp {
         }
     }
 
-    /// Issue an on-demand decode of the given frame number into slot A. A hole
-    /// (no file) holds the previous frame — nothing is requested. The arriving
-    /// frame is applied as a session-preserving swap (see `apply_load_result`).
+    /// Show the given frame number in slot A. A resident frame (#56) is shown
+    /// instantly from the T1 ring; otherwise an on-demand decode is issued and
+    /// applied on arrival (see `apply_load_result`). A hole (no file) holds the
+    /// previous frame — nothing is requested, so playback never stalls.
     fn request_sequence_frame(&mut self, frame: u32) {
         let Some(path) = self.playback.frame_path(frame).map(Path::to_path_buf) else {
             // Hole: keep showing the last real frame; never stall.
@@ -748,14 +783,27 @@ impl ExrApp {
             return;
         };
         self.loaded_file = Some(path.clone());
-        self.loading_a = true;
         self.error_msg = None;
+
+        // Cache hit: show it immediately, no decode round-trip.
+        if let Some(data) = self.frame_cache.get(crate::cache::Slot::A, frame) {
+            self.loading_a = false;
+            self.playback.pending = None;
+            self.swap_image_arc(data, false);
+            self.playback.note_shown(std::time::Instant::now());
+            return;
+        }
+
+        // Miss: decode, tagged with the current epoch + frame number.
+        self.loading_a = true;
         self.playback.pending = Some(frame);
         let tx = self.ensure_worker();
         let _ = tx.send(LoadJob {
             path,
             is_b: false,
             seq_frame: true,
+            frame,
+            epoch: self.playback.epoch,
         });
     }
 
@@ -770,6 +818,7 @@ impl ExrApp {
         let next = (i64::from(self.playback.current_frame) + i64::from(delta))
             .clamp(i64::from(lo), i64::from(hi)) as u32;
         self.playback.current_frame = next;
+        self.playback.bump_epoch(); // a seek supersedes any in-flight decode
         self.request_sequence_frame(next);
     }
 
@@ -782,6 +831,7 @@ impl ExrApp {
         self.playback.state = crate::playback::PlayState::Paused;
         let next = frame.clamp(self.playback.in_point, self.playback.out_point);
         self.playback.current_frame = next;
+        self.playback.bump_epoch(); // a scrub supersedes any in-flight decode
         self.request_sequence_frame(next);
     }
 
@@ -806,6 +856,7 @@ impl ExrApp {
         self.playback.state = crate::playback::PlayState::Stopped;
         let in_point = self.playback.in_point;
         self.playback.current_frame = in_point;
+        self.playback.bump_epoch();
         self.request_sequence_frame(in_point);
     }
 
@@ -892,6 +943,39 @@ impl ExrApp {
     /// results (a newer open of a different file superseded this one) by checking
     /// the result path against the currently-requested path for its slot.
     fn apply_load_result(&mut self, res: LoadResult) {
+        // Playback frame (#7): supersession is by **epoch** (#57), not path —
+        // sequences recur the same paths under loop/ping-pong/scrub-back, so a
+        // stale frame could otherwise be mistaken for the current one. Apply as a
+        // session-preserving swap (zoom/pan/exposure/channel/compare/annotations
+        // carry across frames; reference B is untouched) and cache it (T1, #56).
+        if res.seq_frame {
+            if res.epoch != self.playback.epoch {
+                return; // a seek/scrub/direction change superseded this decode.
+            }
+            self.loading_a = false;
+            self.playback.pending = None;
+            match res.result {
+                Ok(data) => {
+                    let arc = std::sync::Arc::new(data);
+                    // Measure one frame to size the cache budget (homogeneous seq).
+                    self.frame_bytes.get_or_insert_with(|| arc.approx_bytes());
+                    self.frame_cache
+                        .insert(crate::cache::Slot::A, res.frame, arc.clone());
+                    self.frame_cache.evict_to(
+                        self.frame_cache_cap,
+                        self.playback.current_frame,
+                        self.playback.direction,
+                        self.playback.is_playing(),
+                    );
+                    self.swap_image_arc(arc, false);
+                    self.playback.note_shown(std::time::Instant::now());
+                    self.error_msg = None;
+                }
+                Err(e) => self.error_msg = Some(e),
+            }
+            return;
+        }
+
         let current = if res.is_b {
             self.loaded_file_b.as_ref()
         } else {
@@ -899,25 +983,6 @@ impl ExrApp {
         };
         if current != Some(&res.path) {
             // Superseded by a later open (or the slot was reset); drop it.
-            return;
-        }
-
-        // Playback frame (#7): apply as a session-preserving swap — zoom/pan/
-        // exposure/channel/compare/annotations carry across frames, and the
-        // reference B is untouched. Never resets the viewer or recent files.
-        // (Path-check supersession suffices in Phase 2; the epoch counter that
-        // disambiguates recurring paths under loop/scrub lands in Phase 3 (#57).)
-        if res.seq_frame {
-            self.loading_a = false;
-            self.playback.pending = None;
-            match res.result {
-                Ok(data) => {
-                    self.swap_image_data(data, false);
-                    self.playback.note_shown(std::time::Instant::now());
-                    self.error_msg = None;
-                }
-                Err(e) => self.error_msg = Some(e),
-            }
             return;
         }
 
@@ -951,6 +1016,18 @@ impl ExrApp {
                         self.exr_data = Some(std::sync::Arc::new(data));
                         self.reset_viewer_session();
                     }
+                    // If this open started a sequence, seed the T1 ring with the
+                    // opened frame so a scrub-back to it is an instant hit (#56).
+                    if self.playback.is_active()
+                        && let Some(arc) = &self.exr_data
+                    {
+                        self.frame_bytes.get_or_insert_with(|| arc.approx_bytes());
+                        self.frame_cache.insert(
+                            crate::cache::Slot::A,
+                            self.playback.current_frame,
+                            arc.clone(),
+                        );
+                    }
                 }
                 self.error_msg = None;
             }
@@ -977,8 +1054,15 @@ impl ExrApp {
     /// Contrast [`Self::reset_viewer_session`], used for an explicit open / new
     /// session, which drops B and resets the entire viewer.
     fn swap_image_data(&mut self, data: ExrData, is_b: bool) {
+        self.swap_image_arc(std::sync::Arc::new(data), is_b);
+    }
+
+    /// As [`Self::swap_image_data`], but takes an already-`Arc`'d image so a
+    /// playback cache hit (#56) can show a resident frame without cloning its
+    /// pixel buffers — the same `Arc` is held by the T1 ring and the active slot.
+    fn swap_image_arc(&mut self, data: std::sync::Arc<ExrData>, is_b: bool) {
         if is_b {
-            self.exr_data_b = Some(std::sync::Arc::new(data));
+            self.exr_data_b = Some(data);
             // The texture caches only rebuild on a layer-count change, so a new B
             // with the same layer count would keep showing the previous image.
             // Force the reference textures (and the B-dependent diff/composite)
@@ -990,7 +1074,7 @@ impl ExrApp {
             self.viewer.last_sampled_val_b = None;
         } else {
             let layer_count = data.logical_layers.len();
-            self.exr_data = Some(std::sync::Arc::new(data));
+            self.exr_data = Some(data);
             // The full-res A decode has landed: drop the slot-A first-paint proxy
             // (#58). The viewer's zoom/pan session state is preserved so the
             // handoff from proxy to full-res is visually continuous.
@@ -1803,6 +1887,14 @@ impl ExrApp {
                 let sample = self.resource_monitor.sample(&gpu.render_state().device);
                 ui.ctx()
                     .request_repaint_after(std::time::Duration::from_secs(1));
+
+                // Resize the T1 ring to the live RAM budget (#56). Recomputed
+                // each status tick; shrinks under other memory pressure.
+                if let Some(bytes) = self.frame_bytes {
+                    let cache_bytes = self.frame_cache.len() as u64 * bytes as u64;
+                    self.frame_cache_cap =
+                        crate::budget::t1_capacity(&sample, bytes, cache_bytes).max(2);
+                }
                 use crate::resource_monitor::fmt_bytes;
                 let mut text = format!(
                     "RAM {} · sys {}/{}",
@@ -2044,6 +2136,7 @@ impl ExrApp {
                     } else {
                         Direction::Forward
                     };
+                    self.playback.bump_epoch(); // direction change supersedes prefetch
                 }
 
                 let loop_label = match self.playback.loop_mode {
@@ -2568,6 +2661,8 @@ mod tests {
             path: PathBuf::from("superseded.exr"),
             is_b: false,
             seq_frame: false,
+            frame: 0,
+            epoch: 0,
             result: Err("boom".to_string()),
         });
 
@@ -2593,6 +2688,8 @@ mod tests {
             path: PathBuf::from("current.exr"),
             is_b: false,
             seq_frame: false,
+            frame: 0,
+            epoch: 0,
             result: Err("bad exr".to_string()),
         });
 
@@ -2622,6 +2719,8 @@ mod tests {
             path,
             is_b: false,
             seq_frame: false,
+            frame: 0,
+            epoch: 0,
             result: Ok(data_a),
         });
 
@@ -2896,6 +2995,8 @@ mod tests {
             path,
             is_b: false,
             seq_frame: false,
+            frame: 0,
+            epoch: 0,
             result: Ok(data),
         });
 
@@ -3095,13 +3196,16 @@ mod tests {
         app.viewer.scale = 3.0;
         app.viewer.exposure = 1.5;
 
-        // Step to frame 2 (sets loaded_file + pending), then deliver it.
+        // Step to frame 2 (sets loaded_file + pending), then deliver it. The
+        // result must carry the live epoch — the step bumped it.
         app.playback_step(1);
         let data2 = ExrData::load(&f2).unwrap();
         app.apply_load_result(LoadResult {
             path: f2,
             is_b: false,
             seq_frame: true,
+            frame: 2,
+            epoch: app.playback.epoch,
             result: Ok(data2),
         });
 
@@ -3169,6 +3273,88 @@ mod tests {
         assert!(
             !app.viewer.blink_state,
             "Space was consumed by playback, not the blink toggle"
+        );
+    }
+
+    // --- T1 ring cache + epoch (#56/#57, Phase 3) ----------------------------
+
+    /// Deliver a sequence frame to the app as the worker would, at the live epoch.
+    fn deliver_frame(app: &mut ExrApp, path: &std::path::Path, frame: u32) {
+        let data = ExrData::load(path).unwrap();
+        app.apply_load_result(LoadResult {
+            path: path.to_path_buf(),
+            is_b: false,
+            seq_frame: true,
+            frame,
+            epoch: app.playback.epoch,
+            result: Ok(data),
+        });
+    }
+
+    #[test]
+    fn scrub_back_hits_the_cache_without_a_decode() {
+        let dir = tempfile::tempdir().unwrap();
+        let f1 = dir.path().join("c.0001.exr");
+        let f2 = dir.path().join("c.0002.exr");
+        write_rgba_exr(&f1);
+        write_rgba_exr(&f2);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&f1);
+
+        // Step to 2 and deliver it -> frame 2 is now resident.
+        app.playback_step(1);
+        deliver_frame(&mut app, &f2, 2);
+        assert!(app.frame_cache.contains(crate::cache::Slot::A, 2));
+
+        // Scrub to 1 (not cached) -> a real decode is in flight.
+        app.playback_scrub_to(1);
+        assert!(
+            app.loading_a && app.playback.pending == Some(1),
+            "miss decodes"
+        );
+
+        // Scrub back to 2 (cached) -> shown instantly, no decode issued.
+        app.playback_scrub_to(2);
+        assert!(!app.loading_a, "cache hit issues no decode");
+        assert_eq!(app.playback.pending, None);
+    }
+
+    #[test]
+    fn stale_epoch_sequence_result_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let f1 = dir.path().join("c.0001.exr");
+        let f2 = dir.path().join("c.0002.exr");
+        write_rgba_exr(&f1);
+        write_rgba_exr(&f2);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&f1);
+
+        // Request frame 2; capture the epoch its decode was issued under.
+        app.playback_step(1);
+        let stale_epoch = app.playback.epoch;
+
+        // The user scrubs away before frame 2 lands — this bumps the epoch.
+        app.playback_scrub_to(1);
+        assert_ne!(app.playback.epoch, stale_epoch);
+
+        // The late frame-2 result arrives carrying the old epoch: it must be
+        // dropped (recurring paths break the path check; the epoch saves us).
+        let data2 = ExrData::load(&f2).unwrap();
+        app.apply_load_result(LoadResult {
+            path: f2,
+            is_b: false,
+            seq_frame: true,
+            frame: 2,
+            epoch: stale_epoch,
+            result: Ok(data2),
+        });
+        assert!(
+            !app.frame_cache.contains(crate::cache::Slot::A, 2),
+            "stale-epoch frame is not cached"
+        );
+        assert_eq!(
+            app.playback.current_frame, 1,
+            "playhead stays where the user left it"
         );
     }
 }
