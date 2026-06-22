@@ -85,7 +85,11 @@ pub struct BlitUniforms {
     pub bg_mode: f32,
     pub bg_checker_size: f32,
     pub bg_grad_angle: f32,
-    pub _pad_a: f32,
+    /// User gamma applied to the OCIO-transformed image in *display* space, after
+    /// the view transform and before the (un-managed) background composite (#93).
+    /// `1.0` = no-op. In the non-OCIO path gamma lives in `shader.wgsl`; under OCIO
+    /// the display chain is OCIO's, so the user gamma is re-applied here.
+    pub gamma: f32,
     pub _pad_b: f32,
     pub bg_checker_dark: [f32; 4],
     pub bg_checker_light: [f32; 4],
@@ -161,7 +165,7 @@ struct BlitUniforms {
     bg_mode: f32,
     bg_checker_size: f32,
     bg_grad_angle: f32,
-    _pad_a: f32,
+    gamma: f32,
     _pad_b: f32,
     bg_checker_dark: vec4<f32>,
     bg_checker_light: vec4<f32>,
@@ -210,9 +214,16 @@ fn fs_main(i: VOut) -> @location(0) vec4<f32> {
     let disp = textureSample(t, s, i.uv);
     let a = clamp(scene_a, 0.0, 1.0);
 
+    // User gamma (#93): under OCIO the display chain is OCIO's, so the gamma
+    // control is re-applied here in display space, on the image only (the
+    // background stays neutral, composited below). 1.0 is a no-op.
+    var rgb = disp.rgb;
+    if bu.gamma != 1.0 {
+        rgb = pow(max(rgb, vec3<f32>(0.0)), vec3<f32>(1.0 / bu.gamma));
+    }
+
     // Background (checker / solid / gradient), composited AFTER OCIO in display
     // space so neutral grey stays neutral (not colour-managed).
-    var rgb = disp.rgb;
     {
         let screen_pt = i.uv * bu.screen_size;
         let guv = (screen_pt - bu.display_min) / max(bu.display_max - bu.display_min, vec2<f32>(1.0));
