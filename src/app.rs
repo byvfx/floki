@@ -31,6 +31,9 @@ impl From<ThemeChoice> for egui::ThemePreference {
 struct LoadResult {
     path: PathBuf,
     is_b: bool,
+    /// True for an image-sequence frame (#7): apply via `swap_image_data` to
+    /// preserve the viewer session, rather than starting a fresh session.
+    seq_frame: bool,
     result: Result<ExrData, String>,
 }
 
@@ -38,6 +41,9 @@ struct LoadResult {
 struct LoadJob {
     path: PathBuf,
     is_b: bool,
+    /// True when this is a playback frame: skip the first-paint proxy and apply
+    /// as a session-preserving swap on arrival (#7).
+    seq_frame: bool,
 }
 
 /// Message from the decode worker to the UI thread, delivered over `load_rx`. A
@@ -86,6 +92,11 @@ pub struct ExrApp {
     error_msg: Option<String>,
     #[serde(skip)]
     viewer: ExrViewer,
+
+    /// Image-sequence playback state (#7). Persists prefs (fps / loop / direction
+    /// / pacing); the loaded sequence, playhead, and clock reset on each open.
+    #[serde(default)]
+    playback: crate::playback::Playback,
 
     recent_files: Vec<PathBuf>,
     theme: ThemeChoice,
@@ -252,6 +263,7 @@ impl Default for ExrApp {
             exr_data_b: None,
             error_msg: None,
             viewer: ExrViewer::default(),
+            playback: crate::playback::Playback::default(),
             recent_files: Vec::new(),
             theme: ThemeChoice::default(),
             diff_colormap: crate::gradient::Colormap::default(),
@@ -648,27 +660,42 @@ impl ExrApp {
             self.recent_files.truncate(10);
             self.loaded_file = Some(path.clone());
             self.loading_a = true;
+            // An explicit slot-A open (re)evaluates sequence mode: opening one
+            // frame of a numbered sequence enables playback over its siblings; a
+            // lone image leaves single-image behavior unchanged (#7).
+            self.detect_sequence(&path);
         } else {
             self.loaded_file_b = Some(path.clone());
             self.loading_b = true;
         }
         self.error_msg = None;
 
-        // Lazily create the load channel + spawn a single dedicated worker
-        // thread. The worker processes jobs one at a time, so rapidly opening
-        // 5 files queues them instead of spawning 5 parallel GBs-of-RAM parses.
-        // Stale jobs are discarded by `apply_load_result`'s path check.
+        let tx = self.ensure_worker();
+        let _ = tx.send(LoadJob {
+            path,
+            is_b,
+            seq_frame: false,
+        });
+    }
+
+    /// Lazily create the load channel + spawn the single dedicated worker thread,
+    /// returning a sender for [`LoadJob`]s. The worker processes jobs one at a
+    /// time, so rapidly queued requests serialize instead of spawning many
+    /// parallel GBs-of-RAM parses. Stale results are discarded by
+    /// `apply_load_result`'s path check.
+    fn ensure_worker(&mut self) -> std::sync::mpsc::Sender<LoadJob> {
         if self.load_rx.is_none() {
             let (job_tx, job_rx) = std::sync::mpsc::channel::<LoadJob>();
             let (result_tx, result_rx) = std::sync::mpsc::channel::<LoadMsg>();
             std::thread::spawn(move || {
                 for job in job_rx {
                     // Slot-A first-paint proxy (#33): a fast low-res read so the
-                    // image appears before the full decode lands. Slot B is a
-                    // reference (no first paint needed). `from_exr_fast_read`
-                    // returns None for small / tiled / deep files, leaving the
-                    // spinner-then-full path unchanged.
+                    // image appears before the full decode lands. Skipped for
+                    // slot B (a reference) and for playback frames (#7), which
+                    // swap straight to full-res. `from_exr_fast_read` returns None
+                    // for small / tiled / deep files anyway.
                     if !job.is_b
+                        && !job.seq_frame
                         && let Some(proxy) = crate::proxy::ProxyImage::from_exr_fast_read(&job.path)
                     {
                         let _ = result_tx.send(LoadMsg::Proxy {
@@ -680,6 +707,7 @@ impl ExrApp {
                     let _ = result_tx.send(LoadMsg::Loaded(Box::new(LoadResult {
                         path: job.path,
                         is_b: job.is_b,
+                        seq_frame: job.seq_frame,
                         result,
                     })));
                 }
@@ -687,11 +715,174 @@ impl ExrApp {
             self.load_tx = Some(job_tx);
             self.load_rx = Some(result_rx);
         }
-        let tx = self
-            .load_tx
+        self.load_tx
             .clone()
-            .expect("load channel initialized above");
-        let _ = tx.send(LoadJob { path, is_b });
+            .expect("load channel initialized above")
+    }
+
+    // --- Image-sequence playback (#7, Phase 2) -------------------------------
+
+    /// Evaluate sequence mode for a freshly opened slot-A `path`: enter playback
+    /// over the detected siblings (placing the playhead on the opened frame), or
+    /// clear playback for a lone image.
+    fn detect_sequence(&mut self, path: &std::path::Path) {
+        match crate::sequence::detect_from_file(path) {
+            Some(seq) => {
+                let start = seq.number_of(path).unwrap_or(seq.range.0);
+                self.playback.enter(seq, start);
+            }
+            None => self.playback.clear(),
+        }
+    }
+
+    /// Issue an on-demand decode of the given frame number into slot A. A hole
+    /// (no file) holds the previous frame — nothing is requested. The arriving
+    /// frame is applied as a session-preserving swap (see `apply_load_result`).
+    fn request_sequence_frame(&mut self, frame: u32) {
+        let Some(path) = self.playback.frame_path(frame).map(Path::to_path_buf) else {
+            // Hole: keep showing the last real frame; never stall.
+            self.playback.pending = None;
+            return;
+        };
+        self.loaded_file = Some(path.clone());
+        self.loading_a = true;
+        self.error_msg = None;
+        self.playback.pending = Some(frame);
+        let tx = self.ensure_worker();
+        let _ = tx.send(LoadJob {
+            path,
+            is_b: false,
+            seq_frame: true,
+        });
+    }
+
+    /// Step the playhead by `delta` frames, clamped to the in/out range (no
+    /// wrap), and pause. Drives the back/forward transport buttons and arrow keys.
+    fn playback_step(&mut self, delta: i32) {
+        if !self.playback.is_active() {
+            return;
+        }
+        self.playback.state = crate::playback::PlayState::Paused;
+        let (lo, hi) = (self.playback.in_point, self.playback.out_point);
+        let next = (i64::from(self.playback.current_frame) + i64::from(delta))
+            .clamp(i64::from(lo), i64::from(hi)) as u32;
+        self.playback.current_frame = next;
+        self.request_sequence_frame(next);
+    }
+
+    /// Jump the playhead to an absolute frame number (clamped) and pause. Drives
+    /// the scrubber and jump-to-in/out buttons (a P0 seek).
+    fn playback_scrub_to(&mut self, frame: u32) {
+        if !self.playback.is_active() {
+            return;
+        }
+        self.playback.state = crate::playback::PlayState::Paused;
+        let next = frame.clamp(self.playback.in_point, self.playback.out_point);
+        self.playback.current_frame = next;
+        self.request_sequence_frame(next);
+    }
+
+    /// Toggle play/pause. Starting playback anchors the frame clock to now.
+    fn playback_toggle(&mut self) {
+        use crate::playback::PlayState;
+        if !self.playback.is_active() {
+            return;
+        }
+        if self.playback.state == PlayState::Playing {
+            self.playback.state = PlayState::Paused;
+        } else {
+            self.playback.start_playing(std::time::Instant::now());
+        }
+    }
+
+    /// Stop and rewind to the in point.
+    fn playback_stop(&mut self) {
+        if !self.playback.is_active() {
+            return;
+        }
+        self.playback.state = crate::playback::PlayState::Stopped;
+        let in_point = self.playback.in_point;
+        self.playback.current_frame = in_point;
+        self.request_sequence_frame(in_point);
+    }
+
+    /// Move the playhead one frame in the play direction and request it. Returns
+    /// `false` when `Once` has reached the boundary (the caller pauses). Pure of
+    /// wall-time, so tests can drive playback frame-by-frame.
+    fn advance_playhead(&mut self) -> bool {
+        match crate::playback::advance(
+            self.playback.current_frame,
+            self.playback.in_point,
+            self.playback.out_point,
+            self.playback.direction,
+            self.playback.loop_mode,
+        ) {
+            Some((next, dir)) => {
+                self.playback.direction = dir;
+                self.playback.current_frame = next;
+                self.playback.frames_since_anchor += 1;
+                self.request_sequence_frame(next);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Per-frame playback clock. While playing and no decode is in flight, advance
+    /// to the next frame once its absolute deadline (`anchor + n·period`) passes —
+    /// drift-free pacing. Decode-bound playback (stutter) naturally drops the
+    /// effective fps: the next request waits for the previous frame to land.
+    fn tick_playback(&mut self, ctx: &egui::Context) {
+        use crate::playback::PlayState;
+        if !self.playback.is_active() || self.playback.state != PlayState::Playing {
+            return;
+        }
+        let period = self.playback.period();
+        if self.playback.pending.is_none() && !self.loading_a {
+            let now = std::time::Instant::now();
+            let anchor = *self.playback.anchor.get_or_insert(now);
+            let due = anchor + period * self.playback.frames_since_anchor;
+            if now >= due {
+                if self.advance_playhead() {
+                    // If decode fell behind by more than a frame, drop the
+                    // accumulated lag (anchor to now) so we don't burst-catch-up
+                    // — stutter holds wall-time-independent, never skipping.
+                    if now > due + period {
+                        self.playback.anchor = Some(now);
+                        self.playback.frames_since_anchor = 0;
+                    }
+                } else {
+                    self.playback.state = PlayState::Paused;
+                }
+            }
+        }
+        // Keep the clock ticking even while idle between frames.
+        ctx.request_repaint_after(period);
+    }
+
+    /// Context-gated playback keys: with a sequence loaded, Space is play/pause
+    /// (consumed so the viewer's blink toggle doesn't also fire) and Left/Right
+    /// step. Without a sequence, nothing is consumed and Space stays blink-compare.
+    fn handle_playback_keys(&mut self, ctx: &egui::Context) {
+        if !self.playback.is_active() {
+            return;
+        }
+        let (space, left, right) = ctx.input_mut(|i| {
+            (
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Space),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight),
+            )
+        });
+        if space {
+            self.playback_toggle();
+        }
+        if left {
+            self.playback_step(-1);
+        }
+        if right {
+            self.playback_step(1);
+        }
     }
 
     /// Apply a completed [`LoadResult`] from the worker thread. Ignores stale
@@ -705,6 +896,25 @@ impl ExrApp {
         };
         if current != Some(&res.path) {
             // Superseded by a later open (or the slot was reset); drop it.
+            return;
+        }
+
+        // Playback frame (#7): apply as a session-preserving swap — zoom/pan/
+        // exposure/channel/compare/annotations carry across frames, and the
+        // reference B is untouched. Never resets the viewer or recent files.
+        // (Path-check supersession suffices in Phase 2; the epoch counter that
+        // disambiguates recurring paths under loop/scrub lands in Phase 3 (#57).)
+        if res.seq_frame {
+            self.loading_a = false;
+            self.playback.pending = None;
+            match res.result {
+                Ok(data) => {
+                    self.swap_image_data(data, false);
+                    self.playback.note_shown(std::time::Instant::now());
+                    self.error_msg = None;
+                }
+                Err(e) => self.error_msg = Some(e),
+            }
             return;
         }
 
@@ -1041,6 +1251,12 @@ impl eframe::App for ExrApp {
 
         self.poll_async_loads(ui.ctx());
 
+        // Sequence playback (#7): consume transport keys (Space/←/→) before the
+        // viewer sees them, then run the frame clock. Both are no-ops unless a
+        // sequence is loaded, so single-image behavior is unchanged.
+        self.handle_playback_keys(ui.ctx());
+        self.tick_playback(ui.ctx());
+
         // Snapshot to clipboard (#19): request a framebuffer screenshot on the
         // hotkey and consume the reply when it arrives.
         self.process_snapshot(ui.ctx());
@@ -1050,6 +1266,9 @@ impl eframe::App for ExrApp {
         self.draw_color_management_window(ui.ctx());
         self.draw_menu_bar(ui);
         self.draw_status_bar(ui);
+        // Transport bar sits just above the status bar (added after it, so it
+        // stacks above); a no-op panel unless a sequence is loaded.
+        self.draw_transport_bar(ui);
         self.draw_side_panel(ui);
         self.draw_central_canvas(ui);
     }
@@ -1773,6 +1992,110 @@ impl ExrApp {
         });
     }
 
+    /// Transport controls for image-sequence playback (#7). A no-op unless a
+    /// sequence is loaded. Scrubber + play/pause/stop/step/jump + reverse +
+    /// loop-mode + editable target fps and measured fps.
+    fn draw_transport_bar(&mut self, ui: &mut egui::Ui) {
+        use crate::playback::{Direction, LoopMode};
+        if !self.playback.is_active() {
+            return;
+        }
+        egui::Panel::bottom("transport_bar").show_inside(ui, |ui| {
+            ui.horizontal(|ui| {
+                let (lo, hi) = (self.playback.in_point, self.playback.out_point);
+                let playing = self.playback.is_playing();
+
+                if ui.button("|<").on_hover_text("Jump to in").clicked() {
+                    self.playback_scrub_to(lo);
+                }
+                if ui.button("<").on_hover_text("Step back (←)").clicked() {
+                    self.playback_step(-1);
+                }
+                if ui
+                    .button(if playing { "Pause" } else { "Play" })
+                    .on_hover_text("Play/Pause (Space)")
+                    .clicked()
+                {
+                    self.playback_toggle();
+                }
+                if ui.button("Stop").on_hover_text("Stop and rewind").clicked() {
+                    self.playback_stop();
+                }
+                if ui.button(">").on_hover_text("Step forward (→)").clicked() {
+                    self.playback_step(1);
+                }
+                if ui.button(">|").on_hover_text("Jump to out").clicked() {
+                    self.playback_scrub_to(hi);
+                }
+
+                ui.separator();
+
+                let mut reverse = self.playback.direction == Direction::Reverse;
+                if ui
+                    .toggle_value(&mut reverse, "Rev")
+                    .on_hover_text("Reverse play direction")
+                    .changed()
+                {
+                    self.playback.direction = if reverse {
+                        Direction::Reverse
+                    } else {
+                        Direction::Forward
+                    };
+                }
+
+                let loop_label = match self.playback.loop_mode {
+                    LoopMode::Once => "Once",
+                    LoopMode::Loop => "Loop",
+                    LoopMode::PingPong => "Ping-Pong",
+                };
+                if ui
+                    .button(loop_label)
+                    .on_hover_text("Cycle loop mode")
+                    .clicked()
+                {
+                    self.playback.loop_mode = match self.playback.loop_mode {
+                        LoopMode::Once => LoopMode::Loop,
+                        LoopMode::Loop => LoopMode::PingPong,
+                        LoopMode::PingPong => LoopMode::Once,
+                    };
+                }
+
+                ui.separator();
+
+                // Scrubber over the inclusive frame range.
+                let mut frame = self.playback.current_frame;
+                if ui
+                    .add(egui::Slider::new(&mut frame, lo..=hi).text("frame"))
+                    .changed()
+                {
+                    self.playback_scrub_to(frame);
+                }
+                // A hole holds the previous frame; flag it so the readout isn't
+                // mistaken for a decoded frame.
+                if self
+                    .playback
+                    .frame_path(self.playback.current_frame)
+                    .is_none()
+                {
+                    ui.label(egui::RichText::new("(hole)").weak());
+                }
+
+                ui.separator();
+
+                ui.add(
+                    egui::DragValue::new(&mut self.playback.fps_target)
+                        .range(1.0..=120.0)
+                        .speed(0.25)
+                        .suffix(" fps"),
+                )
+                .on_hover_text("Target fps");
+                ui.label(
+                    egui::RichText::new(format!("{:.1} actual", self.playback.measured_fps)).weak(),
+                );
+            });
+        });
+    }
+
     fn draw_side_panel(&mut self, ui: &mut egui::Ui) {
         if !self.viewer.fullscreen {
             egui::Panel::left("side_panel")
@@ -2241,6 +2564,7 @@ mod tests {
         app.apply_load_result(LoadResult {
             path: PathBuf::from("superseded.exr"),
             is_b: false,
+            seq_frame: false,
             result: Err("boom".to_string()),
         });
 
@@ -2265,6 +2589,7 @@ mod tests {
         app.apply_load_result(LoadResult {
             path: PathBuf::from("current.exr"),
             is_b: false,
+            seq_frame: false,
             result: Err("bad exr".to_string()),
         });
 
@@ -2293,6 +2618,7 @@ mod tests {
         app.apply_load_result(LoadResult {
             path,
             is_b: false,
+            seq_frame: false,
             result: Ok(data_a),
         });
 
@@ -2566,6 +2892,7 @@ mod tests {
         app.apply_load_result(LoadResult {
             path,
             is_b: false,
+            seq_frame: false,
             result: Ok(data),
         });
 
@@ -2685,5 +3012,160 @@ mod tests {
         let rect = egui::Rect::from_min_max(egui::pos2(-1920.0, 0.0), egui::pos2(-920.0, 800.0));
         assert!(!cursor_targets_right(egui::pos2(-1500.0, 0.0), rect));
         assert!(cursor_targets_right(egui::pos2(-1000.0, 0.0), rect));
+    }
+
+    // --- Sequence playback (#7, Phase 2) -------------------------------------
+
+    use crate::playback::{Direction, LoopMode, PlayState};
+
+    /// Create `count` empty frame files `s.0001.exr..` in `dir`. Empty is enough
+    /// for detection + transport-state tests (no decode); use real EXRs only when
+    /// a frame must actually load.
+    fn touch_sequence(dir: &std::path::Path, count: u32) {
+        for n in 1..=count {
+            std::fs::write(dir.join(format!("s.{n:04}.exr")), b"").unwrap();
+        }
+    }
+
+    #[test]
+    fn detect_sequence_enters_playback_on_a_numbered_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        touch_sequence(dir.path(), 3);
+        let mut app = ExrApp::default();
+
+        app.detect_sequence(&dir.path().join("s.0002.exr"));
+        assert!(app.playback.is_active(), "siblings -> sequence mode");
+        assert_eq!(
+            app.playback.current_frame, 2,
+            "playhead on the opened frame"
+        );
+        assert_eq!((app.playback.in_point, app.playback.out_point), (1, 3));
+
+        // A lone image leaves sequence mode (single-image behavior unchanged).
+        let solo = tempfile::tempdir().unwrap();
+        std::fs::write(solo.path().join("only.0001.exr"), b"").unwrap();
+        app.detect_sequence(&solo.path().join("only.0001.exr"));
+        assert!(!app.playback.is_active());
+    }
+
+    #[test]
+    fn step_and_scrub_move_playhead_request_frame_and_pause() {
+        let dir = tempfile::tempdir().unwrap();
+        touch_sequence(dir.path(), 5);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&dir.path().join("s.0001.exr"));
+
+        app.playback_step(1);
+        assert_eq!(app.playback.current_frame, 2);
+        assert_eq!(
+            app.loaded_file.as_deref(),
+            Some(dir.path().join("s.0002.exr").as_path()),
+            "the stepped-to frame is the requested load"
+        );
+        assert!(app.loading_a, "a decode is in flight");
+        assert_eq!(app.playback.pending, Some(2));
+        assert_eq!(app.playback.state, PlayState::Paused, "stepping pauses");
+
+        // Scrub past the end clamps to the out point.
+        app.playback_scrub_to(99);
+        assert_eq!(app.playback.current_frame, 5);
+
+        // Step back clamps to the in point (no wrap).
+        app.playback_scrub_to(1);
+        app.playback_step(-1);
+        assert_eq!(app.playback.current_frame, 1);
+    }
+
+    #[test]
+    fn sequence_frame_arrival_swaps_and_preserves_the_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let f1 = dir.path().join("f.0001.exr");
+        let f2 = dir.path().join("f.0002.exr");
+        write_rgba_exr(&f1);
+        write_rgba_exr(&f2);
+        let mut app = ExrApp {
+            exr_data: Some(ExrData::load(&f1).unwrap()),
+            ..Default::default()
+        };
+        app.detect_sequence(&f1);
+        // User mid-session: non-default view.
+        app.viewer.scale = 3.0;
+        app.viewer.exposure = 1.5;
+
+        // Step to frame 2 (sets loaded_file + pending), then deliver it.
+        app.playback_step(1);
+        let data2 = ExrData::load(&f2).unwrap();
+        app.apply_load_result(LoadResult {
+            path: f2,
+            is_b: false,
+            seq_frame: true,
+            result: Ok(data2),
+        });
+
+        assert!(app.exr_data.is_some(), "frame 2 applied");
+        assert_eq!(app.viewer.scale, 3.0, "zoom preserved across the frame");
+        assert_eq!(app.viewer.exposure, 1.5, "exposure preserved");
+        assert!(!app.loading_a, "decode flag cleared");
+        assert_eq!(app.playback.pending, None, "pending cleared on arrival");
+    }
+
+    #[test]
+    fn playing_advances_through_frames_and_loops() {
+        let dir = tempfile::tempdir().unwrap();
+        touch_sequence(dir.path(), 3);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&dir.path().join("s.0001.exr"));
+        app.playback.loop_mode = LoopMode::Loop;
+
+        app.playback_toggle();
+        assert_eq!(app.playback.state, PlayState::Playing);
+
+        // advance_playhead is wall-time-independent, so we can drive frames directly.
+        assert!(app.advance_playhead());
+        assert_eq!(app.playback.current_frame, 2);
+        assert!(app.advance_playhead());
+        assert_eq!(app.playback.current_frame, 3);
+        assert!(app.advance_playhead());
+        assert_eq!(app.playback.current_frame, 1, "looped back to the in point");
+    }
+
+    #[test]
+    fn once_mode_advance_signals_stop_at_the_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        touch_sequence(dir.path(), 2);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&dir.path().join("s.0002.exr")); // start at the out point
+        app.playback.loop_mode = LoopMode::Once;
+        app.playback.direction = Direction::Forward;
+
+        // At the out point, Once has nowhere to go: the clock would pause.
+        assert!(!app.advance_playhead(), "Once at boundary -> stop");
+    }
+
+    #[test]
+    fn space_is_play_pause_with_a_sequence_and_consumed_from_the_viewer() {
+        use egui_kittest::Harness;
+        let dir = tempfile::tempdir().unwrap();
+        touch_sequence(dir.path(), 3);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&dir.path().join("s.0001.exr"));
+        assert_eq!(app.playback.state, PlayState::Stopped);
+
+        let mut h = Harness::new_ui_state(
+            |ui, app: &mut ExrApp| app.handle_playback_keys(ui.ctx()),
+            app,
+        );
+        h.key_press(egui::Key::Space);
+        h.run();
+        app = std::mem::take(h.state_mut());
+        assert_eq!(
+            app.playback.state,
+            PlayState::Playing,
+            "Space starts playback when a sequence is loaded"
+        );
+        assert!(
+            !app.viewer.blink_state,
+            "Space was consumed by playback, not the blink toggle"
+        );
     }
 }

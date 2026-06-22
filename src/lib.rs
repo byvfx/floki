@@ -17,11 +17,12 @@ mod background;
 mod color;
 mod gpu;
 mod gradient;
+// Sequence-playback transport state + pure frame-advance logic (#7).
+mod playback;
 mod proxy;
 mod render_math;
 mod resource_monitor;
-// Pure image-sequence detection (#7). Wired into the app in Phase 2; for now
-// only its own tests exercise it.
+// Pure image-sequence detection (#7), consumed by playback/app.
 pub mod sequence;
 mod snapshot;
 pub mod tools;

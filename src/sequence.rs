@@ -39,6 +39,43 @@ impl Sequence {
     pub fn is_empty(&self) -> bool {
         self.frames.is_empty()
     }
+
+    /// The frame number of each entry in [`Sequence::frames`], ascending.
+    /// Reconstructed from `range` and `holes` — the present numbers are
+    /// `[min..=max]` minus the holes, and `frames` is stored in that same order.
+    #[must_use]
+    pub fn numbers(&self) -> Vec<u32> {
+        let holes: std::collections::HashSet<u32> = self.holes.iter().copied().collect();
+        (self.range.0..=self.range.1)
+            .filter(|n| !holes.contains(n))
+            .collect()
+    }
+
+    /// Path of the frame with the given number, or `None` when it is out of range
+    /// or a hole. The playhead may sit on a hole; the caller holds the previous
+    /// frame in that case (it never stalls).
+    #[must_use]
+    pub fn path_for(&self, number: u32) -> Option<&Path> {
+        if number < self.range.0 || number > self.range.1 {
+            return None;
+        }
+        if self.holes.contains(&number) {
+            return None;
+        }
+        // Index = how many present numbers precede `number` = (offset from min)
+        // minus the holes below it.
+        let holes_below = self.holes.iter().filter(|&&h| h < number).count();
+        let index = (number - self.range.0) as usize - holes_below;
+        self.frames.get(index).map(PathBuf::as_path)
+    }
+
+    /// The frame number of `path` within this sequence, or `None` if it is not a
+    /// member. Used to place the playhead on the file the user actually opened.
+    #[must_use]
+    pub fn number_of(&self, path: &Path) -> Option<u32> {
+        let index = self.frames.iter().position(|p| p == path)?;
+        self.numbers().get(index).copied()
+    }
 }
 
 /// The decomposition of a file stem around its frame field.
@@ -323,5 +360,51 @@ mod tests {
         let seq = detect_from_file(&dir.path().join("frame.0001.EXR")).unwrap();
         assert_eq!(seq.len(), 2);
         assert_eq!(seq.range, (1, 2));
+    }
+
+    // --- number <-> path lookup (Phase 2 helpers) ----------------------------
+
+    #[test]
+    fn numbers_lists_present_frames_skipping_holes() {
+        let dir = tempfile::tempdir().unwrap();
+        touch_all(
+            dir.path(),
+            &["s.0001.exr", "s.0002.exr", "s.0004.exr", "s.0005.exr"],
+        );
+        let seq = detect_from_file(&dir.path().join("s.0001.exr")).unwrap();
+        assert_eq!(seq.numbers(), vec![1, 2, 4, 5]);
+    }
+
+    #[test]
+    fn path_for_maps_number_to_file_and_holes_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        touch_all(
+            dir.path(),
+            &["s.0001.exr", "s.0002.exr", "s.0004.exr", "s.0005.exr"],
+        );
+        let seq = detect_from_file(&dir.path().join("s.0001.exr")).unwrap();
+        assert_eq!(
+            seq.path_for(1),
+            Some(dir.path().join("s.0001.exr").as_path())
+        );
+        assert_eq!(
+            seq.path_for(4),
+            Some(dir.path().join("s.0004.exr").as_path())
+        );
+        assert_eq!(seq.path_for(3), None, "hole maps to None");
+        assert_eq!(seq.path_for(99), None, "out of range maps to None");
+    }
+
+    #[test]
+    fn number_of_recovers_the_opened_frames_number() {
+        let dir = tempfile::tempdir().unwrap();
+        touch_all(
+            dir.path(),
+            &["s.0001.exr", "s.0002.exr", "s.0004.exr", "s.0005.exr"],
+        );
+        let seq = detect_from_file(&dir.path().join("s.0004.exr")).unwrap();
+        assert_eq!(seq.number_of(&dir.path().join("s.0004.exr")), Some(4));
+        assert_eq!(seq.number_of(&dir.path().join("s.0001.exr")), Some(1));
+        assert_eq!(seq.number_of(&dir.path().join("nope.exr")), None);
     }
 }
