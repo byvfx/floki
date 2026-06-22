@@ -20,6 +20,9 @@ mod gradient;
 mod proxy;
 mod render_math;
 mod resource_monitor;
+// Pure image-sequence detection (#7). Wired into the app in Phase 2; for now
+// only its own tests exercise it.
+pub mod sequence;
 mod snapshot;
 pub mod tools;
 mod viewer;
