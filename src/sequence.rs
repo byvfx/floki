@@ -33,8 +33,10 @@ impl Sequence {
         self.frames.len()
     }
 
-    /// Always `false` — a `Sequence` is only constructed with ≥2 frames — but
-    /// provided so clippy doesn't ask for it and callers can be explicit.
+    /// Whether the sequence has no frames. [`detect_from_file`] only ever returns
+    /// a sequence with ≥2 frames, but the fields are public, so this honestly
+    /// reports the backing `frames` rather than assuming the constructor's
+    /// invariant (and satisfies clippy's `len_without_is_empty`).
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.frames.is_empty()
@@ -133,7 +135,18 @@ pub fn detect_from_file(path: &Path) -> Option<Sequence> {
     // BTreeMap iterates by key, so numbers/frames are already numerically sorted.
     let min = *by_number.keys().next()?;
     let max = *by_number.keys().next_back()?;
-    let holes: Vec<u32> = (min..=max).filter(|n| !by_number.contains_key(n)).collect();
+
+    // Holes = the gaps between consecutive present numbers. Computed in one linear
+    // pass over the sorted keys (O(n + holes)) rather than testing every number in
+    // [min..=max], which would be O(range) for a sparse, wide-ranged sequence.
+    let mut holes = Vec::new();
+    let mut prev: Option<u32> = None;
+    for &n in by_number.keys() {
+        if let Some(p) = prev {
+            holes.extend((p + 1)..n);
+        }
+        prev = Some(n);
+    }
     let frames: Vec<PathBuf> = by_number.into_values().collect();
 
     Some(Sequence {
