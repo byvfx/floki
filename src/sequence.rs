@@ -27,7 +27,9 @@ pub struct Sequence {
 }
 
 impl Sequence {
-    /// Number of frames present on disk (excludes holes).
+    /// Number of frames present on disk (excludes holes). Used by tests and the
+    /// transport UI in later phases.
+    #[allow(dead_code)]
     #[must_use]
     pub fn len(&self) -> usize {
         self.frames.len()
@@ -37,6 +39,7 @@ impl Sequence {
     /// a sequence with ≥2 frames, but the fields are public, so this honestly
     /// reports the backing `frames` rather than assuming the constructor's
     /// invariant (and satisfies clippy's `len_without_is_empty`).
+    #[allow(dead_code)]
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.frames.is_empty()
@@ -45,28 +48,37 @@ impl Sequence {
     /// The frame number of each entry in [`Sequence::frames`], ascending.
     /// Reconstructed from `range` and `holes` — the present numbers are
     /// `[min..=max]` minus the holes, and `frames` is stored in that same order.
+    /// A single merge over the already-sorted `holes` (no hashing/allocation
+    /// beyond the result).
     #[must_use]
     pub fn numbers(&self) -> Vec<u32> {
-        let holes: std::collections::HashSet<u32> = self.holes.iter().copied().collect();
-        (self.range.0..=self.range.1)
-            .filter(|n| !holes.contains(n))
-            .collect()
+        let mut out = Vec::with_capacity(self.frames.len());
+        let mut holes = self.holes.iter().copied().peekable();
+        for n in self.range.0..=self.range.1 {
+            if holes.peek() == Some(&n) {
+                holes.next();
+            } else {
+                out.push(n);
+            }
+        }
+        out
     }
 
     /// Path of the frame with the given number, or `None` when it is out of range
     /// or a hole. The playhead may sit on a hole; the caller holds the previous
-    /// frame in that case (it never stalls).
+    /// frame in that case (it never stalls). `holes` is sorted, so the lookups are
+    /// O(log n).
     #[must_use]
     pub fn path_for(&self, number: u32) -> Option<&Path> {
         if number < self.range.0 || number > self.range.1 {
             return None;
         }
-        if self.holes.contains(&number) {
-            return None;
+        if self.holes.binary_search(&number).is_ok() {
+            return None; // it's a hole.
         }
         // Index = how many present numbers precede `number` = (offset from min)
         // minus the holes below it.
-        let holes_below = self.holes.iter().filter(|&&h| h < number).count();
+        let holes_below = self.holes.partition_point(|&h| h < number);
         let index = (number - self.range.0) as usize - holes_below;
         self.frames.get(index).map(PathBuf::as_path)
     }
@@ -172,6 +184,16 @@ pub fn detect_from_file(path: &Path) -> Option<Sequence> {
     // BTreeMap iterates by key, so numbers/frames are already numerically sorted.
     let min = *by_number.keys().next()?;
     let max = *by_number.keys().next_back()?;
+
+    // Guard against a pathological numbering (e.g. `f.1` next to `f.999999999`):
+    // the hole list — and the transport timeline over it — would be enormous. A
+    // run that sparse isn't a coherent sequence, so fall back to single-image
+    // rather than allocate (and iterate) a huge `holes`/`numbers` vector.
+    const MAX_HOLES: u64 = 1_000_000;
+    let hole_count = u64::from(max - min + 1) - by_number.len() as u64;
+    if hole_count > MAX_HOLES {
+        return None;
+    }
 
     // Holes = the gaps between consecutive present numbers. Computed in one linear
     // pass over the sorted keys (O(n + holes)) rather than testing every number in
@@ -332,6 +354,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         touch_all(dir.path(), &["only.0001.exr"]);
         assert_eq!(detect_from_file(&dir.path().join("only.0001.exr")), None);
+    }
+
+    #[test]
+    fn pathologically_sparse_numbering_is_rejected() {
+        // `f.1` next to `f.999999999` would imply ~1e9 holes — not a coherent
+        // sequence. Fall back to single-image instead of allocating a huge vec.
+        let dir = tempfile::tempdir().unwrap();
+        touch_all(dir.path(), &["f.1.exr", "f.999999999.exr"]);
+        assert_eq!(detect_from_file(&dir.path().join("f.1.exr")), None);
     }
 
     #[test]
