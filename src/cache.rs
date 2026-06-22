@@ -67,6 +67,12 @@ impl FrameCache {
         Some(entry.data.clone())
     }
 
+    /// Fetch a resident frame **without** touching LRU order — used by the T2
+    /// pre-upload to read a cached frame's pixels without keeping it warm in T1.
+    pub fn peek(&self, slot: Slot, frame: u32) -> Option<Arc<ExrData>> {
+        self.entries.get(&(slot, frame)).map(|e| e.data.clone())
+    }
+
     /// Insert (or replace) a frame, marking it most-recently-used. Does not evict;
     /// call [`FrameCache::evict_to`] afterward to enforce the budget.
     pub fn insert(&mut self, slot: Slot, frame: u32, data: Arc<ExrData>) {

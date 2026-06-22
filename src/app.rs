@@ -41,6 +41,11 @@ struct LoadResult {
     result: Result<ExrData, String>,
 }
 
+/// serde default for `t2_enabled` (bool's own default is `false`).
+fn ret_true() -> bool {
+    true
+}
+
 /// Job sent to the dedicated EXR worker thread via `load_tx`.
 struct LoadJob {
     path: PathBuf,
@@ -157,6 +162,12 @@ pub struct ExrApp {
     /// timestamped PNG to `~/.floki/snapshots/`. The clipboard copy always happens.
     #[serde(default)]
     save_snapshots: bool,
+
+    /// Pre-upload sequence frames to GPU textures ahead of the playhead (#56, the
+    /// T2 ring) for smoother playback. On by default; a kill-switch back to the
+    /// lazy per-swap path if it misbehaves on a given GPU. Persisted.
+    #[serde(default = "ret_true")]
+    t2_enabled: bool,
     /// A framebuffer screenshot has been requested and we're awaiting its
     /// `Event::Screenshot` reply (transient).
     #[serde(skip)]
@@ -309,6 +320,7 @@ impl Default for ExrApp {
             background: crate::background::Background::default(),
             background_presets: Vec::new(),
             save_snapshots: false,
+            t2_enabled: true,
             snapshot_pending: false,
             snapshot_status: None,
             resource_monitor: crate::resource_monitor::ResourceMonitor::default(),
@@ -769,6 +781,10 @@ impl ExrApp {
     fn detect_sequence(&mut self, path: &std::path::Path) {
         self.frame_cache.clear();
         self.frame_bytes = None;
+        // A different sequence reuses frame numbers, so drop the T2 GPU ring too
+        // (and reset the on-screen frame; the first show re-sets it).
+        self.viewer.clear_t2();
+        self.viewer.set_t2_frame(None);
         // Drop any prior sequence's in-flight frames (a different sequence reuses
         // frame numbers); `enter`/`clear` bump the epoch so their results are
         // dropped. `loading_a` is left to `open_file`, which owns this open.
@@ -800,6 +816,7 @@ impl ExrApp {
             // Cache hit: show immediately, no decode round-trip.
             self.loading_a = false;
             self.playback.pending = None;
+            self.viewer.set_t2_frame(Some(frame)); // bind this frame's T2 texture
             self.swap_image_arc(data, false);
             self.playback.note_shown(std::time::Instant::now());
         } else {
@@ -863,6 +880,42 @@ impl ExrApp {
                 epoch: self.playback.epoch,
             });
             break;
+        }
+    }
+
+    /// Pre-upload T2 GPU textures (#56) for the on-screen frame and the next few
+    /// T1-cached frames ahead of the playhead, within the VRAM budget. Builds at
+    /// most a couple per call to amortize the upload across UI frames; only
+    /// touches frames already resident in T1 (never decodes). UI-thread only.
+    fn pump_t2(&mut self) {
+        if !self.playback.is_active() || self.viewer.t2_cap() == 0 {
+            return;
+        }
+        let Some(gpu) = self.gpu_resources.as_ref() else {
+            return;
+        };
+        let depth = self.viewer.t2_cap().saturating_sub(1);
+        // Empty resident set -> want_list returns the playhead + the window ahead;
+        // we then keep only frames actually cached in T1.
+        let wants = crate::scheduler::want_list(
+            self.playback.current_frame,
+            self.playback.in_point,
+            self.playback.out_point,
+            self.playback.direction,
+            self.playback.loop_mode,
+            &std::collections::HashSet::new(),
+            depth,
+        );
+        let mut built = 0;
+        for w in std::iter::once(self.playback.current_frame).chain(wants) {
+            if built >= 2 {
+                break; // amortize: at most two uploads per frame
+            }
+            if let Some(arc) = self.frame_cache.peek(crate::cache::Slot::A, w)
+                && self.viewer.prebuild_t2(gpu, &arc, w)
+            {
+                built += 1;
+            }
         }
     }
 
@@ -1051,6 +1104,7 @@ impl ExrApp {
                     if res.frame == self.playback.current_frame {
                         self.loading_a = false;
                         self.playback.pending = None;
+                        self.viewer.set_t2_frame(Some(res.frame));
                         self.swap_image_arc(arc, false);
                         self.playback.note_shown(std::time::Instant::now());
                     }
@@ -1451,6 +1505,9 @@ impl eframe::App for ExrApp {
         self.draw_transport_bar(ui);
         self.draw_side_panel(ui);
         self.draw_central_canvas(ui);
+        // Pre-upload T2 GPU textures ahead of the playhead (#56). After the canvas
+        // so the on-screen frame's texture exists; self-gates when T2 is off.
+        self.pump_t2();
     }
 }
 
@@ -1988,6 +2045,25 @@ impl ExrApp {
                     self.frame_cache_cap =
                         crate::budget::t1_capacity(&sample, bytes, cache_bytes).max(2);
                 }
+
+                // Resize the T2 GPU-texture ring to the live VRAM budget (#56).
+                // Conservative: capped low, and disabled (→ lazy path) unless at
+                // least a couple of frames comfortably fit, since a wgpu OOM
+                // aborts the process. Off entirely when the user disables it or
+                // no sequence is loaded.
+                const T2_HARD_CAP: usize = 8;
+                let t2_cap = if self.t2_enabled && self.playback.is_active() {
+                    self.exr_data
+                        .as_ref()
+                        .and_then(|d| d.logical_size(self.viewer.active_layer))
+                        .map_or(0, |(w, h)| {
+                            let fits = crate::budget::max_t2(&sample, w, h);
+                            if fits < 2 { 0 } else { fits.min(T2_HARD_CAP) }
+                        })
+                } else {
+                    0
+                };
+                self.viewer.set_t2_cap(t2_cap);
                 use crate::resource_monitor::fmt_bytes;
                 let mut text = format!(
                     "RAM {} · sys {}/{}",
@@ -2282,6 +2358,22 @@ impl ExrApp {
                 ui.label(
                     egui::RichText::new(format!("{:.1} actual", self.playback.measured_fps)).weak(),
                 );
+
+                ui.separator();
+
+                // T2 GPU pre-upload kill-switch (#56). Off → the lazy per-swap
+                // path (decode-ahead still smooths via the T1 ring).
+                if ui
+                    .checkbox(&mut self.t2_enabled, "GPU cache")
+                    .on_hover_text(
+                        "Pre-upload upcoming frames to GPU textures for smoother \
+                         playback. Turn off if you see VRAM pressure.",
+                    )
+                    .changed()
+                    && !self.t2_enabled
+                {
+                    self.viewer.clear_t2();
+                }
             });
         });
     }
