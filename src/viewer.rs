@@ -8,7 +8,7 @@
 //! runs depends on whether a GPU [`RenderState`](eframe::egui_wgpu::RenderState)
 //! is available:
 //!
-//! - **GPU (default).** [`Self::generate_gpu_texture`](ExrViewer::generate_gpu_texture)
+//! - **GPU (default).** [`Self::build_layer_texture`](ExrViewer::build_layer_texture)
 //!   uploads a layer's RGBA into a bind group; `gpu/shader.wgsl` then applies
 //!   channel isolation, exposure, gamma, sRGB **and every compare mode**
 //!   (wipe / diff / composite) in-shader. So in GPU mode a single generator
@@ -230,6 +230,26 @@ enum GradientTarget {
     Background,
 }
 
+/// A pre-built T2 GPU texture (#56): the `BindGroup` to paint plus the owning
+/// `Texture`, kept so eviction can `.destroy()` it immediately rather than wait
+/// for wgpu's deferred drop (which would let VRAM spike during playback). The
+/// `BindGroup` is shared (`Arc`) with the active-layer slot while displayed.
+struct T2Texture {
+    texture: eframe::egui_wgpu::wgpu::Texture,
+    bind_group: std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>,
+}
+
+/// Pick the T2 frame to evict: the resident frame furthest from the on-screen
+/// frame, which is itself never chosen (its texture is bound for paint). `None`
+/// when nothing but the on-screen frame remains. Pure — the eviction policy is
+/// unit-tested here; the surrounding texture `.destroy()` is not.
+fn t2_victim(frames: impl Iterator<Item = u32>, on_screen: Option<u32>) -> Option<u32> {
+    let anchor = on_screen.unwrap_or(0);
+    frames
+        .filter(|&f| Some(f) != on_screen)
+        .max_by_key(|&f| f.abs_diff(anchor))
+}
+
 /// All canvas state for one A/B pair: view transform, tone controls, the active
 /// [`CompareMode`], the texture caches described in the module docs, plus
 /// sampling/histogram/contact-sheet state. Driven each frame by [`Self::ui`].
@@ -238,6 +258,20 @@ pub struct ExrViewer {
     textures_b: Vec<Option<egui::TextureHandle>>,
     gpu_textures: Vec<Option<std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>>>,
     gpu_textures_b: Vec<Option<std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>>>,
+
+    /// T2 GPU-texture ring (#56): pre-built active-layer textures keyed by frame
+    /// number, so a sequence frame swap binds an already-uploaded texture instead
+    /// of re-packing + re-uploading on the UI thread. Valid only for `t2_layer`;
+    /// cleared on a layer switch. Empty / unused for a single image.
+    t2_ring: std::collections::HashMap<u32, T2Texture>,
+    /// The active layer `t2_ring` was built for; a change invalidates the ring.
+    t2_layer: usize,
+    /// Max frames the ring may hold (VRAM-budgeted by the app each frame). `0`
+    /// disables T2 entirely → the lazy per-swap path (the safe fallback).
+    t2_cap: usize,
+    /// The sequence frame on screen, so `ui()` binds its T2 texture. `None` for a
+    /// single image (lazy path).
+    t2_frame: Option<u32>,
     diff_texture: Option<egui::TextureHandle>,
     /// Cache key for `diff_texture`: layer + every control that changes the diff
     /// pixels (gain, colormap identity, metric, noise floor).
@@ -386,6 +420,10 @@ impl Default for ExrViewer {
             textures_b: Vec::new(),
             gpu_textures: Vec::new(),
             gpu_textures_b: Vec::new(),
+            t2_ring: std::collections::HashMap::new(),
+            t2_layer: 0,
+            t2_cap: 0,
+            t2_frame: None,
             diff_texture: None,
             last_diff_params: (0, 0.0, Colormap::BlackBody, DiffMetric::MaxChannel, 0.0),
             diff_colormap: Colormap::BlackBody,
@@ -1692,9 +1730,29 @@ impl ExrViewer {
             }
 
             if let Some(gpu) = gpu_resources {
-                if self.gpu_textures[self.active_layer].is_none() {
-                    self.gpu_textures[self.active_layer] =
-                        Self::generate_gpu_texture(gpu, exr_data, self.active_layer);
+                // A layer switch invalidates the per-frame T2 ring (textures are
+                // per-layer). Do this before binding/building below.
+                self.ensure_t2_layer();
+                // T2 (#56): bind the on-screen frame's pre-built texture if it is
+                // resident, so the swap is an instant bind, not a re-upload.
+                if self.t2_cap > 0
+                    && let Some(frame) = self.t2_frame
+                    && let Some(t2) = self.t2_ring.get(&frame)
+                {
+                    self.gpu_textures[self.active_layer] = Some(t2.bind_group.clone());
+                }
+                if self.gpu_textures[self.active_layer].is_none()
+                    && let Some(t2) = Self::build_layer_texture(gpu, exr_data, self.active_layer)
+                {
+                    self.gpu_textures[self.active_layer] = Some(t2.bind_group.clone());
+                    // Cache the freshly-built texture into the T2 ring for the
+                    // on-screen frame (a lazy first paint feeds the ring).
+                    if self.t2_cap > 0
+                        && let Some(frame) = self.t2_frame
+                    {
+                        self.t2_ring.insert(frame, t2);
+                        self.evict_t2();
+                    }
                 }
                 if let Some(data_b) = exr_data_b {
                     let layer_b = self
@@ -1702,7 +1760,7 @@ impl ExrViewer {
                         .min(data_b.logical_layers.len().saturating_sub(1));
                     if self.gpu_textures_b[layer_b].is_none() {
                         self.gpu_textures_b[layer_b] =
-                            Self::generate_gpu_texture(gpu, data_b, layer_b);
+                            Self::build_layer_texture(gpu, data_b, layer_b).map(|t2| t2.bind_group);
                     }
                 }
             } else {
@@ -2805,11 +2863,14 @@ impl ExrViewer {
     /// The shader applies channel isolation, exposure, gamma, sRGB and every
     /// compare mode, so this one generator serves all modes; results are cached
     /// per layer in `gpu_textures` / `gpu_textures_b`. See the module-level docs.
-    fn generate_gpu_texture(
+    /// Build a GPU texture + bind group for one layer of an `ExrData`, returning
+    /// the [`T2Texture`] (which keeps the `Texture` handle so it can be explicitly
+    /// destroyed on eviction). UI-thread only (`queue.write_texture`).
+    fn build_layer_texture(
         gpu_resources: &crate::gpu::GpuResources,
         exr_data: &ExrData,
         layer_index: usize,
-    ) -> Option<std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>> {
+    ) -> Option<T2Texture> {
         let render_state = gpu_resources.render_state();
         let (layer, r_chan, g_chan, b_chan, a_chan) = exr_data.logical_channels(layer_index)?;
         let width = layer.size.0;
@@ -2907,7 +2968,90 @@ impl ExrViewer {
             ],
         });
 
-        Some(std::sync::Arc::new(bind_group))
+        Some(T2Texture {
+            texture,
+            bind_group: std::sync::Arc::new(bind_group),
+        })
+    }
+
+    // --- T2 GPU-texture ring (#56) -------------------------------------------
+
+    /// Set the VRAM-budgeted T2 capacity (frames). `0` disables pre-upload and
+    /// drops the ring → the lazy per-swap path. Shrinking evicts immediately.
+    pub(crate) fn set_t2_cap(&mut self, cap: usize) {
+        self.t2_cap = cap;
+        if cap == 0 {
+            self.clear_t2();
+        } else {
+            self.evict_t2();
+        }
+    }
+
+    /// Tell the viewer which sequence frame is on screen, so `ui()` binds its T2
+    /// texture. `None` for a single image (lazy path).
+    pub(crate) fn set_t2_frame(&mut self, frame: Option<u32>) {
+        self.t2_frame = frame;
+    }
+
+    /// Current T2 capacity in frames (`0` = disabled).
+    pub(crate) fn t2_cap(&self) -> usize {
+        self.t2_cap
+    }
+
+    /// Pre-build the T2 texture for `(frame, active layer)` and ring it, evicting
+    /// to the cap. Returns `true` if it actually built (so the caller can amortize
+    /// uploads across frames). No-op — returns `false` — when disabled, already
+    /// resident, or the build fails. UI-thread only. Pass frames already resident
+    /// in the T1 cache; T2 never triggers a decode.
+    pub(crate) fn prebuild_t2(
+        &mut self,
+        gpu: &crate::gpu::GpuResources,
+        exr_data: &ExrData,
+        frame: u32,
+    ) -> bool {
+        if self.t2_cap == 0 {
+            return false;
+        }
+        self.ensure_t2_layer();
+        if self.t2_ring.contains_key(&frame) {
+            return false;
+        }
+        let Some(t2) = Self::build_layer_texture(gpu, exr_data, self.active_layer) else {
+            return false;
+        };
+        self.t2_ring.insert(frame, t2);
+        self.evict_t2();
+        true
+    }
+
+    /// Drop the whole ring when the active layer changes (textures are per-layer).
+    fn ensure_t2_layer(&mut self) {
+        if self.t2_layer != self.active_layer {
+            self.clear_t2();
+            self.t2_layer = self.active_layer;
+        }
+    }
+
+    /// Evict T2 frames furthest from the on-screen frame until within the cap,
+    /// explicitly destroying each so VRAM is released now (not on deferred drop).
+    /// The on-screen frame is never evicted — its bind group is bound for paint.
+    fn evict_t2(&mut self) {
+        let cap = self.t2_cap.max(1);
+        while self.t2_ring.len() > cap {
+            let Some(victim) = t2_victim(self.t2_ring.keys().copied(), self.t2_frame) else {
+                break; // only the on-screen frame remains
+            };
+            if let Some(t2) = self.t2_ring.remove(&victim) {
+                t2.texture.destroy();
+            }
+        }
+    }
+
+    /// Destroy and drop every T2 texture (new sequence / disabled / layer switch).
+    pub(crate) fn clear_t2(&mut self) {
+        for (_, t2) in self.t2_ring.drain() {
+            t2.texture.destroy();
+        }
     }
 
     /// CPU/thumbnail path: bake `layer_index` into an [`egui::TextureHandle`]
@@ -3929,6 +4073,17 @@ mod gui_tests {
     use eframe::egui;
     use egui_kittest::Harness;
     use exr::prelude::*;
+
+    #[test]
+    fn t2_victim_evicts_furthest_and_protects_on_screen() {
+        use super::t2_victim;
+        // On-screen frame 5; the furthest resident frame is evicted, never 5.
+        assert_eq!(t2_victim([3, 4, 5, 6, 9].into_iter(), Some(5)), Some(9));
+        assert_eq!(t2_victim([1, 2, 5, 6].into_iter(), Some(5)), Some(1));
+        // Only the on-screen frame left -> nothing to evict.
+        assert_eq!(t2_victim([5].into_iter(), Some(5)), None);
+        assert_eq!(t2_victim(std::iter::empty(), Some(5)), None);
+    }
 
     /// Tiny 2×2 RGBA EXR fixture so the CPU render path has real data to draw.
     fn write_rgba_exr(path: &std::path::Path) {

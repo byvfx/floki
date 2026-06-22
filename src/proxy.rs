@@ -90,7 +90,7 @@ impl ProxyImage {
         let proxy_height = full_height.div_ceil(factor).max(1);
 
         // Pack the full-res layer to RGBA32Float first (mirrors
-        // `ExrViewer::generate_gpu_texture`'s packing). For a true low-res read
+        // `ExrViewer::build_layer_texture`'s packing). For a true low-res read
         // (#33) this full pack goes away — the whole point — but for the
         // downsample seam we need the source pixels.
         let mut full = vec![0.0f32; full_width * full_height * 4];
