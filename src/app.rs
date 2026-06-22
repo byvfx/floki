@@ -168,6 +168,26 @@ pub struct ExrApp {
     /// lazy per-swap path if it misbehaves on a given GPU. Persisted.
     #[serde(default = "ret_true")]
     t2_enabled: bool,
+
+    /// Render-watch (#101): poll the sequence directory and pick up frames as a
+    /// render writes them — new frames extend the range, re-rendered frames drop
+    /// from cache and re-decode. Off by default (it costs a periodic `read_dir`,
+    /// wasteful on a static dir or a slow network share); the user turns it on for
+    /// a live render. Persisted.
+    #[serde(default)]
+    watch_enabled: bool,
+    /// When watching, park the playhead on the newest frame as it arrives (a
+    /// live "follow the render" view). Persisted.
+    #[serde(default)]
+    watch_follow: bool,
+    /// Last directory scan `(number, signature)`, the baseline the next poll
+    /// diffs against. Empty until the first poll (re)baselines. Runtime-only.
+    #[serde(skip)]
+    watch_sigs: Vec<(u32, crate::sequence::FrameSig)>,
+    /// When the render-watch last polled, to throttle the `read_dir` cadence.
+    #[serde(skip)]
+    last_watch_poll: Option<std::time::Instant>,
+
     /// A framebuffer screenshot has been requested and we're awaiting its
     /// `Event::Screenshot` reply (transient).
     #[serde(skip)]
@@ -321,6 +341,10 @@ impl Default for ExrApp {
             background_presets: Vec::new(),
             save_snapshots: false,
             t2_enabled: true,
+            watch_enabled: false,
+            watch_follow: false,
+            watch_sigs: Vec::new(),
+            last_watch_poll: None,
             snapshot_pending: false,
             snapshot_status: None,
             resource_monitor: crate::resource_monitor::ResourceMonitor::default(),
@@ -789,6 +813,10 @@ impl ExrApp {
         // frame numbers); `enter`/`clear` bump the epoch so their results are
         // dropped. `loading_a` is left to `open_file`, which owns this open.
         self.inflight.clear();
+        // A new sequence (or a lone image) invalidates the watch baseline; the
+        // next poll re-baselines against the freshly-opened group.
+        self.watch_sigs.clear();
+        self.last_watch_poll = None;
         match crate::sequence::detect_from_file(path) {
             Some(seq) => {
                 let start = seq.number_of(path).unwrap_or(seq.range.0);
@@ -1136,6 +1164,129 @@ impl ExrApp {
         }
         if hit_boundary {
             self.playback.state = PlayState::Paused;
+        }
+    }
+
+    /// Render-watch poll (#101). While enabled and a sequence is loaded, re-scan
+    /// the directory on a throttled cadence and fold in what changed: new frames
+    /// extend the range, re-rendered frames drop from cache and re-decode. Cheap
+    /// when nothing changed (one `read_dir` + a stat per frame, per interval).
+    fn tick_render_watch(&mut self, ctx: &egui::Context) {
+        /// How often the watch re-scans the sequence directory.
+        const WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+        if !self.watch_enabled || !self.playback.is_active() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if let Some(last) = self.last_watch_poll {
+            let since = now.duration_since(last);
+            if since < WATCH_INTERVAL {
+                ctx.request_repaint_after(WATCH_INTERVAL - since);
+                return;
+            }
+        }
+        self.last_watch_poll = Some(now);
+        ctx.request_repaint_after(WATCH_INTERVAL); // keep the cadence ticking
+        self.rescan_and_apply();
+    }
+
+    /// The ctx-free, un-throttled core of the render-watch: re-scan the group,
+    /// diff against the baseline, and apply. Returns whether a change was applied
+    /// (the first call only baselines). Separated so it's unit-testable without an
+    /// egui context or wall-clock throttling.
+    fn rescan_and_apply(&mut self) -> bool {
+        // Re-scan from any present frame — the group identity (dir / prefix /
+        // suffix / extension) is shared by every member.
+        let Some(anchor) = self
+            .playback
+            .sequence
+            .as_ref()
+            .and_then(|s| s.frames.first())
+            .cloned()
+        else {
+            return false;
+        };
+        let Some(group) = crate::sequence::scan_group(&anchor) else {
+            return false;
+        };
+        let sigs_new = crate::sequence::sigs_of(&group);
+
+        if self.watch_sigs.is_empty() {
+            self.watch_sigs = sigs_new; // first poll: baseline only, nothing to diff.
+            return false;
+        }
+        let diff = crate::sequence::diff_scans(&self.watch_sigs, &sigs_new);
+        self.watch_sigs = sigs_new;
+        if diff.is_empty() {
+            return false;
+        }
+        self.apply_scan(group, &diff);
+        true
+    }
+
+    /// Fold a render-watch scan diff into live playback state (#101): drop cache
+    /// for frames that changed or vanished, rebuild the sequence range/holes from
+    /// the fresh scan, grow the out-point if it tracked the end, and refresh the
+    /// displayed frame when it changed (or follow the newest).
+    fn apply_scan(
+        &mut self,
+        group: std::collections::BTreeMap<u32, std::path::PathBuf>,
+        diff: &crate::sequence::ScanDiff,
+    ) {
+        use crate::cache::Slot;
+
+        // 1. A re-rendered or removed frame's cached pixels are stale — drop T1+T2.
+        for &f in diff.changed.iter().chain(&diff.removed) {
+            self.frame_cache.remove(Slot::A, f);
+            self.viewer.evict_t2_frame(f);
+            self.inflight.remove(&f);
+        }
+
+        // 2. Rebuild the sequence. Keep the in-point; grow the out-point only if it
+        //    sat at the old end (an untrimmed tail follows the render) or we're
+        //    following. A scan that fell below a sequence (≥2 frames) is ignored.
+        let Some(new_seq) = crate::sequence::Sequence::from_group(group) else {
+            return;
+        };
+        let was_full_out = self
+            .playback
+            .sequence
+            .as_ref()
+            .is_some_and(|s| self.playback.out_point == s.range.1);
+        let new_hi = new_seq.range.1;
+        self.playback.sequence = Some(new_seq);
+        if was_full_out || self.watch_follow {
+            self.playback.out_point = new_hi;
+        }
+        self.playback.current_frame = self
+            .playback
+            .current_frame
+            .clamp(self.playback.in_point, self.playback.out_point);
+
+        // 3. Follow the newest frame, or refresh the displayed frame if it changed
+        //    (added covers a hole the playhead sat on that just filled in).
+        let cur = self.playback.current_frame;
+        let refresh_current =
+            diff.changed.contains(&cur) || diff.added.contains(&cur) || diff.removed.contains(&cur);
+
+        if self.watch_follow {
+            let newest = self
+                .playback
+                .sequence
+                .as_ref()
+                .and_then(|s| s.numbers().last().copied());
+            if let Some(n) = newest {
+                let target = n.clamp(self.playback.in_point, self.playback.out_point);
+                if target != cur || refresh_current {
+                    self.playback.current_frame = target;
+                    self.invalidate_inflight();
+                    self.request_sequence_frame(target);
+                }
+            }
+        } else if refresh_current {
+            self.invalidate_inflight();
+            self.request_sequence_frame(cur);
         }
     }
 
@@ -1595,6 +1746,9 @@ impl eframe::App for ExrApp {
         // sequence is loaded, so single-image behavior is unchanged.
         self.handle_playback_keys(ui.ctx());
         self.tick_playback(ui.ctx());
+        // Pick up frames a render writes while we're open (#101); no-op unless the
+        // user enabled Watch and a sequence is loaded.
+        self.tick_render_watch(ui.ctx());
 
         // Snapshot to clipboard (#19): request a framebuffer screenshot on the
         // hotkey and consume the reply when it arrives.
@@ -2503,6 +2657,28 @@ impl ExrApp {
                     && !self.t2_enabled
                 {
                     self.viewer.clear_t2();
+                }
+
+                ui.separator();
+
+                // Render-watch (#101): pick up frames as a render writes them.
+                if ui
+                    .checkbox(&mut self.watch_enabled, "Watch")
+                    .on_hover_text(
+                        "Watch the sequence folder and load frames as a render \
+                         writes them (new frames extend the range; re-rendered \
+                         frames refresh).",
+                    )
+                    .changed()
+                {
+                    // (Re)baseline on the next poll so existing frames aren't
+                    // mistaken for newly-arrived ones.
+                    self.watch_sigs.clear();
+                    self.last_watch_poll = None;
+                }
+                if self.watch_enabled {
+                    ui.checkbox(&mut self.watch_follow, "Follow")
+                        .on_hover_text("Park the playhead on the newest frame as it arrives.");
                 }
             });
 
@@ -3949,6 +4125,101 @@ mod tests {
         assert!(
             app.inflight.contains(&cur),
             "pump resumed for the new playhead once the worker freed up"
+        );
+    }
+
+    // --- render-watch (#101) -------------------------------------------------
+
+    #[test]
+    fn render_watch_picks_up_new_frames_and_extends_the_range() {
+        let dir = tempfile::tempdir().unwrap();
+        touch_sequence(dir.path(), 3);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&dir.path().join("s.0001.exr"));
+        app.watch_enabled = true;
+        assert_eq!((app.playback.in_point, app.playback.out_point), (1, 3));
+
+        assert!(!app.rescan_and_apply(), "first call only baselines");
+
+        // A render writes two more frames onto the end.
+        std::fs::write(dir.path().join("s.0004.exr"), b"").unwrap();
+        std::fs::write(dir.path().join("s.0005.exr"), b"").unwrap();
+        assert!(app.rescan_and_apply(), "new frames applied");
+        assert_eq!(app.playback.sequence.as_ref().unwrap().range, (1, 5));
+        assert_eq!(
+            app.playback.out_point, 5,
+            "untrimmed out-point follows growth"
+        );
+    }
+
+    #[test]
+    fn render_watch_respects_a_trimmed_out_point() {
+        let dir = tempfile::tempdir().unwrap();
+        touch_sequence(dir.path(), 3);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&dir.path().join("s.0001.exr"));
+        app.watch_enabled = true;
+        app.rescan_and_apply(); // baseline
+
+        // User trims the out-point in to frame 2.
+        app.playback.current_frame = 2;
+        app.playback_set_out();
+        assert_eq!(app.playback.out_point, 2);
+
+        std::fs::write(dir.path().join("s.0004.exr"), b"").unwrap();
+        app.rescan_and_apply();
+        assert_eq!(
+            app.playback.sequence.as_ref().unwrap().range,
+            (1, 4),
+            "range still tracks disk"
+        );
+        assert_eq!(app.playback.out_point, 2, "user trim preserved, not grown");
+    }
+
+    #[test]
+    fn render_watch_evicts_and_refreshes_a_rerendered_frame() {
+        let (dir, paths) = write_sequence(3);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&paths[0]); // playhead on frame 1
+        app.watch_enabled = true;
+        app.rescan_and_apply(); // baseline against the original files
+
+        // Frame 1 is cached (it's the on-screen frame).
+        deliver_frame(&mut app, &paths[0], 1);
+        assert!(app.frame_cache.contains(crate::cache::Slot::A, 1));
+
+        // The render rewrites frame 1 with different content (size changes -> the
+        // signature changes even if mtime resolution is coarse).
+        std::fs::write(&paths[0], vec![0u8; 4096]).unwrap();
+        assert!(app.rescan_and_apply(), "re-rendered frame applied");
+
+        assert!(
+            !app.frame_cache.contains(crate::cache::Slot::A, 1),
+            "stale cached pixels dropped for the re-rendered frame"
+        );
+        assert_eq!(
+            app.playback.pending,
+            Some(1),
+            "the re-rendered on-screen frame is re-requested"
+        );
+        let _ = dir;
+    }
+
+    #[test]
+    fn render_watch_follow_parks_on_the_newest_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        touch_sequence(dir.path(), 3);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&dir.path().join("s.0001.exr")); // playhead 1
+        app.watch_enabled = true;
+        app.watch_follow = true;
+        app.rescan_and_apply(); // baseline
+
+        std::fs::write(dir.path().join("s.0004.exr"), b"").unwrap();
+        app.rescan_and_apply();
+        assert_eq!(
+            app.playback.current_frame, 4,
+            "follow jumps the playhead to the newest frame"
         );
     }
 

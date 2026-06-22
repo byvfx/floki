@@ -3050,6 +3050,15 @@ impl ExrViewer {
         }
     }
 
+    /// Destroy and drop a single frame's T2 texture, if present. Used by the
+    /// render-watch (#101) so a re-rendered frame's stale GPU texture is dropped
+    /// and rebuilt from the fresh decode.
+    pub(crate) fn evict_t2_frame(&mut self, frame: u32) {
+        if let Some(t2) = self.t2_ring.remove(&frame) {
+            t2.texture.destroy();
+        }
+    }
+
     /// Destroy and drop every T2 texture (new sequence / disabled / layer switch).
     pub(crate) fn clear_t2(&mut self) {
         for (_, t2) in self.t2_ring.drain() {
