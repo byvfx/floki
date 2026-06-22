@@ -3087,7 +3087,7 @@ mod tests {
         write_rgba_exr(&f1);
         write_rgba_exr(&f2);
         let mut app = ExrApp {
-            exr_data: Some(ExrData::load(&f1).unwrap()),
+            exr_data: Some(std::sync::Arc::new(ExrData::load(&f1).unwrap())),
             ..Default::default()
         };
         app.detect_sequence(&f1);
