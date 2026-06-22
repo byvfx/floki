@@ -3889,15 +3889,24 @@ fn draw_dashed_rect(
     let draw_line = |start: egui::Pos2, end: egui::Pos2| {
         let dir = end - start;
         let len = dir.length();
+        let stride = dash_length + gap_length;
+        // Degenerate edge or non-advancing stride: nothing to draw (and the
+        // latter would otherwise spin forever / divide by zero on `dir_norm`).
+        if len <= f32::EPSILON || stride <= f32::EPSILON {
+            return;
+        }
         let dir_norm = dir / len;
-        let mut t = 0.0;
-        while t < len {
+        // Derive each dash offset from an integer index rather than accumulating
+        // a float `t += stride`, so rounding error can't drift over a long edge
+        // (and clippy's `while_float` is satisfied). Last index < len by ceil math.
+        let steps = (len / stride).ceil() as usize;
+        for i in 0..steps {
+            let t = i as f32 * stride;
             let t_end = (t + dash_length).min(len);
             painter.line_segment(
                 [start + dir_norm * t, start + dir_norm * t_end],
                 (1.0, color),
             );
-            t += dash_length + gap_length;
         }
     };
 
