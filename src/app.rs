@@ -982,10 +982,39 @@ impl ExrApp {
         self.request_sequence_frame(in_point);
     }
 
-    /// Move the playhead one frame in the play direction and request it. Returns
-    /// `false` when `Once` has reached the boundary (the caller pauses). Pure of
-    /// wall-time, so tests can drive playback frame-by-frame.
-    fn advance_playhead(&mut self) -> bool {
+    /// Set the in point to the playhead (the `I` key / Set In button). Prefetch
+    /// may have run past the new boundary, so supersede in-flight decodes.
+    fn playback_set_in(&mut self) {
+        if !self.playback.is_active() {
+            return;
+        }
+        self.playback.set_in();
+        self.invalidate_inflight();
+    }
+
+    /// Set the out point to the playhead (the `O` key / Set Out button).
+    fn playback_set_out(&mut self) {
+        if !self.playback.is_active() {
+            return;
+        }
+        self.playback.set_out();
+        self.invalidate_inflight();
+    }
+
+    /// Reset the in/out trim to the full sequence range (the Reset button).
+    fn playback_reset_trim(&mut self) {
+        if !self.playback.is_active() {
+            return;
+        }
+        self.playback.reset_trim();
+        self.invalidate_inflight();
+    }
+
+    /// Move the playhead one frame in the play direction **without** issuing a
+    /// decode. Returns `false` when `Once` has reached the boundary (the caller
+    /// pauses). Drop-frames pacing steps through several of these per tick and
+    /// requests only the frame it lands on, so skipped frames are never decoded.
+    fn step_playhead(&mut self) -> bool {
         match crate::playback::advance(
             self.playback.current_frame,
             self.playback.in_point,
@@ -997,10 +1026,21 @@ impl ExrApp {
                 self.playback.direction = dir;
                 self.playback.current_frame = next;
                 self.playback.frames_since_anchor += 1;
-                self.request_sequence_frame(next);
                 true
             }
             None => false,
+        }
+    }
+
+    /// Advance one frame in the play direction and request it. Returns `false`
+    /// when `Once` has reached the boundary (the caller pauses). Pure of wall-time,
+    /// so tests can drive playback frame-by-frame.
+    fn advance_playhead(&mut self) -> bool {
+        if self.step_playhead() {
+            self.request_sequence_frame(self.playback.current_frame);
+            true
+        } else {
+            false
         }
     }
 
@@ -1009,37 +1049,94 @@ impl ExrApp {
     /// drift-free pacing. Decode-bound playback (stutter) naturally drops the
     /// effective fps: the next request waits for the previous frame to land.
     fn tick_playback(&mut self, ctx: &egui::Context) {
-        use crate::playback::PlayState;
+        use crate::playback::{Pacing, PlayState};
         if !self.playback.is_active() || self.playback.state != PlayState::Playing {
             return;
         }
         let period = self.playback.period();
-        // Stutter pacing: advance only when the playhead frame is ready (not
-        // awaiting a decode). With decode-ahead the next frame is usually already
-        // resident, so this advances smoothly; when decode falls behind it holds,
-        // dropping the effective fps without skipping frames.
-        if self.playback.pending.is_none() && !self.loading_a {
-            let now = std::time::Instant::now();
-            let anchor = *self.playback.anchor.get_or_insert(now);
-            let due = anchor + period * self.playback.frames_since_anchor;
-            if now >= due {
-                if self.advance_playhead() {
-                    // If decode fell behind by more than a frame, drop the
-                    // accumulated lag (anchor to now) so we don't burst-catch-up
-                    // — stutter holds wall-time-independent, never skipping.
-                    if now > due + period {
-                        self.playback.anchor = Some(now);
-                        self.playback.frames_since_anchor = 0;
-                    }
-                } else {
-                    self.playback.state = PlayState::Paused;
-                }
-            }
+        match self.playback.pacing {
+            Pacing::Stutter => self.tick_stutter(period),
+            Pacing::DropFrames => self.tick_drop_frames(period),
         }
         // Keep the decode-ahead ring filling even between advances.
         self.pump_decode();
         // Keep the clock ticking even while idle between frames.
         ctx.request_repaint_after(period);
+    }
+
+    /// Stutter pacing: advance only when the playhead frame is ready (not awaiting
+    /// a decode). With decode-ahead the next frame is usually already resident, so
+    /// this advances smoothly; when decode falls behind it holds, dropping the
+    /// effective fps without skipping frames. A review tool's default.
+    fn tick_stutter(&mut self, period: std::time::Duration) {
+        use crate::playback::PlayState;
+        if self.playback.pending.is_some() || self.loading_a {
+            return; // still waiting on the current frame — hold.
+        }
+        let now = std::time::Instant::now();
+        let anchor = *self.playback.anchor.get_or_insert(now);
+        let due = anchor + period * self.playback.frames_since_anchor;
+        if now < due {
+            return;
+        }
+        if self.advance_playhead() {
+            // If decode fell behind by more than a frame, drop the accumulated lag
+            // (anchor to now) so we don't burst-catch-up — stutter holds
+            // wall-time-independent, never skipping.
+            if now > due + period {
+                self.playback.anchor = Some(now);
+                self.playback.frames_since_anchor = 0;
+            }
+        } else {
+            self.playback.state = PlayState::Paused;
+        }
+    }
+
+    /// Drop-frames pacing: the clock advances on wall-time regardless of decode
+    /// readiness, skipping straight to the latest due frame. Intermediate frames
+    /// are stepped over with [`Self::step_playhead`] (no decode) and only the
+    /// landing frame is requested — so when decode can't keep up you see skipped
+    /// frames at a steady wall-clock rate instead of a slowing stutter. A hard
+    /// per-tick cap re-anchors after a long stall so the catch-up can't spiral.
+    fn tick_drop_frames(&mut self, period: std::time::Duration) {
+        use crate::playback::PlayState;
+        // Cap the catch-up burst (e.g. after the window was backgrounded): beyond
+        // this many frames in one tick, re-anchor to now and move on.
+        const MAX_SKIP: u32 = 240;
+        let now = std::time::Instant::now();
+        let anchor = *self.playback.anchor.get_or_insert(now);
+        let mut steps = 0u32;
+        let mut hit_boundary = false;
+        while now >= anchor + period * self.playback.frames_since_anchor {
+            if !self.step_playhead() {
+                hit_boundary = true; // Once reached the boundary.
+                break;
+            }
+            steps += 1;
+            if steps >= MAX_SKIP {
+                self.playback.anchor = Some(now);
+                self.playback.frames_since_anchor = 0;
+                break;
+            }
+        }
+        if steps > 0 {
+            // The playhead skipped past any frame we were awaiting, so that
+            // in-flight decode is no longer the one to show. Clear the awaited
+            // state *before* requesting the new frame: otherwise `loading_a`
+            // stays set for a frame we moved past, and once the stale job lands
+            // (its frame != current) `apply_load_result` leaves the flag up,
+            // permanently gating `pump_decode`. The in-flight job still completes
+            // and fills the cache; the pump then resumes for the new playhead.
+            // No epoch bump — the stale result is a valid cache fill.
+            self.loading_a = false;
+            self.playback.pending = None;
+            // Show whatever the playhead landed on; if it isn't resident yet the
+            // display holds until it decodes while the clock keeps moving.
+            self.request_sequence_frame(self.playback.current_frame);
+        }
+        if hit_boundary {
+            self.playback.state = PlayState::Paused;
+        }
     }
 
     /// Context-gated playback keys: with a sequence loaded, Space is play/pause
@@ -1054,11 +1151,13 @@ impl ExrApp {
         if ctx.egui_wants_keyboard_input() {
             return;
         }
-        let (space, left, right) = ctx.input_mut(|i| {
+        let (space, left, right, set_in, set_out) = ctx.input_mut(|i| {
             (
                 i.consume_key(egui::Modifiers::NONE, egui::Key::Space),
                 i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft),
                 i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::I),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::O),
             )
         });
         if space {
@@ -1069,6 +1168,12 @@ impl ExrApp {
         }
         if right {
             self.playback_step(1);
+        }
+        if set_in {
+            self.playback_set_in();
+        }
+        if set_out {
+            self.playback_set_out();
         }
     }
 
@@ -2260,7 +2365,7 @@ impl ExrApp {
     /// sequence is loaded. Scrubber + play/pause/stop/step/jump + reverse +
     /// loop-mode + editable target fps and measured fps.
     fn draw_transport_bar(&mut self, ui: &mut egui::Ui) {
-        use crate::playback::{Direction, LoopMode};
+        use crate::playback::{Direction, LoopMode, Pacing};
         if !self.playback.is_active() {
             return;
         }
@@ -2326,24 +2431,49 @@ impl ExrApp {
                     };
                 }
 
+                // Pacing toggle (#7): stutter plays every frame; drop-frames holds
+                // wall-clock rate and skips. Wired through to `tick_playback`.
+                let drop = self.playback.pacing == Pacing::DropFrames;
+                let pacing_label = if drop { "Drop" } else { "Stutter" };
+                if ui
+                    .button(pacing_label)
+                    .on_hover_text(
+                        "Pacing when decode can't keep up. Stutter: play every \
+                         frame, fps drops. Drop: hold wall-clock rate, skip frames.",
+                    )
+                    .clicked()
+                {
+                    self.playback.pacing = if drop {
+                        Pacing::Stutter
+                    } else {
+                        Pacing::DropFrames
+                    };
+                }
+
                 ui.separator();
 
-                // Scrubber over the inclusive frame range.
-                let mut frame = self.playback.current_frame;
+                // In/out trim (#7). Set to the playhead; Reset restores the full
+                // sequence span.
                 if ui
-                    .add(egui::Slider::new(&mut frame, lo..=hi).text("frame"))
-                    .changed()
+                    .button("Set In")
+                    .on_hover_text("Trim in point to the playhead (I)")
+                    .clicked()
                 {
-                    self.playback_scrub_to(frame);
+                    self.playback_set_in();
                 }
-                // A hole holds the previous frame; flag it so the readout isn't
-                // mistaken for a decoded frame.
-                if self
-                    .playback
-                    .frame_path(self.playback.current_frame)
-                    .is_none()
+                if ui
+                    .button("Set Out")
+                    .on_hover_text("Trim out point to the playhead (O)")
+                    .clicked()
                 {
-                    ui.label(egui::RichText::new("(hole)").weak());
+                    self.playback_set_out();
+                }
+                if ui
+                    .button("Reset")
+                    .on_hover_text("Reset trim to the full range")
+                    .clicked()
+                {
+                    self.playback_reset_trim();
                 }
 
                 ui.separator();
@@ -2375,7 +2505,105 @@ impl ExrApp {
                     self.viewer.clear_t2();
                 }
             });
+
+            // Timeline row: full-width span with the trimmed region + holes drawn
+            // distinctly, plus the frame readout.
+            ui.horizontal(|ui| {
+                let cur = self.playback.current_frame;
+                let (in_pt, out_pt) = (self.playback.in_point, self.playback.out_point);
+                ui.label(format!("{cur}  [{in_pt}–{out_pt}]"));
+                // A hole holds the previous frame; flag it so the readout isn't
+                // mistaken for a decoded frame.
+                if self.playback.frame_path(cur).is_none() {
+                    ui.label(egui::RichText::new("(hole)").weak());
+                }
+                self.draw_timeline(ui);
+            });
         });
+    }
+
+    /// Draw the playback timeline over the full sequence span: the trimmed
+    /// `[in, out]` region is highlighted, holes are marked distinctly, the in/out
+    /// edges and playhead are drawn as vertical ticks. Click or drag scrubs to the
+    /// frame under the cursor (a P0 seek, clamped to the trim).
+    fn draw_timeline(&mut self, ui: &mut egui::Ui) {
+        let Some((lo, hi)) = self.playback.full_range() else {
+            return;
+        };
+        let (in_pt, out_pt) = (self.playback.in_point, self.playback.out_point);
+        let cur = self.playback.current_frame;
+        let span = hi.saturating_sub(lo); // 0 for a single-frame sequence
+
+        let width = ui.available_width().max(64.0);
+        let (rect, resp) =
+            ui.allocate_exact_size(egui::vec2(width, 22.0), egui::Sense::click_and_drag());
+        if ui.is_rect_visible(rect) {
+            let painter = ui.painter_at(rect);
+            let visuals = ui.visuals();
+            // Map a frame number to an x inside `rect` (single-frame → center).
+            let x_of = |f: u32| {
+                // f64 throughout so the mapping stays monotonic for long
+                // sequences (frame offsets can exceed u16/f32-exact ranges).
+                let t = if span == 0 {
+                    0.5
+                } else {
+                    (f64::from(f.saturating_sub(lo)) / f64::from(span)) as f32
+                };
+                rect.left() + t.clamp(0.0, 1.0) * rect.width()
+            };
+
+            // Track background.
+            painter.rect_filled(rect, 3.0, visuals.extreme_bg_color);
+            // Trimmed [in, out] region.
+            let trim = egui::Rect::from_min_max(
+                egui::pos2(x_of(in_pt), rect.top()),
+                egui::pos2(x_of(out_pt), rect.bottom()),
+            );
+            painter.rect_filled(trim, 3.0, visuals.selection.bg_fill.gamma_multiply(0.4));
+            // Holes: distinct vertical marks across the full span.
+            if let Some(seq) = self.playback.sequence.as_ref() {
+                let hole_color = egui::Color32::from_rgb(206, 92, 60);
+                for &h in &seq.holes {
+                    let x = x_of(h);
+                    painter.line_segment(
+                        [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                        egui::Stroke::new(1.5, hole_color),
+                    );
+                }
+            }
+            // In/out edges.
+            for f in [in_pt, out_pt] {
+                let x = x_of(f);
+                painter.line_segment(
+                    [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                    egui::Stroke::new(2.0, visuals.widgets.active.fg_stroke.color),
+                );
+            }
+            // Playhead (drawn last, on top).
+            let px = x_of(cur);
+            painter.line_segment(
+                [
+                    egui::pos2(px, rect.top() - 2.0),
+                    egui::pos2(px, rect.bottom() + 2.0),
+                ],
+                egui::Stroke::new(2.0, visuals.strong_text_color()),
+            );
+            painter.rect_stroke(
+                rect,
+                3.0,
+                egui::Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color),
+                egui::StrokeKind::Inside,
+            );
+        }
+
+        // Scrub on click or drag, clamped to the trim by `playback_scrub_to`.
+        if (resp.clicked() || resp.dragged())
+            && let Some(pos) = resp.interact_pointer_pos()
+        {
+            let t = f64::from((pos.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
+            let frame = lo + (t * f64::from(span)).round() as u32;
+            self.playback_scrub_to(frame);
+        }
     }
 
     fn draw_side_panel(&mut self, ui: &mut egui::Ui) {
@@ -3624,5 +3852,141 @@ mod tests {
         assert!(!app.inflight.contains(&2), "old prefetch dropped on seek");
         assert!(app.inflight.contains(&6), "new playhead requested");
         assert_eq!(app.playback.current_frame, 6);
+    }
+
+    // --- Transport polish (#7, Phase 5) --------------------------------------
+
+    #[test]
+    fn set_in_out_trims_and_clamps_the_scrub_range() {
+        let dir = tempfile::tempdir().unwrap();
+        touch_sequence(dir.path(), 10);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&dir.path().join("s.0005.exr")); // playhead 5, range 1..=10
+
+        app.playback_set_in(); // in -> playhead (5)
+        assert_eq!((app.playback.in_point, app.playback.out_point), (5, 10));
+        app.playback_scrub_to(8);
+        app.playback_set_out(); // out -> playhead (8)
+        assert_eq!((app.playback.in_point, app.playback.out_point), (5, 8));
+
+        // Scrubbing now clamps to the trimmed range, not the full span.
+        app.playback_scrub_to(1);
+        assert_eq!(app.playback.current_frame, 5, "clamped to the in point");
+        app.playback_scrub_to(99);
+        assert_eq!(app.playback.current_frame, 8, "clamped to the out point");
+
+        // Reset restores the full sequence span.
+        app.playback_reset_trim();
+        assert_eq!((app.playback.in_point, app.playback.out_point), (1, 10));
+    }
+
+    #[test]
+    fn drop_frames_skips_to_the_due_frame_without_decoding_intermediates() {
+        use crate::playback::Pacing;
+        let (_dir, paths) = write_sequence(10);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&paths[0]); // playhead 1, range 1..=10
+        app.playback.loop_mode = LoopMode::Once;
+        app.playback.pacing = Pacing::DropFrames;
+        app.playback.state = PlayState::Playing;
+        app.playback.fps_target = 24.0;
+        let period = app.playback.period();
+        // Backdate the anchor so ~4 frame deadlines are already due this tick.
+        app.playback.anchor = Some(std::time::Instant::now() - period.mul_f32(3.5));
+        app.playback.frames_since_anchor = 0;
+        // Drop-frames ignores the readiness gate that would hold stutter.
+        app.loading_a = true;
+        app.playback.pending = Some(99);
+
+        app.tick_drop_frames(period);
+
+        assert_eq!(
+            app.playback.current_frame, 5,
+            "skipped straight to the wall-clock-due frame"
+        );
+        assert_eq!(
+            app.loaded_file.as_deref(),
+            Some(paths[4].as_path()),
+            "only the landing frame is requested — skipped frames are never decoded"
+        );
+    }
+
+    #[test]
+    fn drop_frames_resumes_decode_after_skipping_past_an_inflight_frame() {
+        use crate::playback::Pacing;
+        let (_dir, paths) = write_sequence(10);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&paths[0]); // playhead 1
+        app.frame_cache_cap = 4;
+        app.playback.pacing = Pacing::DropFrames;
+        app.playback.loop_mode = LoopMode::Once;
+        app.playback.state = PlayState::Playing;
+        app.playback.fps_target = 24.0;
+
+        // Frame 1's decode is in flight (the awaited playhead).
+        app.request_sequence_frame(1);
+        assert!(app.inflight.contains(&1) && app.loading_a);
+
+        // Wall-time jumps: drop-frames skips the playhead past the awaited frame.
+        let period = app.playback.period();
+        app.playback.anchor = Some(std::time::Instant::now() - period.mul_f32(3.5));
+        app.playback.frames_since_anchor = 0;
+        app.tick_drop_frames(period);
+        let cur = app.playback.current_frame;
+        assert!(cur > 1, "skipped ahead of the in-flight frame");
+        assert!(
+            !app.loading_a,
+            "the awaited flag is cleared for the frame we skipped past"
+        );
+
+        // The stale frame-1 decode lands (still a valid cache fill). The pump must
+        // resume for the new playhead instead of staying gated on `loading_a`.
+        deliver_frame(&mut app, &paths[0], 1);
+        assert!(
+            app.frame_cache.contains(crate::cache::Slot::A, 1),
+            "stale result is cached, not discarded"
+        );
+        assert!(
+            app.inflight.contains(&cur),
+            "pump resumed for the new playhead once the worker freed up"
+        );
+    }
+
+    #[test]
+    fn sequence_advance_holds_the_b_reference() {
+        let (_dir, paths) = write_sequence(3);
+        let b_dir = tempfile::tempdir().unwrap();
+        let bpath = b_dir.path().join("ref.exr");
+        write_rgba_exr(&bpath);
+
+        let mut app = ExrApp::default();
+        app.detect_sequence(&paths[0]);
+        // Load a fixed B reference (A-plays / B-holds).
+        let bref = std::sync::Arc::new(ExrData::load(&bpath).unwrap());
+        app.exr_data_b = Some(bref.clone());
+        app.loaded_file_b = Some(bpath.clone());
+
+        // Play A across frames; B must never be touched by the slot-A swaps.
+        app.playback_toggle();
+        app.advance_playhead();
+        deliver_frame(&mut app, &paths[1], 2);
+        app.advance_playhead();
+        deliver_frame(&mut app, &paths[2], 3);
+
+        assert_eq!(
+            app.playback.current_frame, 3,
+            "A advanced through the sequence"
+        );
+        assert!(
+            app.exr_data_b
+                .as_ref()
+                .is_some_and(|b| std::sync::Arc::ptr_eq(b, &bref)),
+            "B is held as the same Arc — playing A never swaps or clears it"
+        );
+        assert_eq!(
+            app.loaded_file_b.as_deref(),
+            Some(bpath.as_path()),
+            "B's loaded path is unchanged"
+        );
     }
 }
