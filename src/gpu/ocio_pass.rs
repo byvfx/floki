@@ -994,7 +994,7 @@ mod metal_tests {
             bg_mode: 0.0, // checkerboard
             bg_checker_size: 3.0,
             bg_grad_angle: 0.0,
-            _pad_a: 0.0,
+            gamma: 1.0,
             _pad_b: 0.0,
             bg_checker_dark: [0.1, 0.1, 0.1, 0.0],
             bg_checker_light: [0.2, 0.2, 0.2, 0.0],

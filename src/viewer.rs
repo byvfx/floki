@@ -2802,7 +2802,10 @@ impl ExrViewer {
                         bg_mode: self.background.mode.as_u32() as f32,
                         bg_checker_size: self.background.checker_size,
                         bg_grad_angle: self.background.gradient_angle,
-                        _pad_a: 0.0,
+                        // Re-apply the user gamma in display space (#93): under
+                        // OCIO the main shader runs with gamma=1 (OCIO owns the
+                        // display chain), so the control would otherwise be inert.
+                        gamma: self.gamma,
                         _pad_b: 0.0,
                         bg_checker_dark: rgb3_to_vec4(self.background.checker_dark),
                         bg_checker_light: rgb3_to_vec4(self.background.checker_light),
@@ -3256,13 +3259,23 @@ impl ExrViewer {
             return None;
         }
 
+        // User gamma in display space, after the OCIO transform (#93) — the OCIO
+        // chain replaces the normal gamma/sRGB ops, so re-apply the control here
+        // to match the GPU blit. `None` when gamma == 1.0 (no-op).
+        let inv_gamma = (self.gamma != 1.0).then(|| 1.0 / self.gamma);
         let mut pixels = vec![egui::Color32::BLACK; width * height];
         pixels.par_iter_mut().enumerate().for_each(|(i, px)| {
             let o = i * 4;
+            let mut c = [buf[o], buf[o + 1], buf[o + 2]];
+            if let Some(ig) = inv_gamma {
+                for v in &mut c {
+                    *v = v.max(0.0).powf(ig);
+                }
+            }
             *px = egui::Color32::from_rgb(
-                (buf[o].clamp(0.0, 1.0) * 255.0) as u8,
-                (buf[o + 1].clamp(0.0, 1.0) * 255.0) as u8,
-                (buf[o + 2].clamp(0.0, 1.0) * 255.0) as u8,
+                (c[0].clamp(0.0, 1.0) * 255.0) as u8,
+                (c[1].clamp(0.0, 1.0) * 255.0) as u8,
+                (c[2].clamp(0.0, 1.0) * 255.0) as u8,
             );
         });
 
