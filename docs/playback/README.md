@@ -22,7 +22,8 @@ regresses the single-image standalone app**.
 GPU texture creation (`generate_gpu_texture`, `viewer.rs`) needs `gpu_resources` +
 `queue.write_texture` → it is **UI-thread only**. The load worker can only produce CPU-side
 `ExrData` (+ `ProxyImage`). The sampler (`sample_pixel`, `viewer.rs`, reached via
-`viewer.ui(ui, &self.exr_data, …)` in `app.rs`) reads the **active slot's `ExrData`** directly.
+`self.viewer.ui(ui, data, …)` in `app.rs`, where `data` is the active slot's `&ExrData`) reads
+the **active slot's `ExrData`** directly.
 
 Therefore:
 
