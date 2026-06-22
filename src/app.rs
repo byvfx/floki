@@ -1120,6 +1120,16 @@ impl ExrApp {
             }
         }
         if steps > 0 {
+            // The playhead skipped past any frame we were awaiting, so that
+            // in-flight decode is no longer the one to show. Clear the awaited
+            // state *before* requesting the new frame: otherwise `loading_a`
+            // stays set for a frame we moved past, and once the stale job lands
+            // (its frame != current) `apply_load_result` leaves the flag up,
+            // permanently gating `pump_decode`. The in-flight job still completes
+            // and fills the cache; the pump then resumes for the new playhead.
+            // No epoch bump — the stale result is a valid cache fill.
+            self.loading_a = false;
+            self.playback.pending = None;
             // Show whatever the playhead landed on; if it isn't resident yet the
             // display holds until it decodes while the clock keeps moving.
             self.request_sequence_frame(self.playback.current_frame);
@@ -2532,11 +2542,12 @@ impl ExrApp {
             let visuals = ui.visuals();
             // Map a frame number to an x inside `rect` (single-frame → center).
             let x_of = |f: u32| {
+                // f64 throughout so the mapping stays monotonic for long
+                // sequences (frame offsets can exceed u16/f32-exact ranges).
                 let t = if span == 0 {
                     0.5
                 } else {
-                    f32::from(u16::try_from(f.saturating_sub(lo)).unwrap_or(u16::MAX))
-                        / span.max(1) as f32
+                    (f64::from(f.saturating_sub(lo)) / f64::from(span)) as f32
                 };
                 rect.left() + t.clamp(0.0, 1.0) * rect.width()
             };
@@ -2589,8 +2600,8 @@ impl ExrApp {
         if (resp.clicked() || resp.dragged())
             && let Some(pos) = resp.interact_pointer_pos()
         {
-            let t = ((pos.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
-            let frame = lo + (t * span as f32).round() as u32;
+            let t = f64::from((pos.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
+            let frame = lo + (t * f64::from(span)).round() as u32;
             self.playback_scrub_to(frame);
         }
     }
@@ -3897,6 +3908,47 @@ mod tests {
             app.loaded_file.as_deref(),
             Some(paths[4].as_path()),
             "only the landing frame is requested — skipped frames are never decoded"
+        );
+    }
+
+    #[test]
+    fn drop_frames_resumes_decode_after_skipping_past_an_inflight_frame() {
+        use crate::playback::Pacing;
+        let (_dir, paths) = write_sequence(10);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&paths[0]); // playhead 1
+        app.frame_cache_cap = 4;
+        app.playback.pacing = Pacing::DropFrames;
+        app.playback.loop_mode = LoopMode::Once;
+        app.playback.state = PlayState::Playing;
+        app.playback.fps_target = 24.0;
+
+        // Frame 1's decode is in flight (the awaited playhead).
+        app.request_sequence_frame(1);
+        assert!(app.inflight.contains(&1) && app.loading_a);
+
+        // Wall-time jumps: drop-frames skips the playhead past the awaited frame.
+        let period = app.playback.period();
+        app.playback.anchor = Some(std::time::Instant::now() - period.mul_f32(3.5));
+        app.playback.frames_since_anchor = 0;
+        app.tick_drop_frames(period);
+        let cur = app.playback.current_frame;
+        assert!(cur > 1, "skipped ahead of the in-flight frame");
+        assert!(
+            !app.loading_a,
+            "the awaited flag is cleared for the frame we skipped past"
+        );
+
+        // The stale frame-1 decode lands (still a valid cache fill). The pump must
+        // resume for the new playhead instead of staying gated on `loading_a`.
+        deliver_frame(&mut app, &paths[0], 1);
+        assert!(
+            app.frame_cache.contains(crate::cache::Slot::A, 1),
+            "stale result is cached, not discarded"
+        );
+        assert!(
+            app.inflight.contains(&cur),
+            "pump resumed for the new playhead once the worker freed up"
         );
     }
 
