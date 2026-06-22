@@ -39,21 +39,17 @@ pub fn want_list(
     if !resident.contains(&playhead) {
         wants.push(playhead);
     }
-    // Total = the (optional) playhead + `decode_ahead` prefetch frames.
-    let target = decode_ahead + usize::from(!resident.contains(&playhead));
 
-    // P2: walk ahead in the play direction, nearest first, with the same rule the
-    // clock uses so loop/ping-pong wrap is consistent. Skip the playhead (handled
-    // above) and anything resident or already queued. A step cap of two full
-    // range traversals guarantees termination (one ping-pong cycle) without a
-    // sentinel, while still letting prefetch continue past the bounce.
-    let range_len = u64::from(out_pt - in_pt) + 1;
-    let max_steps = usize::try_from(range_len.saturating_mul(2)).unwrap_or(usize::MAX);
+    // P2: the prefetch *window* — the next `decode_ahead` positions in the play
+    // direction (the same step rule the clock uses, so loop/ping-pong wrap is
+    // consistent). Return the non-resident ones, nearest first. Walking a fixed
+    // number of *positions* (not "until N non-resident found") bounds the window
+    // to what the ring keeps: it never reaches past the cache horizon to a frame
+    // that would be evicted and re-requested forever. The playhead and duplicates
+    // (ping-pong revisits) are skipped, not pushed.
     let mut frame = playhead;
     let mut dir = direction;
-    let mut steps = 0;
-    while wants.len() < target && steps < max_steps {
-        steps += 1;
+    for _ in 0..decode_ahead {
         let Some((next, next_dir)) = advance(frame, in_pt, out_pt, dir, mode) else {
             break; // Once reached the boundary.
         };
@@ -98,9 +94,10 @@ mod tests {
     #[test]
     fn skips_resident_frames_in_the_prefetch_window() {
         let r = resident(&[5, 6, 8]);
-        // 6 and 8 already cached -> want 7 then 9.
+        // Window = the next 3 positions (6, 7, 8); 6 and 8 are cached, so only 7
+        // is wanted. The window does not reach past position 3 to 9/10.
         let got = want_list(5, 1, 10, Direction::Forward, LoopMode::Loop, &r, 3);
-        assert_eq!(got, vec![7, 9, 10]);
+        assert_eq!(got, vec![7]);
     }
 
     #[test]
@@ -122,10 +119,10 @@ mod tests {
     #[test]
     fn pingpong_prefetch_follows_the_bounce() {
         let r = resident(&[]);
-        // Forward near the out point: playhead 9, then 10, bounce (9 is the
-        // playhead, skipped), 8, 7. Three prefetch frames follow the playhead.
+        // Window of 3 positions from playhead 9: 10, (bounce to 9 = playhead,
+        // skipped), 8. Plus the playhead itself (not resident) first.
         let got = want_list(9, 1, 10, Direction::Forward, LoopMode::PingPong, &r, 3);
-        assert_eq!(got, vec![9, 10, 8, 7]);
+        assert_eq!(got, vec![9, 10, 8]);
     }
 
     #[test]

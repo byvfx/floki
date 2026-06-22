@@ -122,6 +122,11 @@ pub struct ExrApp {
     /// sequence is homogeneous). Sizes the cache budget.
     #[serde(skip)]
     frame_bytes: Option<usize>,
+    /// Sequence frame numbers submitted to the worker but not yet returned (#57).
+    /// Bounds decode-ahead concurrency and prevents re-requesting an in-flight
+    /// frame; cleared on every seek so superseded decodes can't be miscounted.
+    #[serde(skip)]
+    inflight: std::collections::HashSet<u32>,
 
     recent_files: Vec<PathBuf>,
     theme: ThemeChoice,
@@ -294,6 +299,7 @@ impl Default for ExrApp {
             // `budget::max_t1` recomputes it from real RAM headroom.
             frame_cache_cap: 8,
             frame_bytes: None,
+            inflight: std::collections::HashSet::new(),
             recent_files: Vec::new(),
             theme: ThemeChoice::default(),
             diff_colormap: crate::gradient::Colormap::default(),
@@ -763,6 +769,10 @@ impl ExrApp {
     fn detect_sequence(&mut self, path: &std::path::Path) {
         self.frame_cache.clear();
         self.frame_bytes = None;
+        // Drop any prior sequence's in-flight frames (a different sequence reuses
+        // frame numbers); `enter`/`clear` bump the epoch so their results are
+        // dropped. `loading_a` is left to `open_file`, which owns this open.
+        self.inflight.clear();
         match crate::sequence::detect_from_file(path) {
             Some(seq) => {
                 let start = seq.number_of(path).unwrap_or(seq.range.0);
@@ -772,39 +782,98 @@ impl ExrApp {
         }
     }
 
-    /// Show the given frame number in slot A. A resident frame (#56) is shown
-    /// instantly from the T1 ring; otherwise an on-demand decode is issued and
-    /// applied on arrival (see `apply_load_result`). A hole (no file) holds the
-    /// previous frame — nothing is requested, so playback never stalls.
+    /// Move the playhead to `frame` and display it. A resident frame (#56) shows
+    /// instantly from the T1 ring; a miss is marked pending and decoded by
+    /// [`Self::pump_decode`]. A hole (no file) holds the previous frame — nothing
+    /// is requested, so playback never stalls.
     fn request_sequence_frame(&mut self, frame: u32) {
+        self.error_msg = None;
         let Some(path) = self.playback.frame_path(frame).map(Path::to_path_buf) else {
-            // Hole: keep showing the last real frame; never stall.
+            // Hole: keep showing the last real frame; prefetch may still run.
             self.playback.pending = None;
+            self.pump_decode();
             return;
         };
-        self.loaded_file = Some(path.clone());
-        self.error_msg = None;
+        self.loaded_file = Some(path);
 
-        // Cache hit: show it immediately, no decode round-trip.
         if let Some(data) = self.frame_cache.get(crate::cache::Slot::A, frame) {
+            // Cache hit: show immediately, no decode round-trip.
             self.loading_a = false;
             self.playback.pending = None;
             self.swap_image_arc(data, false);
             self.playback.note_shown(std::time::Instant::now());
+        } else {
+            // Miss: mark the playhead as awaited; `pump_decode` submits it (the
+            // want-list puts the playhead first, so it beats any prefetch).
+            self.playback.pending = Some(frame);
+        }
+        self.pump_decode();
+    }
+
+    /// How many frames to decode ahead of the playhead — bounded by the T1 ring
+    /// (`decode_ahead = min(configured, max_t1 − 1)`, tying #57 back-pressure to
+    /// the #56 budget) and a hard cap so a huge sequence can't queue the world.
+    fn prefetch_depth(&self) -> usize {
+        const MAX_PREFETCH: usize = 16;
+        self.frame_cache_cap.saturating_sub(1).min(MAX_PREFETCH)
+    }
+
+    /// Decode-ahead pump (#57): with at most one sequence decode outstanding,
+    /// submit the highest-priority frame the scheduler wants — the awaited
+    /// playhead first, then prefetch ahead in the play direction. Called after
+    /// the playhead moves, after each result lands (the worker just freed up), and
+    /// each playing tick. A no-op while a decode is in flight or a non-sequence
+    /// load is busy, which is what keeps it to one outstanding job.
+    fn pump_decode(&mut self) {
+        if !self.playback.is_active() || !self.inflight.is_empty() || self.loading_a {
             return;
         }
+        // Prefetch only while playing; paused/scrubbing decodes just the playhead.
+        let depth = if self.playback.is_playing() {
+            self.prefetch_depth()
+        } else {
+            0
+        };
+        let resident = self.frame_cache.resident(crate::cache::Slot::A);
+        let wants = crate::scheduler::want_list(
+            self.playback.current_frame,
+            self.playback.in_point,
+            self.playback.out_point,
+            self.playback.direction,
+            self.playback.loop_mode,
+            &resident,
+            depth,
+        );
+        // Submit the first want that has a real file (skip holes).
+        for w in wants {
+            let Some(path) = self.playback.frame_path(w).map(Path::to_path_buf) else {
+                continue; // a hole — nothing to decode there.
+            };
+            self.inflight.insert(w);
+            // The awaited playhead drives the "loading" state; prefetch is silent.
+            if Some(w) == self.playback.pending {
+                self.loading_a = true;
+            }
+            let tx = self.ensure_worker();
+            let _ = tx.send(LoadJob {
+                path,
+                is_b: false,
+                seq_frame: true,
+                frame: w,
+                epoch: self.playback.epoch,
+            });
+            break;
+        }
+    }
 
-        // Miss: decode, tagged with the current epoch + frame number.
-        self.loading_a = true;
-        self.playback.pending = Some(frame);
-        let tx = self.ensure_worker();
-        let _ = tx.send(LoadJob {
-            path,
-            is_b: false,
-            seq_frame: true,
-            frame,
-            epoch: self.playback.epoch,
-        });
+    /// Supersede every in-flight sequence decode: bump the epoch (so late results
+    /// are dropped on arrival) and forget the in-flight set / awaited playhead.
+    /// Called on every seek / scrub / direction change (#57).
+    fn invalidate_inflight(&mut self) {
+        self.playback.bump_epoch();
+        self.inflight.clear();
+        self.loading_a = false;
+        self.playback.pending = None;
     }
 
     /// Step the playhead by `delta` frames, clamped to the in/out range (no
@@ -818,7 +887,7 @@ impl ExrApp {
         let next = (i64::from(self.playback.current_frame) + i64::from(delta))
             .clamp(i64::from(lo), i64::from(hi)) as u32;
         self.playback.current_frame = next;
-        self.playback.bump_epoch(); // a seek supersedes any in-flight decode
+        self.invalidate_inflight(); // a seek supersedes any in-flight decode
         self.request_sequence_frame(next);
     }
 
@@ -831,7 +900,7 @@ impl ExrApp {
         self.playback.state = crate::playback::PlayState::Paused;
         let next = frame.clamp(self.playback.in_point, self.playback.out_point);
         self.playback.current_frame = next;
-        self.playback.bump_epoch(); // a scrub supersedes any in-flight decode
+        self.invalidate_inflight(); // a scrub supersedes any in-flight decode
         self.request_sequence_frame(next);
     }
 
@@ -856,7 +925,7 @@ impl ExrApp {
         self.playback.state = crate::playback::PlayState::Stopped;
         let in_point = self.playback.in_point;
         self.playback.current_frame = in_point;
-        self.playback.bump_epoch();
+        self.invalidate_inflight();
         self.request_sequence_frame(in_point);
     }
 
@@ -892,6 +961,10 @@ impl ExrApp {
             return;
         }
         let period = self.playback.period();
+        // Stutter pacing: advance only when the playhead frame is ready (not
+        // awaiting a decode). With decode-ahead the next frame is usually already
+        // resident, so this advances smoothly; when decode falls behind it holds,
+        // dropping the effective fps without skipping frames.
         if self.playback.pending.is_none() && !self.loading_a {
             let now = std::time::Instant::now();
             let anchor = *self.playback.anchor.get_or_insert(now);
@@ -910,6 +983,8 @@ impl ExrApp {
                 }
             }
         }
+        // Keep the decode-ahead ring filling even between advances.
+        self.pump_decode();
         // Keep the clock ticking even while idle between frames.
         ctx.request_repaint_after(period);
     }
@@ -957,8 +1032,7 @@ impl ExrApp {
             if res.epoch != self.playback.epoch {
                 return; // a seek/scrub/direction change superseded this decode.
             }
-            self.loading_a = false;
-            self.playback.pending = None;
+            self.inflight.remove(&res.frame);
             match res.result {
                 Ok(data) => {
                     let arc = std::sync::Arc::new(data);
@@ -972,12 +1046,26 @@ impl ExrApp {
                         self.playback.direction,
                         self.playback.is_playing(),
                     );
-                    self.swap_image_arc(arc, false);
-                    self.playback.note_shown(std::time::Instant::now());
+                    // Show it only if it's the frame the playhead is waiting on;
+                    // a prefetched frame ahead of the playhead is just cached.
+                    if res.frame == self.playback.current_frame {
+                        self.loading_a = false;
+                        self.playback.pending = None;
+                        self.swap_image_arc(arc, false);
+                        self.playback.note_shown(std::time::Instant::now());
+                    }
                     self.error_msg = None;
                 }
-                Err(e) => self.error_msg = Some(e),
+                Err(e) => {
+                    if res.frame == self.playback.current_frame {
+                        self.loading_a = false;
+                        self.playback.pending = None;
+                        self.error_msg = Some(e);
+                    }
+                }
             }
+            // The worker just freed up — submit the next wanted frame.
+            self.pump_decode();
             return;
         }
 
@@ -2141,7 +2229,8 @@ impl ExrApp {
                     } else {
                         Direction::Forward
                     };
-                    self.playback.bump_epoch(); // direction change supersedes prefetch
+                    // Direction change invalidates prefetch (it ran the other way).
+                    self.invalidate_inflight();
                 }
 
                 let loop_label = match self.playback.loop_mode {
@@ -3361,5 +3450,87 @@ mod tests {
             app.playback.current_frame, 1,
             "playhead stays where the user left it"
         );
+    }
+
+    // --- Decode-ahead prefetch (#57, Phase 4) --------------------------------
+
+    /// Write `count` real RGBA EXR frames `c.0001.exr..` and return the dir.
+    fn write_sequence(count: u32) -> (tempfile::TempDir, Vec<std::path::PathBuf>) {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = (1..=count)
+            .map(|n| {
+                let p = dir.path().join(format!("c.{n:04}.exr"));
+                write_rgba_exr(&p);
+                p
+            })
+            .collect();
+        (dir, paths)
+    }
+
+    #[test]
+    fn playing_prefetches_upcoming_frames_into_the_ring() {
+        let (dir, paths) = write_sequence(5);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&paths[0]);
+        app.frame_cache_cap = 4; // prefetch depth = 3
+        app.playback_toggle(); // Playing, playhead on frame 1
+        app.pump_decode(); // submits the playhead (frame 1, not yet cached)
+        assert!(app.inflight.contains(&1) && app.inflight.len() == 1);
+
+        // Frame 1 lands: shown + cached, and the worker is immediately re-tasked
+        // with the next upcoming frame.
+        deliver_frame(&mut app, &paths[0], 1);
+        assert!(app.frame_cache.contains(crate::cache::Slot::A, 1));
+        assert!(app.inflight.contains(&2), "prefetching frame 2 ahead");
+
+        // Frame 2 is ahead of the playhead: cached but NOT shown; prefetch rolls on.
+        deliver_frame(&mut app, &paths[1], 2);
+        assert!(app.frame_cache.contains(crate::cache::Slot::A, 2));
+        assert!(app.inflight.contains(&3));
+        let _ = dir;
+        assert_eq!(
+            app.playback.current_frame, 1,
+            "playhead unmoved — only the clock advances it, not prefetch"
+        );
+    }
+
+    #[test]
+    fn prefetch_is_bounded_by_the_ring_and_never_overfetches() {
+        // A capacity-2 ring (depth 1) must not request a frame it would have to
+        // immediately evict — otherwise it would re-decode it forever.
+        let (_dir, paths) = write_sequence(5);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&paths[0]);
+        app.frame_cache_cap = 2; // prefetch depth = 1
+        app.playback_toggle();
+        app.pump_decode();
+        deliver_frame(&mut app, &paths[0], 1); // caches 1, prefetches 2
+        assert!(app.inflight.contains(&2));
+        deliver_frame(&mut app, &paths[1], 2); // caches 2; window (just frame 2) is full
+        assert!(
+            app.inflight.is_empty(),
+            "ring full within the window -> nothing more requested"
+        );
+        assert!(app.frame_cache.contains(crate::cache::Slot::A, 1));
+        assert!(app.frame_cache.contains(crate::cache::Slot::A, 2));
+    }
+
+    #[test]
+    fn scrub_invalidates_in_flight_prefetch() {
+        let (_dir, paths) = write_sequence(8);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&paths[0]);
+        app.frame_cache_cap = 4;
+        app.playback_toggle();
+        app.pump_decode();
+        deliver_frame(&mut app, &paths[0], 1); // now prefetching ahead (frame 2)
+        assert!(app.inflight.contains(&2));
+
+        // User scrubs to frame 6: the in-flight prefetch is forgotten and the new
+        // playhead is requested instead.
+        app.playback_scrub_to(6);
+        assert!(!app.inflight.contains(&2), "old prefetch dropped on seek");
+        assert!(app.inflight.contains(&6), "new playhead requested");
+        assert_eq!(app.playback.current_frame, 6);
     }
 }
