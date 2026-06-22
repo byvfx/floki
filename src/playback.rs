@@ -142,6 +142,13 @@ pub struct Playback {
     pub measured_fps: f32,
     #[serde(skip)]
     last_shown: Option<Instant>,
+    /// Supersession counter (#57). Bumped on every seek / scrub / direction or
+    /// sequence change; each decode request and result carries the epoch at issue
+    /// time, and the UI drops any result whose epoch no longer matches. Required
+    /// because sequences recur the same paths (loop / ping-pong / scrub-back), so
+    /// the `(path, is_b)` check alone can mistake a stale frame for the current one.
+    #[serde(skip)]
+    pub epoch: u64,
 }
 
 impl Default for Playback {
@@ -161,6 +168,7 @@ impl Default for Playback {
             pending: None,
             measured_fps: 0.0,
             last_shown: None,
+            epoch: 0,
         }
     }
 }
@@ -191,6 +199,7 @@ impl Playback {
         self.measured_fps = 0.0;
         self.last_shown = None;
         self.sequence = Some(seq);
+        self.bump_epoch();
     }
 
     /// Leave sequence mode (a lone image was opened).
@@ -199,6 +208,14 @@ impl Playback {
         self.state = PlayState::Stopped;
         self.pending = None;
         self.anchor = None;
+        self.bump_epoch();
+    }
+
+    /// Invalidate any in-flight decode: a stale result whose epoch differs from
+    /// the new value is dropped on arrival. Call on every seek / scrub /
+    /// direction or sequence change (#57).
+    pub fn bump_epoch(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
     }
 
     /// Begin playing from the current playhead. The clock anchor is set one
