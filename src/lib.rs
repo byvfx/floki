@@ -14,6 +14,10 @@ pub mod exr_loader;
 
 mod annotation;
 mod background;
+// Pure ring-cache budget math (#56). The decode-ahead scheduler that calls it
+// lands in Phase 3; until then only its own tests exercise it.
+#[allow(dead_code)]
+mod budget;
 mod color;
 mod gpu;
 mod gradient;

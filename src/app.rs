@@ -78,10 +78,13 @@ pub struct ExrApp {
     loaded_file: Option<PathBuf>,
     #[serde(skip)]
     loaded_file_b: Option<PathBuf>,
+    // `Arc` so a decoded frame can be the active image (tier T3) and stay
+    // resident in the playback ring cache (tier T1) at once, without cloning the
+    // (often 600 MB+) pixel buffers. See docs/playback/memory-contract.md.
     #[serde(skip)]
-    exr_data: Option<ExrData>,
+    exr_data: Option<std::sync::Arc<ExrData>>,
     #[serde(skip)]
-    exr_data_b: Option<ExrData>,
+    exr_data_b: Option<std::sync::Arc<ExrData>>,
     #[serde(skip)]
     error_msg: Option<String>,
     #[serde(skip)]
@@ -735,7 +738,7 @@ impl ExrApp {
                     } else {
                         // No proxy: the full decode is this image's first paint —
                         // reset the viewer so it fits the new image.
-                        self.exr_data = Some(data);
+                        self.exr_data = Some(std::sync::Arc::new(data));
                         self.reset_viewer_session();
                     }
                 }
@@ -765,7 +768,7 @@ impl ExrApp {
     /// session, which drops B and resets the entire viewer.
     fn swap_image_data(&mut self, data: ExrData, is_b: bool) {
         if is_b {
-            self.exr_data_b = Some(data);
+            self.exr_data_b = Some(std::sync::Arc::new(data));
             // The texture caches only rebuild on a layer-count change, so a new B
             // with the same layer count would keep showing the previous image.
             // Force the reference textures (and the B-dependent diff/composite)
@@ -777,7 +780,7 @@ impl ExrApp {
             self.viewer.last_sampled_val_b = None;
         } else {
             let layer_count = data.logical_layers.len();
-            self.exr_data = Some(data);
+            self.exr_data = Some(std::sync::Arc::new(data));
             // The full-res A decode has landed: drop the slot-A first-paint proxy
             // (#58). The viewer's zoom/pan session state is preserved so the
             // handoff from proxy to full-res is visually continuous.
@@ -1743,7 +1746,7 @@ impl ExrApp {
                 draw_nuke_status_line(
                     ui,
                     "A",
-                    self.exr_data.as_ref(),
+                    self.exr_data.as_deref(),
                     self.viewer.last_hover_pos_img,
                     self.viewer.last_sampled_val_a,
                     phys_idx_a,
@@ -2036,7 +2039,7 @@ impl ExrApp {
                                 });
 
                                 self.viewer
-                                    .calculate_histogram(exr_data, self.exr_data_b.as_ref());
+                                    .calculate_histogram(exr_data, self.exr_data_b.as_deref());
 
                                 if let Some(bins) = &self.viewer.histogram {
                                     let (rect, _resp) = ui.allocate_exact_size(
@@ -2128,7 +2131,7 @@ impl ExrApp {
                     self.viewer.ui(
                         ui,
                         data,
-                        self.exr_data_b.as_ref(),
+                        self.exr_data_b.as_deref(),
                         self.gpu_resources.as_ref(),
                         self.lut_bg.clone(),
                     );
@@ -2284,7 +2287,7 @@ mod tests {
         let mut app = ExrApp {
             loaded_file: Some(path.clone()),
             loaded_file_b: Some(PathBuf::from("b.exr")),
-            exr_data_b: Some(data_b),
+            exr_data_b: Some(std::sync::Arc::new(data_b)),
             loading_a: true,
             loading_b: true,
             ..Default::default()
@@ -2323,8 +2326,8 @@ mod tests {
         let b = ExrData::load(&path_b).unwrap();
 
         let mut app = ExrApp {
-            exr_data: Some(ExrData::load(&path_a0).unwrap()),
-            exr_data_b: Some(b),
+            exr_data: Some(std::sync::Arc::new(ExrData::load(&path_a0).unwrap())),
+            exr_data_b: Some(std::sync::Arc::new(b)),
             ..Default::default()
         };
         // Simulate a user mid-session: non-default view + annotation + swatch.
@@ -2379,8 +2382,8 @@ mod tests {
         let b1 = ExrData::load(&path_b1).unwrap();
 
         let mut app = ExrApp {
-            exr_data: Some(ExrData::load(&path_a).unwrap()),
-            exr_data_b: Some(ExrData::load(&path_b0).unwrap()),
+            exr_data: Some(std::sync::Arc::new(ExrData::load(&path_a).unwrap())),
+            exr_data_b: Some(std::sync::Arc::new(ExrData::load(&path_b0).unwrap())),
             ..Default::default()
         };
         app.viewer.scale = 2.0;
@@ -2407,7 +2410,7 @@ mod tests {
         let one = ExrData::load(&path_1pass).unwrap();
 
         let mut app = ExrApp {
-            exr_data: Some(ExrData::load(&path_3pass).unwrap()),
+            exr_data: Some(std::sync::Arc::new(ExrData::load(&path_3pass).unwrap())),
             ..Default::default()
         };
         assert_eq!(app.exr_data.as_ref().unwrap().logical_layers.len(), 3);
@@ -2536,7 +2539,7 @@ mod tests {
         let mut app = ExrApp {
             loaded_file: Some(path.clone()),
             loaded_file_b: Some(PathBuf::from("b.exr")),
-            exr_data_b: Some(data_b),
+            exr_data_b: Some(std::sync::Arc::new(data_b)),
             loading_a: true, // full decode in flight
             loading_b: true,
             ..Default::default()
@@ -2587,7 +2590,7 @@ mod tests {
         let proxy = crate::proxy::ProxyImage::from_exr_data_downsampled(&data, 0, 1).unwrap();
 
         let mut app = ExrApp {
-            exr_data: Some(data), // already loaded
+            exr_data: Some(std::sync::Arc::new(data)), // already loaded
             ..Default::default()
         };
         use egui_kittest::Harness;
