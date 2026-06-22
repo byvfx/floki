@@ -142,6 +142,30 @@ impl ExrData {
         let get = |o: Option<usize>| o.and_then(|i| list.get(i));
         Some((layer, get(ll.r), get(ll.g), get(ll.b), get(ll.a)))
     }
+
+    /// Approximate resident size in bytes: the sum of every physical channel
+    /// buffer across every physical layer (sample count × sample size).
+    ///
+    /// This is the per-frame RAM-accounting primitive the playback ring cache
+    /// (#56) budgets against (tier T1). It counts the decoded pixel buffers only
+    /// — the dominant cost — and ignores small bookkeeping (`logical_layers`,
+    /// channel names, attributes), so it is a lower bound on true heap use, but
+    /// a tight one for the sequences playback cares about. Cheap: it reads
+    /// `Vec::len`, it does not walk samples.
+    #[must_use]
+    pub fn approx_bytes(&self) -> usize {
+        self.image
+            .layer_data
+            .iter()
+            .flat_map(|layer| layer.channel_data.list.iter())
+            .map(|channel| match &channel.sample_data {
+                // OpenEXR sample sizes are fixed by the format: half=2, float=4, uint=4.
+                FlatSamples::F16(s) => s.len() * 2,
+                FlatSamples::F32(s) => s.len() * 4,
+                FlatSamples::U32(s) => s.len() * 4,
+            })
+            .sum()
+    }
 }
 
 /// Build the truncated, comma-joined display string of logical-layer names.
@@ -698,5 +722,64 @@ mod tests {
                 || lower.contains("identifier"),
             "error should explain the bad EXR, got: {err}"
         );
+    }
+
+    // --- `approx_bytes` (the #56 T1 RAM-accounting primitive) ----------------
+
+    /// Write a single-part EXR whose channels are `(name, is_half)` pairs, so a
+    /// test can pin the exact decoded buffer sizes. Half channels round-trip as
+    /// `F16` (2 bytes/sample), float channels as `F32` (4 bytes/sample).
+    fn write_typed_exr(path: &Path, w: usize, h: usize, channels: &[(&str, bool)]) {
+        let mut list = smallvec::SmallVec::new();
+        for (name, is_half) in channels {
+            let samples = if *is_half {
+                FlatSamples::F16(vec![f16::from_f32(0.5); w * h])
+            } else {
+                FlatSamples::F32(vec![0.5; w * h])
+            };
+            list.push(AnyChannel::new(Text::from(*name), samples));
+        }
+        let layer = Layer::new(
+            (w, h),
+            LayerAttributes::default(),
+            Encoding::FAST_LOSSLESS,
+            AnyChannels::sort(list),
+        );
+        Image::from_layer(layer)
+            .write()
+            .to_file(path)
+            .expect("write typed exr fixture");
+    }
+
+    #[test]
+    fn approx_bytes_sums_all_channel_buffers() {
+        let dir = tempfile::tempdir().unwrap();
+        let rgba = &[("R", false), ("G", false), ("B", false), ("A", false)];
+
+        // 2x2 RGBA F32: 4 channels × 4 px × 4 bytes = 64.
+        let p = dir.path().join("rgba.exr");
+        write_typed_exr(&p, 2, 2, rgba);
+        assert_eq!(ExrData::load(&p).unwrap().approx_bytes(), 4 * 4 * 4);
+
+        // Larger frame scales linearly with pixel count: 8×4 px = 32.
+        let big = dir.path().join("big.exr");
+        write_typed_exr(&big, 8, 4, rgba);
+        assert_eq!(ExrData::load(&big).unwrap().approx_bytes(), 4 * 32 * 4);
+    }
+
+    #[test]
+    fn approx_bytes_counts_per_sample_type() {
+        let dir = tempfile::tempdir().unwrap();
+        // 2×2 with two half + two float channels:
+        // half  = 2 × (4 px × 2 bytes) = 16
+        // float = 2 × (4 px × 4 bytes) = 32  -> 48 total.
+        let p = dir.path().join("mixed.exr");
+        write_typed_exr(
+            &p,
+            2,
+            2,
+            &[("R", true), ("G", true), ("B", false), ("A", false)],
+        );
+        assert_eq!(ExrData::load(&p).unwrap().approx_bytes(), 16 + 32);
     }
 }
