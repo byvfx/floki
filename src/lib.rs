@@ -22,8 +22,9 @@ mod playback;
 mod proxy;
 mod render_math;
 mod resource_monitor;
-// Pure image-sequence detection (#7), consumed by playback/app.
-pub mod sequence;
+// Pure image-sequence detection (#7) — a crate-internal building block consumed
+// by playback/app.
+mod sequence;
 mod snapshot;
 pub mod tools;
 mod viewer;
