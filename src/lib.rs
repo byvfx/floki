@@ -30,9 +30,7 @@ mod playback;
 mod proxy;
 mod render_math;
 mod resource_monitor;
-// Pure decode want-list scheduler (#57). Consumed by the decode-ahead worker in
-// Phase 4; until then only its own tests exercise it.
-#[allow(dead_code)]
+// Pure decode want-list scheduler (#57), driving the decode-ahead pump.
 mod scheduler;
 // Pure image-sequence detection (#7) — a crate-internal building block consumed
 // by playback/app.
