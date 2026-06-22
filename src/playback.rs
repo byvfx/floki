@@ -234,6 +234,39 @@ impl Playback {
         Duration::from_secs_f32(1.0 / self.fps_target.max(1.0))
     }
 
+    /// Set the in point to the current playhead (a P0 trim). Clamped so it never
+    /// passes the out point; the playhead already sits at the new in point, so the
+    /// range stays valid. Bumps the epoch (a trim supersedes prefetch, which may
+    /// have run past the new boundary).
+    pub fn set_in(&mut self) {
+        self.in_point = self.current_frame.min(self.out_point);
+        self.bump_epoch();
+    }
+
+    /// Set the out point to the current playhead (a P0 trim). Clamped so it never
+    /// precedes the in point. Bumps the epoch.
+    pub fn set_out(&mut self) {
+        self.out_point = self.current_frame.max(self.in_point);
+        self.bump_epoch();
+    }
+
+    /// Reset the in/out trim to the full sequence range. No-op without a sequence.
+    pub fn reset_trim(&mut self) {
+        if let Some(seq) = &self.sequence {
+            let (lo, hi) = seq.range;
+            self.in_point = lo;
+            self.out_point = hi;
+            self.bump_epoch();
+        }
+    }
+
+    /// The full sequence range `(min, max)`, or `None` without a sequence — the
+    /// span the timeline draws, independent of the in/out trim.
+    #[must_use]
+    pub fn full_range(&self) -> Option<(u32, u32)> {
+        self.sequence.as_ref().map(|s| s.range)
+    }
+
     /// Path of the frame with the given number, or `None` for a hole / no sequence.
     #[must_use]
     pub fn frame_path(&self, number: u32) -> Option<&Path> {
@@ -347,6 +380,72 @@ mod tests {
             Some((5, Direction::Forward))
         );
         assert_eq!(advance(5, 5, 5, Direction::Forward, LoopMode::Once), None);
+    }
+
+    fn seq(lo: u32, hi: u32) -> Sequence {
+        Sequence {
+            frames: Vec::new(),
+            range: (lo, hi),
+            holes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn set_in_out_trims_around_the_playhead() {
+        let mut p = Playback {
+            in_point: 1,
+            out_point: 10,
+            current_frame: 4,
+            ..Default::default()
+        };
+        let e0 = p.epoch;
+        p.set_in(); // in moves up to the playhead
+        assert_eq!((p.in_point, p.out_point), (4, 10));
+        assert_ne!(p.epoch, e0, "a trim bumps the epoch");
+
+        p.current_frame = 8;
+        p.set_out(); // out moves down to the playhead
+        assert_eq!((p.in_point, p.out_point), (4, 8));
+    }
+
+    #[test]
+    fn set_in_never_passes_out_and_set_out_never_precedes_in() {
+        let mut p = Playback {
+            in_point: 3,
+            out_point: 6,
+            current_frame: 9, // pathological: clamp keeps in <= out
+            ..Default::default()
+        };
+        p.set_in();
+        assert_eq!(p.in_point, 6, "in clamped to out");
+
+        let mut q = Playback {
+            in_point: 5,
+            out_point: 8,
+            current_frame: 2,
+            ..Default::default()
+        };
+        q.set_out();
+        assert_eq!(q.out_point, 5, "out clamped to in");
+    }
+
+    #[test]
+    fn reset_trim_restores_the_full_range() {
+        let mut p = Playback {
+            sequence: Some(seq(10, 50)),
+            in_point: 20,
+            out_point: 40,
+            ..Default::default()
+        };
+        let e0 = p.epoch;
+        p.reset_trim();
+        assert_eq!((p.in_point, p.out_point), (10, 50));
+        assert_ne!(p.epoch, e0);
+
+        // No sequence -> no-op (and no panic).
+        let mut none = Playback::default();
+        none.reset_trim();
+        assert_eq!((none.in_point, none.out_point), (0, 0));
     }
 
     #[test]
