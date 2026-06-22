@@ -34,8 +34,9 @@ mod resource_monitor;
 // Phase 4; until then only its own tests exercise it.
 #[allow(dead_code)]
 mod scheduler;
-// Pure image-sequence detection (#7), consumed by playback/app.
-pub mod sequence;
+// Pure image-sequence detection (#7) — a crate-internal building block consumed
+// by playback/app.
+mod sequence;
 mod snapshot;
 pub mod tools;
 mod viewer;

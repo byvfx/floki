@@ -921,6 +921,11 @@ impl ExrApp {
         if !self.playback.is_active() {
             return;
         }
+        // Don't steal keys from a focused text field (e.g. the fps `DragValue`):
+        // Space/←/→ must reach the widget. Mirrors the viewer's hotkey gating.
+        if ctx.egui_wants_keyboard_input() {
+            return;
+        }
         let (space, left, right) = ctx.input_mut(|i| {
             (
                 i.consume_key(egui::Modifiers::NONE, egui::Key::Space),

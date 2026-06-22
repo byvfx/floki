@@ -218,10 +218,13 @@ impl Playback {
         self.epoch = self.epoch.wrapping_add(1);
     }
 
-    /// Begin playing from the current playhead, anchoring the clock to now.
+    /// Begin playing from the current playhead. The clock anchor is set one
+    /// period out so the current frame gets a full period of dwell before the
+    /// first advance (otherwise `tick_playback`'s `anchor + n·period` deadline is
+    /// already due on the very frame Play was pressed, skipping the start frame).
     pub fn start_playing(&mut self, now: Instant) {
         self.state = PlayState::Playing;
-        self.anchor = Some(now);
+        self.anchor = Some(now + self.period());
         self.frames_since_anchor = 0;
     }
 
