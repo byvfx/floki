@@ -100,6 +100,13 @@ impl FrameCache {
         self.entries.clear();
     }
 
+    /// Drop a single frame, returning whether it was resident. Used by the
+    /// render-watch (#101) when a frame is re-rendered or removed on disk, so the
+    /// stale pixels don't survive in the ring.
+    pub fn remove(&mut self, slot: Slot, frame: u32) -> bool {
+        self.entries.remove(&(slot, frame)).is_some()
+    }
+
     /// Evict frames until at most `capacity` remain (capacity is floored at 1),
     /// protecting the active frame `(Slot::A, playhead)`. Victim selection is the
     /// directional-ring + LRU policy in [`FrameCache::pick_victim`].
@@ -206,6 +213,20 @@ mod tests {
         assert!(c.get(Slot::A, 6).is_none());
         // Slot is part of the key.
         assert!(c.get(Slot::B, 5).is_none());
+    }
+
+    #[test]
+    fn remove_drops_a_single_frame_and_reports_residency() {
+        let mut c = FrameCache::new();
+        fill(&mut c, Slot::A, &[1, 2, 3]);
+        assert!(c.remove(Slot::A, 2), "resident frame removed");
+        assert!(!c.contains(Slot::A, 2));
+        assert!(
+            c.contains(Slot::A, 1) && c.contains(Slot::A, 3),
+            "others kept"
+        );
+        assert!(!c.remove(Slot::A, 2), "second remove reports absent");
+        assert!(!c.remove(Slot::B, 1), "slot is part of the key");
     }
 
     #[test]
