@@ -25,6 +25,9 @@ mod cache;
 mod color;
 mod gpu;
 mod gradient;
+// Comp layer model — the review-player spine (#103). Pure data model, no wiring
+// yet; consumers land in #104 / #98 / #102 / #112.
+mod layer;
 // Sequence-playback transport state + pure frame-advance logic (#7).
 mod playback;
 mod proxy;
