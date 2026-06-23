@@ -784,10 +784,12 @@ impl ExrViewer {
             ui.selectable_value(&mut self.channel_mode, ChannelMode::G, "G");
             ui.selectable_value(&mut self.channel_mode, ChannelMode::B, "B");
             ui.selectable_value(&mut self.channel_mode, ChannelMode::A, "A");
-            if self.channel_mode != prev_mode {
-                self.textures.fill(None);
-                self.thumbnails.fill(None);
-            }
+if self.channel_mode != prev_mode {
+    self.textures.fill(None);
+    self.textures_b.fill(None);
+    self.thumbnails.fill(None);
+    self.thumbnails_b.fill(None);
+}
 
             ui.separator();
             // Sample aperture as a compact dropdown.
