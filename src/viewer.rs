@@ -231,10 +231,18 @@ enum GradientTarget {
 }
 
 /// A pre-built T2 GPU texture (#56): the `BindGroup` to paint plus the owning
-/// `Texture`, kept so eviction can `.destroy()` it immediately rather than wait
-/// for wgpu's deferred drop (which would let VRAM spike during playback). The
-/// `BindGroup` is shared (`Arc`) with the active-layer slot while displayed.
+/// `Texture`. Eviction simply **drops** this handle; wgpu reclaims the VRAM once
+/// no live reference remains (it refuses to free a texture whose view is still
+/// bound, which is the safety we rely on). We deliberately do *not* call
+/// `Texture::destroy()` — that forcibly frees regardless of references, and on
+/// Vulkan a draw recorded this frame against a just-destroyed texture aborts the
+/// process at submit (Metal tolerated it; Vulkan does not). The `BindGroup` is
+/// shared (`Arc`) with the active-layer slot while displayed.
 struct T2Texture {
+    // Held to own the texture for the ring entry's lifetime: dropping this handle
+    // (on eviction) releases our reference so wgpu can reclaim the VRAM once the
+    // bind group is gone too. Not read directly — ownership/drop is the point.
+    #[allow(dead_code)]
     texture: eframe::egui_wgpu::wgpu::Texture,
     bind_group: std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>,
 }
@@ -242,7 +250,7 @@ struct T2Texture {
 /// Pick the T2 frame to evict: the resident frame furthest from the on-screen
 /// frame, which is itself never chosen (its texture is bound for paint). `None`
 /// when nothing but the on-screen frame remains. Pure — the eviction policy is
-/// unit-tested here; the surrounding texture `.destroy()` is not.
+/// unit-tested here; the surrounding handle drop is not.
 fn t2_victim(frames: impl Iterator<Item = u32>, on_screen: Option<u32>) -> Option<u32> {
     let anchor = on_screen.unwrap_or(0);
     frames
@@ -3035,62 +3043,39 @@ impl ExrViewer {
         }
     }
 
-    /// Evict T2 frames furthest from the on-screen frame until within the cap,
-    /// explicitly destroying each so VRAM is released now (not on deferred drop).
-    /// The on-screen frame is never evicted — its bind group is bound for paint.
+    /// Evict T2 frames furthest from the on-screen frame until within the cap by
+    /// **dropping** their handles; wgpu reclaims the VRAM once the texture has no
+    /// live reference. The on-screen frame is never chosen (its bind group is
+    /// bound for paint). We never call `Texture::destroy()` — see [`T2Texture`]
+    /// for why a synchronous destroy aborts the process on Vulkan.
     fn evict_t2(&mut self) {
         let cap = self.t2_cap.max(1);
         while self.t2_ring.len() > cap {
             let Some(victim) = t2_victim(self.t2_ring.keys().copied(), self.t2_frame) else {
                 break; // only the on-screen frame remains
             };
-            if let Some(t2) = self.t2_ring.remove(&victim) {
-                // `t2_victim` already excludes the on-screen frame, so this
-                // destroys; the guard is belt-and-suspenders.
-                self.destroy_t2_off_screen(victim, t2);
-            }
+            // Drop the handle; wgpu frees the texture when no view is still bound.
+            self.t2_ring.remove(&victim);
         }
     }
 
     /// Drop a single frame's T2 texture, if present. Used by the render-watch
-    /// (#101) so a re-rendered frame's stale GPU texture is dropped and rebuilt
-    /// from the fresh decode. The on-screen frame is never `destroy()`ed (see
-    /// [`Self::destroy_t2_off_screen`]).
+    /// (#101) so a re-rendered frame's stale GPU texture is released and rebuilt
+    /// from the fresh decode. Drop-only (no `destroy()`): if this frame is the one
+    /// on screen, the bound bind group keeps the old texture alive until the next
+    /// paint rebinds the fresh one — no in-flight draw is ever invalidated.
     pub(crate) fn evict_t2_frame(&mut self, frame: u32) {
-        if let Some(t2) = self.t2_ring.remove(&frame) {
-            self.destroy_t2_off_screen(frame, t2);
-        }
+        self.t2_ring.remove(&frame);
     }
 
-    /// Drop every T2 texture (new sequence / disabled / layer switch).
+    /// Drop every T2 texture (new sequence / disabled / layer switch). Drop-only:
+    /// the on-screen frame's texture stays alive through its still-bound bind
+    /// group (cloned into `gpu_textures[active_layer]`) and is freed by wgpu once
+    /// that binding is replaced — critically, this clear can run *before* the
+    /// central panel rebinds for the just-advanced frame, so the bound frame may
+    /// differ from `t2_frame`; dropping is safe for either, a `destroy()` is not.
     pub(crate) fn clear_t2(&mut self) {
-        let frame = self.t2_frame;
-        for (f, t2) in std::mem::take(&mut self.t2_ring) {
-            self.destroy_t2_off_screen_with(frame, f, t2);
-        }
-    }
-
-    /// Explicitly `destroy()` an evicted T2 texture to reclaim VRAM now — but
-    /// **only if it is not the on-screen frame**. The on-screen frame's bind group
-    /// is cloned into `gpu_textures[active_layer]` and is referenced by the paint
-    /// callback being recorded this frame; destroying its texture mid-frame
-    /// invalidates that draw and the backend aborts at submit (Vulkan validates
-    /// this; Metal happens to tolerate it). For the on-screen frame we just drop
-    /// our ring handle — wgpu keeps the texture alive through the still-bound
-    /// bind group and frees it once the active binding is replaced (next swap /
-    /// layer change / re-decode).
-    fn destroy_t2_off_screen(&self, frame: u32, t2: T2Texture) {
-        self.destroy_t2_off_screen_with(self.t2_frame, frame, t2);
-    }
-
-    /// As [`Self::destroy_t2_off_screen`] but with the on-screen frame passed in,
-    /// so a bulk drain can borrow it once instead of per-entry.
-    fn destroy_t2_off_screen_with(&self, on_screen: Option<u32>, frame: u32, t2: T2Texture) {
-        if Some(frame) != on_screen {
-            t2.texture.destroy();
-        }
-        // else: drop `t2`; the texture is freed by wgpu when the bound bind group
-        // is replaced. Destroying it now would kill an in-flight draw.
+        self.t2_ring.clear();
     }
 
     /// CPU/thumbnail path: bake `layer_index` into an [`egui::TextureHandle`]
