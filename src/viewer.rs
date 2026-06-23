@@ -3126,6 +3126,11 @@ impl ExrViewer {
         let (layer, r_chan, g_chan, b_chan, a_chan) = exr_data.logical_channels(layer_index)?;
         let width = layer.size.0;
         let height = layer.size.1;
+        // A zero-sized layer (malformed EXR) has no pixels to bake and would
+        // underflow the `width - 1` / `height - 1` source clamps below.
+        if width == 0 || height == 0 {
+            return None;
+        }
         // Decimate to the thumbnail box when baking a contact-sheet cell; full-res
         // (stride 1) for the CPU-display fallback. See [`thumb_dims`].
         let (out_w, out_h, stride) = thumb_dims(width, height, max_dim);
@@ -3241,6 +3246,11 @@ impl ExrViewer {
         let (layer, r_chan, g_chan, b_chan, a_chan) = exr_data.logical_channels(layer_index)?;
         let width = layer.size.0;
         let height = layer.size.1;
+        // A zero-sized layer (malformed EXR) has no pixels to bake and would
+        // underflow the `width - 1` / `height - 1` source clamps below.
+        if width == 0 || height == 0 {
+            return None;
+        }
         // Decimate to the thumbnail box for contact-sheet cells (see [`thumb_dims`]);
         // full-res for the CPU-display fallback. OCIO then transforms the small buffer.
         let (out_w, out_h, stride) = thumb_dims(width, height, max_dim);
