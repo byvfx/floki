@@ -3045,25 +3045,52 @@ impl ExrViewer {
                 break; // only the on-screen frame remains
             };
             if let Some(t2) = self.t2_ring.remove(&victim) {
-                t2.texture.destroy();
+                // `t2_victim` already excludes the on-screen frame, so this
+                // destroys; the guard is belt-and-suspenders.
+                self.destroy_t2_off_screen(victim, t2);
             }
         }
     }
 
-    /// Destroy and drop a single frame's T2 texture, if present. Used by the
-    /// render-watch (#101) so a re-rendered frame's stale GPU texture is dropped
-    /// and rebuilt from the fresh decode.
+    /// Drop a single frame's T2 texture, if present. Used by the render-watch
+    /// (#101) so a re-rendered frame's stale GPU texture is dropped and rebuilt
+    /// from the fresh decode. The on-screen frame is never `destroy()`ed (see
+    /// [`Self::destroy_t2_off_screen`]).
     pub(crate) fn evict_t2_frame(&mut self, frame: u32) {
         if let Some(t2) = self.t2_ring.remove(&frame) {
-            t2.texture.destroy();
+            self.destroy_t2_off_screen(frame, t2);
         }
     }
 
-    /// Destroy and drop every T2 texture (new sequence / disabled / layer switch).
+    /// Drop every T2 texture (new sequence / disabled / layer switch).
     pub(crate) fn clear_t2(&mut self) {
-        for (_, t2) in self.t2_ring.drain() {
+        let frame = self.t2_frame;
+        for (f, t2) in std::mem::take(&mut self.t2_ring) {
+            self.destroy_t2_off_screen_with(frame, f, t2);
+        }
+    }
+
+    /// Explicitly `destroy()` an evicted T2 texture to reclaim VRAM now — but
+    /// **only if it is not the on-screen frame**. The on-screen frame's bind group
+    /// is cloned into `gpu_textures[active_layer]` and is referenced by the paint
+    /// callback being recorded this frame; destroying its texture mid-frame
+    /// invalidates that draw and the backend aborts at submit (Vulkan validates
+    /// this; Metal happens to tolerate it). For the on-screen frame we just drop
+    /// our ring handle — wgpu keeps the texture alive through the still-bound
+    /// bind group and frees it once the active binding is replaced (next swap /
+    /// layer change / re-decode).
+    fn destroy_t2_off_screen(&self, frame: u32, t2: T2Texture) {
+        self.destroy_t2_off_screen_with(self.t2_frame, frame, t2);
+    }
+
+    /// As [`Self::destroy_t2_off_screen`] but with the on-screen frame passed in,
+    /// so a bulk drain can borrow it once instead of per-entry.
+    fn destroy_t2_off_screen_with(&self, on_screen: Option<u32>, frame: u32, t2: T2Texture) {
+        if Some(frame) != on_screen {
             t2.texture.destroy();
         }
+        // else: drop `t2`; the texture is freed by wgpu when the bound bind group
+        // is replaced. Destroying it now would kill an in-flight draw.
     }
 
     /// CPU/thumbnail path: bake `layer_index` into an [`egui::TextureHandle`]
