@@ -120,6 +120,11 @@ keying `(layer, frame)`, budget split across layers) and avoid building N-way co
 the layer stack as independent one-offs. This is the highest-leverage item, and like the
 playback phases it is pure-logic-first / headless-testable before any UI.
 
+> **The design spike has landed** — see [`layer-model.md`](./layer-model.md). The pure model
+> (`src/layer.rs`, unit-tested) splits the two axes `CompareMode` conflates (arrangement vs
+> blend), generalizes the `(Slot, frame)` cache key to `(LayerId, source_frame)`, and maps
+> today's A/B behavior onto a `LayerStack`. Wiring follows in the build phases there.
+
 ---
 
 ## Phased roadmap (egui-first)
