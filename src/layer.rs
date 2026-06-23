@@ -11,9 +11,10 @@
 //! A [`Layer`] here is a **composite layer** — a placed source in an ordered
 //! stack, à la Chaos Player / Nuke. This is **distinct** from
 //! [`crate::exr_loader::LogicalLayer`], which is an AOV / channel-group *within*
-//! one EXR. A comp [`Layer`] *selects* one such AOV of its source through
-//! [`LayerSource::Image::aov`]. Throughout the review-player code, "layer" without
-//! qualification means the comp layer; the EXR AOV is always "logical layer".
+//! one EXR. A comp [`Layer`] *selects* one such AOV of its source through the
+//! `aov` field of [`LayerSource::Image`]. Throughout the review-player code,
+//! "layer" without qualification means the comp layer; the EXR AOV is always the
+//! "logical layer".
 //!
 //! # The structural idea
 //!
@@ -329,15 +330,19 @@ impl LayerStack {
     }
 
     /// Resolve the composite for a global timeline frame: the bottom-to-top
-    /// sequence of [`Step`]s to render. Image layers blank at this frame (per
-    /// their [`Trim`]) are dropped — they never produce an out-of-range fetch.
+    /// sequence of [`Step`]s to render. Layers blank at this frame are dropped:
+    /// an image layer outside its [`Trim`] span produces no fetch, and an
+    /// adjustment layer outside its span applies no grade — trim bounds *where*
+    /// every layer kind is active, not just image sources.
     #[must_use]
     pub fn composite_at(&self, global: u32) -> Vec<Step> {
         self.visible()
-            .filter_map(|l| match &l.source {
-                LayerSource::Image { source, aov } => {
-                    let source_frame = l.trim.source_frame(global)?;
-                    Some(Step::Draw(Draw {
+            .filter_map(|l| {
+                // A layer is active only within its trimmed span; for image
+                // layers this is also the source frame to fetch.
+                let source_frame = l.trim.source_frame(global)?;
+                Some(match &l.source {
+                    LayerSource::Image { source, aov } => Step::Draw(Draw {
                         id: l.id,
                         source: *source,
                         aov: *aov,
@@ -345,12 +350,12 @@ impl LayerStack {
                         transform: l.transform,
                         blend: l.blend,
                         opacity: l.opacity,
-                    }))
-                }
-                LayerSource::Adjustment => Some(Step::Adjust {
-                    id: l.id,
-                    opacity: l.opacity,
-                }),
+                    }),
+                    LayerSource::Adjustment => Step::Adjust {
+                        id: l.id,
+                        opacity: l.opacity,
+                    },
+                })
             })
             .collect()
     }
@@ -500,6 +505,25 @@ mod tests {
             }
             Step::Draw(_) => panic!("expected an adjust step on top"),
         }
+    }
+
+    #[test]
+    fn adjustment_layer_trim_bounds_where_the_grade_applies() {
+        let mut s = LayerStack::new();
+        s.push_image("plate", src(1), 0, Trim::full(0, 100));
+        let adj = s.push_adjustment("grade");
+        // Restrict the grade to frames [20, 40].
+        s.get_mut(adj).unwrap().trim = Trim::full(20, 40);
+
+        // Outside the grade's span: only the plate draws, no adjust step.
+        let before = s.composite_at(10);
+        assert_eq!(before.len(), 1);
+        assert!(matches!(before[0], Step::Draw(_)));
+
+        // Inside the span: the adjust step is emitted over the plate.
+        let inside = s.composite_at(30);
+        assert_eq!(inside.len(), 2);
+        assert!(matches!(inside[1], Step::Adjust { id, .. } if id == adj));
     }
 
     #[test]
