@@ -115,6 +115,27 @@ fn sample_channel_bounded(
     sample_channel(chan, x, y, w)
 }
 
+/// Contact-sheet thumbnail box, in pixels: both the on-screen cell size and the
+/// resolution thumbnails are baked at (longest edge), so the two never drift.
+const THUMB_BOX: usize = 256;
+
+/// Output dimensions and source stride for a CPU texture bake. With `max_dim ==
+/// None` (the full-res CPU-display fallback) this is the source size at stride 1.
+/// With `Some(d)` (contact-sheet thumbnails) the source is point-decimated so the
+/// longest edge is at most `d` — the per-pixel tone pipeline then runs over the
+/// small output instead of the full frame, which is the difference between
+/// processing ~34k pixels and ~8M for a 4K layer (re-baked on every frame swap
+/// while the sheet is open). Aspect is preserved within rounding.
+fn thumb_dims(width: usize, height: usize, max_dim: Option<usize>) -> (usize, usize, usize) {
+    match max_dim {
+        Some(d) if d > 0 && width.max(height) > d => {
+            let stride = width.max(height).div_ceil(d);
+            (width.div_ceil(stride), height.div_ceil(stride), stride)
+        }
+        _ => (width.max(1), height.max(1), 1),
+    }
+}
+
 /// Which channel(s) the canvas isolates. `RGB` shows full colour; the rest show
 /// a single channel as grayscale. Encoded for the shader via [`Self::as_u32`].
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
@@ -1571,15 +1592,19 @@ impl ExrViewer {
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing = egui::vec2(16.0, 16.0);
                         for i in 0..l_count {
+                            // Contact-sheet cells are 256px; bake the thumbnail at
+                            // that size rather than full-res (re-baked on every frame
+                            // swap while the sheet is open over a sequence).
                             let tex_opt = if is_a {
                                 if viewer.textures[i].is_none() {
-                                    viewer.textures[i] = viewer.generate_texture(ui.ctx(), data, i);
+                                    viewer.textures[i] =
+                                        viewer.generate_texture(ui.ctx(), data, i, Some(THUMB_BOX));
                                 }
                                 viewer.textures[i].as_ref()
                             } else {
                                 if viewer.textures_b[i].is_none() {
                                     viewer.textures_b[i] =
-                                        viewer.generate_texture(ui.ctx(), data, i);
+                                        viewer.generate_texture(ui.ctx(), data, i, Some(THUMB_BOX));
                                 }
                                 viewer.textures_b[i].as_ref()
                             };
@@ -1592,8 +1617,8 @@ impl ExrViewer {
                                 // then center-aligned those unequal cells by different amounts —
                                 // producing the slight vertical "staircase". Fixed rects + paint_at
                                 // remove that degree of freedom entirely.
-                                let thumb_width = 256.0;
-                                let thumb_box = 256.0;
+                                let thumb_width = THUMB_BOX as f32;
+                                let thumb_box = THUMB_BOX as f32;
                                 let label_height = 30.0;
                                 let tex_size = texture.size_vec2();
                                 let aspect = if tex_size.y > 0.0 {
@@ -1766,14 +1791,15 @@ impl ExrViewer {
             } else {
                 if self.textures[self.active_layer].is_none() {
                     self.textures[self.active_layer] =
-                        self.generate_texture(ui.ctx(), exr_data, self.active_layer);
+                        self.generate_texture(ui.ctx(), exr_data, self.active_layer, None);
                 }
                 if let Some(data_b) = exr_data_b {
                     let layer_b = self
                         .active_layer
                         .min(data_b.logical_layers.len().saturating_sub(1));
                     if self.textures_b[layer_b].is_none() {
-                        self.textures_b[layer_b] = self.generate_texture(ui.ctx(), data_b, layer_b);
+                        self.textures_b[layer_b] =
+                            self.generate_texture(ui.ctx(), data_b, layer_b, None);
                     }
                 }
                 let diff_key: DiffCacheKey = (
@@ -3067,19 +3093,23 @@ impl ExrViewer {
         ctx: &egui::Context,
         exr_data: &ExrData,
         layer_index: usize,
+        max_dim: Option<usize>,
     ) -> Option<egui::TextureHandle> {
         #[cfg(feature = "ocio")]
         if self.ocio_active
             && let Some(proc) = &self.ocio_cpu
         {
-            return self.generate_texture_ocio(ctx, exr_data, layer_index, proc);
+            return self.generate_texture_ocio(ctx, exr_data, layer_index, proc, max_dim);
         }
 
         let (layer, r_chan, g_chan, b_chan, a_chan) = exr_data.logical_channels(layer_index)?;
         let width = layer.size.0;
         let height = layer.size.1;
+        // Decimate to the thumbnail box when baking a contact-sheet cell; full-res
+        // (stride 1) for the CPU-display fallback. See [`thumb_dims`].
+        let (out_w, out_h, stride) = thumb_dims(width, height, max_dim);
 
-        let mut pixels = vec![egui::Color32::BLACK; width * height];
+        let mut pixels = vec![egui::Color32::BLACK; out_w * out_h];
 
         // Hoist all loop-invariant scalars out of the per-pixel work.
         let exp_mult = crate::render_math::exposure_to_multiplier(self.exposure);
@@ -3092,11 +3122,14 @@ impl ExrViewer {
         let channel_mode = self.channel_mode;
 
         // Process rows in parallel; each row is an independent, contiguous slice.
+        // Output coordinates map back to source pixels at `stride` (point-sampled).
         pixels
-            .par_chunks_mut(width)
+            .par_chunks_mut(out_w)
             .enumerate()
-            .for_each(|(y, row)| {
-                for (x, px) in row.iter_mut().enumerate() {
+            .for_each(|(oy, row)| {
+                let y = (oy * stride).min(height - 1);
+                for (ox, px) in row.iter_mut().enumerate() {
+                    let x = (ox * stride).min(width - 1);
                     let mut r = sample_channel(r_chan, x, y, width);
                     let mut g = sample_channel(g_chan, x, y, width);
                     let mut b = sample_channel(b_chan, x, y, width);
@@ -3165,8 +3198,8 @@ impl ExrViewer {
             });
 
         let color_image = egui::ColorImage {
-            size: [width, height],
-            source_size: egui::vec2(width as f32, height as f32),
+            size: [out_w, out_h],
+            source_size: egui::vec2(out_w as f32, out_h as f32),
             pixels,
         };
 
@@ -3182,10 +3215,14 @@ impl ExrViewer {
         exr_data: &ExrData,
         layer_index: usize,
         proc: &std::rc::Rc<floki_ocio::CpuProcessor>,
+        max_dim: Option<usize>,
     ) -> Option<egui::TextureHandle> {
         let (layer, r_chan, g_chan, b_chan, a_chan) = exr_data.logical_channels(layer_index)?;
         let width = layer.size.0;
         let height = layer.size.1;
+        // Decimate to the thumbnail box for contact-sheet cells (see [`thumb_dims`]);
+        // full-res for the CPU-display fallback. OCIO then transforms the small buffer.
+        let (out_w, out_h, stride) = thumb_dims(width, height, max_dim);
 
         let exp_mult = crate::render_math::exposure_to_multiplier(self.exposure);
         // Viewport background (issue #18): one config, sampled per pixel below so
@@ -3195,11 +3232,13 @@ impl ExrViewer {
 
         // Build a scene-linear RGBA f32 buffer (exposure + checker composite), then let OCIO
         // transform it in one call (OCIO's CPU path is internally vectorized).
-        let mut buf = vec![0.0_f32; width * height * 4];
-        buf.par_chunks_mut(width * 4)
+        let mut buf = vec![0.0_f32; out_w * out_h * 4];
+        buf.par_chunks_mut(out_w * 4)
             .enumerate()
-            .for_each(|(y, row)| {
-                for x in 0..width {
+            .for_each(|(oy, row)| {
+                let y = (oy * stride).min(height - 1);
+                for ox in 0..out_w {
+                    let x = (ox * stride).min(width - 1);
                     let mut r = sample_channel(r_chan, x, y, width);
                     let mut g = sample_channel(g_chan, x, y, width);
                     let mut b = sample_channel(b_chan, x, y, width);
@@ -3242,7 +3281,7 @@ impl ExrViewer {
                     g += bg[1] * (1.0 - a_clamp);
                     b += bg[2] * (1.0 - a_clamp);
 
-                    let o = x * 4;
+                    let o = ox * 4;
                     row[o] = r;
                     row[o + 1] = g;
                     row[o + 2] = b;
@@ -3250,7 +3289,7 @@ impl ExrViewer {
                 }
             });
 
-        if let Err(e) = proc.apply_rgba(&mut buf, width, height) {
+        if let Err(e) = proc.apply_rgba(&mut buf, out_w, out_h) {
             // Bail rather than display the untransformed buffer: clamping raw
             // scene-linear values to [0,1] would show wrong colors with no
             // indication the transform never ran. Returning None lets the
@@ -3263,7 +3302,7 @@ impl ExrViewer {
         // chain replaces the normal gamma/sRGB ops, so re-apply the control here
         // to match the GPU blit. `None` when gamma == 1.0 (no-op).
         let inv_gamma = (self.gamma != 1.0).then(|| 1.0 / self.gamma);
-        let mut pixels = vec![egui::Color32::BLACK; width * height];
+        let mut pixels = vec![egui::Color32::BLACK; out_w * out_h];
         pixels.par_iter_mut().enumerate().for_each(|(i, px)| {
             let o = i * 4;
             let mut c = [buf[o], buf[o + 1], buf[o + 2]];
@@ -3280,8 +3319,8 @@ impl ExrViewer {
         });
 
         let color_image = egui::ColorImage {
-            size: [width, height],
-            source_size: egui::vec2(width as f32, height as f32),
+            size: [out_w, out_h],
+            source_size: egui::vec2(out_w as f32, out_h as f32),
             pixels,
         };
         Some(ctx.load_texture("exr_viewer", color_image, egui::TextureOptions::LINEAR))
@@ -4086,6 +4125,31 @@ mod gui_tests {
     use eframe::egui;
     use egui_kittest::Harness;
     use exr::prelude::*;
+
+    #[test]
+    fn thumb_dims_decimates_to_the_box_and_preserves_aspect() {
+        use super::thumb_dims;
+        // No cap (CPU-display fallback): full res, stride 1.
+        assert_eq!(thumb_dims(4096, 2160, None), (4096, 2160, 1));
+        // Image already within the box: untouched.
+        assert_eq!(thumb_dims(200, 100, Some(256)), (200, 100, 1));
+        // 4K landscape -> longest edge capped at the box, aspect preserved.
+        let (w, h, stride) = thumb_dims(4096, 2160, Some(256));
+        assert!(w <= 256 && h <= 256, "longest edge within the box: {w}x{h}");
+        assert_eq!(stride, 16, "4096.div_ceil(256)");
+        assert!(
+            (w as f32 / h as f32 - 4096.0 / 2160.0).abs() < 0.05,
+            "aspect kept"
+        );
+        // Portrait caps the height instead.
+        let (w, h, _) = thumb_dims(1080, 1920, Some(256));
+        assert!(
+            w <= 256 && h <= 256 && h >= w,
+            "portrait stays portrait: {w}x{h}"
+        );
+        // Degenerate: never produces a zero dimension.
+        assert_eq!(thumb_dims(0, 0, Some(256)), (1, 1, 1));
+    }
 
     #[test]
     fn t2_victim_evicts_furthest_and_protects_on_screen() {
