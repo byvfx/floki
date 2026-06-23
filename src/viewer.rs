@@ -285,6 +285,13 @@ fn t2_victim(frames: impl Iterator<Item = u32>, on_screen: Option<u32>) -> Optio
 pub struct ExrViewer {
     textures: Vec<Option<egui::TextureHandle>>,
     textures_b: Vec<Option<egui::TextureHandle>>,
+    /// Per-layer **decimated** contact-sheet thumbnails (A/B), kept separate from
+    /// the full-res CPU-display caches above. Sharing one slot would let a ≤256px
+    /// sheet thumbnail leak into the CPU-fallback central view (which gates on
+    /// `is_none()` and so wouldn't regenerate full-res). Same indexing, lifetime,
+    /// and invalidation as `textures`/`textures_b`.
+    thumbnails: Vec<Option<egui::TextureHandle>>,
+    thumbnails_b: Vec<Option<egui::TextureHandle>>,
     gpu_textures: Vec<Option<std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>>>,
     gpu_textures_b: Vec<Option<std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>>>,
 
@@ -447,6 +454,8 @@ impl Default for ExrViewer {
         Self {
             textures: Vec::new(),
             textures_b: Vec::new(),
+            thumbnails: Vec::new(),
+            thumbnails_b: Vec::new(),
             gpu_textures: Vec::new(),
             gpu_textures_b: Vec::new(),
             t2_ring: std::collections::HashMap::new(),
@@ -611,6 +620,8 @@ impl ExrViewer {
                 if self.channel_mode != prev_mode {
                     self.textures.fill(None);
                     self.textures_b.fill(None);
+                    self.thumbnails.fill(None);
+                    self.thumbnails_b.fill(None);
                     self.diff_texture = None;
                 }
             }
@@ -628,6 +639,8 @@ impl ExrViewer {
     fn invalidate_tone(&mut self) {
         self.textures.fill(None);
         self.textures_b.fill(None);
+        self.thumbnails.fill(None);
+        self.thumbnails_b.fill(None);
         self.diff_texture = None;
         self.composite_texture = None;
     }
@@ -773,6 +786,7 @@ impl ExrViewer {
             ui.selectable_value(&mut self.channel_mode, ChannelMode::A, "A");
             if self.channel_mode != prev_mode {
                 self.textures.fill(None);
+                self.thumbnails.fill(None);
             }
 
             ui.separator();
@@ -1546,6 +1560,8 @@ impl ExrViewer {
             self.ocio_sig = sig;
             self.textures.fill(None);
             self.textures_b.fill(None);
+            self.thumbnails.fill(None);
+            self.thumbnails_b.fill(None);
         }
     }
 
@@ -1569,12 +1585,16 @@ impl ExrViewer {
         if self.textures.len() != layer_count {
             self.textures.clear();
             self.textures.resize(layer_count, None);
+            self.thumbnails.clear();
+            self.thumbnails.resize(layer_count, None);
             self.gpu_textures.clear();
             self.gpu_textures.resize(layer_count, None);
         }
         if self.textures_b.len() != layer_count_b {
             self.textures_b.clear();
             self.textures_b.resize(layer_count_b, None);
+            self.thumbnails_b.clear();
+            self.thumbnails_b.resize(layer_count_b, None);
             self.gpu_textures_b.clear();
             self.gpu_textures_b.resize(layer_count_b, None);
         }
@@ -1603,18 +1623,21 @@ impl ExrViewer {
                             // Contact-sheet cells are 256px; bake the thumbnail at
                             // that size rather than full-res (re-baked on every frame
                             // swap while the sheet is open over a sequence).
+                            // Bake into the dedicated thumbnail cache, NOT the
+                            // full-res `textures` slots — otherwise a closed sheet
+                            // would leave a low-res thumbnail in the CPU-fallback view.
                             let tex_opt = if is_a {
-                                if viewer.textures[i].is_none() {
-                                    viewer.textures[i] =
+                                if viewer.thumbnails[i].is_none() {
+                                    viewer.thumbnails[i] =
                                         viewer.generate_texture(ui.ctx(), data, i, Some(THUMB_BOX));
                                 }
-                                viewer.textures[i].as_ref()
+                                viewer.thumbnails[i].as_ref()
                             } else {
-                                if viewer.textures_b[i].is_none() {
-                                    viewer.textures_b[i] =
+                                if viewer.thumbnails_b[i].is_none() {
+                                    viewer.thumbnails_b[i] =
                                         viewer.generate_texture(ui.ctx(), data, i, Some(THUMB_BOX));
                                 }
-                                viewer.textures_b[i].as_ref()
+                                viewer.thumbnails_b[i].as_ref()
                             };
 
                             if let Some(texture) = tex_opt {
@@ -3765,6 +3788,7 @@ impl ExrViewer {
     /// diff/composite textures (which both depend on B).
     pub fn invalidate_reference_textures(&mut self) {
         self.textures_b.fill(None);
+        self.thumbnails_b.fill(None);
         self.gpu_textures_b.fill(None);
         self.diff_texture = None;
         self.composite_texture = None;
@@ -3779,6 +3803,7 @@ impl ExrViewer {
     /// depend on A). Used by [`crate::app::ExrApp::swap_image_data`].
     pub fn invalidate_active_textures(&mut self) {
         self.textures.fill(None);
+        self.thumbnails.fill(None);
         self.gpu_textures.fill(None);
         self.diff_texture = None;
         self.composite_texture = None;
@@ -4452,6 +4477,65 @@ mod gui_tests {
         h.run();
         h.state_mut().viewer.compare_mode = CompareMode::SideBySide;
         h.run();
+    }
+
+    /// Regression for the #107/#112 review: the contact sheet must bake into the
+    /// dedicated `thumbnails` cache, never the full-res `textures` slots — else a
+    /// closed sheet leaves a ≤256px thumbnail in the CPU-fallback central view
+    /// (whose `is_none()` gate then skips full-res regeneration).
+    #[test]
+    fn contact_sheet_uses_thumbnail_cache_not_the_fullres_slots() {
+        let dir = tempfile::tempdir().unwrap();
+        let pa = dir.path().join("a.exr");
+        write_rgba_exr(&pa);
+        let a = ExrData::load(&pa).unwrap();
+
+        let mut h = Harness::new_ui_state(
+            |ui, s: &mut SmokeState| {
+                let SmokeState { viewer, a, b } = s;
+                viewer.ui(ui, a, b.as_ref(), None, None);
+            },
+            SmokeState {
+                viewer: ExrViewer::default(),
+                a,
+                b: None,
+            },
+        );
+
+        // Open the sheet and lay it out. (egui_kittest's first frame is a sizing
+        // pass that doesn't run the ScrollArea content; a second frame bakes it.)
+        h.state_mut().viewer.show_contact_sheet = true;
+        h.run();
+        h.run();
+        assert!(
+            h.state().viewer.thumbnails[0].is_some(),
+            "sheet baked into the dedicated thumbnail cache"
+        );
+
+        // The crux: with the sheet open, wipe the full-res slot and run again. The
+        // sheet path must NOT refill `textures` (it writes only `thumbnails`), so
+        // the slot stays clear — before the fix the sheet baked here and it would
+        // come back populated with a low-res thumbnail.
+        h.state_mut().viewer.textures.fill(None);
+        h.run();
+        assert!(
+            h.state().viewer.textures[0].is_none(),
+            "sheet must not touch the full-res CPU-display slot"
+        );
+        assert!(
+            h.state().viewer.thumbnails[0].is_some(),
+            "thumbnail cache survives (is_none gate skips re-bake)"
+        );
+
+        // Close the sheet: the CPU-fallback central view fills the full-res slot
+        // itself — it was never blocked by a stale low-res thumbnail.
+        h.state_mut().viewer.show_contact_sheet = false;
+        h.run();
+        h.run();
+        assert!(
+            h.state().viewer.textures[0].is_some(),
+            "CPU fallback regenerates the full-res texture once the sheet closes"
+        );
     }
 
     #[test]
