@@ -3064,11 +3064,13 @@ impl ExrViewer {
         self.t2_ring.clear();
     }
 
-    /// CPU/thumbnail path: bake `layer_index` into an [`egui::TextureHandle`]
-    /// with the full channel-select → exposure → gamma → sRGB tone pipeline.
-    /// Used for contact-sheet thumbnails and as the fallback when no GPU
-    /// `render_state` is available. Dispatches to `generate_texture_ocio`
-    /// when an OCIO CPU processor is active.
+    /// CPU contact-sheet thumbnail bake: decimate `layer_index` to the thumbnail
+    /// box and bake it into an [`egui::TextureHandle`] with the channel-select →
+    /// exposure → gamma → sRGB tone pipeline. This is the **headless / no-GPU
+    /// fallback** for the contact sheet (used by tests and when no GPU is
+    /// present); with a GPU, thumbnails render through [`crate::gpu::thumbnail`]
+    /// (OCIO included). #59 removed the CPU viewport render and the CPU OCIO
+    /// processor, so this is non-OCIO only and `max_dim` is always the thumb box.
     fn generate_texture(
         &self,
         ctx: &egui::Context,
@@ -3076,10 +3078,6 @@ impl ExrViewer {
         layer_index: usize,
         max_dim: Option<usize>,
     ) -> Option<egui::TextureHandle> {
-        // Non-OCIO CPU bake only. This is the headless / no-GPU contact-sheet
-        // thumbnail fallback (#59 removed the CPU viewport render and the CPU
-        // OCIO processor); when a GPU is present, thumbnails render through
-        // `crate::gpu::thumbnail` instead, OCIO included.
         let (layer, r_chan, g_chan, b_chan, a_chan) = exr_data.logical_channels(layer_index)?;
         let width = layer.size.0;
         let height = layer.size.1;
@@ -3088,8 +3086,7 @@ impl ExrViewer {
         if width == 0 || height == 0 {
             return None;
         }
-        // Decimate to the thumbnail box when baking a contact-sheet cell; full-res
-        // (stride 1) for the CPU-display fallback. See [`thumb_dims`].
+        // Decimate to the thumbnail box (`max_dim`). See [`thumb_dims`].
         let (out_w, out_h, stride) = thumb_dims(width, height, max_dim);
 
         let mut pixels = vec![egui::Color32::BLACK; out_w * out_h];

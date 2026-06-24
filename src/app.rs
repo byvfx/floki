@@ -502,8 +502,11 @@ impl ExrApp {
         use floki_ocio::DisplayTransformRequest;
 
         // Bump the OCIO generation so the viewer re-renders thumbnails and the
-        // OCIO callback on any config / display / view change (#59).
-        self.ocio_render_gen = self.ocio_render_gen.wrapping_add(1);
+        // OCIO callback on any config / display / view change (#59). `saturating`,
+        // not `wrapping`: the viewer treats 0 as the OCIO-off sentinel and relies
+        // on the generation being non-zero (>= 1) whenever OCIO is active, so this
+        // must never wrap back to 0.
+        self.ocio_render_gen = self.ocio_render_gen.saturating_add(1);
         let Some(cfg) = &self.ocio_config else {
             self.ocio_ready = false;
             return;
