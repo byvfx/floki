@@ -1696,17 +1696,24 @@ impl ExrViewer {
         exr_data: &ExrData,
         exr_data_b: Option<&ExrData>,
         gpu_resources: Option<&crate::gpu::GpuResources>,
+        lut_bg_opt: Option<&std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>>,
     ) {
-        // The GPU thumbnail path applies only when a GPU is present AND OCIO is off
-        // (offscreen OCIO thumbnails are deferred to Phase 2).
-        let use_gpu = gpu_resources.is_some() && !self.ocio_active;
+        // The GPU thumbnail path applies whenever a GPU is present — non-OCIO via
+        // the display shader ([`generate`], Phase 1), OCIO via the two-pass
+        // [`generate_ocio`] (Phase 2). Under OCIO it requires the `Rgba8Unorm`
+        // thumbnail pass to be published (config loaded); until then the CPU
+        // `thumbnails` cache is the fallback.
+        let ocio_ready_for_gpu = !self.ocio_active
+            || gpu_resources.is_some_and(crate::gpu::GpuResources::has_ocio_thumbnail_pass);
+        let use_gpu = gpu_resources.is_some() && ocio_ready_for_gpu;
 
-        // The backdrop is baked into each GPU thumbnail, but background edits don't
-        // run through `invalidate_tone`. Re-render the sheet when it changes (#122
-        // review) — a signature compare catches the settings window / gradient
-        // editor / preset-load paths alike. Queue happens before the drain below so
-        // the stale ids are freed this frame.
-        if use_gpu && self.gpu_thumb_bg.as_ref() != Some(&self.background) {
+        // The checker backdrop is baked into each *non-OCIO* GPU thumbnail, but
+        // background edits don't run through `invalidate_tone`. Re-render the sheet
+        // when it changes (#122 review) — a signature compare catches the settings
+        // window / gradient editor / preset-load paths alike. Queue happens before
+        // the drain below so the stale ids are freed this frame. (OCIO thumbnails
+        // skip the background composite, so they don't depend on it.)
+        if use_gpu && !self.ocio_active && self.gpu_thumb_bg.as_ref() != Some(&self.background) {
             self.invalidate_gpu_thumbnails(true, true);
             self.gpu_thumb_bg = Some(self.background.clone());
         }
@@ -1726,14 +1733,17 @@ impl ExrViewer {
             }
         }
 
-        // Tone snapshot for the GPU thumbnail render. `enable_lut` is forced off in
-        // Phase 1: the user .cube LUT isn't bound into the thumbnail pass yet (only
-        // the default 1x1 LUT bind group is), so honouring it would zero the image.
+        // Tone snapshot for the GPU thumbnail render. `enable_lut` now honours the
+        // user `.cube` LUT: Phase 2 threads the real LUT bind group through to the
+        // draw (non-OCIO display shader) / OCIO pass 1, so the thumbnail matches the
+        // viewport. `lut_bg_opt` is `Some` exactly when `enable_lut` is set (the app
+        // gates it on `lut_bg.is_some()`).
+        let lut_ref = lut_bg_opt;
         let tone = crate::gpu::thumbnail::ThumbnailTone {
             exposure: self.exposure,
             gamma: self.gamma,
             srgb: self.srgb,
-            enable_lut: false,
+            enable_lut: self.enable_lut,
             channel_mode: self.channel_mode.as_u32(),
             lut_domain_min: self.lut_domain_min,
             lut_domain_max: self.lut_domain_max,
@@ -1770,9 +1780,15 @@ impl ExrViewer {
                                     &mut viewer.gpu_thumbnails_b
                                 };
                                 if cache[i].is_none() {
-                                    cache[i] = crate::gpu::thumbnail::generate(
-                                        gpu, data, i, THUMB_BOX, &tone,
-                                    );
+                                    cache[i] = if viewer.ocio_active {
+                                        crate::gpu::thumbnail::generate_ocio(
+                                            gpu, data, i, THUMB_BOX, &tone, lut_ref,
+                                        )
+                                    } else {
+                                        crate::gpu::thumbnail::generate(
+                                            gpu, data, i, THUMB_BOX, &tone, lut_ref,
+                                        )
+                                    };
                                 }
                                 cache[i].as_ref().map(|(id, _, size)| {
                                     (
@@ -1943,7 +1959,7 @@ impl ExrViewer {
         self.sync_texture_caches(layer_count, layer_count_b);
 
         if self.show_contact_sheet {
-            self.draw_contact_sheet(ui, exr_data, exr_data_b, gpu_resources);
+            self.draw_contact_sheet(ui, exr_data, exr_data_b, gpu_resources, lut_bg_opt.as_ref());
         } else {
             // Channel/frame hotkeys are handled up-front in `handle_hotkeys`.
             let (tw, th) = exr_data.logical_size(self.active_layer).unwrap_or((1, 1));
