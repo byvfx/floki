@@ -800,7 +800,9 @@ impl ExrViewer {
             ui.selectable_value(&mut self.channel_mode, ChannelMode::A, "A");
             if self.channel_mode != prev_mode {
                 self.textures.fill(None);
+                self.textures_b.fill(None);
                 self.thumbnails.fill(None);
+                self.thumbnails_b.fill(None);
             }
 
             ui.separator();
