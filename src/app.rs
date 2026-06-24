@@ -94,7 +94,6 @@ struct LutLoadResult {
 /// Edge length of the baked OCIO 3D LUT (#24). 65³ keeps saturated-highlight error well under
 /// 0.02 vs the analytic ACES transform (33³ measured ~0.04 there); ~4.4 MB as RGBA f32, a
 /// trivial VRAM cost for a viewer.
-#[cfg(feature = "ocio")]
 const OCIO_BAKE_LUT_SIZE: u32 = 65;
 
 /// Top-level application state and the [`eframe::App`] implementation. Owns the
@@ -248,40 +247,29 @@ pub struct ExrApp {
     #[serde(skip)]
     lut_domain_max: [f32; 4],
 
-    #[cfg(feature = "ocio")]
     #[serde(default)]
     ocio_display: String,
-    #[cfg(feature = "ocio")]
     #[serde(default)]
     ocio_view: String,
-    #[cfg(feature = "ocio")]
     #[serde(default)]
     ocio_input_cs: String,
-    #[cfg(feature = "ocio")]
     #[serde(default)]
     pub ocio_enabled: bool,
     /// Bake the OCIO display transform to a 3D LUT (#24): trades a tiny amount of accuracy for
     /// a cheap per-pixel texture lookup instead of the analytic ACES ALU — smoother pan/zoom
     /// on weak GPUs. Off by default (analytic is the reference).
-    #[cfg(feature = "ocio")]
     #[serde(default)]
     pub ocio_bake_lut: bool,
-    #[cfg(feature = "ocio")]
     #[serde(skip)]
     ocio_config: Option<floki_ocio::OcioConfig>,
-    #[cfg(feature = "ocio")]
     #[serde(skip)]
     ocio_displays: Vec<floki_ocio::Display>,
-    #[cfg(feature = "ocio")]
     #[serde(skip)]
     ocio_colorspaces: Vec<String>,
-    #[cfg(feature = "ocio")]
     #[serde(skip)]
     ocio_error: Option<String>,
-    #[cfg(feature = "ocio")]
     #[serde(skip)]
     ocio_ready: bool,
-    #[cfg(feature = "ocio")]
     #[serde(skip)]
     ocio_cpu: Option<std::rc::Rc<floki_ocio::CpuProcessor>>,
 
@@ -376,27 +364,16 @@ impl Default for ExrApp {
             lut_error: None,
             lut_domain_min: [0.0, 0.0, 0.0, 0.0],
             lut_domain_max: [1.0, 1.0, 1.0, 0.0],
-            #[cfg(feature = "ocio")]
             ocio_display: String::new(),
-            #[cfg(feature = "ocio")]
             ocio_view: String::new(),
-            #[cfg(feature = "ocio")]
             ocio_input_cs: String::new(),
-            #[cfg(feature = "ocio")]
             ocio_enabled: false,
-            #[cfg(feature = "ocio")]
             ocio_bake_lut: false,
-            #[cfg(feature = "ocio")]
             ocio_config: None,
-            #[cfg(feature = "ocio")]
             ocio_displays: Vec::new(),
-            #[cfg(feature = "ocio")]
             ocio_colorspaces: Vec::new(),
-            #[cfg(feature = "ocio")]
             ocio_error: None,
-            #[cfg(feature = "ocio")]
             ocio_ready: false,
-            #[cfg(feature = "ocio")]
             ocio_cpu: None,
             show_tools_window: false,
             tools_input_dir: String::new(),
@@ -445,7 +422,6 @@ impl ExrApp {
 
         // OCIO state (config handle + GPU pass) can't persist either; rebuild from the
         // persisted path/display/view if OCIO was enabled.
-        #[cfg(feature = "ocio")]
         if app.ocio_enabled {
             app.reload_ocio();
             if !app.ocio_ready {
@@ -459,7 +435,6 @@ impl ExrApp {
     /// Load the OCIO config (from `ocio_path`, or built-in `ocio://default` if empty),
     /// enumerate its color spaces/displays/views, pick sensible defaults, and build the GPU
     /// pass. Errors land in `ocio_error` and clear `ocio_ready`.
-    #[cfg(feature = "ocio")]
     fn reload_ocio(&mut self) {
         use floki_ocio::{ConfigSource, OcioConfig};
 
@@ -518,7 +493,6 @@ impl ExrApp {
 
     /// Rebuild just the GPU pass from the current config + input/display/view selection
     /// (cheaper than reloading the config when the user changes a dropdown).
-    #[cfg(feature = "ocio")]
     fn rebuild_ocio_pass(&mut self) {
         use floki_ocio::DisplayTransformRequest;
 
@@ -2037,15 +2011,11 @@ impl ExrApp {
             // closure, so we can't call the whole-`self` `reload_lut` inside it.
             // Record the request and act on it after the window block closes.
             let mut lut_reload_requested = false;
-            #[cfg(feature = "ocio")]
             let mut ocio_load_requested = false;
-            #[cfg(feature = "ocio")]
             let mut ocio_rebuild_requested = false;
             // Snapshot the enumerations so the combos can read them while the closure holds
             // a mutable borrow of `self` for the selections.
-            #[cfg(feature = "ocio")]
             let ocio_displays = self.ocio_displays.clone();
-            #[cfg(feature = "ocio")]
             let ocio_colorspaces = self.ocio_colorspaces.clone();
             egui::Window::new("Color Management")
                 .open(&mut self.show_settings)
@@ -2053,17 +2023,6 @@ impl ExrApp {
                     ui.heading("Settings");
                     ui.add_space(5.0);
 
-                    #[cfg(not(feature = "ocio"))]
-                    {
-                        ui.label("OCIO Environment / Config Path:");
-                        ui.horizontal(|ui| {
-                            ui.text_edit_singleline(&mut self.ocio_path);
-                            ui.add_enabled(false, egui::Button::new("Browse"))
-                                .on_disabled_hover_text("Build with --features ocio");
-                        });
-                    }
-
-                    #[cfg(feature = "ocio")]
                     {
                         ui.label(
                             "OCIO Config (.ocio) — empty uses built-in ACES (ocio://default):",
@@ -2209,7 +2168,6 @@ impl ExrApp {
                 self.reload_lut();
             }
 
-            #[cfg(feature = "ocio")]
             if ocio_load_requested {
                 self.reload_ocio();
                 if self.ocio_ready {
@@ -3199,15 +3157,12 @@ impl ExrApp {
                     self.viewer.enable_lut = self.enable_lut && self.lut_bg.is_some();
                     self.viewer.lut_domain_min = self.lut_domain_min;
                     self.viewer.lut_domain_max = self.lut_domain_max;
-                    #[cfg(feature = "ocio")]
-                    {
-                        self.viewer.ocio_active = self.ocio_enabled && self.ocio_ready;
-                        self.viewer.ocio_cpu = if self.viewer.ocio_active {
-                            self.ocio_cpu.clone()
-                        } else {
-                            None
-                        };
-                    }
+                    self.viewer.ocio_active = self.ocio_enabled && self.ocio_ready;
+                    self.viewer.ocio_cpu = if self.viewer.ocio_active {
+                        self.ocio_cpu.clone()
+                    } else {
+                        None
+                    };
                     // Diff controls: push the persisted state into the viewer, let
                     // the mode-param UI mutate it during `ui`, then read it back so
                     // `save` persists the latest. Kept identical both ways, so no

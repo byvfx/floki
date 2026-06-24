@@ -401,15 +401,12 @@ pub struct ExrViewer {
     pub lut_domain_max: [f32; 4],
     /// When true (OCIO config loaded + enabled), the single-image central path renders via the
     /// two-pass OCIO callback instead of the direct display chain. Set by the app.
-    #[cfg(feature = "ocio")]
     pub ocio_active: bool,
     /// CPU display transform for thumbnails / CPU fallback (mirrors the GPU OCIO path). Set by
     /// the app; shared via `Rc` because `CpuProcessor` isn't `Clone`.
-    #[cfg(feature = "ocio")]
     pub ocio_cpu: Option<std::rc::Rc<floki_ocio::CpuProcessor>>,
     /// Identity of the current OCIO CPU state; cached CPU textures are invalidated when it
     /// changes (toggle on/off or a new display/view).
-    #[cfg(feature = "ocio")]
     ocio_sig: usize,
     pub show_tooltip: bool,
     pub channel_mode: ChannelMode,
@@ -543,11 +540,8 @@ impl Default for ExrViewer {
             enable_lut: false,
             lut_domain_min: [0.0, 0.0, 0.0, 0.0],
             lut_domain_max: [1.0, 1.0, 1.0, 0.0],
-            #[cfg(feature = "ocio")]
             ocio_active: false,
-            #[cfg(feature = "ocio")]
             ocio_cpu: None,
-            #[cfg(feature = "ocio")]
             ocio_sig: 0,
             show_tooltip: true,
             channel_mode: ChannelMode::RGB,
@@ -1627,7 +1621,6 @@ impl ExrViewer {
     /// Drop cached CPU textures (thumbnails / fallback) when the OCIO CPU
     /// processor changes, so they regenerate with — or without — the display
     /// transform. A no-op while the processor identity is unchanged.
-    #[cfg(feature = "ocio")]
     fn invalidate_ocio_cpu_textures(&mut self) {
         let sig = if self.ocio_active {
             self.ocio_cpu
@@ -1705,13 +1698,8 @@ impl ExrViewer {
         gpu_resources: Option<&crate::gpu::GpuResources>,
     ) {
         // The GPU thumbnail path applies only when a GPU is present AND OCIO is off
-        // (offscreen OCIO thumbnails are deferred to Phase 2). Compile both with and
-        // without the `ocio` feature.
-        #[cfg(feature = "ocio")]
-        let ocio_on = self.ocio_active;
-        #[cfg(not(feature = "ocio"))]
-        let ocio_on = false;
-        let use_gpu = gpu_resources.is_some() && !ocio_on;
+        // (offscreen OCIO thumbnails are deferred to Phase 2).
+        let use_gpu = gpu_resources.is_some() && !self.ocio_active;
 
         // The backdrop is baked into each GPU thumbnail, but background edits don't
         // run through `invalidate_tone`. Re-render the sheet when it changes (#122
@@ -1936,7 +1924,6 @@ impl ExrViewer {
     ) {
         self.handle_hotkeys(ui, exr_data_b.is_some());
 
-        #[cfg(feature = "ocio")]
         self.invalidate_ocio_cpu_textures();
 
         self.apply_blink_mode(ui, exr_data_b.is_some());
@@ -2731,18 +2718,15 @@ impl ExrViewer {
         // Per-frame ring allocator: bumped by each `draw_gpu` call. Up to ~4
         // draws per frame fit well within the 16-slot ring (2 KB total).
         let uniform_offset = std::cell::Cell::new(0u32);
-        #[cfg(feature = "ocio")]
         let ocio_active = self.ocio_active;
         // Under OCIO, draw_gpu accumulates pass-1 draws here instead of emitting a
         // callback per call; a single OcioCallback covering the whole frame (both
         // side-by-side images included) is emitted after draw_all.
-        #[cfg(feature = "ocio")]
         let ocio_draws: std::cell::RefCell<Vec<crate::gpu::ocio_pass::OcioPass1Draw>> =
             std::cell::RefCell::new(Vec::new());
         // Running FNV-1a hash of everything that affects the OCIO render (uniforms +
         // texture identities) so the (expensive) display transform is skipped on
         // repaints that change nothing — hover, menus, animations.
-        #[cfg(feature = "ocio")]
         let ocio_sig = std::cell::Cell::new(0xcbf29ce484222325u64);
         let draw_gpu = |painter: &egui::Painter,
                         bg_a: std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>,
@@ -2761,7 +2745,6 @@ impl ExrViewer {
 
             // OCIO path: pass 1 must emit scene-linear, so bypass the built-in
             // display chain (sRGB/gamma/.cube LUT). Exposure stays (linear).
-            #[cfg(feature = "ocio")]
             if ocio_active {
                 u.srgb = 0;
                 u.gamma = 1.0;
@@ -2795,7 +2778,6 @@ impl ExrViewer {
             // Diff is a false-color heat-map visualization (display-space,
             // not color-managed), so it always uses the normal pipeline —
             // even under OCIO it is NOT accumulated into the OCIO pass.
-            #[cfg(feature = "ocio")]
             if ocio_active && !is_diff {
                 // Fold this draw's inputs (uniform bytes + texture pointers) into
                 // the per-frame render signature; OcioCallback re-renders only
@@ -3044,7 +3026,6 @@ impl ExrViewer {
             // the blit, so there is no separate dim draw here. Diff opts out: it
             // renders a display-space heat map via the normal pipeline (see
             // draw_gpu), so OCIO never runs for it.
-            #[cfg(feature = "ocio")]
             let ocio_handled = if self.ocio_active
                 && !matches!(program.arrangement, render_program::Arrangement::Diff)
             {
@@ -3125,8 +3106,6 @@ impl ExrViewer {
             } else {
                 false
             };
-            #[cfg(not(feature = "ocio"))]
-            let ocio_handled = false;
 
             if !ocio_handled {
                 if self.overscan_opacity > 0.0 && !is_sbs {
@@ -3359,7 +3338,6 @@ impl ExrViewer {
         layer_index: usize,
         max_dim: Option<usize>,
     ) -> Option<egui::TextureHandle> {
-        #[cfg(feature = "ocio")]
         if self.ocio_active
             && let Some(proc) = &self.ocio_cpu
         {
@@ -3477,7 +3455,6 @@ impl ExrViewer {
 
     /// CPU equivalent of the GPU OCIO path for thumbnails / CPU fallback: channel-select +
     /// exposure + checkerboard composite (scene-linear), then the OCIO display transform.
-    #[cfg(feature = "ocio")]
     fn generate_texture_ocio(
         &self,
         ctx: &egui::Context,
@@ -3690,7 +3667,6 @@ impl ExrViewer {
         layer_a_idx: usize,
         layer_b_idx: usize,
     ) -> Option<egui::TextureHandle> {
-        #[cfg(feature = "ocio")]
         if self.ocio_active
             && let Some(proc) = &self.ocio_cpu
         {
@@ -3821,7 +3797,6 @@ impl ExrViewer {
     /// (exposure + checker composite, scene-linear) then runs the OCIO display transform —
     /// mirrors [`Self::generate_texture_ocio`]. As in that path the checker is composited
     /// pre-OCIO (an accepted parity nuance — this CPU path is fallback/thumbnails only).
-    #[cfg(feature = "ocio")]
     fn generate_composite_texture_ocio(
         &self,
         ctx: &egui::Context,

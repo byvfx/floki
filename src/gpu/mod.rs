@@ -2,7 +2,6 @@ use bytemuck::{Pod, Zeroable};
 use eframe::egui_wgpu::wgpu;
 use std::sync::Arc;
 
-#[cfg(feature = "ocio")]
 pub mod ocio_pass;
 
 pub mod resources;
@@ -69,7 +68,6 @@ pub struct Uniforms {
 /// applies the overscan dim factor outside the display window. All rects/sizes are
 /// in egui *points* (the same unit as `Uniforms.screen_size` / `rect_min`), so the
 /// 16-point checker and the display-window boundary match the non-OCIO path on HiDPI.
-#[cfg(feature = "ocio")]
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct BlitUniforms {
@@ -141,18 +139,13 @@ pub struct GpuState {
     /// Same shader/layout as `pipeline` but renders into an `Rgba32Float` offscreen target
     /// (the OCIO "pass 1" scene-linear buffer). Drive it with `srgb=0, gamma=1, enable_lut=0`
     /// so it emits linear color for the OCIO display transform.
-    #[cfg(feature = "ocio")]
     pub pipeline_linear: wgpu::RenderPipeline,
     /// Blits the OCIO display texture into egui's render pass (OCIO "paint").
-    #[cfg(feature = "ocio")]
     pub blit_pipeline: wgpu::RenderPipeline,
-    #[cfg(feature = "ocio")]
     pub blit_layout: wgpu::BindGroupLayout,
-    #[cfg(feature = "ocio")]
     pub blit_sampler: wgpu::Sampler,
 }
 
-#[cfg(feature = "ocio")]
 const BLIT_SHADER: &str = r#"
 struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
 @vertex
@@ -640,7 +633,6 @@ impl GpuState {
                 ],
             }));
 
-        #[cfg(feature = "ocio")]
         let pipeline_linear = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Exr Linear Offscreen Pipeline"),
             layout: Some(&pipeline_layout),
@@ -672,7 +664,6 @@ impl GpuState {
             cache: None,
         });
 
-        #[cfg(feature = "ocio")]
         let (blit_pipeline, blit_layout, blit_sampler) = {
             let blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("Blit Shader"),
@@ -787,13 +778,9 @@ impl GpuState {
             uniform_buffer,
             uniform_bind_group,
             uniform_stride,
-            #[cfg(feature = "ocio")]
             pipeline_linear,
-            #[cfg(feature = "ocio")]
             blit_pipeline,
-            #[cfg(feature = "ocio")]
             blit_layout,
-            #[cfg(feature = "ocio")]
             blit_sampler,
         }
     }
@@ -993,7 +980,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "ocio")]
     #[test]
     fn blit_uniforms_size_is_16_byte_aligned() {
         // The OCIO blit uniform buffer must be a multiple of 16 bytes (WGSL uniform rule).

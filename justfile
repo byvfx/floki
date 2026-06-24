@@ -14,17 +14,17 @@ default:
 # Build + run floki with self-contained (vendored) OCIO. Inits the submodule first.
 ocio:
     git submodule update --init --recursive
-    cargo run --release --features ocio-vendored
+    cargo run --release --no-default-features --features vendored
 
 # Build (no run) floki with vendored OCIO.
 ocio-build:
     git submodule update --init --recursive
-    cargo build --release --features ocio-vendored
+    cargo build --release --no-default-features --features vendored
 
 # Run the floki-ocio static-link smoke test against vendored OCIO.
 ocio-test:
     git submodule update --init --recursive
-    cargo test --features ocio-vendored
+    cargo test --no-default-features --features vendored
 
 # Apply the auto-fixable pedantic/style lints (use_self, uninlined_format_args, etc.),
 # then reformat. Zero-behavior-risk cleanup; run `cargo test` afterwards. See issue #68.

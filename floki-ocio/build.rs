@@ -32,9 +32,10 @@ mod native {
 
     pub fn build() {
         // Vendored takes precedence: a self-contained static build should never fall back to a
-        // system OCIO even if both features are on (the app's `ocio-vendored` enables `ocio`,
-        // which carries `system-ocio`). Selected at compile time so the `cmake` build-dep (only
-        // present under `vendored-ocio`) is never referenced by a system-only build.
+        // system OCIO even if both features are on (the app's `default` carries `system-ocio`, so
+        // a `--features vendored` build without `--no-default-features` enables both). Selected at
+        // compile time so the `cmake` build-dep (only present under `vendored-ocio`) is never
+        // referenced by a system-only build.
         #[cfg(feature = "vendored-ocio")]
         let backend = build_vendored_ocio();
         #[cfg(all(feature = "system-ocio", not(feature = "vendored-ocio")))]
@@ -84,7 +85,7 @@ mod native {
             panic!(
                 "could not locate a system OpenColorIO.\n\
                  For a self-contained build that needs no installed OCIO, run `cargo ocio-run` \
-                 (or `cargo build --release --features ocio-vendored`) — it statically builds \
+                 (or `cargo build --release --no-default-features --features vendored`) — it statically builds \
                  OCIO from the vendored submodule via cmake.\n\
                  To link an installed OCIO instead, set OPENCOLORIO_ROOT to its install prefix \
                  (containing include/ and lib/), or install it via Homebrew (macOS)."
