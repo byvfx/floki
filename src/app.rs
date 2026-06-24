@@ -38,6 +38,12 @@ struct LoadResult {
     frame: u32,
     /// Supersession epoch at issue time (#57).
     epoch: u64,
+    /// Slot-A explicit-open generation at issue time (#109). Supersedes by a
+    /// *later open*, independent of `loaded_file` — which playback churns to the
+    /// current frame's path (`request_sequence_frame`), so it can't be the
+    /// supersession key for the open. Unused for seq-frames (epoch-keyed) and B
+    /// (its `loaded_file_b` is stable, still path-keyed).
+    open_gen: u64,
     result: Result<ExrData, String>,
 }
 
@@ -58,6 +64,8 @@ struct LoadJob {
     /// Supersession epoch at issue time (#57); the result is dropped if it no
     /// longer matches `Playback::epoch` on arrival.
     epoch: u64,
+    /// Slot-A explicit-open generation at issue time (#109); see [`LoadResult`].
+    open_gen: u64,
 }
 
 /// Message from the decode worker to the UI thread, delivered over `load_rx`. A
@@ -98,6 +106,12 @@ pub struct ExrApp {
     loaded_file: Option<PathBuf>,
     #[serde(skip)]
     loaded_file_b: Option<PathBuf>,
+    /// Monotonic slot-A explicit-open generation (#109). Bumped on every slot-A
+    /// `open_file` and on unload; a load result whose `open_gen` no longer matches
+    /// was superseded by a later open. Decouples open-supersession from
+    /// `loaded_file` (which playback rewrites to the current frame's path).
+    #[serde(skip)]
+    open_gen_a: u64,
     // `Arc` so a decoded frame can be the active image (tier T3) and stay
     // resident in the playback ring cache (tier T1) at once, without cloning the
     // (often 600 MB+) pixel buffers. See docs/playback/memory-contract.md.
@@ -320,6 +334,7 @@ impl Default for ExrApp {
         Self {
             loaded_file: None,
             loaded_file_b: None,
+            open_gen_a: 0,
             exr_data: None,
             exr_data_b: None,
             error_msg: None,
@@ -731,6 +746,10 @@ impl ExrApp {
             self.recent_files.insert(0, path.clone());
             self.recent_files.truncate(10);
             self.loaded_file = Some(path.clone());
+            // New slot-A open: bump the generation so any in-flight open's result
+            // is superseded, even though playback may have rewritten `loaded_file`
+            // to a frame path in the meantime (#109).
+            self.open_gen_a += 1;
             self.loading_a = true;
             // An explicit slot-A open (re)evaluates sequence mode: opening one
             // frame of a numbered sequence enables playback over its siblings; a
@@ -749,6 +768,7 @@ impl ExrApp {
             seq_frame: false,
             frame: 0,
             epoch: self.playback.epoch,
+            open_gen: self.open_gen_a,
         });
     }
 
@@ -784,6 +804,7 @@ impl ExrApp {
                         seq_frame: job.seq_frame,
                         frame: job.frame,
                         epoch: job.epoch,
+                        open_gen: job.open_gen,
                         result,
                     })));
                 }
@@ -906,6 +927,8 @@ impl ExrApp {
                 seq_frame: true,
                 frame: w,
                 epoch: self.playback.epoch,
+                // Seq-frames supersede by epoch, not open generation.
+                open_gen: 0,
             });
             break;
         }
@@ -1379,13 +1402,19 @@ impl ExrApp {
             return;
         }
 
-        let current = if res.is_b {
-            self.loaded_file_b.as_ref()
+        // Supersession for an explicit open. Slot B is path-keyed (its
+        // `loaded_file_b` is only set by an explicit B open / unload, never by
+        // playback). Slot A is **generation**-keyed (#109): `loaded_file` is
+        // rewritten to the current frame's path during playback, so a path check
+        // could drop a still-current open's result — and dropping it here returns
+        // before clearing `loading_a`, permanently gating `pump_decode`. The
+        // generation is bumped only by a later open or an unload.
+        let superseded = if res.is_b {
+            self.loaded_file_b.as_ref() != Some(&res.path)
         } else {
-            self.loaded_file.as_ref()
+            res.open_gen != self.open_gen_a
         };
-        if current != Some(&res.path) {
-            // Superseded by a later open (or the slot was reset); drop it.
+        if superseded {
             return;
         }
 
@@ -1567,6 +1596,9 @@ impl ExrApp {
             self.loaded_file = None;
             self.exr_data_b = None;
             self.loaded_file_b = None;
+            // Supersede any in-flight slot-A open so its late result can't
+            // resurrect the released image (#109 / #117).
+            self.open_gen_a += 1;
             // Tear down the app-owned playback + decode state too. Without this the
             // T1 ring keeps every decoded frame resident (the memory leak) and the
             // decode-ahead pump keeps re-issuing `LoadJob`s for the now-unloaded
@@ -3287,10 +3319,12 @@ mod tests {
 
     #[test]
     fn stale_load_result_is_ignored() {
-        // A result for a path the user has since navigated away from must not
-        // clobber state or clear the in-flight flag for the current request.
+        // A result from an open the user has since superseded (a later open bumped
+        // the slot-A generation) must not clobber state or clear the in-flight flag
+        // for the current request (#109).
         let mut app = ExrApp {
             loaded_file: Some(PathBuf::from("current.exr")),
+            open_gen_a: 2, // a newer open is in flight
             loading_a: true,
             ..Default::default()
         };
@@ -3301,6 +3335,7 @@ mod tests {
             seq_frame: false,
             frame: 0,
             epoch: 0,
+            open_gen: 1, // the older, superseded open
             result: Err("boom".to_string()),
         });
 
@@ -3311,6 +3346,87 @@ mod tests {
         assert!(
             app.loading_a,
             "stale result must leave the current load in flight"
+        );
+    }
+
+    /// #109: opening a new EXR while the timeline plays must load it. Playback
+    /// rewrites `loaded_file` to the current frame's path
+    /// (`request_sequence_frame`), so superseding the explicit open by *path*
+    /// dropped its still-current result — and that drop returned before clearing
+    /// `loading_a`, permanently gating `pump_decode` ("doesn't load until you stop
+    /// and reopen"). The open is now superseded by **generation**, immune to the
+    /// `loaded_file` churn.
+    #[test]
+    fn open_result_applies_despite_loaded_file_churn_during_playback() {
+        let dir = tempfile::tempdir().unwrap();
+        let newf = dir.path().join("new.exr");
+        write_rgba_exr(&newf);
+        let data = ExrData::load(&newf).unwrap();
+
+        // An explicit open of `new.exr` is in flight at generation 5.
+        let mut app = ExrApp {
+            loaded_file: Some(newf.clone()),
+            open_gen_a: 5,
+            loading_a: true,
+            ..Default::default()
+        };
+        // Playback then rewrites `loaded_file` to the frame on screen — the churn
+        // that used to make the open's result look superseded.
+        app.loaded_file = Some(dir.path().join("seq.0007.exr"));
+
+        app.apply_load_result(LoadResult {
+            path: newf,
+            is_b: false,
+            seq_frame: false,
+            frame: 0,
+            epoch: 0,
+            open_gen: 5, // still the current open
+            result: Ok(data),
+        });
+
+        assert!(
+            app.exr_data.is_some(),
+            "the open is applied despite the loaded_file churn"
+        );
+        assert!(
+            !app.loading_a,
+            "loading flag cleared — pump_decode is not left gated"
+        );
+    }
+
+    /// #109/#117: unloading bumps the open generation, so a slot-A open still in
+    /// flight when the user unloads can't resurrect the released image on arrival.
+    #[test]
+    fn unload_supersedes_an_in_flight_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("x.exr");
+        write_rgba_exr(&f);
+        let data = ExrData::load(&f).unwrap();
+
+        // An open is in flight (gen 1, loading).
+        let mut app = ExrApp {
+            loaded_file: Some(f.clone()),
+            open_gen_a: 1,
+            loading_a: true,
+            ..Default::default()
+        };
+        app.unload(false); // bumps the generation; releases the slot
+        assert!(app.open_gen_a > 1, "unload advances the open generation");
+
+        // The now-stale open result lands.
+        app.apply_load_result(LoadResult {
+            path: f,
+            is_b: false,
+            seq_frame: false,
+            frame: 0,
+            epoch: 0,
+            open_gen: 1,
+            result: Ok(data),
+        });
+
+        assert!(
+            app.exr_data.is_none(),
+            "a late open must not resurrect the unloaded slot"
         );
     }
 
@@ -3328,6 +3444,7 @@ mod tests {
             seq_frame: false,
             frame: 0,
             epoch: 0,
+            open_gen: 0,
             result: Err("bad exr".to_string()),
         });
 
@@ -3359,6 +3476,7 @@ mod tests {
             seq_frame: false,
             frame: 0,
             epoch: 0,
+            open_gen: 0,
             result: Ok(data_a),
         });
 
@@ -3635,6 +3753,7 @@ mod tests {
             seq_frame: false,
             frame: 0,
             epoch: 0,
+            open_gen: 0,
             result: Ok(data),
         });
 
@@ -3900,6 +4019,7 @@ mod tests {
             seq_frame: true,
             frame: 2,
             epoch: app.playback.epoch,
+            open_gen: 0,
             result: Ok(data2),
         });
 
@@ -3981,6 +4101,7 @@ mod tests {
             seq_frame: true,
             frame,
             epoch: app.playback.epoch,
+            open_gen: 0,
             result: Ok(data),
         });
     }
@@ -4040,6 +4161,7 @@ mod tests {
             seq_frame: true,
             frame: 2,
             epoch: stale_epoch,
+            open_gen: 0,
             result: Ok(data2),
         });
         assert!(
