@@ -1572,10 +1572,13 @@ impl ExrViewer {
     /// the signature is unchanged. Replaces the old `ocio_cpu` Rc-pointer identity
     /// trick now that the CPU OCIO processor is gone (#59).
     fn invalidate_thumbnails_on_ocio_change(&mut self) {
-        // `ocio_active` in the top bit, generation in the rest: distinct for
-        // every (on/off, gen) pair, and 0 when OCIO is off.
+        // 0 is the OCIO-off sentinel; when active, mix the generation through an
+        // odd multiplier (a bijection on u64, so distinct generations stay
+        // distinct). The generation is >= 1 whenever OCIO is active (set by
+        // `rebuild_ocio_pass` before `ocio_ready`), so the product is non-zero and
+        // never collides with the off sentinel.
         let sig = if self.ocio_active {
-            (1u64 << 63) | self.ocio_render_gen
+            self.ocio_render_gen.wrapping_mul(0x100000001b3)
         } else {
             0
         };
