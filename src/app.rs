@@ -1553,6 +1553,10 @@ impl ExrApp {
         if is_b {
             self.exr_data_b = None;
             self.loaded_file_b = None;
+            // Drop any in-flight B load so a late decode can't resurrect B and
+            // `loading_b` doesn't stick (the path-supersession guard in
+            // `apply_load_result` returns before clearing it). #117.
+            self.loading_b = false;
             // B-only compare modes are meaningless without B.
             self.viewer.compare_mode = crate::viewer::CompareMode::SingleA;
             self.viewer.blink_state = false;
@@ -1563,6 +1567,21 @@ impl ExrApp {
             self.loaded_file = None;
             self.exr_data_b = None;
             self.loaded_file_b = None;
+            // Tear down the app-owned playback + decode state too. Without this the
+            // T1 ring keeps every decoded frame resident (the memory leak) and the
+            // decode-ahead pump keeps re-issuing `LoadJob`s for the now-unloaded
+            // sequence — a late sequence-frame result (guarded by epoch, not path)
+            // could even resurrect the image. Mirrors the load-side reset in
+            // `detect_sequence`; `playback.clear()` bumps the epoch so any in-flight
+            // decode is dropped on arrival. #117.
+            self.frame_cache.clear();
+            self.frame_bytes = None;
+            self.inflight.clear();
+            self.watch_sigs.clear();
+            self.last_watch_poll = None;
+            self.loading_a = false;
+            self.loading_b = false;
+            self.playback.clear();
             self.reset_viewer_session();
         }
         self.error_msg = None;
@@ -3740,6 +3759,53 @@ mod tests {
         std::fs::write(solo.path().join("only.0001.exr"), b"").unwrap();
         app.detect_sequence(&solo.path().join("only.0001.exr"));
         assert!(!app.playback.is_active());
+    }
+
+    /// #117: unloading slot A must release the app-owned T1 ring (the leak) and
+    /// tear down the decode pump, or the decoded frames stay resident and the
+    /// pump keeps re-issuing `LoadJob`s for the unloaded sequence (a late
+    /// epoch-guarded frame could even resurrect the image).
+    #[test]
+    fn unload_a_releases_the_frame_cache_and_stops_the_decode_pump() {
+        let dir = tempfile::tempdir().unwrap();
+        let f1 = dir.path().join("s.0001.exr");
+        let f2 = dir.path().join("s.0002.exr");
+        write_rgba_exr(&f1);
+        write_rgba_exr(&f2);
+
+        let mut app = ExrApp {
+            exr_data: Some(std::sync::Arc::new(ExrData::load(&f1).unwrap())),
+            loaded_file: Some(f1.clone()),
+            ..Default::default()
+        };
+        app.detect_sequence(&f1);
+        assert!(app.playback.is_active(), "sequence mode entered");
+
+        // Simulate a populated T1 ring + an in-flight decode + a stuck load flag.
+        app.frame_cache.insert(
+            crate::cache::Slot::A,
+            1,
+            std::sync::Arc::new(ExrData::load(&f1).unwrap()),
+        );
+        app.inflight.insert(2);
+        app.loading_a = true;
+        let epoch_before = app.playback.epoch;
+
+        app.unload(false);
+
+        assert!(app.exr_data.is_none(), "image released");
+        assert!(app.frame_cache.is_empty(), "T1 ring freed — no leak");
+        assert!(app.inflight.is_empty(), "no in-flight decodes survive");
+        assert!(!app.playback.is_active(), "sequence torn down");
+        assert!(!app.loading_a, "loading flag cleared");
+        assert_ne!(
+            app.playback.epoch, epoch_before,
+            "epoch bumped so any late decode is dropped on arrival"
+        );
+
+        // The decode-ahead pump issues nothing for an unloaded sequence.
+        app.pump_decode();
+        assert!(app.inflight.is_empty(), "pump stays idle after unload");
     }
 
     #[test]
