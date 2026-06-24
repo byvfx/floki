@@ -260,7 +260,42 @@ impl OcioGpuPass {
         rp.set_bind_group(1, scene_bind_group, &[]);
         rp.draw(0..3, 0..1);
     }
+
+    /// Build a set-1 (scene input) bind group binding `scene_view` + this pass's
+    /// scene sampler. The viewport path caches one such group on `OcioTargets`
+    /// (the scene texture is stable across frames); the contact-sheet thumbnail
+    /// render (#67 Phase 2) instead renders a *fresh* scene texture per thumbnail
+    /// and builds a throwaway bind group here for the single offscreen pass.
+    pub fn create_scene_bind_group(
+        &self,
+        device: &wgpu::Device,
+        scene_view: &wgpu::TextureView,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("OCIO thumbnail scene bind group"),
+            layout: &self.group_layouts[1],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(scene_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.scene_sampler),
+                },
+            ],
+        })
+    }
 }
+
+/// An [`OcioGpuPass`] built for the `Rgba8Unorm` contact-sheet thumbnail target,
+/// distinct from the main viewport pass (which targets the swapchain
+/// `target_format`). Cached in `callback_resources`, rebuilt alongside the main
+/// pass in `App::rebuild_ocio_pass`, and consumed by
+/// [`crate::gpu::thumbnail::generate_ocio`] (#67 Phase 2) so contact-sheet
+/// thumbnails run the same OCIO display transform offscreen into an
+/// egui-registerable texture.
+pub struct OcioThumbnailPass(pub OcioGpuPass);
 
 // ---------------------------------------------------------------------------
 // Two-pass viewer integration: pass 1 (composite + exposure -> scene-linear

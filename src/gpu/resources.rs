@@ -95,6 +95,45 @@ impl GpuResources {
             .remove::<crate::gpu::ocio_pass::OcioTargets>();
     }
 
+    /// Publish a (re)built [`OcioGpuPass`](crate::gpu::ocio_pass::OcioGpuPass)
+    /// **built for the `Rgba8Unorm` thumbnail format** into `callback_resources`,
+    /// wrapped in [`OcioThumbnailPass`](crate::gpu::ocio_pass::OcioThumbnailPass).
+    /// The contact-sheet GPU thumbnail render (#67 Phase 2) reads it back to run
+    /// the OCIO display transform offscreen. Rebuilt alongside the main pass.
+    pub fn publish_ocio_thumbnail_pass(&self, pass: crate::gpu::ocio_pass::OcioGpuPass) {
+        self.render_state
+            .renderer
+            .write()
+            .callback_resources
+            .insert(crate::gpu::ocio_pass::OcioThumbnailPass(pass));
+    }
+
+    /// Drop the cached
+    /// [`OcioThumbnailPass`](crate::gpu::ocio_pass::OcioThumbnailPass) (e.g. when
+    /// the OCIO config fails to build a thumbnail pass). The contact sheet then
+    /// falls back to the CPU thumbnail path until a pass is published again.
+    pub fn clear_ocio_thumbnail_pass(&self) {
+        self.render_state
+            .renderer
+            .write()
+            .callback_resources
+            .remove::<crate::gpu::ocio_pass::OcioThumbnailPass>();
+    }
+
+    /// Whether an [`OcioThumbnailPass`](crate::gpu::ocio_pass::OcioThumbnailPass)
+    /// is currently published. The contact sheet uses this to decide whether the
+    /// GPU OCIO thumbnail path is available, or whether to fall back to the CPU
+    /// `thumbnails` cache (config still loading / build failed).
+    #[must_use]
+    pub fn has_ocio_thumbnail_pass(&self) -> bool {
+        self.render_state
+            .renderer
+            .read()
+            .callback_resources
+            .get::<crate::gpu::ocio_pass::OcioThumbnailPass>()
+            .is_some()
+    }
+
     /// Drop the cached [`OcioTargets`](crate::gpu::ocio_pass::OcioTargets) from
     /// `callback_resources` (e.g. when OCIO is disabled or the config is
     /// reloaded without a new pass). The next OCIO frame recreates them on
@@ -123,5 +162,8 @@ impl GpuResources {
         renderer
             .callback_resources
             .remove::<crate::gpu::ocio_pass::OcioTargets>();
+        renderer
+            .callback_resources
+            .remove::<crate::gpu::ocio_pass::OcioThumbnailPass>();
     }
 }

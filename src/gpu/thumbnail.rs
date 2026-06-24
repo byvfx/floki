@@ -1,20 +1,28 @@
-//! GPU contact-sheet thumbnail generator (#67, Phase 1).
+//! GPU contact-sheet thumbnail generator (#67).
 //!
-//! Renders one decimated AOV layer through the shared display shader
-//! ([`crate::gpu::shader`]) into a small `Rgba8Unorm` texture and registers it
-//! with egui, replacing the per-frame CPU `generate_texture` bake on the GPU
-//! path. The render is identical to the main viewport draw (`srgb`, `gamma`,
-//! `exposure`, channel select, background composite), but into a fresh opaque
-//! target sized to the thumbnail box — so the sheet matches the central view.
+//! Renders one decimated AOV layer through the display pipeline into a small
+//! `Rgba8Unorm` texture and registers it with egui, replacing the per-frame CPU
+//! `generate_texture` bake on the GPU path. There are two display backends,
+//! matching the main viewport:
 //!
-//! Only used when a GPU is present **and** OCIO is not active; the CPU
-//! `thumbnails` cache remains the fallback for the headless / OCIO cases
-//! (offscreen OCIO thumbnails are a deferred Phase 2).
+//! * **Non-OCIO** ([`generate`], Phase 1): the shared display shader
+//!   ([`crate::gpu::shader`]) — `srgb`, `gamma`, `exposure`, channel select,
+//!   optional `.cube` LUT, background composite — into a fresh opaque target.
+//!   The load-bearing correctness fact (validated by the on-device test below):
+//!   the display shader emits sRGB-encoded, checker-composited, opaque bytes when
+//!   driven with `srgb=1, skip_checker=0, opacity=1.0`, so rendering into an
+//!   `Rgba8Unorm` target yields exactly the bytes egui displays correctly.
+//! * **OCIO** ([`generate_ocio`], Phase 2): the two-pass OCIO path — pass 1
+//!   (`pipeline_linear`: exposure + optional `.cube` LUT into a scene-linear
+//!   `Rgba16Float` offscreen), then pass 2 (the
+//!   [`OcioThumbnailPass`](crate::gpu::ocio_pass::OcioThumbnailPass) display
+//!   transform into the `Rgba8Unorm` target). The display-space checker
+//!   background (composited in the viewport's blit) is skipped — every thumbnail
+//!   pixel is image, so the sheet shows the OCIO-managed colour over the layer's
+//!   own alpha. This is the path that lets #59 retire the CPU OCIO bake.
 //!
-//! The load-bearing correctness fact (validated by the on-device test below):
-//! the display shader emits sRGB-encoded, checker-composited, opaque bytes when
-//! driven with `srgb=1, skip_checker=0, opacity=1.0`, so rendering into an
-//! `Rgba8Unorm` target yields exactly the bytes egui displays correctly.
+//! The CPU `thumbnails` cache remains the fallback for the headless case and
+//! while the OCIO config is still loading (no thumbnail pass published yet).
 
 use eframe::egui_wgpu::wgpu;
 
@@ -47,7 +55,175 @@ pub fn generate(
     layer_index: usize,
     max_dim: usize,
     tone: &ThumbnailTone,
+    lut_bg: Option<&std::sync::Arc<wgpu::BindGroup>>,
 ) -> Option<(egui::TextureId, wgpu::Texture, egui::Vec2)> {
+    let (pixels, out_w, out_h, full_w, full_h) = decimate_source(exr_data, layer_index, max_dim)?;
+
+    // Honour the user `.cube` LUT (group 3) when enabled; otherwise the default
+    // 1x1 LUT bind group. Resolved here so `enable_lut=1` in the uniforms always
+    // has a real LUT bound (Phase 1 forced it off because only the default group
+    // was available).
+    let lut = lut_bg
+        .filter(|_| tone.enable_lut)
+        .map(std::sync::Arc::as_ref);
+
+    let (tex_id, target) = render_pixels(
+        gpu_resources,
+        &pixels,
+        out_w,
+        out_h,
+        &uniforms_for(tone, out_w, out_h),
+        lut,
+        |view, device, renderer| {
+            renderer.register_native_texture(device, view, wgpu::FilterMode::Linear)
+        },
+    )?;
+    // Report the FULL-RES size so the contact sheet fits by the true aspect.
+    Some((tex_id, target, egui::vec2(full_w as f32, full_h as f32)))
+}
+
+/// Render `layer_index` of `exr_data` through the **OCIO** display transform
+/// (#67 Phase 2): pass 1 (`pipeline_linear`: exposure + optional `.cube` LUT into
+/// a scene-linear `Rgba16Float` offscreen) then pass 2 (the published
+/// [`OcioThumbnailPass`](crate::gpu::ocio_pass::OcioThumbnailPass) into the
+/// `Rgba8Unorm` target), registered with egui.
+///
+/// Returns `None` if the layer is empty **or** no thumbnail pass is published
+/// yet (config still loading) — the caller then stays on the CPU thumbnail path.
+/// The display-space background composite is skipped (see the module docs); the
+/// thumbnail carries the layer's own alpha.
+pub fn generate_ocio(
+    gpu_resources: &crate::gpu::GpuResources,
+    exr_data: &crate::exr_loader::ExrData,
+    layer_index: usize,
+    max_dim: usize,
+    tone: &ThumbnailTone,
+    lut_bg: Option<&std::sync::Arc<wgpu::BindGroup>>,
+) -> Option<(egui::TextureId, wgpu::Texture, egui::Vec2)> {
+    use crate::gpu::ocio_pass::OcioThumbnailPass;
+
+    let (pixels, out_w, out_h, full_w, full_h) = decimate_source(exr_data, layer_index, max_dim)?;
+
+    let render_state = gpu_resources.render_state();
+    let device = &render_state.device;
+    let queue = &render_state.queue;
+    let gpu_state = gpu_resources.gpu_state.as_ref();
+
+    // `_source` / `_scene` are held so their textures outlive the passes (the
+    // bind groups borrow their views; the command buffer references them until
+    // the submit below completes).
+    let (_source, source_bg) = upload_source(device, queue, gpu_state, &pixels, out_w, out_h);
+
+    let scene = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("OCIO Thumbnail Scene"),
+        size: wgpu::Extent3d {
+            width: out_w as u32,
+            height: out_h as u32,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        // Must match `pipeline_linear`'s color target (gpu/mod.rs).
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let scene_view = scene.create_view(&wgpu::TextureViewDescriptor::default());
+
+    let target = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("OCIO Thumbnail Target"),
+        size: wgpu::Extent3d {
+            width: out_w as u32,
+            height: out_h as u32,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+
+    // Pass-1 uniforms: scene-linear (srgb=0, gamma=1, skip_checker=1) so the OCIO
+    // transform receives the exposed, optionally-LUT'd image without a display
+    // encode or baked checker. The user gamma (applied post-OCIO in the viewport
+    // blit) is intentionally a no-op here — a known Phase 2 limitation.
+    let mut u = uniforms_for(tone, out_w, out_h);
+    u.srgb = 0;
+    u.gamma = 1.0;
+    u.skip_checker = 1;
+    queue.write_buffer(&gpu_state.uniform_buffer, 0, bytemuck::bytes_of(&u));
+
+    let lut = lut_bg
+        .filter(|_| tone.enable_lut)
+        .map(std::sync::Arc::as_ref)
+        .unwrap_or(gpu_state.default_lut_bind_group.as_ref());
+
+    // Encode both passes under a *read* lock (the OCIO thumbnail pass lives in
+    // `callback_resources`; reading it needs only `&renderer`), submit, then drop
+    // that lock before taking a `write` lock solely to register the result — so
+    // the write lock's scope is just `register_native_texture`, as in `generate`.
+    {
+        let renderer = render_state.renderer.read();
+        let thumb_pass = &renderer.callback_resources.get::<OcioThumbnailPass>()?.0;
+        let scene_bg = thumb_pass.create_scene_bind_group(device, &scene_view);
+
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        // Pass 1: composite + exposure (+ optional LUT) into scene-linear.
+        {
+            let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("OCIO Thumbnail Pass 1 (scene-linear)"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &scene_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            rp.set_pipeline(&gpu_state.pipeline_linear);
+            rp.set_bind_group(0, &source_bg, &[]);
+            rp.set_bind_group(1, gpu_state.default_tex_bind_group.as_ref(), &[]);
+            rp.set_bind_group(2, &gpu_state.uniform_bind_group, &[0]);
+            rp.set_bind_group(3, lut, &[]);
+            rp.draw(0..6, 0..1);
+        }
+        // Pass 2: OCIO display transform over the whole (image-filled) target.
+        thumb_pass.render(&mut encoder, &target_view, &scene_bg, None);
+        queue.submit([encoder.finish()]);
+    }
+
+    let tex_id = render_state.renderer.write().register_native_texture(
+        device,
+        &target_view,
+        wgpu::FilterMode::Linear,
+    );
+
+    Some((tex_id, target, egui::vec2(full_w as f32, full_h as f32)))
+}
+
+/// Point-decimate `layer_index` of `exr_data` into an `Rgba32Float` source
+/// buffer whose longest edge is `<= max_dim`, mirroring `generate_texture`'s
+/// `(ox*stride).min(width-1)` sampling. Alpha defaults to 1.0 when the layer has
+/// no alpha channel. Returns `(pixels, out_w, out_h, full_w, full_h)` — the full
+/// dims let the contact sheet fit by the true aspect ratio. `None` if empty.
+fn decimate_source(
+    exr_data: &crate::exr_loader::ExrData,
+    layer_index: usize,
+    max_dim: usize,
+) -> Option<(Vec<f32>, usize, usize, usize, usize)> {
     let (layer, r_chan, g_chan, b_chan, a_chan) = exr_data.logical_channels(layer_index)?;
     let width = layer.size.0;
     let height = layer.size.1;
@@ -57,9 +233,6 @@ pub fn generate(
 
     let (out_w, out_h, stride) = crate::viewer::thumb_dims(width, height, Some(max_dim));
 
-    // Point-decimate into an Rgba32Float source buffer, mirroring
-    // `generate_texture`'s `(ox*stride).min(width-1)` sampling. Alpha defaults to
-    // 1.0 when the layer has no alpha channel.
     let mut pixels = vec![0.0f32; out_w * out_h * 4];
     let r_s = crate::viewer::sample_channel_f32(r_chan);
     let g_s = crate::viewer::sample_channel_f32(g_chan);
@@ -81,19 +254,7 @@ pub fn generate(
             };
         }
     }
-
-    let (tex_id, target) = render_pixels(
-        gpu_resources,
-        &pixels,
-        out_w,
-        out_h,
-        &uniforms_for(tone, out_w, out_h),
-        |view, device, renderer| {
-            renderer.register_native_texture(device, view, wgpu::FilterMode::Linear)
-        },
-    )?;
-    // Report the FULL-RES size so the contact sheet fits by the true aspect.
-    Some((tex_id, target, egui::vec2(width as f32, height as f32)))
+    Some((pixels, out_w, out_h, width, height))
 }
 
 /// Build the per-thumbnail `Uniforms` from the tone/background config. Mirrors
@@ -149,12 +310,16 @@ fn rgb3_to_vec4(c: [f32; 3]) -> [f32; 4] {
 /// on-device test passes a closure that copies the target to a readback buffer
 /// instead. Factored this way so the wgpu correctness can be proved without an
 /// egui `Renderer`.
+///
+/// `lut_bg` is the group-3 LUT bind group bound for the draw (the user `.cube`
+/// LUT when enabled); `None` binds the default 1x1 LUT.
 fn render_pixels<R>(
     gpu_resources: &crate::gpu::GpuResources,
     src_pixels: &[f32],
     out_w: usize,
     out_h: usize,
     uniforms: &crate::gpu::Uniforms,
+    lut_bg: Option<&wgpu::BindGroup>,
     register: impl FnOnce(&wgpu::TextureView, &wgpu::Device, &mut eframe::egui_wgpu::Renderer) -> R,
 ) -> Option<(R, wgpu::Texture)> {
     let render_state = gpu_resources.render_state();
@@ -211,7 +376,11 @@ fn render_pixels<R>(
         rp.set_bind_group(0, &source_bg, &[]);
         rp.set_bind_group(1, gpu_state.default_tex_bind_group.as_ref(), &[]);
         rp.set_bind_group(2, &gpu_state.uniform_bind_group, &[0]);
-        rp.set_bind_group(3, gpu_state.default_lut_bind_group.as_ref(), &[]);
+        rp.set_bind_group(
+            3,
+            lut_bg.unwrap_or(gpu_state.default_lut_bind_group.as_ref()),
+            &[],
+        );
         rp.draw(0..6, 0..1);
     }
     queue.submit([encoder.finish()]);
@@ -439,5 +608,221 @@ mod tests {
              (128 = no encode, 223 = double encode)"
         );
         assert_eq!(data[3], 255, "thumbnail output must be opaque");
+    }
+}
+
+/// On-device validation of the OCIO thumbnail chain (#67 Phase 2): pass 1
+/// (`pipeline_linear` -> scene-linear `Rgba16Float`) + the new
+/// [`OcioGpuPass::create_scene_bind_group`] + pass 2
+/// ([`OcioGpuPass::render`] -> `Rgba8Unorm`), mirroring `generate_ocio`'s encode
+/// without egui's `Renderer`. Requires the OCIO backend, so it's gated like the
+/// other OCIO Metal tests and runs only locally (not in the toolchain-free CI
+/// `Test & Lint` job, which builds `--no-default-features`).
+#[cfg(all(
+    test,
+    target_os = "macos",
+    any(feature = "system-ocio", feature = "vendored")
+))]
+mod ocio_tests {
+    use super::*;
+    use crate::gpu::GpuState;
+    use crate::gpu::ocio_pass::OcioGpuPass;
+
+    #[test]
+    fn ocio_thumbnail_two_pass_runs_on_device() {
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let adapter = match pollster::block_on(
+            instance.request_adapter(&wgpu::RequestAdapterOptions::default()),
+        ) {
+            Ok(a) => a,
+            Err(_) => {
+                eprintln!("no GPU adapter available; skipping on-device OCIO thumbnail test");
+                return;
+            }
+        };
+        let Ok((device, queue)) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                label: Some("ocio-thumb-test-device"),
+                required_features: wgpu::Features::FLOAT32_FILTERABLE,
+                ..Default::default()
+            }))
+        else {
+            eprintln!("GPU lacks FLOAT32_FILTERABLE; skipping on-device OCIO thumbnail test");
+            return;
+        };
+
+        // Build the default config + an Rgba8Unorm OCIO pass (the thumbnail format).
+        let cfg = floki_ocio::OcioConfig::load(floki_ocio::ConfigSource::BuiltIn("ocio://default"))
+            .expect("load default config");
+        let input_colorspace = cfg
+            .scene_linear_colorspace()
+            .or_else(|| {
+                cfg.color_spaces()
+                    .into_iter()
+                    .find(|c| !c.is_data)
+                    .map(|c| c.name)
+            })
+            .expect("a non-data colorspace");
+        let display = cfg.default_display();
+        let view = cfg
+            .displays()
+            .into_iter()
+            .find(|d| d.name == display)
+            .map(|d| d.default_view)
+            .expect("default view");
+        let bundle = cfg
+            .build_gpu_shader(&floki_ocio::DisplayTransformRequest {
+                input_colorspace,
+                display,
+                view,
+                bake_lut_size: 0,
+            })
+            .expect("build gpu shader bundle");
+
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let gpu_state = GpuState::new(&device, &queue, format);
+        let pass = OcioGpuPass::from_bundle(&device, &queue, &bundle, format)
+            .expect("OCIO thumbnail pipeline should create on this device");
+
+        // 2x2 scene-linear 18% grey, opaque.
+        let out_w = 2usize;
+        let out_h = 2usize;
+        let src: Vec<f32> = [0.18f32, 0.18, 0.18, 1.0]
+            .iter()
+            .cycle()
+            .take(out_w * out_h * 4)
+            .copied()
+            .collect();
+        let (_source, source_bg) = upload_source(&device, &queue, &gpu_state, &src, out_w, out_h);
+
+        let scene = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("ocio-thumb-scene"),
+            size: wgpu::Extent3d {
+                width: out_w as u32,
+                height: out_h as u32,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let scene_view = scene.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("ocio-thumb-target"),
+            size: wgpu::Extent3d {
+                width: out_w as u32,
+                height: out_h as u32,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Pass-1 uniforms: scene-linear (srgb=0, gamma=1, skip_checker=1), as in
+        // `generate_ocio`.
+        let mut u = uniforms_for(
+            &ThumbnailTone {
+                exposure: 0.0,
+                gamma: 1.0,
+                srgb: false,
+                enable_lut: false,
+                channel_mode: 0,
+                lut_domain_min: [0.0, 0.0, 0.0, 0.0],
+                lut_domain_max: [1.0, 1.0, 1.0, 1.0],
+                background: crate::background::Background::default(),
+            },
+            out_w,
+            out_h,
+        );
+        u.srgb = 0;
+        u.skip_checker = 1;
+        queue.write_buffer(&gpu_state.uniform_buffer, 0, bytemuck::bytes_of(&u));
+
+        let scene_bg = pass.create_scene_bind_group(&device, &scene_view);
+
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ocio-thumb-readback"),
+            size: 256 * out_h as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("ocio-thumb-pass1"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &scene_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            rp.set_pipeline(&gpu_state.pipeline_linear);
+            rp.set_bind_group(0, &source_bg, &[]);
+            rp.set_bind_group(1, gpu_state.default_tex_bind_group.as_ref(), &[]);
+            rp.set_bind_group(2, &gpu_state.uniform_bind_group, &[0]);
+            rp.set_bind_group(3, gpu_state.default_lut_bind_group.as_ref(), &[]);
+            rp.draw(0..6, 0..1);
+        }
+        pass.render(&mut encoder, &target_view, &scene_bg, None);
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(256),
+                    rows_per_image: Some(out_h as u32),
+                },
+            },
+            wgpu::Extent3d {
+                width: out_w as u32,
+                height: out_h as u32,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit([encoder.finish()]);
+
+        readback.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let data = readback.slice(..).get_mapped_range();
+        let (r, a) = (data[0], data[3]);
+        eprintln!("ocio thumbnail on-device readback: red byte = {r}, alpha = {a}");
+        // The two-pass chain ran and produced a non-degenerate display-encoded
+        // grey (0.18 linear -> a mid grey, not clamped to black/white), with the
+        // source's opaque alpha passed through OCIO. Loose bounds keep this robust
+        // across the config's exact view transform.
+        assert!(
+            (20..=250).contains(&r),
+            "0.18 linear should map to a mid display grey, got {r}"
+        );
+        assert_eq!(
+            a, 255,
+            "OCIO thumbnail must preserve the opaque source alpha"
+        );
     }
 }

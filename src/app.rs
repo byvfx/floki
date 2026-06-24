@@ -546,6 +546,20 @@ impl ExrApp {
                 gpu.publish_ocio_pass(pass);
                 self.ocio_ready = true;
                 self.ocio_error = None;
+
+                // Second pass built for the `Rgba8Unorm` contact-sheet thumbnail
+                // target (#67 Phase 2): same bundle, different output format. A
+                // failure here is non-fatal — the viewport stays OCIO-managed and
+                // the contact sheet falls back to the CPU thumbnail path.
+                match crate::gpu::ocio_pass::OcioGpuPass::from_bundle(
+                    &rs.device,
+                    &rs.queue,
+                    &bundle,
+                    eframe::egui_wgpu::wgpu::TextureFormat::Rgba8Unorm,
+                ) {
+                    Ok(thumb_pass) => gpu.publish_ocio_thumbnail_pass(thumb_pass),
+                    Err(_) => gpu.clear_ocio_thumbnail_pass(),
+                }
             }
             Err(e) => {
                 self.ocio_error = Some(format!("Pipeline failed: {e}"));
