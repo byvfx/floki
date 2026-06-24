@@ -164,49 +164,52 @@ pub fn generate_ocio(
         .map(std::sync::Arc::as_ref)
         .unwrap_or(gpu_state.default_lut_bind_group.as_ref());
 
-    // Encode both passes while borrowing the pass out of `callback_resources`,
-    // submit, then drop that borrow before taking the renderer's write lock to
-    // register the result (can't hold an immutable `callback_resources` borrow
-    // and `&mut renderer` at once).
-    let tex_id = {
-        let mut renderer = render_state.renderer.write();
-        {
-            let thumb_pass = &renderer.callback_resources.get::<OcioThumbnailPass>()?.0;
-            let scene_bg = thumb_pass.create_scene_bind_group(device, &scene_view);
+    // Encode both passes under a *read* lock (the OCIO thumbnail pass lives in
+    // `callback_resources`; reading it needs only `&renderer`), submit, then drop
+    // that lock before taking a `write` lock solely to register the result — so
+    // the write lock's scope is just `register_native_texture`, as in `generate`.
+    {
+        let renderer = render_state.renderer.read();
+        let thumb_pass = &renderer.callback_resources.get::<OcioThumbnailPass>()?.0;
+        let scene_bg = thumb_pass.create_scene_bind_group(device, &scene_view);
 
-            let mut encoder =
-                device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-            // Pass 1: composite + exposure (+ optional LUT) into scene-linear.
-            {
-                let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("OCIO Thumbnail Pass 1 (scene-linear)"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &scene_view,
-                        resolve_target: None,
-                        depth_slice: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-                rp.set_pipeline(&gpu_state.pipeline_linear);
-                rp.set_bind_group(0, &source_bg, &[]);
-                rp.set_bind_group(1, gpu_state.default_tex_bind_group.as_ref(), &[]);
-                rp.set_bind_group(2, &gpu_state.uniform_bind_group, &[0]);
-                rp.set_bind_group(3, lut, &[]);
-                rp.draw(0..6, 0..1);
-            }
-            // Pass 2: OCIO display transform over the whole (image-filled) target.
-            thumb_pass.render(&mut encoder, &target_view, &scene_bg, None);
-            queue.submit([encoder.finish()]);
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        // Pass 1: composite + exposure (+ optional LUT) into scene-linear.
+        {
+            let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("OCIO Thumbnail Pass 1 (scene-linear)"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &scene_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            rp.set_pipeline(&gpu_state.pipeline_linear);
+            rp.set_bind_group(0, &source_bg, &[]);
+            rp.set_bind_group(1, gpu_state.default_tex_bind_group.as_ref(), &[]);
+            rp.set_bind_group(2, &gpu_state.uniform_bind_group, &[0]);
+            rp.set_bind_group(3, lut, &[]);
+            rp.draw(0..6, 0..1);
         }
-        renderer.register_native_texture(device, &target_view, wgpu::FilterMode::Linear)
-    };
+        // Pass 2: OCIO display transform over the whole (image-filled) target.
+        thumb_pass.render(&mut encoder, &target_view, &scene_bg, None);
+        queue.submit([encoder.finish()]);
+    }
+
+    let tex_id = render_state.renderer.write().register_native_texture(
+        device,
+        &target_view,
+        wgpu::FilterMode::Linear,
+    );
 
     Some((tex_id, target, egui::vec2(full_w as f32, full_h as f32)))
 }

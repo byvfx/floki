@@ -1736,8 +1736,9 @@ impl ExrViewer {
         // Tone snapshot for the GPU thumbnail render. `enable_lut` now honours the
         // user `.cube` LUT: Phase 2 threads the real LUT bind group through to the
         // draw (non-OCIO display shader) / OCIO pass 1, so the thumbnail matches the
-        // viewport. `lut_bg_opt` is `Some` exactly when `enable_lut` is set (the app
-        // gates it on `lut_bg.is_some()`).
+        // viewport. `lut_bg_opt` may be `Some` even while the LUT is disabled (a
+        // file is loaded but the toggle is off); the generators bind it only when
+        // `tone.enable_lut` is set, so passing it unconditionally is safe.
         let lut_ref = lut_bg_opt;
         let tone = crate::gpu::thumbnail::ThumbnailTone {
             exposure: self.exposure,
