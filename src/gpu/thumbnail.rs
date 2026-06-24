@@ -304,12 +304,20 @@ mod tests {
                 return;
             }
         };
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("thumbnail-test-device"),
-            required_features: wgpu::Features::FLOAT32_FILTERABLE,
-            ..Default::default()
-        }))
-        .expect("request_device");
+        // FLOAT32_FILTERABLE is required by `GpuState` (the 3D LUT). CI runners
+        // often expose a software adapter that lacks it — skip rather than panic so
+        // this device-gated test never fails on a GPU-less/limited runner (it still
+        // runs + asserts on a real GPU, e.g. Metal locally).
+        let Ok((device, queue)) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                label: Some("thumbnail-test-device"),
+                required_features: wgpu::Features::FLOAT32_FILTERABLE,
+                ..Default::default()
+            }))
+        else {
+            eprintln!("GPU lacks FLOAT32_FILTERABLE; skipping on-device thumbnail test");
+            return;
+        };
 
         let gpu_state = GpuState::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
 
