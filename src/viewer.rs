@@ -72,7 +72,7 @@ pub(crate) fn sample_channel(
 /// If the channel is F32 (the common EXR case), return its slice for direct
 /// indexing — eliminates the per-pixel `FlatSamples` enum match in hot loops.
 /// Non-F32 channels return `None`; fall back to [`sample_channel`] for those.
-fn sample_channel_f32(
+pub(crate) fn sample_channel_f32(
     chan: Option<&exr::image::AnyChannel<exr::image::FlatSamples>>,
 ) -> Option<&[f32]> {
     chan.and_then(|c| match &c.sample_data {
@@ -85,7 +85,7 @@ fn sample_channel_f32(
 /// [`sample_channel`] for non-F32 channels. Used in hot pixel loops to skip
 /// the enum match on the F32 fast path.
 #[inline]
-fn pixel_val(
+pub(crate) fn pixel_val(
     f32_slice: Option<&[f32]>,
     chan: Option<&exr::image::AnyChannel<exr::image::FlatSamples>>,
     x: usize,
@@ -127,7 +127,11 @@ const THUMB_BOX: usize = 256;
 /// small output instead of the full frame, which is the difference between
 /// processing ~34k pixels and ~8M for a 4K layer (re-baked on every frame swap
 /// while the sheet is open). Aspect is preserved within rounding.
-fn thumb_dims(width: usize, height: usize, max_dim: Option<usize>) -> (usize, usize, usize) {
+pub(crate) fn thumb_dims(
+    width: usize,
+    height: usize,
+    max_dim: Option<usize>,
+) -> (usize, usize, usize) {
     match max_dim {
         Some(d) if d > 0 && width.max(height) > d => {
             let stride = width.max(height).div_ceil(d);
@@ -293,6 +297,37 @@ pub struct ExrViewer {
     /// and invalidation as `textures`/`textures_b`.
     thumbnails: Vec<Option<egui::TextureHandle>>,
     thumbnails_b: Vec<Option<egui::TextureHandle>>,
+    /// GPU contact-sheet thumbnails (#67): per-layer `(egui TextureId, owned
+    /// Rgba8Unorm target, full-res size)`. Used instead of `thumbnails` when a GPU
+    /// is present and OCIO is off; the CPU `thumbnails` path is the headless / OCIO
+    /// fallback. The owned `Texture` keeps the registered view alive; the
+    /// `TextureId` must be `free_texture`d on eviction — deferred via
+    /// `pending_thumb_frees` since the `egui_wgpu::Renderer` is only reachable from
+    /// `draw_contact_sheet`. `_b` is the side-by-side B cache (symmetric).
+    gpu_thumbnails: Vec<
+        Option<(
+            egui::TextureId,
+            eframe::egui_wgpu::wgpu::Texture,
+            egui::Vec2,
+        )>,
+    >,
+    gpu_thumbnails_b: Vec<
+        Option<(
+            egui::TextureId,
+            eframe::egui_wgpu::wgpu::Texture,
+            egui::Vec2,
+        )>,
+    >,
+    /// `TextureId`s awaiting `free_texture`, drained at the top of
+    /// `draw_contact_sheet` (the only site with the renderer handle). Invalidation
+    /// sites can't free directly (no `gpu_resources`), so they push here instead.
+    pending_thumb_frees: Vec<egui::TextureId>,
+    /// The background the GPU thumbnails were baked with (#67). The backdrop is
+    /// composited into the cached texture, but background edits (settings window /
+    /// gradient editor / preset load) don't go through `invalidate_tone`; a
+    /// signature compare in `draw_contact_sheet` re-renders the sheet when it
+    /// changes, catching every mutation path.
+    gpu_thumb_bg: Option<crate::background::Background>,
     gpu_textures: Vec<Option<std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>>>,
     gpu_textures_b: Vec<Option<std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>>>,
 
@@ -468,6 +503,10 @@ impl Default for ExrViewer {
             textures_b: Vec::new(),
             thumbnails: Vec::new(),
             thumbnails_b: Vec::new(),
+            gpu_thumbnails: Vec::new(),
+            gpu_thumbnails_b: Vec::new(),
+            pending_thumb_frees: Vec::new(),
+            gpu_thumb_bg: None,
             gpu_textures: Vec::new(),
             gpu_textures_b: Vec::new(),
             t2_ring: std::collections::HashMap::new(),
@@ -636,6 +675,7 @@ impl ExrViewer {
                     self.textures_b.fill(None);
                     self.thumbnails.fill(None);
                     self.thumbnails_b.fill(None);
+                    self.invalidate_gpu_thumbnails(true, true);
                     self.diff_texture = None;
                 }
             }
@@ -647,6 +687,27 @@ impl ExrViewer {
         }
     }
 
+    /// Drain the GPU contact-sheet thumbnail caches (#67), queuing every
+    /// registered `TextureId` for deferred `free_texture` (drained in
+    /// `draw_contact_sheet`, which holds the renderer). Mirrors the A/B scoping of
+    /// the CPU `thumbnails.fill(None)` sites: `a`/`b` select which side(s) to clear.
+    fn invalidate_gpu_thumbnails(&mut self, a: bool, b: bool) {
+        if a {
+            for slot in self.gpu_thumbnails.iter_mut() {
+                if let Some((id, _, _)) = slot.take() {
+                    self.pending_thumb_frees.push(id);
+                }
+            }
+        }
+        if b {
+            for slot in self.gpu_thumbnails_b.iter_mut() {
+                if let Some((id, _, _)) = slot.take() {
+                    self.pending_thumb_frees.push(id);
+                }
+            }
+        }
+    }
+
     /// Invalidate cached CPU display textures whose pixels depend on the
     /// exposure / gamma / sRGB tone pipeline, so they regenerate next frame.
     /// (The GPU path reads the live uniform each frame and needs no invalidation.)
@@ -655,6 +716,9 @@ impl ExrViewer {
         self.textures_b.fill(None);
         self.thumbnails.fill(None);
         self.thumbnails_b.fill(None);
+        // GPU thumbnails bake the tone into a cached texture (unlike the live
+        // viewport uniform), so an exposure/gamma change must re-render them.
+        self.invalidate_gpu_thumbnails(true, true);
         self.diff_texture = None;
         self.composite_texture = None;
     }
@@ -803,6 +867,7 @@ impl ExrViewer {
                 self.textures_b.fill(None);
                 self.thumbnails.fill(None);
                 self.thumbnails_b.fill(None);
+                self.invalidate_gpu_thumbnails(true, true);
             }
 
             ui.separator();
@@ -1578,6 +1643,9 @@ impl ExrViewer {
             self.textures_b.fill(None);
             self.thumbnails.fill(None);
             self.thumbnails_b.fill(None);
+            // Toggling OCIO flips the GPU-vs-CPU thumbnail path; clear the GPU
+            // cache so stale GPU-rendered thumbnails don't linger after the switch.
+            self.invalidate_gpu_thumbnails(true, true);
         }
     }
 
@@ -1603,6 +1671,12 @@ impl ExrViewer {
             self.textures.resize(layer_count, None);
             self.thumbnails.clear();
             self.thumbnails.resize(layer_count, None);
+            // Queue any registered GPU thumbnail ids for deferred free before the
+            // slots are dropped (the renderer is only reachable in the sheet draw).
+            for (id, _, _) in self.gpu_thumbnails.drain(..).flatten() {
+                self.pending_thumb_frees.push(id);
+            }
+            self.gpu_thumbnails.resize_with(layer_count, || None);
             self.gpu_textures.clear();
             self.gpu_textures.resize(layer_count, None);
         }
@@ -1611,6 +1685,10 @@ impl ExrViewer {
             self.textures_b.resize(layer_count_b, None);
             self.thumbnails_b.clear();
             self.thumbnails_b.resize(layer_count_b, None);
+            for (id, _, _) in self.gpu_thumbnails_b.drain(..).flatten() {
+                self.pending_thumb_frees.push(id);
+            }
+            self.gpu_thumbnails_b.resize_with(layer_count_b, || None);
             self.gpu_textures_b.clear();
             self.gpu_textures_b.resize(layer_count_b, None);
         }
@@ -1624,7 +1702,56 @@ impl ExrViewer {
         ui: &mut egui::Ui,
         exr_data: &ExrData,
         exr_data_b: Option<&ExrData>,
+        gpu_resources: Option<&crate::gpu::GpuResources>,
     ) {
+        // The GPU thumbnail path applies only when a GPU is present AND OCIO is off
+        // (offscreen OCIO thumbnails are deferred to Phase 2). Compile both with and
+        // without the `ocio` feature.
+        #[cfg(feature = "ocio")]
+        let ocio_on = self.ocio_active;
+        #[cfg(not(feature = "ocio"))]
+        let ocio_on = false;
+        let use_gpu = gpu_resources.is_some() && !ocio_on;
+
+        // The backdrop is baked into each GPU thumbnail, but background edits don't
+        // run through `invalidate_tone`. Re-render the sheet when it changes (#122
+        // review) — a signature compare catches the settings window / gradient
+        // editor / preset-load paths alike. Queue happens before the drain below so
+        // the stale ids are freed this frame.
+        if use_gpu && self.gpu_thumb_bg.as_ref() != Some(&self.background) {
+            self.invalidate_gpu_thumbnails(true, true);
+            self.gpu_thumb_bg = Some(self.background.clone());
+        }
+
+        // Drain deferred `free_texture`s (#67): invalidation sites have no renderer
+        // handle, so they queue evicted GPU thumbnail ids here; this is the one site
+        // that holds the renderer. With no GPU nothing was ever registered — just
+        // clear the queue.
+        if !self.pending_thumb_frees.is_empty() {
+            if let Some(gpu) = gpu_resources {
+                let mut renderer = gpu.render_state().renderer.write();
+                for id in self.pending_thumb_frees.drain(..) {
+                    renderer.free_texture(&id);
+                }
+            } else {
+                self.pending_thumb_frees.clear();
+            }
+        }
+
+        // Tone snapshot for the GPU thumbnail render. `enable_lut` is forced off in
+        // Phase 1: the user .cube LUT isn't bound into the thumbnail pass yet (only
+        // the default 1x1 LUT bind group is), so honouring it would zero the image.
+        let tone = crate::gpu::thumbnail::ThumbnailTone {
+            exposure: self.exposure,
+            gamma: self.gamma,
+            srgb: self.srgb,
+            enable_lut: false,
+            channel_mode: self.channel_mode.as_u32(),
+            lut_domain_min: self.lut_domain_min,
+            lut_domain_max: self.lut_domain_max,
+            background: self.background.clone(),
+        };
+
         let draw_sheet = |viewer: &mut Self,
                           ui: &mut egui::Ui,
                           data: &crate::exr_loader::ExrData,
@@ -1642,21 +1769,65 @@ impl ExrViewer {
                             // Bake into the dedicated thumbnail cache, NOT the
                             // full-res `textures` slots — otherwise a closed sheet
                             // would leave a low-res thumbnail in the CPU-fallback view.
-                            let tex_opt = if is_a {
-                                if viewer.thumbnails[i].is_none() {
-                                    viewer.thumbnails[i] =
-                                        viewer.generate_texture(ui.ctx(), data, i, Some(THUMB_BOX));
+                            //
+                            // Each path yields `(egui::Image, full_res_size)`: the GPU
+                            // path renders through the display shader into a cached
+                            // Rgba8Unorm texture (#67); the CPU path is the headless /
+                            // OCIO fallback.
+                            let cell: Option<(egui::Image<'_>, egui::Vec2)> = if use_gpu {
+                                let gpu = gpu_resources.expect("use_gpu implies gpu_resources");
+                                let cache = if is_a {
+                                    &mut viewer.gpu_thumbnails
+                                } else {
+                                    &mut viewer.gpu_thumbnails_b
+                                };
+                                if cache[i].is_none() {
+                                    cache[i] = crate::gpu::thumbnail::generate(
+                                        gpu, data, i, THUMB_BOX, &tone,
+                                    );
                                 }
-                                viewer.thumbnails[i].as_ref()
+                                cache[i].as_ref().map(|(id, _, size)| {
+                                    (
+                                        egui::Image::new(egui::load::SizedTexture::new(*id, *size)),
+                                        *size,
+                                    )
+                                })
                             } else {
-                                if viewer.thumbnails_b[i].is_none() {
-                                    viewer.thumbnails_b[i] =
-                                        viewer.generate_texture(ui.ctx(), data, i, Some(THUMB_BOX));
-                                }
-                                viewer.thumbnails_b[i].as_ref()
+                                let tex_opt = if is_a {
+                                    if viewer.thumbnails[i].is_none() {
+                                        viewer.thumbnails[i] = viewer.generate_texture(
+                                            ui.ctx(),
+                                            data,
+                                            i,
+                                            Some(THUMB_BOX),
+                                        );
+                                    }
+                                    viewer.thumbnails[i].as_ref()
+                                } else {
+                                    if viewer.thumbnails_b[i].is_none() {
+                                        viewer.thumbnails_b[i] = viewer.generate_texture(
+                                            ui.ctx(),
+                                            data,
+                                            i,
+                                            Some(THUMB_BOX),
+                                        );
+                                    }
+                                    viewer.thumbnails_b[i].as_ref()
+                                };
+                                // Aspect uses the layer's FULL-RES size, not the
+                                // decimated thumbnail dims — `thumb_dims` can collapse
+                                // a thin axis to 1px, distorting aspect and diverging
+                                // from the GPU path (which reports full-res). (#122)
+                                tex_opt.map(|t| {
+                                    let size = data.logical_size(i).map_or_else(
+                                        || t.size_vec2(),
+                                        |(w, h)| egui::vec2(w as f32, h as f32),
+                                    );
+                                    (egui::Image::new(t), size)
+                                })
                             };
 
-                            if let Some(texture) = tex_opt {
+                            if let Some((image, draw_size)) = cell {
                                 // Reserve an EXACTLY uniform cell, then position the image and
                                 // label by absolute geometry. Auto-layout (allocate_ui /
                                 // vertical_centered) let cell heights vary by a few px (inherited
@@ -1667,9 +1838,8 @@ impl ExrViewer {
                                 let thumb_width = THUMB_BOX as f32;
                                 let thumb_box = THUMB_BOX as f32;
                                 let label_height = 30.0;
-                                let tex_size = texture.size_vec2();
-                                let aspect = if tex_size.y > 0.0 {
-                                    tex_size.x / tex_size.y
+                                let aspect = if draw_size.y > 0.0 {
+                                    draw_size.x / draw_size.y
                                 } else {
                                     1.0
                                 };
@@ -1697,7 +1867,7 @@ impl ExrViewer {
                                     ),
                                     egui::vec2(fit_w, fit_h),
                                 );
-                                egui::Image::new(texture).paint_at(ui, img_rect);
+                                image.paint_at(ui, img_rect);
 
                                 // Label: centered in the strip beneath the box.
                                 ui.painter().text(
@@ -1786,7 +1956,7 @@ impl ExrViewer {
         self.sync_texture_caches(layer_count, layer_count_b);
 
         if self.show_contact_sheet {
-            self.draw_contact_sheet(ui, exr_data, exr_data_b);
+            self.draw_contact_sheet(ui, exr_data, exr_data_b, gpu_resources);
         } else {
             // Channel/frame hotkeys are handled up-front in `handle_hotkeys`.
             let (tw, th) = exr_data.logical_size(self.active_layer).unwrap_or((1, 1));
@@ -3839,6 +4009,7 @@ impl ExrViewer {
     pub fn invalidate_reference_textures(&mut self) {
         self.textures_b.fill(None);
         self.thumbnails_b.fill(None);
+        self.invalidate_gpu_thumbnails(false, true);
         self.gpu_textures_b.fill(None);
         self.diff_texture = None;
         self.composite_texture = None;
@@ -3854,6 +4025,7 @@ impl ExrViewer {
     pub fn invalidate_active_textures(&mut self) {
         self.textures.fill(None);
         self.thumbnails.fill(None);
+        self.invalidate_gpu_thumbnails(true, false);
         self.gpu_textures.fill(None);
         self.diff_texture = None;
         self.composite_texture = None;
