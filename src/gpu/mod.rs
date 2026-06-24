@@ -5,6 +5,7 @@ use std::sync::Arc;
 pub mod ocio_pass;
 
 pub mod resources;
+pub mod thumbnail;
 
 pub use resources::GpuResources;
 
@@ -96,6 +97,12 @@ pub struct BlitUniforms {
 
 pub struct GpuState {
     pub pipeline: wgpu::RenderPipeline,
+    /// Same shader/layout as `pipeline` but targets an `Rgba8Unorm` offscreen
+    /// texture with `blend: None` (REPLACE) — one opaque quad into a fresh
+    /// target. Drives the GPU contact-sheet thumbnail render (#67): with
+    /// `srgb=1, skip_checker=0, opacity=1.0` it emits the sRGB-encoded,
+    /// checker-composited, opaque bytes egui displays directly.
+    pub thumbnail_pipeline: wgpu::RenderPipeline,
     pub bind_group_layout_tex: wgpu::BindGroupLayout,
     /// Kept on the struct for potential future use; the ring-buffer bind group
     /// (`uniform_bind_group` below) is what the paint callbacks actually use.
@@ -376,6 +383,35 @@ impl GpuState {
                 targets: &[Some(wgpu::ColorTargetState {
                     format: target_format,
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        // GPU contact-sheet thumbnail pipeline (#67): identical to `pipeline` but
+        // renders one opaque quad (`blend: None` = REPLACE) into a fresh
+        // `Rgba8Unorm` target (egui's required format for `register_native_texture`).
+        let thumbnail_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Exr Thumbnail Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
                 compilation_options: Default::default(),
@@ -729,6 +765,7 @@ impl GpuState {
 
         Self {
             pipeline,
+            thumbnail_pipeline,
             bind_group_layout_tex,
             bind_group_layout_uniform,
             bind_group_layout_lut,
