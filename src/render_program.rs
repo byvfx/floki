@@ -6,9 +6,10 @@
 //! [`CompareMode`] inline to decide which texture(s) to bind and how. This module
 //! is the seam that routes those decisions through the pure layer model instead:
 //! the viewer keeps a two-layer [`LayerStack`] (slot A at the bottom, slot B on
-//! top), and each frame [`resolve`] configures it from the live viewer state and
-//! reads [`LayerStack::composite_at`] to produce a [`RenderProgram`] the draw
-//! paths consume.
+//! top), and every UI repaint [`resolve`] configures it from the live viewer
+//! state and reads [`LayerStack::composite_at`] to produce a [`RenderProgram`]
+//! the draw paths consume. (It resolves at global timeline frame 0 this phase —
+//! see [`resolve`] for why that is exact, not a placeholder.)
 //!
 //! [`ExrViewer`]: crate::viewer::ExrViewer
 //!
@@ -226,6 +227,14 @@ pub fn resolve(
     input: &ResolveInput,
 ) -> RenderProgram {
     configure(stack, ids, input);
+    // Resolve at global frame 0 deliberately. This phase's two layers are always
+    // `Trim::full(0, u32::MAX)` with offset 0 and nothing mutates their trim, so
+    // every global frame yields the same visible draws; the only thing that varies
+    // with the frame is each `Draw`'s `source_frame`, which `ProgramDraw` does not
+    // carry — the renderer still fetches by `active_layer` through the existing
+    // texture caches. So the program is frame-invariant and `0` is exact, not a
+    // placeholder. When per-layer trim/offset become real (#104 / locked-step A/B
+    // #98), thread the live global frame through `ResolveInput` and pass it here.
     let draws = stack
         .composite_at(0)
         .into_iter()
