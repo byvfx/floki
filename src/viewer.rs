@@ -322,6 +322,12 @@ pub struct ExrViewer {
     /// `draw_contact_sheet` (the only site with the renderer handle). Invalidation
     /// sites can't free directly (no `gpu_resources`), so they push here instead.
     pending_thumb_frees: Vec<egui::TextureId>,
+    /// The background the GPU thumbnails were baked with (#67). The backdrop is
+    /// composited into the cached texture, but background edits (settings window /
+    /// gradient editor / preset load) don't go through `invalidate_tone`; a
+    /// signature compare in `draw_contact_sheet` re-renders the sheet when it
+    /// changes, catching every mutation path.
+    gpu_thumb_bg: Option<crate::background::Background>,
     gpu_textures: Vec<Option<std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>>>,
     gpu_textures_b: Vec<Option<std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>>>,
 
@@ -500,6 +506,7 @@ impl Default for ExrViewer {
             gpu_thumbnails: Vec::new(),
             gpu_thumbnails_b: Vec::new(),
             pending_thumb_frees: Vec::new(),
+            gpu_thumb_bg: None,
             gpu_textures: Vec::new(),
             gpu_textures_b: Vec::new(),
             t2_ring: std::collections::HashMap::new(),
@@ -1697,6 +1704,25 @@ impl ExrViewer {
         exr_data_b: Option<&ExrData>,
         gpu_resources: Option<&crate::gpu::GpuResources>,
     ) {
+        // The GPU thumbnail path applies only when a GPU is present AND OCIO is off
+        // (offscreen OCIO thumbnails are deferred to Phase 2). Compile both with and
+        // without the `ocio` feature.
+        #[cfg(feature = "ocio")]
+        let ocio_on = self.ocio_active;
+        #[cfg(not(feature = "ocio"))]
+        let ocio_on = false;
+        let use_gpu = gpu_resources.is_some() && !ocio_on;
+
+        // The backdrop is baked into each GPU thumbnail, but background edits don't
+        // run through `invalidate_tone`. Re-render the sheet when it changes (#122
+        // review) — a signature compare catches the settings window / gradient
+        // editor / preset-load paths alike. Queue happens before the drain below so
+        // the stale ids are freed this frame.
+        if use_gpu && self.gpu_thumb_bg.as_ref() != Some(&self.background) {
+            self.invalidate_gpu_thumbnails(true, true);
+            self.gpu_thumb_bg = Some(self.background.clone());
+        }
+
         // Drain deferred `free_texture`s (#67): invalidation sites have no renderer
         // handle, so they queue evicted GPU thumbnail ids here; this is the one site
         // that holds the renderer. With no GPU nothing was ever registered — just
@@ -1711,15 +1737,6 @@ impl ExrViewer {
                 self.pending_thumb_frees.clear();
             }
         }
-
-        // The GPU thumbnail path applies only when a GPU is present AND OCIO is off
-        // (offscreen OCIO thumbnails are deferred to Phase 2). Compile both with and
-        // without the `ocio` feature.
-        #[cfg(feature = "ocio")]
-        let ocio_on = self.ocio_active;
-        #[cfg(not(feature = "ocio"))]
-        let ocio_on = false;
-        let use_gpu = gpu_resources.is_some() && !ocio_on;
 
         // Tone snapshot for the GPU thumbnail render. `enable_lut` is forced off in
         // Phase 1: the user .cube LUT isn't bound into the thumbnail pass yet (only
@@ -1797,7 +1814,17 @@ impl ExrViewer {
                                     }
                                     viewer.thumbnails_b[i].as_ref()
                                 };
-                                tex_opt.map(|t| (egui::Image::new(t), t.size_vec2()))
+                                // Aspect uses the layer's FULL-RES size, not the
+                                // decimated thumbnail dims — `thumb_dims` can collapse
+                                // a thin axis to 1px, distorting aspect and diverging
+                                // from the GPU path (which reports full-res). (#122)
+                                tex_opt.map(|t| {
+                                    let size = data.logical_size(i).map_or_else(
+                                        || t.size_vec2(),
+                                        |(w, h)| egui::vec2(w as f32, h as f32),
+                                    );
+                                    (egui::Image::new(t), size)
+                                })
                             };
 
                             if let Some((image, draw_size)) = cell {
