@@ -734,10 +734,9 @@ fn upload_lut(
     (tex, view)
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos", any(feature = "system-ocio", feature = "vendored")))]
 mod metal_tests {
     use super::*;
-
     fn default_request(cfg: &floki_ocio::OcioConfig) -> floki_ocio::DisplayTransformRequest {
         let input_colorspace = cfg
             .scene_linear_colorspace()
