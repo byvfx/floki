@@ -270,8 +270,13 @@ pub struct ExrApp {
     ocio_error: Option<String>,
     #[serde(skip)]
     ocio_ready: bool,
+    /// Monotonic generation of the OCIO display transform, bumped on every
+    /// `rebuild_ocio_pass` (config / display / view change). Pushed into the
+    /// viewer each frame so it can invalidate contact-sheet thumbnails and force
+    /// OCIO re-renders when the managed look changes (#59 replaced the old
+    /// `ocio_cpu` Rc-pointer identity used for this).
     #[serde(skip)]
-    ocio_cpu: Option<std::rc::Rc<floki_ocio::CpuProcessor>>,
+    ocio_render_gen: u64,
 
     #[serde(skip)]
     show_tools_window: bool,
@@ -374,7 +379,7 @@ impl Default for ExrApp {
             ocio_colorspaces: Vec::new(),
             ocio_error: None,
             ocio_ready: false,
-            ocio_cpu: None,
+            ocio_render_gen: 0,
             show_tools_window: false,
             tools_input_dir: String::new(),
             tools_output_dir: String::new(),
@@ -496,7 +501,9 @@ impl ExrApp {
     fn rebuild_ocio_pass(&mut self) {
         use floki_ocio::DisplayTransformRequest;
 
-        self.ocio_cpu = None;
+        // Bump the OCIO generation so the viewer re-renders thumbnails and the
+        // OCIO callback on any config / display / view change (#59).
+        self.ocio_render_gen = self.ocio_render_gen.wrapping_add(1);
         let Some(cfg) = &self.ocio_config else {
             self.ocio_ready = false;
             return;
@@ -526,8 +533,6 @@ impl ExrApp {
                 return;
             }
         };
-        // CPU processor for thumbnails / fallback (best-effort; GPU path is primary).
-        self.ocio_cpu = cfg.build_cpu_processor(&req).ok().map(std::rc::Rc::new);
         let Some(gpu) = &self.gpu_resources else {
             self.ocio_ready = false;
             return;
@@ -3172,11 +3177,7 @@ impl ExrApp {
                     self.viewer.lut_domain_min = self.lut_domain_min;
                     self.viewer.lut_domain_max = self.lut_domain_max;
                     self.viewer.ocio_active = self.ocio_enabled && self.ocio_ready;
-                    self.viewer.ocio_cpu = if self.viewer.ocio_active {
-                        self.ocio_cpu.clone()
-                    } else {
-                        None
-                    };
+                    self.viewer.ocio_render_gen = self.ocio_render_gen;
                     // Diff controls: push the persisted state into the viewer, let
                     // the mode-param UI mutate it during `ui`, then read it back so
                     // `save` persists the latest. Kept identical both ways, so no

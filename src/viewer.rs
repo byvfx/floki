@@ -4,30 +4,22 @@
 //!
 //! # Texture generation
 //!
-//! Two rendering paths produce what's drawn, and which `generate_*` function
-//! runs depends on whether a GPU [`RenderState`](eframe::egui_wgpu::RenderState)
-//! is available:
+//! Rendering is **GPU-only** (#59 removed the CPU viewport render path; the app
+//! requires a GPU and aborts without one):
+//! [`Self::build_layer_texture`](ExrViewer::build_layer_texture) uploads a
+//! layer's RGBA into a bind group; `gpu/shader.wgsl` then applies channel
+//! isolation, exposure, gamma, sRGB **and every compare mode** (wipe / diff /
+//! composite) in-shader, so a single generator serves all modes, cached per layer
+//! in `gpu_textures` / `gpu_textures_b`. Under OCIO the display chain is the
+//! two-pass OCIO callback ([`crate::gpu::ocio_pass`]) instead.
 //!
-//! - **GPU (default).** [`Self::build_layer_texture`](ExrViewer::build_layer_texture)
-//!   uploads a layer's RGBA into a bind group; `gpu/shader.wgsl` then applies
-//!   channel isolation, exposure, gamma, sRGB **and every compare mode**
-//!   (wipe / diff / composite) in-shader. So in GPU mode a single generator
-//!   serves all modes, cached per layer in `gpu_textures` / `gpu_textures_b`.
-//!
-//! - **CPU (no `render_state`, plus contact-sheet thumbnails).** The result is
-//!   baked into an [`egui::TextureHandle`], so each compare mode needs its own
-//!   generator. When an OCIO CPU processor is active each path dispatches to its
-//!   `_ocio` sibling (display transform instead of the built-in sRGB tone math):
-//!
-//!   | Situation            | Function                       | OCIO-active variant               | Cache (key)                                 |
-//!   |----------------------|--------------------------------|-----------------------------------|---------------------------------------------|
-//!   | Single layer / thumb | `generate_texture`             | `generate_texture_ocio`           | `textures` / `textures_b` (per-layer slot)  |
-//!   | [`CompareMode::DiffMatte`] | `generate_diff_texture`   | — (diff is tone-mode-agnostic)    | `diff_texture`, key `(active_layer, diff_multiplier)` |
-//!   | [`CompareMode::Composite`] | `generate_composite_texture` | `generate_composite_texture_ocio` | `composite_texture`, key `(active_layer, blend_mode)` |
-//!
-//! All caches invalidate on a layer-count change; the per-layer slots also clear
-//! on an OCIO-state change and via [`ExrViewer::invalidate_reference_textures`]
-//! when B is replaced.
+//! The only CPU bake that remains is [`Self::generate_texture`] for
+//! contact-sheet thumbnails — the **headless / no-GPU fallback** (used by tests
+//! and when no GPU is present). With a GPU, thumbnails render through
+//! [`crate::gpu::thumbnail`] (OCIO included). Thumbnail caches invalidate on a
+//! layer-count change, an OCIO-state change
+//! ([`ExrViewer::invalidate_thumbnails_on_ocio_change`]), and via
+//! [`ExrViewer::invalidate_reference_textures`] when B is replaced.
 
 use crate::annotation::{Annotation, AnnotationKind, AnnotationTool};
 use crate::exr_loader::ExrData;
@@ -97,23 +89,6 @@ pub(crate) fn pixel_val(
     } else {
         sample_channel(chan, x, y, width)
     }
-}
-
-/// Like [`sample_channel`] but with a bounds check: returns `0.0` if `(x, y)`
-/// is outside `[0, w) × [0, h)`. Needed in diff/composite generators where
-/// images A and B may have different dimensions and the loop iterates over the
-/// union. Previously duplicated 3× as inline 5-arg `get_val` closures.
-fn sample_channel_bounded(
-    chan: Option<&exr::image::AnyChannel<exr::image::FlatSamples>>,
-    x: usize,
-    y: usize,
-    w: usize,
-    h: usize,
-) -> f32 {
-    if x >= w || y >= h {
-        return 0.0;
-    }
-    sample_channel(chan, x, y, w)
 }
 
 /// Contact-sheet thumbnail box, in pixels: both the on-screen cell size and the
@@ -238,15 +213,7 @@ struct CanvasLayout {
     tex_size: egui::Vec2,
     /// Pixel dimensions of image B's active layer, if B is loaded.
     tex_size_b: Option<egui::Vec2>,
-    /// Whether the active compare mode is side-by-side (skips overscan dimming
-    /// and the display-window overlays).
-    is_side_by_side: bool,
 }
-
-/// Cache key for the CPU `diff_texture`: `(layer, gain, colormap, metric, floor)`.
-/// Compared by value (`Colormap` is `PartialEq`) to invalidate the cached diff
-/// when any control that affects its pixels changes.
-type DiffCacheKey = (usize, f32, Colormap, DiffMetric, f32);
 
 /// Which feature the shared gradient editor is currently editing — the result of
 /// "Apply" / "Save as preset" is routed accordingly.
@@ -288,13 +255,10 @@ fn t2_victim(frames: impl Iterator<Item = u32>, on_screen: Option<u32>) -> Optio
 /// [`CompareMode`], the texture caches described in the module docs, plus
 /// sampling/histogram/contact-sheet state. Driven each frame by [`Self::ui`].
 pub struct ExrViewer {
-    textures: Vec<Option<egui::TextureHandle>>,
-    textures_b: Vec<Option<egui::TextureHandle>>,
-    /// Per-layer **decimated** contact-sheet thumbnails (A/B), kept separate from
-    /// the full-res CPU-display caches above. Sharing one slot would let a ≤256px
-    /// sheet thumbnail leak into the CPU-fallback central view (which gates on
-    /// `is_none()` and so wouldn't regenerate full-res). Same indexing, lifetime,
-    /// and invalidation as `textures`/`textures_b`.
+    /// Per-layer **decimated** contact-sheet thumbnails (A/B). The CPU thumbnail
+    /// bake ([`Self::generate_texture`]) is the headless / no-GPU fallback; when a
+    /// GPU is present, `gpu_thumbnails` is used instead (#67). Cleared on a layer
+    /// *count* change or any tone/OCIO change.
     thumbnails: Vec<Option<egui::TextureHandle>>,
     thumbnails_b: Vec<Option<egui::TextureHandle>>,
     /// GPU contact-sheet thumbnails (#67): per-layer `(egui TextureId, owned
@@ -344,10 +308,6 @@ pub struct ExrViewer {
     /// The sequence frame on screen, so `ui()` binds its T2 texture. `None` for a
     /// single image (lazy path).
     t2_frame: Option<u32>,
-    diff_texture: Option<egui::TextureHandle>,
-    /// Cache key for `diff_texture`: layer + every control that changes the diff
-    /// pixels (gain, colormap identity, metric, noise floor).
-    last_diff_params: DiffCacheKey,
     /// Diff visualization controls (see issue #15). The active colormap, the
     /// magnitude metric, and the noise floor. Hydrated from `ExrApp` each frame so
     /// they persist across sessions; mutated here by the mode-param UI.
@@ -383,8 +343,6 @@ pub struct ExrViewer {
     /// GPU texture is re-uploaded only when the gradient ramp changes.
     bg_gradient_lut: Vec<u8>,
     bg_gradient_sig: Option<Gradient>,
-    composite_texture: Option<egui::TextureHandle>,
-    last_composite_params: (usize, BlendMode), // (layer_index, blend_mode)
     pub blink_state: bool,
     pub blink_interval: f32,
     pub fullscreen: bool,
@@ -402,12 +360,16 @@ pub struct ExrViewer {
     /// When true (OCIO config loaded + enabled), the single-image central path renders via the
     /// two-pass OCIO callback instead of the direct display chain. Set by the app.
     pub ocio_active: bool,
-    /// CPU display transform for thumbnails / CPU fallback (mirrors the GPU OCIO path). Set by
-    /// the app; shared via `Rc` because `CpuProcessor` isn't `Clone`.
-    pub ocio_cpu: Option<std::rc::Rc<floki_ocio::CpuProcessor>>,
-    /// Identity of the current OCIO CPU state; cached CPU textures are invalidated when it
-    /// changes (toggle on/off or a new display/view).
-    ocio_sig: usize,
+    /// Monotonic generation of the OCIO display transform, set by the app each
+    /// frame and bumped whenever the OCIO pass is rebuilt (config / display /
+    /// view change). Together with `ocio_active` it forms the signature that
+    /// invalidates contact-sheet thumbnails when the managed look changes — the
+    /// replacement for the old `ocio_cpu` Rc-pointer identity (#59 removed the CPU
+    /// OCIO processor).
+    pub ocio_render_gen: u64,
+    /// Last-applied `(ocio_active, ocio_render_gen)` signature; thumbnails are
+    /// re-rendered when it changes. See [`Self::invalidate_thumbnails_on_ocio_change`].
+    ocio_sig: u64,
     pub show_tooltip: bool,
     pub channel_mode: ChannelMode,
     pub compare_mode: CompareMode,
@@ -496,8 +458,6 @@ impl Default for ExrViewer {
     fn default() -> Self {
         let (layer_stack, layer_ids) = crate::render_program::new_ab_stack();
         Self {
-            textures: Vec::new(),
-            textures_b: Vec::new(),
             thumbnails: Vec::new(),
             thumbnails_b: Vec::new(),
             gpu_thumbnails: Vec::new(),
@@ -510,8 +470,6 @@ impl Default for ExrViewer {
             t2_layer: 0,
             t2_cap: 0,
             t2_frame: None,
-            diff_texture: None,
-            last_diff_params: (0, 0.0, Colormap::BlackBody, DiffMetric::MaxChannel, 0.0),
             diff_colormap: Colormap::BlackBody,
             diff_metric: DiffMetric::MaxChannel,
             diff_floor: 0.0,
@@ -528,8 +486,6 @@ impl Default for ExrViewer {
             new_bg_preset_name: String::new(),
             bg_gradient_lut: Vec::new(),
             bg_gradient_sig: None,
-            composite_texture: None,
-            last_composite_params: (0, BlendMode::Over),
             blink_state: false,
             blink_interval: 1.0,
             fullscreen: false,
@@ -541,7 +497,7 @@ impl Default for ExrViewer {
             lut_domain_min: [0.0, 0.0, 0.0, 0.0],
             lut_domain_max: [1.0, 1.0, 1.0, 0.0],
             ocio_active: false,
-            ocio_cpu: None,
+            ocio_render_gen: 0,
             ocio_sig: 0,
             show_tooltip: true,
             channel_mode: ChannelMode::RGB,
@@ -665,12 +621,9 @@ impl ExrViewer {
                     self.channel_mode = ChannelMode::RGB;
                 }
                 if self.channel_mode != prev_mode {
-                    self.textures.fill(None);
-                    self.textures_b.fill(None);
                     self.thumbnails.fill(None);
                     self.thumbnails_b.fill(None);
                     self.invalidate_gpu_thumbnails(true, true);
-                    self.diff_texture = None;
                 }
             }
         });
@@ -702,19 +655,16 @@ impl ExrViewer {
         }
     }
 
-    /// Invalidate cached CPU display textures whose pixels depend on the
+    /// Invalidate cached contact-sheet thumbnails whose pixels depend on the
     /// exposure / gamma / sRGB tone pipeline, so they regenerate next frame.
-    /// (The GPU path reads the live uniform each frame and needs no invalidation.)
+    /// (The central viewport is GPU-only and reads the live uniform each frame, so
+    /// it needs no invalidation; only the baked thumbnails do.)
     fn invalidate_tone(&mut self) {
-        self.textures.fill(None);
-        self.textures_b.fill(None);
         self.thumbnails.fill(None);
         self.thumbnails_b.fill(None);
         // GPU thumbnails bake the tone into a cached texture (unlike the live
         // viewport uniform), so an exposure/gamma change must re-render them.
         self.invalidate_gpu_thumbnails(true, true);
-        self.diff_texture = None;
-        self.composite_texture = None;
     }
 
     fn reset_exposure(&mut self) {
@@ -857,8 +807,6 @@ impl ExrViewer {
             ui.selectable_value(&mut self.channel_mode, ChannelMode::B, "B");
             ui.selectable_value(&mut self.channel_mode, ChannelMode::A, "A");
             if self.channel_mode != prev_mode {
-                self.textures.fill(None);
-                self.textures_b.fill(None);
                 self.thumbnails.fill(None);
                 self.thumbnails_b.fill(None);
                 self.invalidate_gpu_thumbnails(true, true);
@@ -1618,26 +1566,28 @@ impl ExrViewer {
         });
     }
 
-    /// Drop cached CPU textures (thumbnails / fallback) when the OCIO CPU
-    /// processor changes, so they regenerate with — or without — the display
-    /// transform. A no-op while the processor identity is unchanged.
-    fn invalidate_ocio_cpu_textures(&mut self) {
+    /// Re-render contact-sheet thumbnails when the OCIO managed look changes —
+    /// toggled on/off (`ocio_active`) or a new config / display / view
+    /// (`ocio_render_gen`, bumped by the app's `rebuild_ocio_pass`). A no-op while
+    /// the signature is unchanged. Replaces the old `ocio_cpu` Rc-pointer identity
+    /// trick now that the CPU OCIO processor is gone (#59).
+    fn invalidate_thumbnails_on_ocio_change(&mut self) {
+        // 0 is the OCIO-off sentinel; when active, mix the generation through an
+        // odd multiplier (a bijection on u64, so distinct generations stay
+        // distinct). The generation is >= 1 whenever OCIO is active (set by
+        // `rebuild_ocio_pass` before `ocio_ready`), so the product is non-zero and
+        // never collides with the off sentinel.
         let sig = if self.ocio_active {
-            self.ocio_cpu
-                .as_ref()
-                .map(|p| std::rc::Rc::as_ptr(p) as usize)
-                .unwrap_or(1)
+            self.ocio_render_gen.wrapping_mul(0x100000001b3)
         } else {
             0
         };
         if sig != self.ocio_sig {
             self.ocio_sig = sig;
-            self.textures.fill(None);
-            self.textures_b.fill(None);
             self.thumbnails.fill(None);
             self.thumbnails_b.fill(None);
-            // Toggling OCIO flips the GPU-vs-CPU thumbnail path; clear the GPU
-            // cache so stale GPU-rendered thumbnails don't linger after the switch.
+            // Toggling OCIO flips the GPU thumbnail backend (display shader vs the
+            // OCIO two-pass); clear the GPU cache so stale thumbnails don't linger.
             self.invalidate_gpu_thumbnails(true, true);
         }
     }
@@ -1656,12 +1606,12 @@ impl ExrViewer {
         }
     }
 
-    /// Resize the per-layer texture caches to the current A/B layer counts,
-    /// clearing them (forcing regeneration) whenever a count changes.
+    /// Resize the per-layer thumbnail / GPU-texture caches to the current A/B
+    /// layer counts, clearing them (forcing regeneration) whenever a count
+    /// changes. `thumbnails` length is the sentinel (it tracks the layer count for
+    /// both the CPU and GPU thumbnail caches).
     fn sync_texture_caches(&mut self, layer_count: usize, layer_count_b: usize) {
-        if self.textures.len() != layer_count {
-            self.textures.clear();
-            self.textures.resize(layer_count, None);
+        if self.thumbnails.len() != layer_count {
             self.thumbnails.clear();
             self.thumbnails.resize(layer_count, None);
             // Queue any registered GPU thumbnail ids for deferred free before the
@@ -1673,9 +1623,7 @@ impl ExrViewer {
             self.gpu_textures.clear();
             self.gpu_textures.resize(layer_count, None);
         }
-        if self.textures_b.len() != layer_count_b {
-            self.textures_b.clear();
-            self.textures_b.resize(layer_count_b, None);
+        if self.thumbnails_b.len() != layer_count_b {
             self.thumbnails_b.clear();
             self.thumbnails_b.resize(layer_count_b, None);
             for (id, _, _) in self.gpu_thumbnails_b.drain(..).flatten() {
@@ -1941,7 +1889,7 @@ impl ExrViewer {
     ) {
         self.handle_hotkeys(ui, exr_data_b.is_some());
 
-        self.invalidate_ocio_cpu_textures();
+        self.invalidate_thumbnails_on_ocio_change();
 
         self.apply_blink_mode(ui, exr_data_b.is_some());
 
@@ -2009,68 +1957,11 @@ impl ExrViewer {
                             Self::build_layer_texture(gpu, data_b, layer_b).map(|t2| t2.bind_group);
                     }
                 }
-            } else {
-                if self.textures[self.active_layer].is_none() {
-                    self.textures[self.active_layer] =
-                        self.generate_texture(ui.ctx(), exr_data, self.active_layer, None);
-                }
-                if let Some(data_b) = exr_data_b {
-                    let layer_b = self
-                        .active_layer
-                        .min(data_b.logical_layers.len().saturating_sub(1));
-                    if self.textures_b[layer_b].is_none() {
-                        self.textures_b[layer_b] =
-                            self.generate_texture(ui.ctx(), data_b, layer_b, None);
-                    }
-                }
-                let diff_key: DiffCacheKey = (
-                    self.active_layer,
-                    self.diff_multiplier,
-                    self.diff_colormap.clone(),
-                    self.diff_metric,
-                    self.diff_floor,
-                );
-                if let Some(exr_b) = exr_data_b
-                    && self.compare_mode == CompareMode::DiffMatte
-                    && (self.diff_texture.is_none() || self.last_diff_params != diff_key)
-                {
-                    let layer_b = self
-                        .active_layer
-                        .min(exr_b.logical_layers.len().saturating_sub(1));
-                    self.diff_texture = self.generate_diff_texture(
-                        ui.ctx(),
-                        exr_data,
-                        exr_b,
-                        self.active_layer,
-                        layer_b,
-                    );
-                    self.last_diff_params = diff_key;
-                }
-                if let Some(exr_b) = exr_data_b
-                    && self.compare_mode == CompareMode::Composite
-                    && (self.composite_texture.is_none()
-                        || self.last_composite_params != (self.active_layer, self.blend_mode))
-                {
-                    let layer_b = self
-                        .active_layer
-                        .min(exr_b.logical_layers.len().saturating_sub(1));
-                    self.composite_texture = self.generate_composite_texture(
-                        ui.ctx(),
-                        exr_data,
-                        exr_b,
-                        self.active_layer,
-                        layer_b,
-                    );
-                    self.last_composite_params = (self.active_layer, self.blend_mode);
-                }
             }
 
-            // Draw texture
-            let has_texture = if gpu_resources.is_some() {
-                self.gpu_textures[self.active_layer].is_some()
-            } else {
-                self.textures[self.active_layer].is_some()
-            };
+            // Draw texture. GPU is the only render path (#59); without a GPU
+            // (headless tests) nothing is uploaded, so the canvas draw is skipped.
+            let has_texture = self.gpu_textures[self.active_layer].is_some();
             if has_texture {
                 let (rect, response) =
                     ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
@@ -2175,13 +2066,10 @@ impl ExrViewer {
                     image_size,
                     tex_size,
                     tex_size_b,
-                    is_side_by_side,
                 };
 
                 if let Some(gpu) = gpu_resources {
                     self.draw_canvas_gpu(ui, &layout, exr_data_b, gpu, lut_bg_opt);
-                } else {
-                    self.draw_canvas_cpu(ui, &layout, exr_data_b);
                 }
 
                 // Annotation overlay on top of the image (and its in-progress shape).
@@ -2454,170 +2342,6 @@ impl ExrViewer {
             wipe_position: self.wipe_center[0],
         };
         crate::render_program::resolve(&mut self.layer_stack, self.layer_ids, &input)
-    }
-
-    /// CPU fallback render path (no GPU `render_state`): paint the already-baked
-    /// `egui::TextureHandle`s for the active compare mode. Mirrors the GPU path's
-    /// layout, minus the in-shader effects (those are pre-applied when the CPU
-    /// textures are generated).
-    fn draw_canvas_cpu(
-        &mut self,
-        ui: &egui::Ui,
-        layout: &CanvasLayout,
-        exr_data_b: Option<&ExrData>,
-    ) {
-        let CanvasLayout {
-            rect,
-            disp_rect,
-            image_rect,
-            image_size,
-            tex_size,
-            tex_size_b,
-            is_side_by_side,
-        } = *layout;
-        // Resolve the layer model up front (the CPU fallback does not blink, so the
-        // raw compare mode is used — matching the pre-existing behavior).
-        let program = self.render_program(self.compare_mode);
-        let unclipped_painter = ui.painter().with_clip_rect(rect);
-        let painter = ui.painter().with_clip_rect(rect.intersect(disp_rect));
-
-        // Defense-in-depth: the active-layer CPU texture is normally guaranteed
-        // present by `has_texture` in `ExrViewer::ui()`, but that invariant crosses
-        // a function-call boundary, so bail out cleanly rather than panicking here.
-        let Some(texture) = self.textures[self.active_layer].as_ref() else {
-            return;
-        };
-        let draw_image = |painter: &egui::Painter,
-                          tex: &egui::TextureHandle,
-                          clip_rect: egui::Rect,
-                          target_rect: egui::Rect,
-                          opacity: f32| {
-            let alpha = opacity;
-            let final_clip_rect = painter.clip_rect().intersect(clip_rect);
-            painter.with_clip_rect(final_clip_rect).image(
-                tex.id(),
-                target_rect,
-                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                egui::Color32::from_white_alpha((alpha * 255.0) as u8),
-            );
-        };
-
-        // The active-layer slot-B CPU texture, clamped to B's layer count.
-        let tex_b = || {
-            exr_data_b.and_then(|d| {
-                self.textures_b[self
-                    .active_layer
-                    .min(d.logical_layers.len().saturating_sub(1))]
-                .as_ref()
-            })
-        };
-        let draw_all_cpu = |p: &egui::Painter, opac: f32| match program.arrangement {
-            // Single (one draw) and Composite (the pre-baked `composite_texture`).
-            render_program::Arrangement::Stacked => {
-                if program.is_composite {
-                    if let Some(comp) = &self.composite_texture {
-                        draw_image(p, comp, rect, image_rect, opac);
-                    }
-                } else if let Some(draw) = program.draws.first() {
-                    match draw.input {
-                        render_program::ProgramInput::A => {
-                            draw_image(p, texture, rect, image_rect, opac);
-                        }
-                        render_program::ProgramInput::B => {
-                            if let Some(tb) = tex_b() {
-                                draw_image(p, tb, rect, image_rect, opac);
-                            }
-                        }
-                    }
-                }
-            }
-            render_program::Arrangement::Wipe { .. } => {
-                // CPU fallback: keep it vertical for simplicity, but use new center state
-                let wipe_x = image_rect.min.x + image_rect.width() * self.wipe_center[0];
-                let clamped_wipe_x = wipe_x.clamp(rect.min.x, rect.max.x);
-                let mut rect_a = rect;
-                rect_a.max.x = clamped_wipe_x;
-                let mut rect_b = rect;
-                rect_b.min.x = clamped_wipe_x;
-
-                draw_image(p, texture, rect_a, image_rect, opac);
-                if let Some(tb) = tex_b() {
-                    draw_image(p, tb, rect_b, image_rect, opac);
-                }
-
-                let alpha = (self.wipe_line_opacity * 255.0) as u8;
-                let color = egui::Color32::from_white_alpha(alpha);
-                p.line_segment(
-                    [
-                        egui::pos2(wipe_x, rect.min.y),
-                        egui::pos2(wipe_x, rect.max.y),
-                    ],
-                    (2.0, color),
-                );
-            }
-            render_program::Arrangement::SideBySide => {
-                if let (Some(tex_b), Some(size_b)) = (tex_b(), tex_size_b) {
-                    let mut image_size_b = size_b * self.scale;
-                    if self.normalize_side_by_side {
-                        let scale_b = (tex_size.y * self.scale) / size_b.y;
-                        image_size_b = size_b * scale_b;
-                    }
-                    let combined_width = image_size.x + image_size_b.x;
-                    let combined_height = image_size.y.max(image_size_b.y);
-
-                    let combined_rect = egui::Rect::from_center_size(
-                        rect.center() + self.translation,
-                        egui::vec2(combined_width, combined_height),
-                    );
-
-                    let mut image_rect_a = egui::Rect::from_min_size(combined_rect.min, image_size);
-                    image_rect_a.set_center(egui::pos2(
-                        image_rect_a.center().x,
-                        combined_rect.center().y,
-                    ));
-
-                    let mut image_rect_b = egui::Rect::from_min_size(
-                        egui::pos2(combined_rect.min.x + image_size.x, combined_rect.min.y),
-                        image_size_b,
-                    );
-                    image_rect_b.set_center(egui::pos2(
-                        image_rect_b.center().x,
-                        combined_rect.center().y,
-                    ));
-
-                    draw_image(p, texture, rect, image_rect_a, opac);
-                    draw_image(p, tex_b, rect, image_rect_b, opac);
-
-                    p.line_segment(
-                        [
-                            egui::pos2(image_rect_b.min.x, combined_rect.min.y),
-                            egui::pos2(image_rect_b.min.x, combined_rect.max.y),
-                        ],
-                        (2.0, egui::Color32::GRAY),
-                    );
-                } else {
-                    draw_image(p, texture, rect, image_rect, opac);
-                }
-            }
-            render_program::Arrangement::Diff => {
-                if let Some(diff) = &self.diff_texture {
-                    draw_image(p, diff, rect, image_rect, opac);
-                }
-            }
-        };
-
-        if self.overscan_opacity > 0.0 && !is_side_by_side {
-            draw_all_cpu(&unclipped_painter, self.overscan_opacity);
-        }
-        // Side-by-Side renders at full brightness with the full-canvas clip.
-        draw_all_cpu(
-            if is_side_by_side {
-                &unclipped_painter
-            } else {
-                &painter
-            },
-            1.0,
-        );
     }
 
     /// GPU render path (the default): build per-draw uniforms and emit wgpu
@@ -3086,14 +2810,11 @@ impl ExrViewer {
                         bg_checker_light: rgb3_to_vec4(self.background.checker_light),
                         bg_solid: rgb3_to_vec4(self.background.solid),
                     };
-                    // Finalize the render signature with the OCIO config/view
-                    // identity (its CPU processor is rebuilt on any config change),
-                    // so changing the display/view forces a re-render.
-                    let mut render_sig = ocio_sig.get();
-                    if let Some(p) = &self.ocio_cpu {
-                        render_sig = (render_sig ^ (std::rc::Rc::as_ptr(p) as *const () as u64))
-                            .wrapping_mul(0x100000001b3);
-                    }
+                    // Finalize the render signature with the OCIO generation
+                    // (bumped by the app on any config / display / view change), so
+                    // switching the managed look forces a re-render.
+                    let render_sig =
+                        (ocio_sig.get() ^ self.ocio_render_gen).wrapping_mul(0x100000001b3);
                     // Scissor the OCIO transform to the visible image so it skips
                     // the empty background. Side-by-side spans the canvas with two
                     // images, so it opts out (None = whole target).
@@ -3355,12 +3076,10 @@ impl ExrViewer {
         layer_index: usize,
         max_dim: Option<usize>,
     ) -> Option<egui::TextureHandle> {
-        if self.ocio_active
-            && let Some(proc) = &self.ocio_cpu
-        {
-            return self.generate_texture_ocio(ctx, exr_data, layer_index, proc, max_dim);
-        }
-
+        // Non-OCIO CPU bake only. This is the headless / no-GPU contact-sheet
+        // thumbnail fallback (#59 removed the CPU viewport render and the CPU
+        // OCIO processor); when a GPU is present, thumbnails render through
+        // `crate::gpu::thumbnail` instead, OCIO included.
         let (layer, r_chan, g_chan, b_chan, a_chan) = exr_data.logical_channels(layer_index)?;
         let width = layer.size.0;
         let height = layer.size.1;
@@ -3470,469 +3189,6 @@ impl ExrViewer {
         Some(ctx.load_texture("exr_viewer", color_image, egui::TextureOptions::LINEAR))
     }
 
-    /// CPU equivalent of the GPU OCIO path for thumbnails / CPU fallback: channel-select +
-    /// exposure + checkerboard composite (scene-linear), then the OCIO display transform.
-    fn generate_texture_ocio(
-        &self,
-        ctx: &egui::Context,
-        exr_data: &ExrData,
-        layer_index: usize,
-        proc: &std::rc::Rc<floki_ocio::CpuProcessor>,
-        max_dim: Option<usize>,
-    ) -> Option<egui::TextureHandle> {
-        let (layer, r_chan, g_chan, b_chan, a_chan) = exr_data.logical_channels(layer_index)?;
-        let width = layer.size.0;
-        let height = layer.size.1;
-        // A zero-sized layer (malformed EXR) has no pixels to bake and would
-        // underflow the `width - 1` / `height - 1` source clamps below.
-        if width == 0 || height == 0 {
-            return None;
-        }
-        // Decimate to the thumbnail box for contact-sheet cells (see [`thumb_dims`]);
-        // full-res for the CPU-display fallback. OCIO then transforms the small buffer.
-        let (out_w, out_h, stride) = thumb_dims(width, height, max_dim);
-
-        let exp_mult = crate::render_math::exposure_to_multiplier(self.exposure);
-        // Viewport background (issue #18): one config, sampled per pixel below so
-        // every CPU composite path agrees with the GPU `background_color`.
-        let bg_cfg = &self.background;
-        let channel_mode = self.channel_mode;
-
-        // Build a scene-linear RGBA f32 buffer (exposure + checker composite), then let OCIO
-        // transform it in one call (OCIO's CPU path is internally vectorized).
-        let mut buf = vec![0.0_f32; out_w * out_h * 4];
-        buf.par_chunks_mut(out_w * 4)
-            .enumerate()
-            .for_each(|(oy, row)| {
-                let y = (oy * stride).min(height - 1);
-                for ox in 0..out_w {
-                    let x = (ox * stride).min(width - 1);
-                    let mut r = sample_channel(r_chan, x, y, width);
-                    let mut g = sample_channel(g_chan, x, y, width);
-                    let mut b = sample_channel(b_chan, x, y, width);
-                    let mut a = sample_channel(a_chan, x, y, width);
-                    if a_chan.is_none() {
-                        a = 1.0;
-                    }
-                    match channel_mode {
-                        ChannelMode::R => {
-                            g = r;
-                            b = r;
-                            a = 1.0;
-                        }
-                        ChannelMode::G => {
-                            r = g;
-                            b = g;
-                            a = 1.0;
-                        }
-                        ChannelMode::B => {
-                            r = b;
-                            g = b;
-                            a = 1.0;
-                        }
-                        ChannelMode::A => {
-                            r = a;
-                            g = a;
-                            b = a;
-                            a = 1.0;
-                        }
-                        ChannelMode::RGB => {}
-                    }
-
-                    r *= exp_mult;
-                    g *= exp_mult;
-                    b *= exp_mult;
-
-                    let bg = bg_cfg.sample_linear(x as f32, y as f32, width as f32, height as f32);
-                    let a_clamp = a.clamp(0.0, 1.0);
-                    r += bg[0] * (1.0 - a_clamp);
-                    g += bg[1] * (1.0 - a_clamp);
-                    b += bg[2] * (1.0 - a_clamp);
-
-                    let o = ox * 4;
-                    row[o] = r;
-                    row[o + 1] = g;
-                    row[o + 2] = b;
-                    row[o + 3] = 1.0;
-                }
-            });
-
-        if let Err(e) = proc.apply_rgba(&mut buf, out_w, out_h) {
-            // Bail rather than display the untransformed buffer: clamping raw
-            // scene-linear values to [0,1] would show wrong colors with no
-            // indication the transform never ran. Returning None lets the
-            // caller fall back / show nothing instead of silent garbage.
-            log::error!("OCIO CPU transform failed: {e}");
-            return None;
-        }
-
-        // User gamma in display space, after the OCIO transform (#93) — the OCIO
-        // chain replaces the normal gamma/sRGB ops, so re-apply the control here
-        // to match the GPU blit. `None` when gamma == 1.0 (no-op).
-        let inv_gamma = (self.gamma != 1.0).then(|| 1.0 / self.gamma);
-        let mut pixels = vec![egui::Color32::BLACK; out_w * out_h];
-        pixels.par_iter_mut().enumerate().for_each(|(i, px)| {
-            let o = i * 4;
-            let mut c = [buf[o], buf[o + 1], buf[o + 2]];
-            if let Some(ig) = inv_gamma {
-                for v in &mut c {
-                    *v = v.max(0.0).powf(ig);
-                }
-            }
-            *px = egui::Color32::from_rgb(
-                (c[0].clamp(0.0, 1.0) * 255.0) as u8,
-                (c[1].clamp(0.0, 1.0) * 255.0) as u8,
-                (c[2].clamp(0.0, 1.0) * 255.0) as u8,
-            );
-        });
-
-        let color_image = egui::ColorImage {
-            size: [out_w, out_h],
-            source_size: egui::vec2(out_w as f32, out_h as f32),
-            pixels,
-        };
-        Some(ctx.load_texture("exr_viewer", color_image, egui::TextureOptions::LINEAR))
-    }
-
-    /// CPU-fallback parity for [`CompareMode::DiffMatte`]: `|A − B|` scaled by
-    /// `diff_multiplier` and mapped through a heat ramp. Cached in `diff_texture`,
-    /// keyed by `(active_layer, diff_multiplier)`. The GPU path (default) does
-    /// this in-shader. Diff is tone-mode-agnostic, so there is no `_ocio` variant.
-    fn generate_diff_texture(
-        &self,
-        ctx: &egui::Context,
-        data_a: &ExrData,
-        data_b: &ExrData,
-        layer_a_idx: usize,
-        layer_b_idx: usize,
-    ) -> Option<egui::TextureHandle> {
-        let (layer_a, r_chan_a, g_chan_a, b_chan_a, _) = data_a.logical_channels(layer_a_idx)?;
-        let (layer_b, r_chan_b, g_chan_b, b_chan_b, _) = data_b.logical_channels(layer_b_idx)?;
-
-        let width = layer_a.size.0.max(layer_b.size.0);
-        let height = layer_a.size.1.max(layer_b.size.1);
-
-        let mut pixels = vec![egui::Color32::BLACK; width * height];
-
-        // VFX-style diff: per-pixel difference reduced per `diff_metric`, gained,
-        // noise-floored, then mapped through the active colormap gradient. Display-
-        // space false color — must stay in lockstep with the `is_diff_mode` branch
-        // in gpu/shader.wgsl (the GPU path is what's normally on screen; this CPU
-        // path serves thumbnails / GPU-less fallback).
-        let gain = self.diff_multiplier;
-        let nfloor = self.diff_floor;
-        let denom = (1.0 - nfloor).max(1e-3);
-        let metric = self.diff_metric;
-        let grad = self.diff_colormap.gradient();
-        let (aw, ah) = (layer_a.size.0, layer_a.size.1);
-        let (bw, bh) = (layer_b.size.0, layer_b.size.1);
-
-        pixels
-            .par_chunks_mut(width)
-            .enumerate()
-            .for_each(|(y, row)| {
-                for (x, px) in row.iter_mut().enumerate() {
-                    let sr = sample_channel_bounded(r_chan_a, x, y, aw, ah)
-                        - sample_channel_bounded(r_chan_b, x, y, bw, bh);
-                    let sg = sample_channel_bounded(g_chan_a, x, y, aw, ah)
-                        - sample_channel_bounded(g_chan_b, x, y, bw, bh);
-                    let sb = sample_channel_bounded(b_chan_a, x, y, aw, ah)
-                        - sample_channel_bounded(b_chan_b, x, y, bw, bh);
-                    let remap = |raw: f32| ((raw * gain - nfloor) / denom).clamp(0.0, 1.0);
-                    let (cr, cg, cb) = match metric {
-                        DiffMetric::PerChannelRGB => {
-                            (remap(sr.abs()), remap(sg.abs()), remap(sb.abs()))
-                        }
-                        DiffMetric::Luminance => {
-                            let m = remap((0.2126 * sr + 0.7152 * sg + 0.0722 * sb).abs());
-                            let c = grad.sample(m);
-                            (c[0], c[1], c[2])
-                        }
-                        DiffMetric::MaxChannel => {
-                            let m = remap(sr.abs().max(sg.abs()).max(sb.abs()));
-                            let c = grad.sample(m);
-                            (c[0], c[1], c[2])
-                        }
-                    };
-                    *px = egui::Color32::from_rgb(
-                        (cr * 255.0 + 0.5) as u8,
-                        (cg * 255.0 + 0.5) as u8,
-                        (cb * 255.0 + 0.5) as u8,
-                    );
-                }
-            });
-
-        let color_image = egui::ColorImage {
-            size: [width, height],
-            source_size: egui::vec2(width as f32, height as f32),
-            pixels,
-        };
-
-        Some(ctx.load_texture("exr_viewer_diff", color_image, egui::TextureOptions::LINEAR))
-    }
-
-    /// CPU-fallback parity for [`CompareMode::Composite`]. Blends A and B in
-    /// linear space (premultiplied-alpha aware) per [`BlendMode`], then runs the
-    /// same exposure → checkerboard → gamma → sRGB tone pipeline as
-    /// [`Self::generate_texture`]. Like the CPU diff path it ignores per-channel
-    /// isolation — the GPU path (the default) applies that after the blend.
-    fn generate_composite_texture(
-        &self,
-        ctx: &egui::Context,
-        data_a: &ExrData,
-        data_b: &ExrData,
-        layer_a_idx: usize,
-        layer_b_idx: usize,
-    ) -> Option<egui::TextureHandle> {
-        if self.ocio_active
-            && let Some(proc) = &self.ocio_cpu
-        {
-            return self.generate_composite_texture_ocio(
-                ctx,
-                data_a,
-                data_b,
-                layer_a_idx,
-                layer_b_idx,
-                proc,
-            );
-        }
-
-        let (layer_a, r_chan_a, g_chan_a, b_chan_a, a_chan_a) =
-            data_a.logical_channels(layer_a_idx)?;
-        let (layer_b, r_chan_b, g_chan_b, b_chan_b, a_chan_b) =
-            data_b.logical_channels(layer_b_idx)?;
-
-        let width = layer_a.size.0.max(layer_b.size.0);
-        let height = layer_a.size.1.max(layer_b.size.1);
-
-        let mut pixels = vec![egui::Color32::BLACK; width * height];
-
-        let exp_mult = crate::render_math::exposure_to_multiplier(self.exposure);
-        // Viewport background (issue #18): one config, sampled per pixel below so
-        // every CPU composite path agrees with the GPU `background_color`.
-        let bg_cfg = &self.background;
-        let gamma = self.gamma;
-        let apply_gamma = self.gamma != 1.0;
-        let apply_srgb = self.srgb;
-        let blend_mode = self.blend_mode;
-        let (aw, ah) = (layer_a.size.0, layer_a.size.1);
-        let (bw, bh) = (layer_b.size.0, layer_b.size.1);
-
-        pixels
-            .par_chunks_mut(width)
-            .enumerate()
-            .for_each(|(y, row)| {
-                for (x, px) in row.iter_mut().enumerate() {
-                    let ar = sample_channel_bounded(r_chan_a, x, y, aw, ah);
-                    let ag = sample_channel_bounded(g_chan_a, x, y, aw, ah);
-                    let ab = sample_channel_bounded(b_chan_a, x, y, aw, ah);
-                    let aa = if a_chan_a.is_some() {
-                        sample_channel_bounded(a_chan_a, x, y, aw, ah)
-                    } else {
-                        1.0
-                    };
-
-                    let br = sample_channel_bounded(r_chan_b, x, y, bw, bh);
-                    let bg = sample_channel_bounded(g_chan_b, x, y, bw, bh);
-                    let bb = sample_channel_bounded(b_chan_b, x, y, bw, bh);
-                    let ba = if a_chan_b.is_some() {
-                        sample_channel_bounded(a_chan_b, x, y, bw, bh)
-                    } else {
-                        1.0
-                    };
-
-                    // Premultiplied-alpha blends; keep in lockstep with the
-                    // `blend_mode` switch in gpu/shader.wgsl.
-                    let (mut r, mut g, mut b, a) = match blend_mode {
-                        BlendMode::Over => (
-                            ar + br * (1.0 - aa),
-                            ag + bg * (1.0 - aa),
-                            ab + bb * (1.0 - aa),
-                            aa + ba * (1.0 - aa),
-                        ),
-                        BlendMode::Under => (
-                            br + ar * (1.0 - ba),
-                            bg + ag * (1.0 - ba),
-                            bb + ab * (1.0 - ba),
-                            ba + aa * (1.0 - ba),
-                        ),
-                        BlendMode::Add => (ar + br, ag + bg, ab + bb, (aa + ba).min(1.0)),
-                        BlendMode::Multiply => (ar * br, ag * bg, ab * bb, aa),
-                        BlendMode::Screen => (
-                            ar + br - ar * br,
-                            ag + bg - ag * bg,
-                            ab + bb - ab * bb,
-                            aa + ba - aa * ba,
-                        ),
-                    };
-
-                    let bg = bg_cfg.sample_linear(x as f32, y as f32, width as f32, height as f32);
-
-                    r *= exp_mult;
-                    g *= exp_mult;
-                    b *= exp_mult;
-
-                    let a_clamp = a.clamp(0.0, 1.0);
-                    r += bg[0] * (1.0 - a_clamp);
-                    g += bg[1] * (1.0 - a_clamp);
-                    b += bg[2] * (1.0 - a_clamp);
-
-                    if apply_gamma {
-                        r = crate::render_math::apply_gamma(r, gamma);
-                        g = crate::render_math::apply_gamma(g, gamma);
-                        b = crate::render_math::apply_gamma(b, gamma);
-                    }
-
-                    if apply_srgb {
-                        r = Self::linear_to_srgb(r);
-                        g = Self::linear_to_srgb(g);
-                        b = Self::linear_to_srgb(b);
-                    }
-
-                    let r_u8 = (r.clamp(0.0, 1.0) * 255.0) as u8;
-                    let g_u8 = (g.clamp(0.0, 1.0) * 255.0) as u8;
-                    let b_u8 = (b.clamp(0.0, 1.0) * 255.0) as u8;
-
-                    *px = egui::Color32::from_rgb(r_u8, g_u8, b_u8);
-                }
-            });
-
-        let color_image = egui::ColorImage {
-            size: [width, height],
-            source_size: egui::vec2(width as f32, height as f32),
-            pixels,
-        };
-
-        Some(ctx.load_texture(
-            "exr_viewer_composite",
-            color_image,
-            egui::TextureOptions::LINEAR,
-        ))
-    }
-
-    /// CPU OCIO parity for [`CompareMode::Composite`]: blends A and B in linear space
-    /// (exposure + checker composite, scene-linear) then runs the OCIO display transform —
-    /// mirrors [`Self::generate_texture_ocio`]. As in that path the checker is composited
-    /// pre-OCIO (an accepted parity nuance — this CPU path is fallback/thumbnails only).
-    fn generate_composite_texture_ocio(
-        &self,
-        ctx: &egui::Context,
-        data_a: &ExrData,
-        data_b: &ExrData,
-        layer_a_idx: usize,
-        layer_b_idx: usize,
-        proc: &std::rc::Rc<floki_ocio::CpuProcessor>,
-    ) -> Option<egui::TextureHandle> {
-        let (layer_a, r_chan_a, g_chan_a, b_chan_a, a_chan_a) =
-            data_a.logical_channels(layer_a_idx)?;
-        let (layer_b, r_chan_b, g_chan_b, b_chan_b, a_chan_b) =
-            data_b.logical_channels(layer_b_idx)?;
-
-        let width = layer_a.size.0.max(layer_b.size.0);
-        let height = layer_a.size.1.max(layer_b.size.1);
-
-        let exp_mult = crate::render_math::exposure_to_multiplier(self.exposure);
-        // Viewport background (issue #18): one config, sampled per pixel below so
-        // every CPU composite path agrees with the GPU `background_color`.
-        let bg_cfg = &self.background;
-        let blend_mode = self.blend_mode;
-        let (aw, ah) = (layer_a.size.0, layer_a.size.1);
-        let (bw, bh) = (layer_b.size.0, layer_b.size.1);
-
-        let mut buf = vec![0.0_f32; width * height * 4];
-        buf.par_chunks_mut(width * 4)
-            .enumerate()
-            .for_each(|(y, row)| {
-                for x in 0..width {
-                    let ar = sample_channel_bounded(r_chan_a, x, y, aw, ah);
-                    let ag = sample_channel_bounded(g_chan_a, x, y, aw, ah);
-                    let ab = sample_channel_bounded(b_chan_a, x, y, aw, ah);
-                    let aa = if a_chan_a.is_some() {
-                        sample_channel_bounded(a_chan_a, x, y, aw, ah)
-                    } else {
-                        1.0
-                    };
-                    let br = sample_channel_bounded(r_chan_b, x, y, bw, bh);
-                    let bg = sample_channel_bounded(g_chan_b, x, y, bw, bh);
-                    let bb = sample_channel_bounded(b_chan_b, x, y, bw, bh);
-                    let ba = if a_chan_b.is_some() {
-                        sample_channel_bounded(a_chan_b, x, y, bw, bh)
-                    } else {
-                        1.0
-                    };
-
-                    // Premultiplied-alpha blends; keep in lockstep with the `blend_mode`
-                    // switch in gpu/shader.wgsl and `generate_composite_texture`.
-                    let (mut r, mut g, mut b, a) = match blend_mode {
-                        BlendMode::Over => (
-                            ar + br * (1.0 - aa),
-                            ag + bg * (1.0 - aa),
-                            ab + bb * (1.0 - aa),
-                            aa + ba * (1.0 - aa),
-                        ),
-                        BlendMode::Under => (
-                            br + ar * (1.0 - ba),
-                            bg + ag * (1.0 - ba),
-                            bb + ab * (1.0 - ba),
-                            ba + aa * (1.0 - ba),
-                        ),
-                        BlendMode::Add => (ar + br, ag + bg, ab + bb, (aa + ba).min(1.0)),
-                        BlendMode::Multiply => (ar * br, ag * bg, ab * bb, aa),
-                        BlendMode::Screen => (
-                            ar + br - ar * br,
-                            ag + bg - ag * bg,
-                            ab + bb - ab * bb,
-                            aa + ba - aa * ba,
-                        ),
-                    };
-
-                    r *= exp_mult;
-                    g *= exp_mult;
-                    b *= exp_mult;
-
-                    let bg = bg_cfg.sample_linear(x as f32, y as f32, width as f32, height as f32);
-                    let a_clamp = a.clamp(0.0, 1.0);
-                    r += bg[0] * (1.0 - a_clamp);
-                    g += bg[1] * (1.0 - a_clamp);
-                    b += bg[2] * (1.0 - a_clamp);
-
-                    let o = x * 4;
-                    row[o] = r;
-                    row[o + 1] = g;
-                    row[o + 2] = b;
-                    row[o + 3] = 1.0;
-                }
-            });
-
-        if let Err(e) = proc.apply_rgba(&mut buf, width, height) {
-            // Fail closed (see generate_texture_ocio): show nothing rather than
-            // clamped, untransformed composite colors.
-            log::error!("OCIO CPU composite transform failed: {e}");
-            return None;
-        }
-
-        let mut pixels = vec![egui::Color32::BLACK; width * height];
-        pixels.par_iter_mut().enumerate().for_each(|(i, px)| {
-            let o = i * 4;
-            *px = egui::Color32::from_rgb(
-                (buf[o].clamp(0.0, 1.0) * 255.0) as u8,
-                (buf[o + 1].clamp(0.0, 1.0) * 255.0) as u8,
-                (buf[o + 2].clamp(0.0, 1.0) * 255.0) as u8,
-            );
-        });
-
-        let color_image = egui::ColorImage {
-            size: [width, height],
-            source_size: egui::vec2(width as f32, height as f32),
-            pixels,
-        };
-        Some(ctx.load_texture(
-            "exr_viewer_composite",
-            color_image,
-            egui::TextureOptions::LINEAR,
-        ))
-    }
-
     fn sample_pixel(
         &self,
         exr_data: &ExrData,
@@ -3994,33 +3250,26 @@ impl ExrViewer {
     }
 
     /// Drop every cached reference-image (B) texture so the viewport rebuilds from the
-    /// newly loaded data. The texture caches otherwise only refresh when the layer *count*
+    /// newly loaded data. The caches otherwise only refresh when the layer *count*
     /// changes, so re-loading a different B with the same layer count would keep showing the
-    /// stale image. Clears the GPU bind groups, the CPU thumbnails, and the cached
-    /// diff/composite textures (which both depend on B).
+    /// stale image. Clears the GPU bind groups and the contact-sheet thumbnails (CPU + GPU).
     pub fn invalidate_reference_textures(&mut self) {
-        self.textures_b.fill(None);
         self.thumbnails_b.fill(None);
         self.invalidate_gpu_thumbnails(false, true);
         self.gpu_textures_b.fill(None);
-        self.diff_texture = None;
-        self.composite_texture = None;
     }
 
     /// Drop every cached image-A texture so the viewport rebuilds from the newly
     /// swapped data - the A-side counterpart of [`Self::invalidate_reference_textures`].
-    /// The texture caches otherwise only refresh when the layer *count* changes, so
+    /// The caches otherwise only refresh when the layer *count* changes, so
     /// swapping a different A with the same layer count (e.g. the next frame in an
     /// image sequence, #7) would keep showing the stale image. Clears the GPU bind
-    /// groups, the CPU thumbnails, and the cached diff/composite textures (which both
-    /// depend on A). Used by [`crate::app::ExrApp::swap_image_data`].
+    /// groups and the contact-sheet thumbnails (CPU + GPU). Used by
+    /// [`crate::app::ExrApp::swap_image_data`].
     pub fn invalidate_active_textures(&mut self) {
-        self.textures.fill(None);
         self.thumbnails.fill(None);
         self.invalidate_gpu_thumbnails(true, false);
         self.gpu_textures.fill(None);
-        self.diff_texture = None;
-        self.composite_texture = None;
     }
 
     /// Clear the slot-A proxy (first-paint) texture. Called when the full-res
@@ -4691,10 +3940,11 @@ mod gui_tests {
         b: Option<ExrData>,
     }
 
-    /// Drive the full `ExrViewer::ui` CPU path (no GPU `render_state`) with a
-    /// loaded A and B across every compare mode plus the contact sheet, asserting
-    /// it lays out without panicking. Exercises the seams extracted from `ui()`
-    /// in #26 (contact sheet, pixel sampling, CPU draw paths).
+    /// Drive `ExrViewer::ui` headless (no GPU `render_state`) with a loaded A and
+    /// B across every compare mode plus the contact sheet, asserting it lays out
+    /// without panicking. Without a GPU the central canvas is not drawn (#59 made
+    /// rendering GPU-only), so this exercises the non-render seams: state
+    /// transitions, contact sheet, pixel sampling, overlays.
     #[test]
     fn ui_renders_all_compare_modes_without_panicking() {
         let dir = tempfile::tempdir().unwrap();
@@ -4737,12 +3987,12 @@ mod gui_tests {
         h.run();
     }
 
-    /// Regression for the #107/#112 review: the contact sheet must bake into the
-    /// dedicated `thumbnails` cache, never the full-res `textures` slots — else a
-    /// closed sheet leaves a ≤256px thumbnail in the CPU-fallback central view
-    /// (whose `is_none()` gate then skips full-res regeneration).
+    /// The headless contact sheet (no GPU) bakes per-layer thumbnails into the
+    /// CPU `thumbnails` cache. This is the no-GPU fallback that survived the #59
+    /// CPU-viewport-render deletion; with a real GPU the sheet uses
+    /// `gpu_thumbnails` instead (`crate::gpu::thumbnail`).
     #[test]
-    fn contact_sheet_uses_thumbnail_cache_not_the_fullres_slots() {
+    fn headless_contact_sheet_bakes_cpu_thumbnails() {
         let dir = tempfile::tempdir().unwrap();
         let pa = dir.path().join("a.exr");
         write_rgba_exr(&pa);
@@ -4767,32 +4017,16 @@ mod gui_tests {
         h.run();
         assert!(
             h.state().viewer.thumbnails[0].is_some(),
-            "sheet baked into the dedicated thumbnail cache"
+            "headless sheet baked into the CPU thumbnail cache"
         );
 
-        // The crux: with the sheet open, wipe the full-res slot and run again. The
-        // sheet path must NOT refill `textures` (it writes only `thumbnails`), so
-        // the slot stays clear — before the fix the sheet baked here and it would
-        // come back populated with a low-res thumbnail.
-        h.state_mut().viewer.textures.fill(None);
+        // Re-baking is idempotent: a cleared slot refills next layout pass.
+        h.state_mut().viewer.thumbnails.fill(None);
         h.run();
-        assert!(
-            h.state().viewer.textures[0].is_none(),
-            "sheet must not touch the full-res CPU-display slot"
-        );
+        h.run();
         assert!(
             h.state().viewer.thumbnails[0].is_some(),
-            "thumbnail cache survives (is_none gate skips re-bake)"
-        );
-
-        // Close the sheet: the CPU-fallback central view fills the full-res slot
-        // itself — it was never blocked by a stale low-res thumbnail.
-        h.state_mut().viewer.show_contact_sheet = false;
-        h.run();
-        h.run();
-        assert!(
-            h.state().viewer.textures[0].is_some(),
-            "CPU fallback regenerates the full-res texture once the sheet closes"
+            "thumbnail cache refills after invalidation"
         );
     }
 
