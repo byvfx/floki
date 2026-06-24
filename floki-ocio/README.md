@@ -50,7 +50,7 @@ The first build is slow (it compiles OCIO + all ext deps); subsequent builds are
 Build the app against it from the workspace root:
 
 ```sh
-cargo build --release --features ocio-vendored
+cargo build --release --no-default-features --features vendored
 ```
 
 Or use the convenience wrappers (defined in the workspace `.cargo/config.toml` and `justfile`):

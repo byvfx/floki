@@ -76,7 +76,6 @@ impl GpuResources {
     }
 }
 
-#[cfg(feature = "ocio")]
 impl GpuResources {
     /// Publish a (re)built [`OcioGpuPass`] into `callback_resources` (the OCIO
     /// callback reads it from there) **and** invalidate the cached

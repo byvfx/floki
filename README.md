@@ -107,11 +107,20 @@ cargo run --release
 
 ### Color management (OpenColorIO)
 
-OCIO support is **off by default** (the standard build needs no C++ toolchain). Two opt-in builds:
+OCIO support is **always compiled** — it is mandatory, not an opt-in feature. What you choose
+is the native backend: link an installed OCIO (the default), or statically build a vendored
+copy. A bare `cargo run` uses the system backend.
 
-**Recommended — self-contained (vendored):** statically builds OCIO 2.4.2 from the vendored
-submodule, so nothing needs to be installed system-wide. Works the same on Windows, Linux,
-and macOS. The first build is slow (minutes); then it's cached.
+**Fast dev — link an installed OCIO (system, the default):** a plain `cargo run --release`
+links an OCIO found via `OPENCOLORIO_ROOT` (any OS) or Homebrew (macOS). Fast, no cmake.
+
+```bash
+cargo run --release
+```
+
+**Recommended for distribution — self-contained (vendored):** statically builds OCIO 2.4.2
+from the vendored submodule, so nothing needs to be installed system-wide. Works the same on
+Windows, Linux, and macOS. The first build is slow (minutes); then it's cached.
 
 ```bash
 # One short command on any OS (cargo alias from .cargo/config.toml):
@@ -124,13 +133,6 @@ just ocio
 Prerequisites: a C++ toolchain (MSVC "Desktop development with C++" on Windows; clang/gcc
 elsewhere), **cmake ≥ 3.14**, **ninja**, **python3**, and the OCIO submodule checked out
 (`git submodule update --init --recursive` — done automatically by `just ocio`).
-
-**Fast dev — link an installed OCIO (system):** for when you already have OCIO installed.
-
-```bash
-# Located via OPENCOLORIO_ROOT (any OS) or Homebrew (macOS). Fast, no cmake.
-cargo run --release --features ocio
-```
 
 Once running, enable it in **Color Management…** (check *Enable OCIO*). With the config-path
 field empty it uses the built-in ACES config, or `$OCIO` if that environment variable is set
@@ -194,7 +196,7 @@ standalone `floki-ocio` crate that wraps OpenColorIO.
 
 **Color management**
 - **`color/cube.rs`** — Adobe `.cube` 3D-LUT parsing.
-- **`floki-ocio/`** — a standalone crate wrapping OpenColorIO over FFI, with a GLSL→WGSL shader transpiler; linked only under the `ocio` / `ocio-vendored` features.
+- **`floki-ocio/`** — a standalone crate wrapping OpenColorIO over FFI, with a GLSL→WGSL shader transpiler; always linked (the `system-ocio` / `vendored` features select the native backend).
 
 **Tooling & CLI**
 - **`tools.rs`** — the multi-threaded EXR Header Converter (batch channel renaming via `rayon`) with progress reporting and `RUST_LOG` logging.

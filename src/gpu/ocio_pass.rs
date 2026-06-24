@@ -734,7 +734,7 @@ fn upload_lut(
     (tex, view)
 }
 
-#[cfg(all(test, feature = "ocio"))]
+#[cfg(test)]
 mod metal_tests {
     use super::*;
 
