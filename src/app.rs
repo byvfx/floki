@@ -1587,6 +1587,31 @@ impl ExrApp {
         self.error_msg = None;
     }
 
+    /// floki's own resident image footprint in bytes: the decoded pixel buffers it
+    /// holds — slot A (or, for a sequence, the resident T1 frames) plus slot B.
+    /// Shown in the status bar beside process RSS. Unlike RSS — which the allocator
+    /// keeps mapped after a free, so it doesn't budge on unload — this drops
+    /// immediately when an image is released, reflecting what floki actually holds
+    /// (#117).
+    fn tracked_image_bytes(&self) -> u64 {
+        // For a sequence the active frame is one of the resident T1 frames (a
+        // shared `Arc`), so the cache already accounts for slot A — don't also add
+        // `exr_data`, which would double-count it.
+        let a = if self.playback.is_active() {
+            self.frame_bytes
+                .map_or(0, |b| self.frame_cache.len() as u64 * b as u64)
+        } else {
+            self.exr_data
+                .as_ref()
+                .map_or(0, |d| d.approx_bytes() as u64)
+        };
+        let b = self
+            .exr_data_b
+            .as_ref()
+            .map_or(0, |d| d.approx_bytes() as u64);
+        a + b
+    }
+
     /// Load EXR files dragged onto the window. While files are dragged over the
     /// window a left/right split overlay is drawn; on drop a single file routes
     /// by position (right half → reference Image B) and multiple files load
@@ -2343,8 +2368,12 @@ impl ExrApp {
                 };
                 self.viewer.set_t2_cap(t2_cap);
                 use crate::resource_monitor::fmt_bytes;
+                // floki's tracked image footprint leads the readout: it drops to 0
+                // on unload, whereas process RSS lags (the allocator keeps freed
+                // pages mapped). #117.
                 let mut text = format!(
-                    "RAM {} · sys {}/{}",
+                    "img {} · RAM {} · sys {}/{}",
+                    fmt_bytes(self.tracked_image_bytes()),
                     fmt_bytes(sample.proc_bytes),
                     fmt_bytes(sample.sys_used),
                     fmt_bytes(sample.sys_total),
@@ -3782,18 +3811,27 @@ mod tests {
         assert!(app.playback.is_active(), "sequence mode entered");
 
         // Simulate a populated T1 ring + an in-flight decode + a stuck load flag.
-        app.frame_cache.insert(
-            crate::cache::Slot::A,
-            1,
-            std::sync::Arc::new(ExrData::load(&f1).unwrap()),
-        );
+        // `frame_bytes` is captured on the first real decode; set it so the
+        // tracked-footprint accounting has a per-frame size to multiply by.
+        let frame = std::sync::Arc::new(ExrData::load(&f1).unwrap());
+        app.frame_bytes = Some(frame.approx_bytes());
+        app.frame_cache.insert(crate::cache::Slot::A, 1, frame);
         app.inflight.insert(2);
         app.loading_a = true;
         let epoch_before = app.playback.epoch;
+        assert!(
+            app.tracked_image_bytes() > 0,
+            "footprint reflects the resident frame"
+        );
 
         app.unload(false);
 
         assert!(app.exr_data.is_none(), "image released");
+        assert_eq!(
+            app.tracked_image_bytes(),
+            0,
+            "tracked footprint drops to zero on unload"
+        );
         assert!(app.frame_cache.is_empty(), "T1 ring freed — no leak");
         assert!(app.inflight.is_empty(), "no in-flight decodes survive");
         assert!(!app.playback.is_active(), "sequence torn down");
