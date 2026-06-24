@@ -14,8 +14,8 @@ members = [".", "floki-ocio"]
 # OCIO is mandatory — it is always compiled. These features only select the
 # native backend (mutually exclusive — vendored wins in floki-ocio/build.rs).
 default = ["system-ocio"]
-# Dev default: link an installed OCIO (Homebrew / OPENCOLORIO_ROOT). Fast, no
-# cmake; a bare `cargo run` uses this. Needs no C++ toolchain beyond a linker.
+# Dev default: link an installed OCIO (Homebrew / OPENCOLORIO_ROOT). Fast; avoids
+# the vendored OCIO cmake build, but still requires a C++ toolchain for floki-ocio's shim/shaderc.
 system-ocio = ["floki-ocio/system-ocio"]
 # Distributable build: OCIO statically built from the vendored submodule (cmake)
 # so the binary is self-contained. Use with `--no-default-features` to avoid
