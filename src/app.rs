@@ -26,8 +26,10 @@ impl From<ThemeChoice> for egui::ThemePreference {
 
 /// Result of an off-thread EXR decode, delivered back to the UI thread by
 /// [`ExrApp::open_file`]'s worker and applied in [`ExrApp::apply_load_result`].
-/// `path` identifies which request this is, so a stale result from a
-/// superseded open can be discarded.
+/// A stale result from a superseded request is discarded; which field is the
+/// supersession key depends on the request kind: a **seq-frame** by `epoch`
+/// (#57), a **slot-A explicit open** by `open_gen` (#109), and a **slot-B
+/// open** by `path` (its `loaded_file_b` is never rewritten by playback).
 struct LoadResult {
     path: PathBuf,
     is_b: bool,
@@ -768,7 +770,9 @@ impl ExrApp {
             seq_frame: false,
             frame: 0,
             epoch: self.playback.epoch,
-            open_gen: self.open_gen_a,
+            // Only slot-A opens supersede by generation; B is path-keyed, so its
+            // job carries no meaningful generation.
+            open_gen: if is_b { 0 } else { self.open_gen_a },
         });
     }
 
