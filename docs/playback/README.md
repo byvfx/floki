@@ -11,6 +11,11 @@ caching or decode-ahead exists:
 
 - **#7 — [sequence playback](sequence-playback.md):** detection, transport, clock, pacing, A/B.
 
+…and, now that Phases 0–5 have shipped, the plan for what's left:
+
+- **[hardening plan](hardening-plan.md) (#100):** post-ship status, the INV-SAMPLE gap-close,
+  real-footage validation, and the feature follow-ons (#94 / #75 / #112 / #98), sequenced.
+
 They are written **first** (before code) so the contracts can't drift, and so each implementation
 phase can reference a fixed target. Every phase below is independently shippable and **never
 regresses the single-image standalone app**.
