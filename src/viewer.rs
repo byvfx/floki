@@ -1698,13 +1698,8 @@ impl ExrViewer {
         gpu_resources: Option<&crate::gpu::GpuResources>,
     ) {
         // The GPU thumbnail path applies only when a GPU is present AND OCIO is off
-        // (offscreen OCIO thumbnails are deferred to Phase 2). Compile both with and
-        // without the `ocio` feature.
-        #[cfg(feature = "ocio")]
-        let ocio_on = self.ocio_active;
-        #[cfg(not(feature = "ocio"))]
-        let ocio_on = false;
-        let use_gpu = gpu_resources.is_some() && !ocio_on;
+        // (offscreen OCIO thumbnails are deferred to Phase 2).
+        let use_gpu = gpu_resources.is_some() && !self.ocio_active;
 
         // The backdrop is baked into each GPU thumbnail, but background edits don't
         // run through `invalidate_tone`. Re-render the sheet when it changes (#122
