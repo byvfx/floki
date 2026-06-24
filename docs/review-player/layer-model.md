@@ -144,6 +144,13 @@ single-image or A/B paths:
 
 1. **Adopt the model behind today's UI** — represent the current A/B + `CompareMode` as a
    2-layer `LayerStack` internally, keeping the existing controls. Pure refactor, no new UX.
+   **Landed ([#114](https://github.com/byvfx/floki/issues/114)).** `src/render_program.rs`
+   reconfigures the viewer's held 2-layer stack from `compare_mode` / `blend_mode` /
+   `active_layer` each frame and resolves it via `LayerStack::composite_at` into a
+   `RenderProgram`; both the GPU and CPU draw paths now dispatch on that program instead of
+   matching `CompareMode` inline. The two layers carry stable `LayerId`s (the `Slot ⇄ LayerId`
+   cache-key seam). Arrangement geometry (wipe/side-by-side) and the diff-matte inspection stay
+   viewer-side this phase; the N-input render lands with #104.
 2. **N-way compare — [#104](https://github.com/byvfx/floki/issues/104).** N source layers +
    `Layout::Grid`; generalize the cache key and the scheduler look-ahead across visible layers.
 3. **Per-layer transform + infinite canvas**, then the **adjustment / brush / text** layer

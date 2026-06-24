@@ -32,6 +32,7 @@
 use crate::annotation::{Annotation, AnnotationKind, AnnotationTool};
 use crate::exr_loader::ExrData;
 use crate::gradient::{Colormap, DiffMetric, Gradient};
+use crate::render_program;
 use eframe::egui;
 use rayon::prelude::*;
 
@@ -447,10 +448,21 @@ pub struct ExrViewer {
     /// viewport layout so the proxy lands in the same rect the full-res render
     /// will occupy (the proxy texture itself is lower-res and upscaled).
     proxy_full_size: Option<egui::Vec2>,
+
+    /// The two-layer A/B comp stack (#114): slot A at the bottom, slot B on top.
+    /// The existing `compare_mode` / `blend_mode` / `active_layer` fields remain
+    /// the source of truth; each frame [`crate::render_program::resolve`]
+    /// reconfigures this stack from them and reads its `composite_at`, so the draw
+    /// paths dispatch off the layer model instead of branching on `CompareMode`
+    /// inline. `layer_ids` are stable for the session — the cache-key seam toward
+    /// `(LayerId, source_frame)` (`src/cache.rs`).
+    layer_stack: crate::layer::LayerStack,
+    layer_ids: (crate::layer::LayerId, crate::layer::LayerId),
 }
 
 impl Default for ExrViewer {
     fn default() -> Self {
+        let (layer_stack, layer_ids) = crate::render_program::new_ab_stack();
         Self {
             textures: Vec::new(),
             textures_b: Vec::new(),
@@ -535,6 +547,8 @@ impl Default for ExrViewer {
             anno_text_edit: None,
             proxy_texture: None,
             proxy_full_size: None,
+            layer_stack,
+            layer_ids,
         }
     }
 }
@@ -2249,11 +2263,35 @@ impl ExrViewer {
         }
     }
 
+    /// Reconfigure the held A/B [`crate::layer::LayerStack`] from the current
+    /// viewer state and resolve it into the [`crate::render_program::RenderProgram`]
+    /// the draw paths dispatch on (#114). `effective_mode` is the compare mode
+    /// *after* any blink override, so blink alternates A/B through the model like a
+    /// normal `Single{A,B}` switch. This is the single seam where the draw paths
+    /// read the layer model instead of branching on `CompareMode` directly.
+    fn render_program(
+        &mut self,
+        effective_mode: CompareMode,
+    ) -> crate::render_program::RenderProgram {
+        let input = crate::render_program::ResolveInput {
+            compare_mode: effective_mode,
+            blend_mode: self.blend_mode,
+            active_layer: self.active_layer,
+            wipe_position: self.wipe_center[0],
+        };
+        crate::render_program::resolve(&mut self.layer_stack, self.layer_ids, &input)
+    }
+
     /// CPU fallback render path (no GPU `render_state`): paint the already-baked
     /// `egui::TextureHandle`s for the active compare mode. Mirrors the GPU path's
     /// layout, minus the in-shader effects (those are pre-applied when the CPU
     /// textures are generated).
-    fn draw_canvas_cpu(&self, ui: &egui::Ui, layout: &CanvasLayout, exr_data_b: Option<&ExrData>) {
+    fn draw_canvas_cpu(
+        &mut self,
+        ui: &egui::Ui,
+        layout: &CanvasLayout,
+        exr_data_b: Option<&ExrData>,
+    ) {
         let CanvasLayout {
             rect,
             disp_rect,
@@ -2263,6 +2301,9 @@ impl ExrViewer {
             tex_size_b,
             is_side_by_side,
         } = *layout;
+        // Resolve the layer model up front (the CPU fallback does not blink, so the
+        // raw compare mode is used — matching the pre-existing behavior).
+        let program = self.render_program(self.compare_mode);
         let unclipped_painter = ui.painter().with_clip_rect(rect);
         let painter = ui.painter().with_clip_rect(rect.intersect(disp_rect));
 
@@ -2287,21 +2328,36 @@ impl ExrViewer {
             );
         };
 
-        let draw_all_cpu = |p: &egui::Painter, opac: f32| match self.compare_mode {
-            CompareMode::SingleA => {
-                draw_image(p, texture, rect, image_rect, opac);
-            }
-            CompareMode::SingleB => {
-                if let Some(tex_b) = exr_data_b.and_then(|d| {
-                    self.textures_b[self
-                        .active_layer
-                        .min(d.logical_layers.len().saturating_sub(1))]
-                    .as_ref()
-                }) {
-                    draw_image(p, tex_b, rect, image_rect, opac);
+        // The active-layer slot-B CPU texture, clamped to B's layer count.
+        let tex_b = || {
+            exr_data_b.and_then(|d| {
+                self.textures_b[self
+                    .active_layer
+                    .min(d.logical_layers.len().saturating_sub(1))]
+                .as_ref()
+            })
+        };
+        let draw_all_cpu = |p: &egui::Painter, opac: f32| match program.arrangement {
+            // Single (one draw) and Composite (the pre-baked `composite_texture`).
+            render_program::Arrangement::Stacked => {
+                if program.is_composite {
+                    if let Some(comp) = &self.composite_texture {
+                        draw_image(p, comp, rect, image_rect, opac);
+                    }
+                } else if let Some(draw) = program.draws.first() {
+                    match draw.input {
+                        render_program::ProgramInput::A => {
+                            draw_image(p, texture, rect, image_rect, opac);
+                        }
+                        render_program::ProgramInput::B => {
+                            if let Some(tb) = tex_b() {
+                                draw_image(p, tb, rect, image_rect, opac);
+                            }
+                        }
+                    }
                 }
             }
-            CompareMode::Wipe => {
+            render_program::Arrangement::Wipe { .. } => {
                 // CPU fallback: keep it vertical for simplicity, but use new center state
                 let wipe_x = image_rect.min.x + image_rect.width() * self.wipe_center[0];
                 let clamped_wipe_x = wipe_x.clamp(rect.min.x, rect.max.x);
@@ -2311,13 +2367,8 @@ impl ExrViewer {
                 rect_b.min.x = clamped_wipe_x;
 
                 draw_image(p, texture, rect_a, image_rect, opac);
-                if let Some(tex_b) = exr_data_b.and_then(|d| {
-                    self.textures_b[self
-                        .active_layer
-                        .min(d.logical_layers.len().saturating_sub(1))]
-                    .as_ref()
-                }) {
-                    draw_image(p, tex_b, rect_b, image_rect, opac);
+                if let Some(tb) = tex_b() {
+                    draw_image(p, tb, rect_b, image_rect, opac);
                 }
 
                 let alpha = (self.wipe_line_opacity * 255.0) as u8;
@@ -2330,14 +2381,8 @@ impl ExrViewer {
                     (2.0, color),
                 );
             }
-            CompareMode::SideBySide => {
-                let tex_b_opt = exr_data_b.and_then(|d| {
-                    self.textures_b[self
-                        .active_layer
-                        .min(d.logical_layers.len().saturating_sub(1))]
-                    .as_ref()
-                });
-                if let (Some(tex_b), Some(size_b)) = (tex_b_opt, tex_size_b) {
+            render_program::Arrangement::SideBySide => {
+                if let (Some(tex_b), Some(size_b)) = (tex_b(), tex_size_b) {
                     let mut image_size_b = size_b * self.scale;
                     if self.normalize_side_by_side {
                         let scale_b = (tex_size.y * self.scale) / size_b.y;
@@ -2380,14 +2425,9 @@ impl ExrViewer {
                     draw_image(p, texture, rect, image_rect, opac);
                 }
             }
-            CompareMode::DiffMatte => {
+            render_program::Arrangement::Diff => {
                 if let Some(diff) = &self.diff_texture {
                     draw_image(p, diff, rect, image_rect, opac);
-                }
-            }
-            CompareMode::Composite => {
-                if let Some(comp) = &self.composite_texture {
-                    draw_image(p, comp, rect, image_rect, opac);
                 }
             }
         };
@@ -2668,159 +2708,165 @@ impl ExrViewer {
                 }
             }
 
-            let draw_all = |p: &egui::Painter, opac: f32| match comp_mode {
-                CompareMode::SingleA => {
-                    draw_gpu(p, bg_a.clone(), None, rect, image_rect, false, false, opac);
-                }
-                CompareMode::SingleB => {
-                    if let Some(bg_b) = exr_data_b.and_then(|d| {
+            // Resolve the layer model into the render program the draw paths
+            // dispatch on. `comp_mode` already folds in the blink override, so
+            // blink alternates A/B through the model.
+            let program = self.render_program(comp_mode);
+
+            let draw_all = |p: &egui::Painter, opac: f32| {
+                // Slot-B GPU bind group for the active layer, clamped to B's count.
+                let pick_b = || {
+                    exr_data_b.and_then(|d| {
                         self.gpu_textures_b[self
                             .active_layer
                             .min(d.logical_layers.len().saturating_sub(1))]
                         .clone()
-                    }) {
-                        draw_gpu(p, bg_b, None, rect, image_rect, false, false, opac);
-                    }
-                }
-                CompareMode::Wipe => {
-                    let bg_b_opt = exr_data_b.and_then(|d| {
-                        self.gpu_textures_b[self
-                            .active_layer
-                            .min(d.logical_layers.len().saturating_sub(1))]
-                        .clone()
-                    });
-                    // Single draw call: the shader handles the wipe split.
-                    // Bind the real B texture so the shader can sample it when
-                    // is_wipe_mode is set; falls back to the default texture if
-                    // no B image is loaded.
-                    draw_gpu(
-                        p,
-                        bg_a.clone(),
-                        bg_b_opt,
-                        rect,
-                        image_rect,
-                        false,
-                        false,
-                        opac,
-                    );
-
-                    // Draw the rotated wipe line and handle
-                    let center_screen = egui::pos2(
-                        image_rect.min.x + image_rect.width() * self.wipe_center[0],
-                        image_rect.min.y + image_rect.height() * self.wipe_center[1],
-                    );
-                    let angle_rad = self.wipe_angle.to_radians();
-                    // Line direction is perpendicular to the normal (cos, sin)
-                    let dir = egui::vec2(-angle_rad.sin(), angle_rad.cos());
-                    let max_dist = image_rect.width().hypot(image_rect.height());
-                    let p1 = center_screen + dir * max_dist;
-                    let p2 = center_screen - dir * max_dist;
-
-                    let alpha = (self.wipe_line_opacity * 255.0) as u8;
-                    let color = egui::Color32::from_white_alpha(alpha);
-
-                    p.line_segment([p1, p2], (2.0, color));
-                    p.circle_filled(center_screen, 8.0, color);
-                }
-                CompareMode::SideBySide => {
-                    let bg_b_opt = exr_data_b.and_then(|d| {
-                        self.gpu_textures_b[self
-                            .active_layer
-                            .min(d.logical_layers.len().saturating_sub(1))]
-                        .clone()
-                    });
-                    if let (Some(bg_b), Some(size_b)) = (bg_b_opt, tex_size_b) {
-                        let mut image_size_b = size_b * self.scale;
-                        if self.normalize_side_by_side {
-                            let scale_b = (tex_size.y * self.scale) / size_b.y;
-                            image_size_b = size_b * scale_b;
+                    })
+                };
+                match program.arrangement {
+                    // Single (one draw) and Composite (B over A in the blend shader).
+                    render_program::Arrangement::Stacked => {
+                        if program.is_composite {
+                            if let Some(bg_b) = pick_b() {
+                                draw_gpu(
+                                    p,
+                                    bg_a.clone(),
+                                    Some(bg_b),
+                                    rect,
+                                    image_rect,
+                                    false,
+                                    true,
+                                    opac,
+                                );
+                            }
+                        } else if let Some(draw) = program.draws.first() {
+                            match draw.input {
+                                render_program::ProgramInput::A => {
+                                    draw_gpu(
+                                        p,
+                                        bg_a.clone(),
+                                        None,
+                                        rect,
+                                        image_rect,
+                                        false,
+                                        false,
+                                        opac,
+                                    );
+                                }
+                                render_program::ProgramInput::B => {
+                                    if let Some(bg_b) = pick_b() {
+                                        draw_gpu(
+                                            p, bg_b, None, rect, image_rect, false, false, opac,
+                                        );
+                                    }
+                                }
+                            }
                         }
-                        let combined_width = image_size.x + image_size_b.x;
-                        let combined_height = image_size.y.max(image_size_b.y);
-                        let combined_rect = egui::Rect::from_center_size(
-                            rect.center() + self.translation,
-                            egui::vec2(combined_width, combined_height),
+                    }
+                    render_program::Arrangement::Wipe { .. } => {
+                        let bg_b_opt = pick_b();
+                        // Single draw call: the shader handles the wipe split.
+                        // Bind the real B texture so the shader can sample it when
+                        // is_wipe_mode is set; falls back to the default texture if
+                        // no B image is loaded.
+                        draw_gpu(
+                            p,
+                            bg_a.clone(),
+                            bg_b_opt,
+                            rect,
+                            image_rect,
+                            false,
+                            false,
+                            opac,
                         );
-                        let mut image_rect_a =
-                            egui::Rect::from_min_size(combined_rect.min, image_size);
-                        image_rect_a.set_center(egui::pos2(
-                            image_rect_a.center().x,
-                            combined_rect.center().y,
-                        ));
-                        let mut image_rect_b = egui::Rect::from_min_size(
-                            egui::pos2(combined_rect.min.x + image_size.x, combined_rect.min.y),
-                            image_size_b,
-                        );
-                        image_rect_b.set_center(egui::pos2(
-                            image_rect_b.center().x,
-                            combined_rect.center().y,
-                        ));
 
-                        draw_gpu(
-                            p,
-                            bg_a.clone(),
-                            None,
-                            rect,
-                            image_rect_a,
-                            false,
-                            false,
-                            opac,
+                        // Draw the rotated wipe line and handle
+                        let center_screen = egui::pos2(
+                            image_rect.min.x + image_rect.width() * self.wipe_center[0],
+                            image_rect.min.y + image_rect.height() * self.wipe_center[1],
                         );
-                        draw_gpu(p, bg_b, None, rect, image_rect_b, false, false, opac);
-                        p.line_segment(
-                            [
-                                egui::pos2(image_rect_b.min.x, combined_rect.min.y),
-                                egui::pos2(image_rect_b.min.x, combined_rect.max.y),
-                            ],
-                            (2.0, egui::Color32::GRAY),
-                        );
-                    } else {
-                        draw_gpu(p, bg_a.clone(), None, rect, image_rect, false, false, opac);
+                        let angle_rad = self.wipe_angle.to_radians();
+                        // Line direction is perpendicular to the normal (cos, sin)
+                        let dir = egui::vec2(-angle_rad.sin(), angle_rad.cos());
+                        let max_dist = image_rect.width().hypot(image_rect.height());
+                        let p1 = center_screen + dir * max_dist;
+                        let p2 = center_screen - dir * max_dist;
+
+                        let alpha = (self.wipe_line_opacity * 255.0) as u8;
+                        let color = egui::Color32::from_white_alpha(alpha);
+
+                        p.line_segment([p1, p2], (2.0, color));
+                        p.circle_filled(center_screen, 8.0, color);
                     }
-                }
-                CompareMode::DiffMatte => {
-                    let bg_b_opt = exr_data_b.and_then(|d| {
-                        self.gpu_textures_b[self
-                            .active_layer
-                            .min(d.logical_layers.len().saturating_sub(1))]
-                        .clone()
-                    });
-                    if let Some(bg_b) = bg_b_opt {
-                        draw_gpu(
-                            p,
-                            bg_a.clone(),
-                            Some(bg_b),
-                            rect,
-                            image_rect,
-                            true,
-                            false,
-                            opac,
-                        );
+                    render_program::Arrangement::SideBySide => {
+                        let bg_b_opt = pick_b();
+                        if let (Some(bg_b), Some(size_b)) = (bg_b_opt, tex_size_b) {
+                            let mut image_size_b = size_b * self.scale;
+                            if self.normalize_side_by_side {
+                                let scale_b = (tex_size.y * self.scale) / size_b.y;
+                                image_size_b = size_b * scale_b;
+                            }
+                            let combined_width = image_size.x + image_size_b.x;
+                            let combined_height = image_size.y.max(image_size_b.y);
+                            let combined_rect = egui::Rect::from_center_size(
+                                rect.center() + self.translation,
+                                egui::vec2(combined_width, combined_height),
+                            );
+                            let mut image_rect_a =
+                                egui::Rect::from_min_size(combined_rect.min, image_size);
+                            image_rect_a.set_center(egui::pos2(
+                                image_rect_a.center().x,
+                                combined_rect.center().y,
+                            ));
+                            let mut image_rect_b = egui::Rect::from_min_size(
+                                egui::pos2(combined_rect.min.x + image_size.x, combined_rect.min.y),
+                                image_size_b,
+                            );
+                            image_rect_b.set_center(egui::pos2(
+                                image_rect_b.center().x,
+                                combined_rect.center().y,
+                            ));
+
+                            draw_gpu(
+                                p,
+                                bg_a.clone(),
+                                None,
+                                rect,
+                                image_rect_a,
+                                false,
+                                false,
+                                opac,
+                            );
+                            draw_gpu(p, bg_b, None, rect, image_rect_b, false, false, opac);
+                            p.line_segment(
+                                [
+                                    egui::pos2(image_rect_b.min.x, combined_rect.min.y),
+                                    egui::pos2(image_rect_b.min.x, combined_rect.max.y),
+                                ],
+                                (2.0, egui::Color32::GRAY),
+                            );
+                        } else {
+                            draw_gpu(p, bg_a.clone(), None, rect, image_rect, false, false, opac);
+                        }
                     }
-                }
-                CompareMode::Composite => {
-                    let bg_b_opt = exr_data_b.and_then(|d| {
-                        self.gpu_textures_b[self
-                            .active_layer
-                            .min(d.logical_layers.len().saturating_sub(1))]
-                        .clone()
-                    });
-                    if let Some(bg_b) = bg_b_opt {
-                        draw_gpu(
-                            p,
-                            bg_a.clone(),
-                            Some(bg_b),
-                            rect,
-                            image_rect,
-                            false,
-                            true,
-                            opac,
-                        );
+                    render_program::Arrangement::Diff => {
+                        if let Some(bg_b) = pick_b() {
+                            draw_gpu(
+                                p,
+                                bg_a.clone(),
+                                Some(bg_b),
+                                rect,
+                                image_rect,
+                                true,
+                                false,
+                                opac,
+                            );
+                        }
                     }
                 }
             };
 
-            let is_sbs = matches!(comp_mode, CompareMode::SideBySide);
+            let is_sbs = matches!(program.arrangement, render_program::Arrangement::SideBySide);
 
             // OCIO path: one pass over the whole frame. Accumulate the pass-1
             // draws (draw_gpu pushes into ocio_draws) and emit a single
@@ -2829,7 +2875,9 @@ impl ExrViewer {
             // renders a display-space heat map via the normal pipeline (see
             // draw_gpu), so OCIO never runs for it.
             #[cfg(feature = "ocio")]
-            let ocio_handled = if self.ocio_active && !matches!(comp_mode, CompareMode::DiffMatte) {
+            let ocio_handled = if self.ocio_active
+                && !matches!(program.arrangement, render_program::Arrangement::Diff)
+            {
                 // Overscan is dimmed in the blit (when opacity > 0); when opacity
                 // is 0 we hide it by clipping the callback to the display window.
                 let overscan_dim = !is_sbs && self.overscan_opacity > 0.0;
@@ -4177,9 +4225,10 @@ mod gui_tests {
     //! (events → `key_pressed` → state mutation); the smoke test additionally
     //! drives the full [`ExrViewer::ui`] CPU path (`render_state = None`) across
     //! every compare mode to guard the render/extraction seams.
-    use super::{ChannelMode, CompareMode, ExrViewer};
+    use super::{BlendMode, ChannelMode, CompareMode, ExrViewer};
     use crate::annotation::{Annotation, AnnotationKind, AnnotationTool};
     use crate::exr_loader::ExrData;
+    use crate::render_program;
     use eframe::egui;
     use egui_kittest::Harness;
     use exr::prelude::*;
@@ -4427,6 +4476,49 @@ mod gui_tests {
         v.compare_mode = CompareMode::SingleB;
         v.blink_state = true;
         assert!(v.has_mode_params(), "blink exposes the speed control");
+    }
+
+    /// The #114 seam: `render_program` must plumb the live viewer fields
+    /// (compare_mode, blend_mode, active_layer, wipe_center) into the layer model
+    /// and resolve them through `LayerStack::composite_at`. The pure mapping is
+    /// covered in `render_program`'s own tests; this guards the field wiring.
+    #[test]
+    fn render_program_plumbs_viewer_state_into_the_layer_model() {
+        let mut v = ExrViewer::default();
+
+        // SingleA (the default) solos slot A: one stacked draw of A.
+        let p = v.render_program(CompareMode::SingleA);
+        assert_eq!(p.arrangement, render_program::Arrangement::Stacked);
+        assert_eq!(p.draws.len(), 1);
+        assert_eq!(p.draws[0].input, render_program::ProgramInput::A);
+        assert!(!p.is_composite);
+
+        // Composite plumbs blend_mode onto the top (B) draw + flags is_composite,
+        // and active_layer threads into every draw's AOV.
+        v.blend_mode = BlendMode::Screen;
+        v.active_layer = 2;
+        let p = v.render_program(CompareMode::Composite);
+        assert!(p.is_composite);
+        assert_eq!(p.draws.len(), 2);
+        assert_eq!(
+            (p.draws[1].input, p.draws[1].blend),
+            (render_program::ProgramInput::B, BlendMode::Screen)
+        );
+        assert!(p.draws.iter().all(|d| d.aov == 2), "active_layer → aov");
+
+        // Wipe carries wipe_center[0] as the split position.
+        v.wipe_center = [0.3, 0.5];
+        let p = v.render_program(CompareMode::Wipe);
+        assert_eq!(
+            p.arrangement,
+            render_program::Arrangement::Wipe { position: 0.3 }
+        );
+
+        // DiffMatte is the diff inspection — two inputs, never a composite.
+        let p = v.render_program(CompareMode::DiffMatte);
+        assert_eq!(p.arrangement, render_program::Arrangement::Diff);
+        assert!(!p.is_composite);
+        assert_eq!(p.draws.len(), 2);
     }
 
     struct SmokeState {
