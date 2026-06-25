@@ -2144,7 +2144,7 @@ impl ExrViewer {
             if self.show_tooltip {
                 response
                     .clone()
-                    .on_hover_text_at_pointer("▶ playing — pause to sample pixels");
+                    .on_hover_text_at_pointer("readout paused during playback / seek");
             }
             return;
         }
