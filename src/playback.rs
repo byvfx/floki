@@ -185,6 +185,19 @@ impl Playback {
         self.state == PlayState::Playing
     }
 
+    /// Whether the pixel readout / color sampler should be suppressed
+    /// (INV-SAMPLE, #7): true while the clock is advancing **or** a seek's frame
+    /// is still in flight. In both cases the displayed frame can lag the playhead,
+    /// so a sample would either disagree with the playhead label or cost a full
+    /// ~600 MB `ExrData` scan on every hover. The readout re-enables once the
+    /// clock stops and the awaited frame has landed (`pending` cleared on swap).
+    /// Always `false` without a sequence (`is_playing` is false and `pending`
+    /// stays `None`), so single-image sampling is unaffected.
+    #[must_use]
+    pub fn sampling_suppressed(&self) -> bool {
+        self.is_playing() || self.pending.is_some()
+    }
+
     /// Enter sequence mode: adopt `seq`, reset in/out to the full range, place
     /// the playhead at `start` (clamped), and reset the clock. Prefs are kept.
     pub fn enter(&mut self, seq: Sequence, start: u32) {
@@ -321,6 +334,29 @@ mod tests {
         assert_eq!(pb.state, PlayState::Stopped);
         assert_eq!(pb.measured_fps, 0.0, "stop clears the stale rate");
         assert!(pb.anchor.is_none());
+    }
+
+    #[test]
+    fn sampling_suppressed_tracks_play_and_pending() {
+        let mut pb = Playback::default();
+        // Stopped, no in-flight frame, no sequence → live readout.
+        assert!(!pb.sampling_suppressed());
+
+        // Advancing clock → suppressed.
+        pb.start_playing(Instant::now());
+        assert!(pb.is_playing());
+        assert!(pb.sampling_suppressed());
+
+        // Paused but a seek's frame is still decoding → still suppressed (the
+        // displayed frame can lag the playhead until it lands).
+        pb.state = PlayState::Paused;
+        pb.pending = Some(7);
+        assert!(pb.sampling_suppressed());
+
+        // Settled: paused and the awaited frame landed (`pending` cleared on swap)
+        // → readout re-enabled.
+        pb.pending = None;
+        assert!(!pb.sampling_suppressed());
     }
 
     #[test]
