@@ -64,7 +64,8 @@ the contracts). Pure-logic-first where possible.
 
 ### 2. #100 — real-footage validation (Mac + Windows footage is ready)
 
-Validation is mostly a *soak*, but unproductive without instrumentation first.
+Validation is mostly a *soak*, but unproductive without instrumentation first. The instrumentation
+shipped (#128); the soak is now a runnable checklist: **[soak-checklist.md](soak-checklist.md)**.
 
 - **Instrumentation:** a toggleable cache-state debug overlay — T1/T2 residency counts, the live
   `max_t1`/`max_t2` caps and the budget inputs, measured-vs-target fps, evictions/sec, dropped-epoch

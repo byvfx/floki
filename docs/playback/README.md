@@ -15,6 +15,8 @@ caching or decode-ahead exists:
 
 - **[hardening plan](hardening-plan.md) (#100):** post-ship status, the INV-SAMPLE gap-close,
   real-footage validation, and the feature follow-ons (#94 / #75 / #112 / #98), sequenced.
+- **[soak checklist](soak-checklist.md) (#100):** the runnable real-footage validation pass —
+  footage matrix, per-mode checks, the four flagged risks, INV-SAMPLE confirmation, pass criteria.
 
 They are written **first** (before code) so the contracts can't drift, and so each implementation
 phase can reference a fixed target. Every phase below is independently shippable and **never
