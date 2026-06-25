@@ -845,6 +845,10 @@ impl ExrApp {
     fn detect_sequence(&mut self, path: &std::path::Path) {
         self.frame_cache.clear();
         self.frame_bytes = None;
+        // Reset the debug-overlay counters so each opened sequence's soak run
+        // starts clean (#100).
+        self.dbg_evictions = 0;
+        self.dbg_dropped_epoch = 0;
         // A different sequence reuses frame numbers, so drop the T2 GPU ring too
         // (and reset the on-screen frame; the first show re-sets it).
         self.viewer.clear_t2();
@@ -1045,7 +1049,7 @@ impl ExrApp {
         if !self.playback.is_active() {
             return;
         }
-        self.playback.state = crate::playback::PlayState::Stopped;
+        self.playback.stop();
         let in_point = self.playback.in_point;
         self.playback.current_frame = in_point;
         self.invalidate_inflight();
