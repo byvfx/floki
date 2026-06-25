@@ -110,23 +110,27 @@ impl FrameCache {
     /// Evict frames until at most `capacity` remain (capacity is floored at 1),
     /// protecting the active frame `(Slot::A, playhead)`. Victim selection is the
     /// directional-ring + LRU policy in [`FrameCache::pick_victim`].
+    /// Returns the number of frames evicted (for instrumentation).
     pub fn evict_to(
         &mut self,
         capacity: usize,
         playhead: u32,
         direction: Direction,
         playing: bool,
-    ) {
+    ) -> usize {
         let cap = capacity.max(1);
+        let mut evicted = 0;
         while self.entries.len() > cap {
             match self.pick_victim(playhead, direction, playing) {
                 Some(victim) => {
                     self.entries.remove(&victim);
+                    evicted += 1;
                 }
                 // Only the protected active frame remains — stop.
                 None => break,
             }
         }
+        evicted
     }
 
     /// Choose the next frame to evict, or `None` if only the protected active
@@ -256,7 +260,12 @@ mod tests {
         // Playhead 5; 3,4 are behind, 6,7 ahead.
         fill(&mut c, Slot::A, &[3, 4, 5, 6, 7]);
         // Trim to 3: the two behind frames (furthest first: 3 then 4) are dropped.
-        c.evict_to(3, 5, Direction::Forward, true);
+        // The returned count (used by the #100 debug overlay) reflects that.
+        assert_eq!(
+            c.evict_to(3, 5, Direction::Forward, true),
+            2,
+            "evicted count"
+        );
         assert!(c.contains(Slot::A, 5));
         assert!(
             c.contains(Slot::A, 6) && c.contains(Slot::A, 7),

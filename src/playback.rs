@@ -228,6 +228,18 @@ impl Playback {
         self.frames_since_anchor = 0;
     }
 
+    /// Stop the clock and reset the pacing measurement. The smoothed
+    /// `measured_fps` reflects the *last* playback, so it's cleared here — a
+    /// stopped transport reads `0.0` rather than a stale rate. The caller sets the
+    /// playhead (stop rewinds to the in point).
+    pub fn stop(&mut self) {
+        self.state = PlayState::Stopped;
+        self.anchor = None;
+        self.frames_since_anchor = 0;
+        self.measured_fps = 0.0;
+        self.last_shown = None;
+    }
+
     /// Frame period for the target fps (clamped so fps can't be ≤ 0).
     #[must_use]
     pub fn period(&self) -> Duration {
@@ -293,6 +305,23 @@ impl Playback {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn stop_resets_the_fps_measurement() {
+        let mut pb = Playback::default();
+        pb.start_playing(Instant::now());
+        // Two shown frames give a non-zero measured fps.
+        pb.note_shown(Instant::now());
+        pb.note_shown(Instant::now());
+        // (measured_fps may be 0 if the two `now`s coincide; the contract under
+        // test is that stop() zeroes it regardless.)
+        pb.measured_fps = 24.0;
+        pb.stop();
+        assert_eq!(pb.state, PlayState::Stopped);
+        assert_eq!(pb.measured_fps, 0.0, "stop clears the stale rate");
+        assert!(pb.anchor.is_none());
+    }
 
     #[test]
     fn forward_advances_until_out_then_loops() {

@@ -148,6 +148,21 @@ pub struct ExrApp {
     #[serde(skip)]
     inflight: std::collections::HashSet<u32>,
 
+    /// Playback debug overlay (#100): a toggleable window showing live cache /
+    /// budget / pacing state, so real-footage soak testing is observable rather
+    /// than guesswork. Transient, off by default.
+    #[serde(skip)]
+    show_playback_debug: bool,
+    /// Last `ResourceMonitor` sample, stashed each status tick for the overlay
+    /// (the budget inputs: sys + VRAM used/total).
+    #[serde(skip)]
+    dbg_last_sample: Option<crate::resource_monitor::Sample>,
+    /// Cumulative T1 evictions and dropped stale-epoch results, for the overlay.
+    #[serde(skip)]
+    dbg_evictions: u64,
+    #[serde(skip)]
+    dbg_dropped_epoch: u64,
+
     recent_files: Vec<PathBuf>,
     theme: ThemeChoice,
 
@@ -341,6 +356,10 @@ impl Default for ExrApp {
             frame_cache_cap: 8,
             frame_bytes: None,
             inflight: std::collections::HashSet::new(),
+            show_playback_debug: false,
+            dbg_last_sample: None,
+            dbg_evictions: 0,
+            dbg_dropped_epoch: 0,
             recent_files: Vec::new(),
             theme: ThemeChoice::default(),
             diff_colormap: crate::gradient::Colormap::default(),
@@ -826,6 +845,10 @@ impl ExrApp {
     fn detect_sequence(&mut self, path: &std::path::Path) {
         self.frame_cache.clear();
         self.frame_bytes = None;
+        // Reset the debug-overlay counters so each opened sequence's soak run
+        // starts clean (#100).
+        self.dbg_evictions = 0;
+        self.dbg_dropped_epoch = 0;
         // A different sequence reuses frame numbers, so drop the T2 GPU ring too
         // (and reset the on-screen frame; the first show re-sets it).
         self.viewer.clear_t2();
@@ -1026,7 +1049,7 @@ impl ExrApp {
         if !self.playback.is_active() {
             return;
         }
-        self.playback.state = crate::playback::PlayState::Stopped;
+        self.playback.stop();
         let in_point = self.playback.in_point;
         self.playback.current_frame = in_point;
         self.invalidate_inflight();
@@ -1362,6 +1385,7 @@ impl ExrApp {
         // carry across frames; reference B is untouched) and cache it (T1, #56).
         if res.seq_frame {
             if res.epoch != self.playback.epoch {
+                self.dbg_dropped_epoch = self.dbg_dropped_epoch.saturating_add(1);
                 return; // a seek/scrub/direction change superseded this decode.
             }
             self.inflight.remove(&res.frame);
@@ -1372,12 +1396,13 @@ impl ExrApp {
                     self.frame_bytes.get_or_insert_with(|| arc.approx_bytes());
                     self.frame_cache
                         .insert(crate::cache::Slot::A, res.frame, arc.clone());
-                    self.frame_cache.evict_to(
-                        self.frame_cache_cap,
-                        self.playback.current_frame,
-                        self.playback.direction,
-                        self.playback.is_playing(),
-                    );
+                    self.dbg_evictions =
+                        self.dbg_evictions.saturating_add(self.frame_cache.evict_to(
+                            self.frame_cache_cap,
+                            self.playback.current_frame,
+                            self.playback.direction,
+                            self.playback.is_playing(),
+                        ) as u64);
                     // Show it only if it's the frame the playhead is waiting on;
                     // a prefetched frame ahead of the playhead is just cached.
                     if res.frame == self.playback.current_frame {
@@ -1833,6 +1858,7 @@ impl eframe::App for ExrApp {
         self.draw_help_window(ui.ctx());
         self.draw_tools_window(ui.ctx());
         self.draw_color_management_window(ui.ctx());
+        self.draw_playback_debug(ui.ctx());
         self.draw_menu_bar(ui);
         self.draw_status_bar(ui);
         // Transport bar sits just above the status bar (added after it, so it
@@ -2306,6 +2332,11 @@ impl ExrApp {
                         }
                         ui.checkbox(&mut self.save_snapshots, "Also save to ~/.floki/snapshots")
                             .on_hover_text("Write a timestamped PNG alongside the clipboard copy");
+                        ui.separator();
+                        ui.checkbox(&mut self.show_playback_debug, "Playback Debug")
+                            .on_hover_text(
+                                "Live cache / budget / pacing readout for playback soak testing (#100)",
+                            );
                     });
 
                     ui.menu_button("Settings", |ui| {
@@ -2354,6 +2385,7 @@ impl ExrApp {
             // numbers keep ticking while the app is otherwise idle.
             if let Some(gpu) = &self.gpu_resources {
                 let sample = self.resource_monitor.sample(&gpu.render_state().device);
+                self.dbg_last_sample = Some(sample); // stash for the debug overlay
                 ui.ctx()
                     .request_repaint_after(std::time::Duration::from_secs(1));
 
@@ -2577,6 +2609,121 @@ impl ExrApp {
                 }
             });
         });
+    }
+
+    /// Live playback debug overlay (#100): cache / budget / pacing readout for
+    /// real-footage soak testing. Toggled from View ▸ Playback Debug. Read-only;
+    /// values are snapshotted into locals first so the `Window::open` borrow of
+    /// `show_playback_debug` doesn't clash with reading the rest of `self`.
+    fn draw_playback_debug(&mut self, ctx: &egui::Context) {
+        if !self.show_playback_debug {
+            return;
+        }
+        use crate::resource_monitor::fmt_bytes;
+
+        let pb = &self.playback;
+        let active = pb.is_active();
+        let full_range = pb.full_range();
+        let (in_pt, out_pt, frame, epoch) = (pb.in_point, pb.out_point, pb.current_frame, pb.epoch);
+        let state = format!("{:?}", pb.state);
+        let dir = format!("{:?}", pb.direction);
+        let loop_mode = format!("{:?}", pb.loop_mode);
+        let pacing = format!("{:?}", pb.pacing);
+        let (fps_target, fps_measured) = (pb.fps_target, pb.measured_fps);
+        let pending = pb.pending;
+
+        let t1_len = self.frame_cache.len();
+        let t1_cap = self.frame_cache_cap;
+        let t2_len = self.viewer.t2_len();
+        let t2_cap = self.viewer.t2_cap();
+        let frame_bytes = self.frame_bytes;
+        let mut inflight: Vec<u32> = self.inflight.iter().copied().collect();
+        inflight.sort_unstable();
+        let sample = self.dbg_last_sample;
+        let (evictions, dropped) = (self.dbg_evictions, self.dbg_dropped_epoch);
+
+        let mut open = true;
+        egui::Window::new("Playback debug")
+            .open(&mut open)
+            .resizable(false)
+            .default_width(260.0)
+            .show(ctx, |ui| {
+                if !active {
+                    ui.label("No sequence loaded.");
+                    return;
+                }
+                egui::Grid::new("pb_dbg_grid")
+                    .num_columns(2)
+                    .spacing([12.0, 2.0])
+                    .show(ui, |ui| {
+                        let (lo, hi) = full_range.unwrap_or((0, 0));
+                        ui.label("range");
+                        ui.label(format!("{lo}–{hi}  (in/out {in_pt}–{out_pt})"));
+                        ui.end_row();
+
+                        ui.label("frame");
+                        ui.label(format!("{frame}  ·  {state}  ·  {dir}"));
+                        ui.end_row();
+
+                        ui.label("mode");
+                        ui.label(format!("{loop_mode}  ·  {pacing}  ·  epoch {epoch}"));
+                        ui.end_row();
+
+                        ui.label("fps");
+                        ui.label(format!("{fps_measured:.1} / {fps_target:.0} target"));
+                        ui.end_row();
+
+                        ui.label("T1 (CPU)");
+                        let t1_frame = frame_bytes
+                            .map(|b| fmt_bytes(b as u64))
+                            .unwrap_or_else(|| "—".into());
+                        ui.label(format!("{t1_len} / {t1_cap} frames  ·  ~{t1_frame}/frame"));
+                        ui.end_row();
+
+                        ui.label("T2 (GPU)");
+                        let t2 = if t2_cap == 0 {
+                            "off".to_string()
+                        } else {
+                            format!("{t2_len} / {t2_cap} frames")
+                        };
+                        ui.label(t2);
+                        ui.end_row();
+
+                        ui.label("worker");
+                        let pend = pending.map_or_else(|| "—".to_string(), |f| f.to_string());
+                        ui.label(format!("in-flight {inflight:?}  ·  pending {pend}"));
+                        ui.end_row();
+
+                        if let Some(s) = sample {
+                            ui.label("RAM");
+                            ui.label(format!(
+                                "{} / {}",
+                                fmt_bytes(s.sys_used),
+                                fmt_bytes(s.sys_total)
+                            ));
+                            ui.end_row();
+
+                            ui.label("VRAM");
+                            let vram = match (s.gpu_used, s.gpu_budget) {
+                                (Some(u), Some(b)) => {
+                                    format!("{} / {}", fmt_bytes(u), fmt_bytes(b))
+                                }
+                                _ => "n/a (off-Metal fixed cap)".to_string(),
+                            };
+                            ui.label(vram);
+                            ui.end_row();
+                        }
+
+                        ui.label("evictions");
+                        ui.label(evictions.to_string());
+                        ui.end_row();
+
+                        ui.label("dropped-epoch");
+                        ui.label(dropped.to_string());
+                        ui.end_row();
+                    });
+            });
+        self.show_playback_debug = open;
     }
 
     /// Transport controls for image-sequence playback (#7). A no-op unless a
