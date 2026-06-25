@@ -2995,6 +2995,11 @@ impl ExrViewer {
         self.t2_cap
     }
 
+    /// Number of GPU textures currently resident in the T2 ring (instrumentation).
+    pub(crate) fn t2_len(&self) -> usize {
+        self.t2_ring.len()
+    }
+
     /// Pre-build the T2 texture for `(frame, active layer)` and ring it, evicting
     /// to the cap. Returns `true` if it actually built (so the caller can amortize
     /// uploads across frames). No-op — returns `false` — when disabled, already
