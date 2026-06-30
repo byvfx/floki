@@ -1007,39 +1007,43 @@ impl ExrApp {
         } else {
             0
         };
-        let resident = self.frame_cache.resident(crate::cache::Slot::A);
-        let wants = crate::scheduler::want_list(
+        // The single highest-priority frame to fetch: allocation-free and
+        // short-circuiting (it skips holes via the decodable predicate), so a
+        // large precache depth doesn't build a full want-list every pump.
+        let want = crate::scheduler::next_want(
             self.playback.current_frame,
             self.playback.in_point,
             self.playback.out_point,
             self.playback.direction,
             self.playback.loop_mode,
-            &resident,
             depth,
+            |f| self.frame_cache.contains(crate::cache::Slot::A, f),
+            |f| self.playback.frame_path(f).is_some(),
         );
-        // Submit the first want that has a real file (skip holes).
-        for w in wants {
-            let Some(path) = self.playback.frame_path(w).map(Path::to_path_buf) else {
-                continue; // a hole — nothing to decode there.
-            };
-            self.inflight.insert(w);
-            // The awaited playhead drives the "loading" state; prefetch is silent.
-            if Some(w) == self.playback.pending {
-                self.loading_a = true;
-            }
-            let tx = self.ensure_worker();
-            let _ = tx.send(LoadJob {
-                path,
-                is_b: false,
-                seq_frame: true,
-                frame: w,
-                epoch: self.playback.epoch,
-                // Seq-frames supersede by epoch, not open generation.
-                open_gen: 0,
-                beauty_only: self.decode_beauty_only(w),
-            });
-            break;
+        let Some(w) = want else {
+            return; // nothing wanted — the window is fully resident.
+        };
+        let path = self
+            .playback
+            .frame_path(w)
+            .map(Path::to_path_buf)
+            .expect("next_want only returns decodable frames");
+        self.inflight.insert(w);
+        // The awaited playhead drives the "loading" state; prefetch is silent.
+        if Some(w) == self.playback.pending {
+            self.loading_a = true;
         }
+        let tx = self.ensure_worker();
+        let _ = tx.send(LoadJob {
+            path,
+            is_b: false,
+            seq_frame: true,
+            frame: w,
+            epoch: self.playback.epoch,
+            // Seq-frames supersede by epoch, not open generation.
+            open_gen: 0,
+            beauty_only: self.decode_beauty_only(w),
+        });
     }
 
     /// Pre-upload T2 GPU textures (#56) for the on-screen frame and the next few
@@ -3147,30 +3151,26 @@ impl ExrApp {
             painter.rect_filled(trim, 3.0, visuals.selection.bg_fill.gamma_multiply(0.4));
             // Cache-fill bar (#56, step 4): a thin green strip along the bottom of
             // the track marking which frames are resident in the T1 ring. Each
-            // resident frame fills its `[f, f+1)` slot so contiguous residency
-            // reads as one solid bar; the gap to a full green bar is the part of
-            // the range that doesn't fit the RAM budget (or hasn't decoded yet).
-            let resident = self.frame_cache.resident(crate::cache::Slot::A);
-            if !resident.is_empty() {
-                let strip_h = 4.0;
-                let strip_top = rect.bottom() - strip_h;
-                let slot_w = if span == 0 {
-                    rect.width()
-                } else {
-                    (rect.width() / f64::from(span) as f32).max(1.0)
-                };
-                let fill = egui::Color32::from_rgb(64, 168, 96);
-                for &f in &resident {
-                    if f < in_pt || f > out_pt {
-                        continue; // only the trimmed range is the precache target
-                    }
-                    let x0 = x_of(f);
-                    let seg = egui::Rect::from_min_max(
-                        egui::pos2(x0, strip_top),
-                        egui::pos2((x0 + slot_w).min(rect.right()), rect.bottom()),
-                    );
-                    painter.rect_filled(seg, 0.0, fill);
+            // resident frame fills its own equal slot (`[f, f+1)` over `span + 1`
+            // slots, so the last frame `hi` gets a real slot too) — contiguous
+            // residency reads as one solid bar; the gap to a full green bar is the
+            // part of the range that doesn't fit the RAM budget (or hasn't decoded
+            // yet). `resident_frames` is allocation-free for this per-repaint walk.
+            let strip_top = rect.bottom() - 4.0;
+            let nslots = f64::from(span) + 1.0; // frames lo..=hi inclusive
+            let slot_x = |f: u32| {
+                rect.left() + ((f64::from(f.saturating_sub(lo)) / nslots) as f32) * rect.width()
+            };
+            let fill = egui::Color32::from_rgb(64, 168, 96);
+            for f in self.frame_cache.resident_frames(crate::cache::Slot::A) {
+                if f < in_pt || f > out_pt {
+                    continue; // only the trimmed range is the precache target
                 }
+                let seg = egui::Rect::from_min_max(
+                    egui::pos2(slot_x(f), strip_top),
+                    egui::pos2(slot_x(f + 1).min(rect.right()), rect.bottom()),
+                );
+                painter.rect_filled(seg, 0.0, fill);
             }
             // Holes: distinct vertical marks across the full span.
             if let Some(seq) = self.playback.sequence.as_ref() {
