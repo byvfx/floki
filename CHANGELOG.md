@@ -5,6 +5,74 @@ All notable changes to Floki are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.0] - 2026-06-30
+
+The **image-sequence playback** release. Floki becomes a sequence review player:
+open one frame of a numbered sequence and play the whole shot, with a smart
+cache that keeps playback real-time and degrades instead of crashing under
+memory pressure.
+
+> **Raised system requirements.** Color management is now always-on (OpenColorIO
+> is mandatory, #121) and the viewport is GPU-only (the CPU render path and CPU
+> OCIO processor were removed, #59) — Floki now requires a GPU supporting
+> `FLOAT32_FILTERABLE`. There is no CPU fallback.
+
+### Added
+- **Image-sequence playback (#7).** Open one frame of a numbered sequence to
+  play the whole shot. A drift-corrected frame clock with editable **target fps**
+  and a live **measured fps** readout, **Loop / Once / Ping-Pong**, **reverse**,
+  **in/out trim** (Set In / Set Out / Reset), and **Stutter vs Drop-frames**
+  pacing. A transport bar with a scrubber/timeline that marks the trimmed region
+  and missing frames (holes); Space toggles play/pause, ←/→ step, Stop halts in
+  place. Sequence detection handles numeric sort and gaps (#83).
+- **Byte-budgeted playback cache (#56/#57/#92).** A four-tier cache keeps frames
+  resident across the CPU/GPU boundary: a **T1 CPU ring** fed by a **decode-ahead
+  prefetch worker** and a **T2 GPU-texture pre-upload ring**, each sized live from
+  the RAM/VRAM budget so a scrub-back or loop is an instant hit and playback
+  degrades (fewer frames / lower fps) instead of crashing under pressure.
+- **Beauty-only fast decode (#132).** While playing, decode just the beauty/first
+  layer — multi-part AOV EXRs decode several times faster and use far less RAM —
+  then re-decode the settled frame in full so the pixel readout and AOV switch
+  stay correct. A "Beauty preview" toggle; on by default.
+- **Eager precache + cache-fill bar (#133).** A "Precache" toggle fills the whole
+  in/out range into the cache up front, so once the green residency bar under the
+  scrubber is full the span plays and loops with the decoder idle. Bounded by the
+  RAM budget — it caches what fits and shows it honestly.
+- **Pixel-readout correctness during playback (#131).** The color sampler is
+  suppressed while the clock advances (it would lag the playhead or cost a full
+  frame scan per hover) and re-enabled on settle, re-decoding the frame in full so
+  the probe is always pixel-accurate when you stop to inspect.
+- **Live render-watch (#101).** Watch the sequence folder and pick up frames as a
+  render writes them — new frames extend the range, re-rendered frames refresh —
+  with an optional "Follow" to park the playhead on the newest frame.
+- **Playback debug overlay (#100).** A live readout (residency, fps, worker
+  in-flight/pending, RAM/VRAM, evictions) for soak-testing playback on real
+  footage, with a runnable soak checklist (#129).
+- **GPU contact-sheet thumbnails (#67).** The contact sheet now renders thumbnails
+  on the GPU through the OCIO display transform, replacing the CPU thumbnail bake.
+
+### Changed
+- **OCIO is now mandatory (#121).** The non-OCIO build is gone; color management
+  is always on, so what you see matches the configured display transform by
+  default.
+- **Internal: a comp layer-stack model now backs the A/B compare UI (#103/#114).**
+  The pure, headless layer model is the spine for upcoming N-way compare and
+  locked-step A/B work; adopting it behind today's compare UI is a no-behavior
+  refactor.
+
+### Removed
+- **CPU viewport render path + CPU OCIO processor (#59).** The viewport renders
+  exclusively on the GPU now (see the raised-requirements note above).
+
+### Fixed
+- Open a new EXR while a sequence is playing (#109).
+- Release the frame cache and stop the decode pump when slot A is unloaded, so
+  decoded frames don't leak and the pump doesn't keep re-issuing jobs (#117).
+- Apply the user gamma control in the OCIO view path (#93).
+- Dedicate a contact-sheet thumbnail cache so it doesn't fight the main texture
+  cache (#115).
+- Index-based dashes in the dashed-rectangle overlay (#71).
+
 ## [1.8.0] - 2026-06-21
 
 ### Added
@@ -353,7 +421,8 @@ Initial release.
 - Advanced metadata header inspector.
 - Cross-platform GitHub Actions builds (Linux, Windows, macOS).
 
-[Unreleased]: https://github.com/byvfx/floki/compare/v1.5.2...HEAD
+[Unreleased]: https://github.com/byvfx/floki/compare/v1.9.0...HEAD
+[1.9.0]: https://github.com/byvfx/floki/compare/v1.8.0...v1.9.0
 [1.5.2]: https://github.com/byvfx/floki/compare/v1.5.1...v1.5.2
 [1.5.1]: https://github.com/byvfx/floki/compare/v1.5.0...v1.5.1
 [1.5.0]: https://github.com/byvfx/floki/compare/v1.4.4...v1.5.0
