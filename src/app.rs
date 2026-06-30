@@ -1091,18 +1091,30 @@ impl ExrApp {
         }
     }
 
-    /// On settling from playback (pause / boundary stop), re-decode the playhead
-    /// at full resolution so the readout + AOV switcher see every channel
-    /// (INV-SAMPLE, #7). The beauty-only ring frame (#56, step 3) stays on screen
-    /// instantly while the full frame decodes; sampling re-enables when it lands.
-    /// A no-op when the playhead is already full-resident. Supersedes in-flight
-    /// beauty prefetch so its (now stale) result can't clear the awaited upgrade.
+    /// On settling from playback (pause / stop / boundary), ensure the playhead
+    /// is resident at **full** resolution so the readout + AOV switcher see every
+    /// channel (INV-SAMPLE, #7).
+    ///
+    /// - Already full-resident → nothing to do; the displayed frame is
+    ///   sampling-ready and no decode is scheduled.
+    /// - Beauty-only (#56, step 3) or missing → supersede in-flight beauty
+    ///   prefetch (so its now-stale result can't clear the awaited upgrade) and
+    ///   re-decode the playhead in full. A beauty-only frame stays on screen
+    ///   instantly while the full frame decodes; sampling re-enables when it lands.
     fn settle_to_full(&mut self) {
         if !self.playback.is_active() {
             return;
         }
+        let frame = self.playback.current_frame;
+        let full_resident = self
+            .frame_cache
+            .peek(crate::cache::Slot::A, frame)
+            .is_some_and(|d| !d.beauty_only);
+        if full_resident {
+            return;
+        }
         self.invalidate_inflight();
-        self.request_sequence_frame(self.playback.current_frame);
+        self.request_sequence_frame(frame);
     }
 
     /// Stop playback, halting **in place** — the playhead stays on the frame the
@@ -4361,6 +4373,33 @@ mod tests {
         // The |< button still rewinds to the in-point.
         app.playback_scrub_to(app.playback.in_point);
         assert_eq!(app.playback.current_frame, 1);
+    }
+
+    #[test]
+    fn settle_is_a_noop_when_the_playhead_is_already_full_resident() {
+        let dir = tempfile::tempdir().unwrap();
+        let f1 = dir.path().join("s.0001.exr");
+        let f2 = dir.path().join("s.0002.exr");
+        write_rgba_exr(&f1);
+        write_rgba_exr(&f2);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&f1);
+        app.playback.current_frame = 1;
+
+        // A full (all-AOV) frame already resident at the playhead.
+        let full = std::sync::Arc::new(ExrData::load(&f1).unwrap());
+        assert!(!full.beauty_only);
+        app.frame_cache.insert(crate::cache::Slot::A, 1, full);
+        app.playback.state = PlayState::Paused;
+        let epoch = app.playback.epoch;
+
+        app.settle_to_full();
+        assert_eq!(app.playback.pending, None, "no re-decode scheduled");
+        assert!(app.inflight.is_empty(), "no in-flight work");
+        assert_eq!(
+            app.playback.epoch, epoch,
+            "epoch untouched — no supersession when the frame is already full"
+        );
     }
 
     #[test]
