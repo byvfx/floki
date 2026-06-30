@@ -1,8 +1,18 @@
 use exr::prelude::*;
 use std::path::Path;
 
+/// The decoded-image type the viewer works with: a (small) list of physical
+/// layers, each a flat `AnyChannels` buffer. Both the full read (`all_layers`)
+/// and the beauty-only read (a single layer, re-wrapped) produce this shape.
+type FlatImage = Image<smallvec::SmallVec<[Layer<AnyChannels<FlatSamples>>; 2]>>;
+
+/// Error returned when the synchronous parse path panics (see [`ExrData::load`]).
+const DECODE_PANIC_MSG: &str = "Failed to decode EXR: the decompressor panicked. The file may use an \
+     unsupported compression variant, be corrupted, or trigger a bug in the \
+     exr crate's miniz_oxide decompressor.";
+
 pub struct ExrData {
-    pub image: Image<smallvec::SmallVec<[Layer<AnyChannels<FlatSamples>>; 2]>>,
+    pub image: FlatImage,
     /// Displayable passes derived by grouping channels by their dotted name
     /// prefix. See [`LogicalLayer`].
     pub logical_layers: Vec<LogicalLayer>,
@@ -10,6 +20,13 @@ pub struct ExrData {
     /// load time. Shown in the status bar; rebuilding it every frame for
     /// Blender EXRs with 100+ layers was wasteful.
     pub channels_str: String,
+    /// True when this frame was decoded **beauty-only** (a single layer, via
+    /// [`ExrData::load_beauty`]) for the playback ring (#56, hardening step 3)
+    /// rather than the full all-AOV [`ExrData::load`]. Such a frame is correct
+    /// for the displayed beauty/active layer but carries no other AOVs and is
+    /// not a valid sampling source — `app.rs` re-decodes it in full on settle so
+    /// the readout + AOV switcher see every channel (INV-SAMPLE, #7).
+    pub beauty_only: bool,
 }
 
 /// A displayable "layer" (render pass) derived from grouping a physical EXR
@@ -61,55 +78,64 @@ impl ExrData {
                 .all_attributes()
                 .from_file(path_ref)
         }))
-        .map_err(|_| {
-            "Failed to decode EXR: the decompressor panicked. The file may use an \
-             unsupported compression variant, be corrupted, or trigger a bug in the \
-             exr crate's miniz_oxide decompressor."
-                .to_string()
-        })?;
+        .map_err(|_| DECODE_PANIC_MSG.to_string())?;
 
-        match read_result {
-            Ok(image) => {
-                let logical_layers = build_logical_layers(&image);
-                let channels_str = build_channels_str(&logical_layers);
-                Ok(Self {
-                    image,
-                    logical_layers,
-                    channels_str,
-                })
-            }
-            Err(e) => {
-                let err_str = e.to_string();
-                if err_str.contains("file identifier missing") {
-                    // Try to read the first 4 bytes to help the user
-                    if let Ok(mut f) = std::fs::File::open(path_ref) {
-                        use std::io::Read;
-                        let mut buf = [0u8; 4];
-                        if f.read_exact(&mut buf).is_ok() {
-                            let hex_str = format!(
-                                "{:02X} {:02X} {:02X} {:02X}",
-                                buf[0], buf[1], buf[2], buf[3]
-                            );
-                            let ascii_str: String = buf
-                                .iter()
-                                .map(|&b| {
-                                    if (32..=126).contains(&b) {
-                                        b as char
-                                    } else {
-                                        '.'
-                                    }
-                                })
-                                .collect();
-                            return Err(format!(
-                                "Not a valid EXR file (magic number missing).\nFirst 4 bytes: [{hex_str}] ('{ascii_str}')\nMake sure this is actually an OpenEXR file and not a renamed PNG, JPG, or corrupted file."
-                            ));
-                        }
-                    }
-                    Err("Not a valid EXR file (magic number missing). The file might be corrupted or in another format.".to_string())
-                } else {
-                    Err(err_str)
-                }
-            }
+        let image = map_read_err(read_result, path_ref)?;
+        Ok(Self::from_image(image, false))
+    }
+
+    /// Decode only the **first valid layer** of an EXR — the beauty/main pass by
+    /// the usual VFX convention — for the playback ring cache (#56, hardening
+    /// step 3). Cheaper than [`Self::load`] in both decode time and resident
+    /// bytes for **multi-part** EXRs (one part per AOV): the block reader filters
+    /// out every other part, so their scanlines are never decompressed. A
+    /// single-part multichannel file stores all AOVs interleaved in one part's
+    /// blocks, so the whole part still decompresses — the saving there is only
+    /// the discarded per-channel copy, not the inflate.
+    ///
+    /// The result is flagged [`beauty_only`](Self::beauty_only): it is correct
+    /// for the displayed beauty/active layer but is **not** a valid sampling or
+    /// AOV-switch source, so the caller re-decodes the settled frame in full
+    /// (INV-SAMPLE, #7) when the clock stops.
+    ///
+    /// # Errors
+    /// Same contract as [`Self::load`].
+    pub fn load_beauty(path: impl AsRef<Path>) -> std::result::Result<Self, String> {
+        let path_ref = path.as_ref();
+
+        // `first_valid_layer` yields a single `Layer`; re-wrap it in the
+        // one-element layer list the rest of the app expects, so beauty-only and
+        // full frames are the same `ExrData` shape downstream.
+        let read_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            read()
+                .no_deep_data()
+                .largest_resolution_level()
+                .all_channels()
+                .first_valid_layer()
+                .all_attributes()
+                .from_file(path_ref)
+        }))
+        .map_err(|_| DECODE_PANIC_MSG.to_string())?;
+
+        let single = map_read_err(read_result, path_ref)?;
+        let image = FlatImage {
+            attributes: single.attributes,
+            layer_data: smallvec::smallvec![single.layer_data],
+        };
+        Ok(Self::from_image(image, true))
+    }
+
+    /// Build an [`ExrData`] from a decoded image: regroup channels into logical
+    /// layers and precompute the status-bar string. Shared by [`Self::load`] and
+    /// [`Self::load_beauty`].
+    fn from_image(image: FlatImage, beauty_only: bool) -> Self {
+        let logical_layers = build_logical_layers(&image);
+        let channels_str = build_channels_str(&logical_layers);
+        Self {
+            image,
+            logical_layers,
+            channels_str,
+            beauty_only,
         }
     }
 
@@ -168,6 +194,40 @@ impl ExrData {
             })
             .fold(0usize, usize::saturating_add)
     }
+}
+
+/// Map an `exr` read error to a human-readable string, with a friendlier
+/// message (and a hex/ASCII dump of the first four bytes) when the file is
+/// missing the OpenEXR magic number. Generic over the read result so both the
+/// full (`all_layers`) and beauty-only (`first_valid_layer`) reads share it.
+fn map_read_err<T>(
+    read_result: std::result::Result<T, exr::error::Error>,
+    path: &Path,
+) -> std::result::Result<T, String> {
+    read_result.map_err(|e| {
+        let err_str = e.to_string();
+        if err_str.contains("file identifier missing") {
+            // Try to read the first 4 bytes to help the user.
+            if let Ok(mut f) = std::fs::File::open(path) {
+                use std::io::Read;
+                let mut buf = [0u8; 4];
+                if f.read_exact(&mut buf).is_ok() {
+                    let hex_str =
+                        format!("{:02X} {:02X} {:02X} {:02X}", buf[0], buf[1], buf[2], buf[3]);
+                    let ascii_str: String = buf
+                        .iter()
+                        .map(|&b| if (32..=126).contains(&b) { b as char } else { '.' })
+                        .collect();
+                    return format!(
+                        "Not a valid EXR file (magic number missing).\nFirst 4 bytes: [{hex_str}] ('{ascii_str}')\nMake sure this is actually an OpenEXR file and not a renamed PNG, JPG, or corrupted file."
+                    );
+                }
+            }
+            "Not a valid EXR file (magic number missing). The file might be corrupted or in another format.".to_string()
+        } else {
+            err_str
+        }
+    })
 }
 
 /// Build the truncated, comma-joined display string of logical-layer names.
@@ -783,5 +843,100 @@ mod tests {
             &[("R", true), ("G", true), ("B", false), ("A", false)],
         );
         assert_eq!(ExrData::load(&p).unwrap().approx_bytes(), 16 + 32);
+    }
+
+    // --- Beauty-only decode (#56, hardening step 3) --------------------------
+
+    /// Write a **multi-part** EXR: a named `beauty` part (RGBA) followed by a
+    /// named `normal` part (X/Y/Z). Multi-part is exactly the case beauty-only
+    /// decode wins on — `first_valid_layer` filters the second part's blocks.
+    fn write_multipart_exr(path: &Path) {
+        const W: usize = 2;
+        const H: usize = 2;
+        let named = |name: &str, chans: &[&str]| {
+            let mut list = smallvec::SmallVec::new();
+            for c in chans {
+                list.push(AnyChannel::new(
+                    Text::from(*c),
+                    FlatSamples::F32(vec![0.5; W * H]),
+                ));
+            }
+            let attrs = LayerAttributes {
+                layer_name: Some(Text::from(name)),
+                ..Default::default()
+            };
+            Layer::new(
+                (W, H),
+                attrs,
+                Encoding::FAST_LOSSLESS,
+                AnyChannels::sort(list),
+            )
+        };
+        let layers: smallvec::SmallVec<[Layer<AnyChannels<FlatSamples>>; 2]> = smallvec::smallvec![
+            named("beauty", &["R", "G", "B", "A"]),
+            named("normal", &["X", "Y", "Z"]),
+        ];
+        Image::from_layers(
+            ImageAttributes::new(IntegerBounds::from_dimensions((W, H))),
+            layers,
+        )
+        .write()
+        .to_file(path)
+        .expect("write multipart exr");
+    }
+
+    #[test]
+    fn full_load_sees_every_part_beauty_load_sees_only_the_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multipart.exr");
+        write_multipart_exr(&path);
+
+        // Full decode: both physical parts present, flagged all-AOV.
+        let full = ExrData::load(&path).expect("full load");
+        assert!(!full.beauty_only, "load() is a full all-AOV decode");
+        assert_eq!(full.image.layer_data.len(), 2, "both parts decoded");
+
+        // Beauty-only decode: just the first part (beauty/RGBA), flagged.
+        let beauty = ExrData::load_beauty(&path).expect("beauty load");
+        assert!(beauty.beauty_only, "load_beauty() sets the flag");
+        assert_eq!(
+            beauty.image.layer_data.len(),
+            1,
+            "only the first part is decoded"
+        );
+        // That single part is the RGBA beauty, fully resolved.
+        assert_eq!(beauty.logical_layers.len(), 1);
+        let ll = &beauty.logical_layers[0];
+        assert!(
+            ll.r.is_some() && ll.g.is_some() && ll.b.is_some() && ll.a.is_some(),
+            "beauty part resolves all four RGBA slots"
+        );
+
+        // The beauty-only frame is strictly lighter in RAM (one part vs two).
+        assert!(
+            beauty.approx_bytes() < full.approx_bytes(),
+            "beauty-only frame is smaller: {} vs {}",
+            beauty.approx_bytes(),
+            full.approx_bytes()
+        );
+    }
+
+    #[test]
+    fn beauty_load_rejects_non_exr_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not_an.exr");
+        std::fs::write(&path, b"definitely not an exr").unwrap();
+        // Shares the same friendly error path as `load`.
+        let err = match ExrData::load_beauty(&path) {
+            Ok(_) => panic!("garbage must not parse as EXR"),
+            Err(e) => e,
+        };
+        let lower = err.to_lowercase();
+        assert!(
+            lower.contains("magic number")
+                || lower.contains("valid exr")
+                || lower.contains("identifier"),
+            "error should explain the bad EXR, got: {err}"
+        );
     }
 }

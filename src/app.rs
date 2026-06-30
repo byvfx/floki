@@ -68,6 +68,10 @@ struct LoadJob {
     epoch: u64,
     /// Slot-A explicit-open generation at issue time (#109); see [`LoadResult`].
     open_gen: u64,
+    /// Decode beauty-only (a single layer) rather than all AOVs (#56, hardening
+    /// step 3). Set for playback prefetch while the clock advances; cleared for
+    /// explicit opens and the full re-decode on settle. See [`ExrData::load_beauty`].
+    beauty_only: bool,
 }
 
 /// Message from the decode worker to the UI thread, delivered over `load_rx`. A
@@ -198,6 +202,15 @@ pub struct ExrApp {
     /// lazy per-swap path if it misbehaves on a given GPU. Persisted.
     #[serde(default = "ret_true")]
     t2_enabled: bool,
+
+    /// Decode only the beauty/first layer for the playback ring while the clock
+    /// is advancing (#56, hardening step 3): cheaper decode + smaller resident
+    /// frames for multi-part AOV EXRs, so playback feeds the decode wall faster.
+    /// On settle the playhead is re-decoded in full so the readout + AOV switch
+    /// see every channel (INV-SAMPLE, #7). On by default; a kill-switch back to
+    /// always-full decode if a file's first layer isn't its beauty. Persisted.
+    #[serde(default = "ret_true")]
+    beauty_preview: bool,
 
     /// Render-watch (#101): poll the sequence directory and pick up frames as a
     /// render writes them — new frames extend the range, re-rendered frames drop
@@ -370,6 +383,7 @@ impl Default for ExrApp {
             background_presets: Vec::new(),
             save_snapshots: false,
             t2_enabled: true,
+            beauty_preview: true,
             watch_enabled: false,
             watch_follow: false,
             watch_sigs: Vec::new(),
@@ -788,6 +802,9 @@ impl ExrApp {
             // Only slot-A opens supersede by generation; B is path-keyed, so its
             // job carries no meaningful generation.
             open_gen: if is_b { 0 } else { self.open_gen_a },
+            // An explicit open always decodes in full (it seeds the session and
+            // the T1 RAM budget; AOVs must be present).
+            beauty_only: false,
         });
     }
 
@@ -816,7 +833,14 @@ impl ExrApp {
                             proxy,
                         });
                     }
-                    let result = ExrData::load(&job.path);
+                    // Beauty-only for playback prefetch while moving (#56, step 3):
+                    // one layer, faster decode + smaller resident frame. Full
+                    // all-AOV decode for opens and the settle re-decode.
+                    let result = if job.beauty_only {
+                        ExrData::load_beauty(&job.path)
+                    } else {
+                        ExrData::load(&job.path)
+                    };
                     let _ = result_tx.send(LoadMsg::Loaded(Box::new(LoadResult {
                         path: job.path,
                         is_b: job.is_b,
@@ -885,12 +909,22 @@ impl ExrApp {
         self.loaded_file = Some(path);
 
         if let Some(data) = self.frame_cache.get(crate::cache::Slot::A, frame) {
-            // Cache hit: show immediately, no decode round-trip.
+            // A beauty-only ring frame (#56, step 3) is fine to *display* while
+            // moving, but on settle it must be upgraded to a full all-AOV decode
+            // so the readout + AOV switch are correct (INV-SAMPLE, #7). Show it
+            // now for instant feedback, but keep the playhead awaited so sampling
+            // stays suppressed until the full frame lands.
+            let needs_full = !self.playback.is_playing() && data.beauty_only;
             self.loading_a = false;
-            self.playback.pending = None;
             self.viewer.set_t2_frame(Some(frame)); // bind this frame's T2 texture
             self.swap_image_arc(data, false);
-            self.playback.note_shown(std::time::Instant::now());
+            if needs_full {
+                self.playback.pending = Some(frame);
+            } else {
+                // Cache hit: show immediately, no decode round-trip.
+                self.playback.pending = None;
+                self.playback.note_shown(std::time::Instant::now());
+            }
         } else {
             // Miss: mark the playhead as awaited; `pump_decode` submits it (the
             // want-list puts the playhead first, so it beats any prefetch).
@@ -905,6 +939,17 @@ impl ExrApp {
     fn prefetch_depth(&self) -> usize {
         const MAX_PREFETCH: usize = 16;
         self.frame_cache_cap.saturating_sub(1).min(MAX_PREFETCH)
+    }
+
+    /// Whether the next playback decode should be **beauty-only** (#56, hardening
+    /// step 3). True only while the clock is advancing *and* the viewer is showing
+    /// the beauty/first layer — a beauty-only frame holds just that layer, so it
+    /// would be wrong to serve a different active AOV from it. Paused/scrubbing
+    /// decodes (and any non-beauty active layer) stay full so sampling and AOV
+    /// switching are correct (INV-SAMPLE, #7). The `beauty_preview` kill-switch
+    /// forces always-full.
+    fn decode_beauty_only(&self) -> bool {
+        self.beauty_preview && self.playback.is_playing() && self.viewer.active_layer == 0
     }
 
     /// Decode-ahead pump (#57): with at most one sequence decode outstanding,
@@ -952,6 +997,7 @@ impl ExrApp {
                 epoch: self.playback.epoch,
                 // Seq-frames supersede by epoch, not open generation.
                 open_gen: 0,
+                beauty_only: self.decode_beauty_only(),
             });
             break;
         }
@@ -1039,21 +1085,48 @@ impl ExrApp {
         }
         if self.playback.state == PlayState::Playing {
             self.playback.state = PlayState::Paused;
+            self.settle_to_full();
         } else {
             self.playback.start_playing(std::time::Instant::now());
         }
     }
 
-    /// Stop and rewind to the in point.
+    /// On settling from playback (pause / stop / boundary), ensure the playhead
+    /// is resident at **full** resolution so the readout + AOV switcher see every
+    /// channel (INV-SAMPLE, #7).
+    ///
+    /// - Already full-resident → nothing to do; the displayed frame is
+    ///   sampling-ready and no decode is scheduled.
+    /// - Beauty-only (#56, step 3) or missing → supersede in-flight beauty
+    ///   prefetch (so its now-stale result can't clear the awaited upgrade) and
+    ///   re-decode the playhead in full. A beauty-only frame stays on screen
+    ///   instantly while the full frame decodes; sampling re-enables when it lands.
+    fn settle_to_full(&mut self) {
+        if !self.playback.is_active() {
+            return;
+        }
+        let frame = self.playback.current_frame;
+        let full_resident = self
+            .frame_cache
+            .peek(crate::cache::Slot::A, frame)
+            .is_some_and(|d| !d.beauty_only);
+        if full_resident {
+            return;
+        }
+        self.invalidate_inflight();
+        self.request_sequence_frame(frame);
+    }
+
+    /// Stop playback, halting **in place** — the playhead stays on the frame the
+    /// user stopped on (rewind is the dedicated `|<` jump-to-in button). Like a
+    /// pause but also resets the pacing clock. Re-decodes the settled frame in
+    /// full so the readout + AOV switch see every channel (INV-SAMPLE, #7).
     fn playback_stop(&mut self) {
         if !self.playback.is_active() {
             return;
         }
         self.playback.stop();
-        let in_point = self.playback.in_point;
-        self.playback.current_frame = in_point;
-        self.invalidate_inflight();
-        self.request_sequence_frame(in_point);
+        self.settle_to_full();
     }
 
     /// Set the in point to the playhead (the `I` key / Set In button). Prefetch
@@ -1163,6 +1236,7 @@ impl ExrApp {
             }
         } else {
             self.playback.state = PlayState::Paused;
+            self.settle_to_full();
         }
     }
 
@@ -1210,6 +1284,7 @@ impl ExrApp {
         }
         if hit_boundary {
             self.playback.state = PlayState::Paused;
+            self.settle_to_full();
         }
     }
 
@@ -1393,7 +1468,13 @@ impl ExrApp {
                 Ok(data) => {
                     let arc = std::sync::Arc::new(data);
                     // Measure one frame to size the cache budget (homogeneous seq).
-                    self.frame_bytes.get_or_insert_with(|| arc.approx_bytes());
+                    // Only a *full* frame is representative: beauty-only frames
+                    // (#56, step 3) are smaller, so sizing the ring off one would
+                    // over-fill RAM when full frames land on settle. The opening
+                    // decode is always full, so this seeds from it.
+                    if !arc.beauty_only {
+                        self.frame_bytes.get_or_insert_with(|| arc.approx_bytes());
+                    }
                     self.frame_cache
                         .insert(crate::cache::Slot::A, res.frame, arc.clone());
                     self.dbg_evictions =
@@ -2752,7 +2833,11 @@ impl ExrApp {
                 {
                     self.playback_toggle();
                 }
-                if ui.button("Stop").on_hover_text("Stop and rewind").clicked() {
+                if ui
+                    .button("Stop")
+                    .on_hover_text("Stop (halt in place; |< rewinds to in)")
+                    .clicked()
+                {
                     self.playback_stop();
                 }
                 if ui.button(">").on_hover_text("Step forward (→)").clicked() {
@@ -2868,6 +2953,28 @@ impl ExrApp {
                     && !self.t2_enabled
                 {
                     self.viewer.clear_t2();
+                }
+
+                ui.separator();
+
+                // Beauty-only playback decode kill-switch (#56, step 3). On → the
+                // ring decodes just the beauty/first layer while moving (faster
+                // decode, smaller frames for multi-part AOV EXRs); the settled
+                // frame is always re-decoded in full. Off → always decode all AOVs.
+                if ui
+                    .checkbox(&mut self.beauty_preview, "Beauty preview")
+                    .on_hover_text(
+                        "While playing, decode only the beauty/first layer for a \
+                         faster, lighter cache; the paused frame is always full. \
+                         Turn off if a file's first layer isn't its beauty.",
+                    )
+                    .changed()
+                {
+                    // Switching modes makes the cached ring (now the wrong decode
+                    // mode) stale; drop it so frames re-decode under the new mode.
+                    self.frame_cache.clear();
+                    self.invalidate_inflight();
+                    self.request_sequence_frame(self.playback.current_frame);
                 }
 
                 ui.separator();
@@ -4155,6 +4262,169 @@ mod tests {
         assert_eq!(app.viewer.exposure, 1.5, "exposure preserved");
         assert!(!app.loading_a, "decode flag cleared");
         assert_eq!(app.playback.pending, None, "pending cleared on arrival");
+    }
+
+    // --- Beauty-only playback decode (#56, hardening step 3) -----------------
+
+    #[test]
+    fn beauty_only_decode_gated_on_playing_and_beauty_layer() {
+        let dir = tempfile::tempdir().unwrap();
+        touch_sequence(dir.path(), 3);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&dir.path().join("s.0001.exr"));
+
+        // Stopped → full decode (the readout/AOV switch need all channels).
+        assert!(!app.decode_beauty_only(), "not playing ⇒ full decode");
+
+        app.playback_toggle(); // start playing
+        assert!(app.playback.is_playing());
+        app.viewer.active_layer = 0;
+        assert!(
+            app.decode_beauty_only(),
+            "playing + beauty layer ⇒ beauty-only"
+        );
+
+        // Viewing a non-beauty AOV: a beauty-only frame wouldn't carry it, so
+        // playback stays full-decode for correctness.
+        app.viewer.active_layer = 2;
+        assert!(!app.decode_beauty_only(), "non-beauty active layer ⇒ full");
+
+        // Kill-switch forces always-full.
+        app.viewer.active_layer = 0;
+        app.beauty_preview = false;
+        assert!(!app.decode_beauty_only(), "kill-switch off ⇒ full");
+    }
+
+    #[test]
+    fn settling_on_a_beauty_only_frame_awaits_a_full_redecode() {
+        let dir = tempfile::tempdir().unwrap();
+        let f1 = dir.path().join("s.0001.exr");
+        let f2 = dir.path().join("s.0002.exr");
+        write_rgba_exr(&f1);
+        write_rgba_exr(&f2); // a second frame makes it a real sequence
+        let mut app = ExrApp::default();
+        app.detect_sequence(&f1);
+        app.playback.current_frame = 1;
+
+        // Simulate the play-time ring: a beauty-only frame resident at the playhead.
+        let beauty = std::sync::Arc::new(ExrData::load_beauty(&f1).unwrap());
+        assert!(beauty.beauty_only);
+        app.frame_cache.insert(crate::cache::Slot::A, 1, beauty);
+        app.playback.state = PlayState::Paused; // settled
+
+        app.request_sequence_frame(1);
+        // The beauty frame is shown instantly, but the playhead stays awaited so
+        // the readout is suppressed until the full all-AOV frame lands.
+        assert!(app.exr_data.is_some(), "beauty frame shown immediately");
+        assert_eq!(app.playback.pending, Some(1), "full re-decode awaited");
+        assert!(
+            app.playback.sampling_suppressed(),
+            "readout suppressed until the full frame lands"
+        );
+        // And the re-decode it pumped is a *full* decode, not beauty-only.
+        assert!(!app.decode_beauty_only());
+
+        // Deliver the full frame: cache upgrades, sampling re-enables.
+        let full = ExrData::load(&f1).unwrap();
+        assert!(!full.beauty_only);
+        app.apply_load_result(LoadResult {
+            path: f1,
+            is_b: false,
+            seq_frame: true,
+            frame: 1,
+            epoch: app.playback.epoch,
+            open_gen: 0,
+            result: Ok(full),
+        });
+        assert_eq!(
+            app.playback.pending, None,
+            "settled once the full frame lands"
+        );
+        assert!(
+            !app.frame_cache
+                .get(crate::cache::Slot::A, 1)
+                .unwrap()
+                .beauty_only,
+            "ring entry upgraded to the full decode"
+        );
+        assert!(!app.playback.sampling_suppressed(), "readout live again");
+    }
+
+    #[test]
+    fn stop_halts_in_place_and_does_not_rewind() {
+        let dir = tempfile::tempdir().unwrap();
+        touch_sequence(dir.path(), 5);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&dir.path().join("s.0001.exr"));
+
+        // Play forward to frame 3, then stop.
+        app.playback_toggle();
+        app.advance_playhead();
+        app.advance_playhead();
+        assert_eq!(app.playback.current_frame, 3);
+
+        app.playback_stop();
+        assert_eq!(app.playback.state, PlayState::Stopped);
+        assert_eq!(
+            app.playback.current_frame, 3,
+            "stop halts on the current frame, not the in-point"
+        );
+
+        // The |< button still rewinds to the in-point.
+        app.playback_scrub_to(app.playback.in_point);
+        assert_eq!(app.playback.current_frame, 1);
+    }
+
+    #[test]
+    fn settle_is_a_noop_when_the_playhead_is_already_full_resident() {
+        let dir = tempfile::tempdir().unwrap();
+        let f1 = dir.path().join("s.0001.exr");
+        let f2 = dir.path().join("s.0002.exr");
+        write_rgba_exr(&f1);
+        write_rgba_exr(&f2);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&f1);
+        app.playback.current_frame = 1;
+
+        // A full (all-AOV) frame already resident at the playhead.
+        let full = std::sync::Arc::new(ExrData::load(&f1).unwrap());
+        assert!(!full.beauty_only);
+        app.frame_cache.insert(crate::cache::Slot::A, 1, full);
+        app.playback.state = PlayState::Paused;
+        let epoch = app.playback.epoch;
+
+        app.settle_to_full();
+        assert_eq!(app.playback.pending, None, "no re-decode scheduled");
+        assert!(app.inflight.is_empty(), "no in-flight work");
+        assert_eq!(
+            app.playback.epoch, epoch,
+            "epoch untouched — no supersession when the frame is already full"
+        );
+    }
+
+    #[test]
+    fn pausing_from_play_settles_the_beauty_frame_to_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let f1 = dir.path().join("s.0001.exr");
+        let f2 = dir.path().join("s.0002.exr");
+        write_rgba_exr(&f1);
+        write_rgba_exr(&f2); // a second frame makes it a real sequence
+        let mut app = ExrApp::default();
+        app.detect_sequence(&f1);
+        app.playback.current_frame = 1;
+
+        let beauty = std::sync::Arc::new(ExrData::load_beauty(&f1).unwrap());
+        app.frame_cache.insert(crate::cache::Slot::A, 1, beauty);
+        app.exr_data = app.frame_cache.peek(crate::cache::Slot::A, 1);
+        app.playback.start_playing(std::time::Instant::now());
+
+        app.playback_toggle(); // play → pause triggers the settle
+        assert_eq!(app.playback.state, PlayState::Paused);
+        assert_eq!(
+            app.playback.pending,
+            Some(1),
+            "pausing on a beauty frame awaits its full re-decode"
+        );
     }
 
     #[test]
