@@ -7,7 +7,7 @@
 
 **Floki** is a fast, hardware-accelerated Rust GUI application tailored for Technical Directors, Compositors, and LookDev Artists who need to deeply inspect and compare multi-layered OpenEXR files. 
 
-Powered by `egui`, `wgpu`, and the pure-Rust `exr` crate, it allows you to instantly view dense pixel data, isolate color channels, explore unbounded floating-point histograms, perform pixel-perfect A/B diffing, and **play image sequences in real time** — all natively on your GPU.
+Powered by `egui`, `wgpu`, and the pure-Rust `exr` crate, it allows you to instantly view dense pixel data, isolate color channels, explore unbounded floating-point histograms, and perform pixel-perfect A/B diffing — all rendered natively on your GPU — as well as **play image sequences in real time**.
 
 ![Floki viewer](assets/floki_1-7-0_base.png)
 
@@ -59,7 +59,7 @@ Comparison controls follow a two-tier toolbar: the everyday controls stay on a s
 * **Channel Isolation:** Quickly isolate `R`, `G`, `B`, `A`, or view `RGB` composite with single-key shortcuts.
 
 ### Color Management
-* **OpenColorIO (always on):** Color management is mandatory and built in — point Floki at an OCIO config and pick the display/view transform to see your footage in the right space by default. The transform runs on the GPU and can optionally be baked to a 3D LUT for smoother pan/zoom on weaker GPUs.
+* **OpenColorIO (built in):** OCIO is compiled into every build — there is no non-OCIO build. Point Floki at a config and pick the display/view transform to see your footage in the right space; it auto-enables when a config loads and can be toggled on/off from **Color Management**. The transform runs on the GPU and can optionally be baked to a 3D LUT for smoother pan/zoom on weaker GPUs.
 * **3D LUT Support:** Load Adobe `.cube` 3D LUTs and apply them in real time on the GPU as a display transform, alongside the built-in Exposure/Gamma/sRGB controls.
 
 ### Customizable Viewport Background
@@ -95,7 +95,7 @@ Comparison controls follow a two-tier toolbar: the everyday controls stay on a s
 | `C` | View Full RGB (Color) |
 | `1` | View Image A (when B is loaded) |
 | `2` | View Image B (when B is loaded) |
-| `Space` | Play / pause the sequence — or toggle Blink Mode when no sequence is loaded |
+| `Space` | Play / pause the sequence — or, with no sequence loaded, toggle Blink Mode (requires a reference Image B) |
 | `←` / `→` | Step one frame back / forward (sequence) |
 | `I` / `O` | Set the in / out trim point to the playhead (sequence) |
 | `Cmd/Ctrl + Shift + S` | Snapshot the current view to the clipboard |
