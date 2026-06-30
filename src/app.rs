@@ -352,7 +352,7 @@ impl Default for ExrApp {
             playback: crate::playback::Playback::default(),
             frame_cache: crate::cache::FrameCache::new(),
             // Conservative starting budget until the first frame is measured and
-            // `budget::max_t1` recomputes it from real RAM headroom.
+            // `budget::max_t1` recomputes it from a slice of free RAM.
             frame_cache_cap: 8,
             frame_bytes: None,
             inflight: std::collections::HashSet::new(),

@@ -42,10 +42,14 @@ From `sysinfo` `sys_total` / `sys_used` in `Sample`. Requires a new **`ExrData::
 (sum of physical channel buffers × sample size) — no per-frame accounting exists today.
 
 ```
-ram_budget = sys_total × headroom − sys_used
-max_t1     = floor(ram_budget / measured_t1)   # measure measured_t1 once on the first real frame;
-                                               # sequences are homogeneous
+ram_budget = (sys_total − sys_used) × free_pct   # a slice of *free* RAM, not of total
+max_t1     = floor(ram_budget / measured_t1)     # measure measured_t1 once on the first real frame;
+                                                 # sequences are homogeneous
 ```
+
+Sized from *free* RAM (not `total × headroom − used`) on purpose: when other apps hold most of the
+machine, a total-based ceiling collapses the ring to near-zero even with tens of GB physically free.
+A free-relative slice keeps a usable read-ahead window and shrinks smoothly under external pressure.
 
 ## Windows differ — T1 vs T2
 
