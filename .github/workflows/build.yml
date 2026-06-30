@@ -3,14 +3,25 @@ name: Build
 on:
   push:
     branches: [ "main" ]
+    # Skip the build for docs-only pushes (the `v*` release tags below are
+    # unaffected — their `chore(release)` commit touches Cargo.toml/lock).
+    # `paths-ignore` only skips when *every* changed file matches, so a push
+    # that also touches code still builds.
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'assets/**'
+      - 'LICENSE'
     tags:
       - 'v*'
   pull_request:
     branches: [ "main" ]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'assets/**'
+      - 'LICENSE'
   workflow_dispatch:
-
-permissions:
-  contents: write
 
 env:
   CARGO_TERM_COLOR: always
