@@ -7,7 +7,7 @@
 
 **Floki** is a fast, hardware-accelerated Rust GUI application tailored for Technical Directors, Compositors, and LookDev Artists who need to deeply inspect and compare multi-layered OpenEXR files. 
 
-Powered by `egui`, `wgpu`, and the pure-Rust `exr` crate, it allows you to instantly view dense pixel data, isolate color channels, explore unbounded floating-point histograms, and perform pixel-perfect A/B diffing natively on your GPU.
+Powered by `egui`, `wgpu`, and the pure-Rust `exr` crate, it allows you to instantly view dense pixel data, isolate color channels, explore unbounded floating-point histograms, perform pixel-perfect A/B diffing, and **play image sequences in real time** — all natively on your GPU.
 
 ![Floki viewer](assets/floki_1-7-0_base.png)
 
@@ -18,6 +18,18 @@ Powered by `egui`, `wgpu`, and the pure-Rust `exr` crate, it allows you to insta
 ### Hardware-Accelerated Rendering
 * **Vulkan/Metal/DX12 Backend:** All image exposure scaling, gamma correction, sRGB mapping, and A/B difference matte compositing are executed via custom WGSL shaders on the GPU.
 * **GPU-Required Pipeline:** All rendering runs on the GPU via `wgpu` (Vulkan/Metal/DX12); a working GPU and driver are required to launch. *(An internal CPU render path exists for contact-sheet thumbnails and headless tests — it is not a runtime fallback for a missing GPU.)*
+
+### Image-Sequence Playback
+Open one frame of a numbered sequence (e.g. `render.0101.exr`) and play the whole shot — Floki is a review player, not just a still viewer.
+* **Transport & timeline:** Play/pause, step, reverse, and stop-in-place, with a scrubber/timeline that highlights the trimmed region and marks any missing frames (holes). Editable target fps with a live measured-fps readout.
+* **Loop & pacing:** Loop, Once, or Ping-Pong; choose **Stutter** (play every frame; fps drops under load) or **Drop-frames** (hold the wall-clock rate; skip frames) pacing.
+* **In/out trim:** Set in/out points to review just a section — the cache and playback respect the trim.
+* **Smart cache:** A byte-budgeted ring keeps decoded frames resident in RAM and pre-uploaded to the GPU within a *live* memory budget, so scrub-backs and loops are instant and playback degrades gracefully instead of crashing under memory pressure.
+* **Beauty-only fast decode:** While playing, only the beauty/first layer is decoded for a much faster, lighter cache on heavy multi-part AOV EXRs; the paused frame re-decodes in full so the pixel readout and AOV switch stay accurate.
+* **Eager precache:** Optionally cache the whole in/out range up front — a green fill bar under the scrubber shows what's resident — so the span plays and loops with the decoder idle.
+* **Live render-watch:** Watch the sequence folder and pick up frames as a render writes them (new frames extend the range; re-rendered frames refresh), optionally parking the playhead on the newest frame.
+
+<!-- TODO(1.9.0): add a playback/transport screenshot, e.g. assets/floki_1-9-0_playback.png -->
 
 ### Deep Inspection
 * **Precision Pixel Sampling:** Hover over any pixel to reveal exact floating-point values (R, G, B, A) regardless of bit-depth (F16, F32, U32).
@@ -47,10 +59,11 @@ Comparison controls follow a two-tier toolbar: the everyday controls stay on a s
 * **Channel Isolation:** Quickly isolate `R`, `G`, `B`, `A`, or view `RGB` composite with single-key shortcuts.
 
 ### Color Management
-* **3D LUT Support:** Load Adobe `.cube` 3D LUTs and apply them in real time on the GPU as a display transform, alongside the built-in Exposure/Gamma/sRGB controls (OCIO config path is also configurable).
+* **OpenColorIO (always on):** Color management is mandatory and built in — point Floki at an OCIO config and pick the display/view transform to see your footage in the right space by default. The transform runs on the GPU and can optionally be baked to a 3D LUT for smoother pan/zoom on weaker GPUs.
+* **3D LUT Support:** Load Adobe `.cube` 3D LUTs and apply them in real time on the GPU as a display transform, alongside the built-in Exposure/Gamma/sRGB controls.
 
 ### Customizable Viewport Background
-* **Background Modes:** Replace the default transparency checkerboard with a checkerboard (custom cell colours and size), a solid colour, or a multi-stop gradient at any angle — set from **View ▸ Viewport Background**. Save named presets that persist across sessions. The background composites consistently across the GPU, CPU, and OCIO paths.
+* **Background Modes:** Replace the default transparency checkerboard with a checkerboard (custom cell colours and size), a solid colour, or a multi-stop gradient at any angle — set from **View ▸ Viewport Background**. Save named presets that persist across sessions. The background composites consistently across the GPU and OCIO display paths.
 
 ### Snapshot & Review
 * **Snapshot to Clipboard:** Copy exactly what's on screen to the system clipboard with `Cmd/Ctrl + Shift + S` (or **View ▸ Snapshot to Clipboard**) — background, compare mode, OCIO, and annotations all included. Optionally also save a timestamped PNG to `~/.floki/snapshots/`.
@@ -82,7 +95,9 @@ Comparison controls follow a two-tier toolbar: the everyday controls stay on a s
 | `C` | View Full RGB (Color) |
 | `1` | View Image A (when B is loaded) |
 | `2` | View Image B (when B is loaded) |
-| `Space` | Toggle Blink Mode (Strobes between A and B) |
+| `Space` | Play / pause the sequence — or toggle Blink Mode when no sequence is loaded |
+| `←` / `→` | Step one frame back / forward (sequence) |
+| `I` / `O` | Set the in / out trim point to the playhead (sequence) |
 | `Cmd/Ctrl + Shift + S` | Snapshot the current view to the clipboard |
 | `Esc` | Cancel the active annotation tool (or exit fullscreen) |
 | `Shift + Click` | Sample pixel and save to swatch palette |
@@ -197,6 +212,15 @@ standalone `floki-ocio` crate that wraps OpenColorIO.
 **Color management**
 - **`color/cube.rs`** — Adobe `.cube` 3D-LUT parsing.
 - **`floki-ocio/`** — a standalone crate wrapping OpenColorIO over FFI, with a GLSL→WGSL shader transpiler; always linked (the `system-ocio` / `vendored` features select the native backend).
+
+**Sequence playback**
+- **`sequence.rs`** — numbered-sequence detection: parsing, numeric sort, and hole detection.
+- **`playback.rs`** — the transport state machine (playhead, loop modes, in/out trim, pacing) and the pure frame-advance logic.
+- **`scheduler.rs`** — the pure decode want-list / next-frame scheduler (priority order, prefetch window).
+- **`cache.rs`** — the byte-budgeted T1 ring of decoded frames with directional-ring + LRU eviction.
+- **`budget.rs`** — the RAM/VRAM budget math sizing the T1/T2 rings from a live memory sample.
+- **`proxy.rs`** — the low-res first-paint proxy (fast subsampled EXR read).
+- **`layer.rs`** — the pure comp layer-stack model backing A/B compare (the spine for N-way / locked-step).
 
 **Tooling & CLI**
 - **`tools.rs`** — the multi-threaded EXR Header Converter (batch channel renaming via `rayon`) with progress reporting and `RUST_LOG` logging.
