@@ -93,7 +93,23 @@ resident):**
   smooth playback. The free-RAM model yields 27 frames where the old total-ceiling model gave ~20 —
   graceful degradation on a small machine, as intended.
 
-### 3. Beauty-only fast decode for playback T1 (decode-wall lever; likely do before #94)
+### 3. Beauty-only fast decode for playback T1 — **implemented** (`feat/beauty-only-decode`)
+
+> Built: `ExrData::load_beauty` reads the **first valid layer** via the `exr` crate's
+> `first_valid_layer()`, which block-filters every other part — so multi-part AOV EXRs skip
+> decompressing the AOV parts entirely (decode-time + resident-bytes win). A single-part
+> multichannel file still decompresses its one part (all channels share blocks), so the win there is
+> only the discarded per-channel copy; this is the honest limit of channel selection in scanline EXR.
+> The playback ring decodes beauty-only **while the clock advances and the viewer shows the beauty
+> layer** (`decode_beauty_only` gate); a non-beauty active AOV or the `beauty_preview` kill-switch
+> forces full decode. On settle (pause / boundary stop / scrub), `settle_to_full` re-decodes the
+> playhead in full so the readout + AOV switch see every channel (coheres with #127/INV-SAMPLE). The
+> T1 RAM budget is sized only from *full* frames, so beauty frames never over-fill. The
+> "hold-more-frames" budget win (size the cap by the smaller beauty frame while moving) is a
+> follow-up — this lands the decode-wall win first.
+
+Original sizing notes (kept for reference):
+
 
 The single biggest cost in both decode time *and* T1 size is that every frame decodes **all AOVs**
 (~1.3 GB resident for a 500 MB file). For *playback preview* only the beauty/active layer is shown.
