@@ -126,7 +126,24 @@ The single biggest cost in both decode time *and* T1 size is that every frame de
 - Pure-ish: the partial-read path is unit-testable on a fixture EXR; the play/pause decode-mode switch
   needs manual verification. Arguably **higher-leverage and lower-effort than #94** — sequence it first.
 
-### 4. Eager precache + cache-fill indicator (PDplayer / OpenRV-style)
+### 4. Eager precache + cache-fill indicator — **implemented** (`feat/eager-precache`)
+
+> Built: a **Precache** transport toggle (persisted, default off). When on, `pump_decode` fills the
+> whole budget (`frame_cache_cap − 1`, dropping the 16-frame window cap) playing *or* paused, so the
+> want-list naturally requests every in-range frame nearest-first; `tick_precache` kicks the fill
+> while idle and the chain self-sustains from `apply_load_result`. Bounded by RAM: it fills to the
+> cap and **latches** (`precache_filled`, reset on playhead/range move) so a range larger than the
+> budget doesn't churn on the live cap's edge wobble (re-decoding an evicted frame every tick) — it
+> fills what fits and stops, so the resident span is honest. The **cache-fill bar** is
+> a green strip along the bottom of the scrubber/timeline showing per-frame **T1** residency.
+> Composes with beauty-only (step 3): precache prefetches frames **beauty-only** for future playback
+> while the settled playhead stays **full** (per-frame `decode_beauty_only(frame)` gate) — so a whole
+> shot's worth of small beauty frames can go green in RAM, then loops glass-smooth. (T2-residency
+> overlay on the bar and a "hold-more-frames" budget that sizes the cap by the beauty frame are
+> follow-ups.)
+
+Original design notes (kept for reference):
+
 
 Today the scheduler prefetches a *sliding window* ahead of the playhead (#57 decode-ahead). Review
 tools also offer an **eager precache**: fill the whole in/out range into the cache up front, so once

@@ -89,11 +89,17 @@ impl FrameCache {
     /// The set of resident frame numbers for a slot (input to the scheduler).
     #[must_use]
     pub fn resident(&self, slot: Slot) -> HashSet<u32> {
+        self.resident_frames(slot).collect()
+    }
+
+    /// Resident frame numbers for a slot, **without allocating** — for callers
+    /// that only iterate (the timeline cache-fill bar, #56 step 4, on every
+    /// repaint). Order is unspecified.
+    pub fn resident_frames(&self, slot: Slot) -> impl Iterator<Item = u32> + '_ {
         self.entries
             .keys()
-            .filter(|(s, _)| *s == slot)
+            .filter(move |(s, _)| *s == slot)
             .map(|(_, f)| *f)
-            .collect()
     }
 
     pub fn clear(&mut self) {

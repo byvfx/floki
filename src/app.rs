@@ -212,6 +212,26 @@ pub struct ExrApp {
     #[serde(default = "ret_true")]
     beauty_preview: bool,
 
+    /// Eager precache (#56, hardening step 4): fill the whole in/out range into
+    /// the T1 ring up front — not just the decode-ahead window — so the cached
+    /// span plays *and loops* with the decoder idle (PDplayer / OpenRV-style).
+    /// Bounded by the live RAM budget: it fills to `frame_cache_cap` and the
+    /// cache-fill bar under the scrubber shows the resident span; it never
+    /// pretends to hold what won't fit. Off by default (it eagerly commits RAM);
+    /// an explicit transport toggle. Persisted.
+    #[serde(default)]
+    precache: bool,
+
+    /// Runtime latch: set once eager precache (#56, step 4) has filled the in/out
+    /// range as far as the RAM budget allows, so `tick_precache` stops re-pumping.
+    /// Without it, a range larger than the budget churns — the live cap wobbles by
+    /// a frame at the edge and the evicted frame is re-requested every tick
+    /// (decode→evict→repeat). Reset whenever the playhead moves or the range
+    /// changes (`invalidate_inflight`, `advance_playhead`, enabling precache), so
+    /// the new window refills. Never persisted.
+    #[serde(skip)]
+    precache_filled: bool,
+
     /// Render-watch (#101): poll the sequence directory and pick up frames as a
     /// render writes them — new frames extend the range, re-rendered frames drop
     /// from cache and re-decode. Off by default (it costs a periodic `read_dir`,
@@ -384,6 +404,8 @@ impl Default for ExrApp {
             save_snapshots: false,
             t2_enabled: true,
             beauty_preview: true,
+            precache: false,
+            precache_filled: false,
             watch_enabled: false,
             watch_follow: false,
             watch_sigs: Vec::new(),
@@ -881,6 +903,8 @@ impl ExrApp {
         // frame numbers); `enter`/`clear` bump the epoch so their results are
         // dropped. `loading_a` is left to `open_file`, which owns this open.
         self.inflight.clear();
+        // A new sequence resets the precache fill latch (#56, step 4).
+        self.precache_filled = false;
         // A new sequence (or a lone image) invalidates the watch baseline; the
         // next poll re-baselines against the freshly-opened group.
         self.watch_sigs.clear();
@@ -941,15 +965,25 @@ impl ExrApp {
         self.frame_cache_cap.saturating_sub(1).min(MAX_PREFETCH)
     }
 
-    /// Whether the next playback decode should be **beauty-only** (#56, hardening
-    /// step 3). True only while the clock is advancing *and* the viewer is showing
-    /// the beauty/first layer — a beauty-only frame holds just that layer, so it
-    /// would be wrong to serve a different active AOV from it. Paused/scrubbing
-    /// decodes (and any non-beauty active layer) stay full so sampling and AOV
-    /// switching are correct (INV-SAMPLE, #7). The `beauty_preview` kill-switch
-    /// forces always-full.
-    fn decode_beauty_only(&self) -> bool {
-        self.beauty_preview && self.playback.is_playing() && self.viewer.active_layer == 0
+    /// Whether decoding `frame` should be **beauty-only** (#56, hardening step 3).
+    /// Requires the `beauty_preview` kill-switch on and the viewer showing the
+    /// beauty/first layer — a beauty-only frame holds just that layer, so it would
+    /// be wrong to serve a different active AOV from it. Then:
+    ///
+    /// - **Playing** → every ring frame is beauty (the readout is suppressed while
+    ///   moving, so the other AOVs aren't needed — INV-SAMPLE, #7).
+    /// - **Settled + precache** (#56, step 4) → the *prefetched* frames are beauty
+    ///   for future playback, but the playhead itself stays **full** so its
+    ///   sampling + AOV switch are correct.
+    /// - Otherwise (a plain paused/scrubbing decode) → full.
+    fn decode_beauty_only(&self, frame: u32) -> bool {
+        if !self.beauty_preview || self.viewer.active_layer != 0 {
+            return false;
+        }
+        if self.playback.is_playing() {
+            return true;
+        }
+        self.precache && frame != self.playback.current_frame
     }
 
     /// Decode-ahead pump (#57): with at most one sequence decode outstanding,
@@ -962,45 +996,54 @@ impl ExrApp {
         if !self.playback.is_active() || !self.inflight.is_empty() || self.loading_a {
             return;
         }
-        // Prefetch only while playing; paused/scrubbing decodes just the playhead.
-        let depth = if self.playback.is_playing() {
+        // Precache (#56, step 4): fill the whole budget (no 16-frame window cap),
+        // playing or paused, so the in/out range goes fully resident. Otherwise
+        // prefetch the sliding window while playing; paused decodes just the
+        // playhead.
+        let depth = if self.precache {
+            self.frame_cache_cap.saturating_sub(1)
+        } else if self.playback.is_playing() {
             self.prefetch_depth()
         } else {
             0
         };
-        let resident = self.frame_cache.resident(crate::cache::Slot::A);
-        let wants = crate::scheduler::want_list(
+        // The single highest-priority frame to fetch: allocation-free and
+        // short-circuiting (it skips holes via the decodable predicate), so a
+        // large precache depth doesn't build a full want-list every pump.
+        let want = crate::scheduler::next_want(
             self.playback.current_frame,
             self.playback.in_point,
             self.playback.out_point,
             self.playback.direction,
             self.playback.loop_mode,
-            &resident,
             depth,
+            |f| self.frame_cache.contains(crate::cache::Slot::A, f),
+            |f| self.playback.frame_path(f).is_some(),
         );
-        // Submit the first want that has a real file (skip holes).
-        for w in wants {
-            let Some(path) = self.playback.frame_path(w).map(Path::to_path_buf) else {
-                continue; // a hole — nothing to decode there.
-            };
-            self.inflight.insert(w);
-            // The awaited playhead drives the "loading" state; prefetch is silent.
-            if Some(w) == self.playback.pending {
-                self.loading_a = true;
-            }
-            let tx = self.ensure_worker();
-            let _ = tx.send(LoadJob {
-                path,
-                is_b: false,
-                seq_frame: true,
-                frame: w,
-                epoch: self.playback.epoch,
-                // Seq-frames supersede by epoch, not open generation.
-                open_gen: 0,
-                beauty_only: self.decode_beauty_only(),
-            });
-            break;
+        let Some(w) = want else {
+            return; // nothing wanted — the window is fully resident.
+        };
+        let path = self
+            .playback
+            .frame_path(w)
+            .map(Path::to_path_buf)
+            .expect("next_want only returns decodable frames");
+        self.inflight.insert(w);
+        // The awaited playhead drives the "loading" state; prefetch is silent.
+        if Some(w) == self.playback.pending {
+            self.loading_a = true;
         }
+        let tx = self.ensure_worker();
+        let _ = tx.send(LoadJob {
+            path,
+            is_b: false,
+            seq_frame: true,
+            frame: w,
+            epoch: self.playback.epoch,
+            // Seq-frames supersede by epoch, not open generation.
+            open_gen: 0,
+            beauty_only: self.decode_beauty_only(w),
+        });
     }
 
     /// Pre-upload T2 GPU textures (#56) for the on-screen frame and the next few
@@ -1047,6 +1090,8 @@ impl ExrApp {
         self.inflight.clear();
         self.loading_a = false;
         self.playback.pending = None;
+        // The playhead/range moved — the precache window shifts, so let it refill.
+        self.precache_filled = false;
     }
 
     /// Step the playhead by `delta` frames, clamped to the in/out range (no
@@ -1184,6 +1229,8 @@ impl ExrApp {
     /// so tests can drive playback frame-by-frame.
     fn advance_playhead(&mut self) -> bool {
         if self.step_playhead() {
+            // The playhead advanced — the precache window shifts ahead of it.
+            self.precache_filled = false;
             self.request_sequence_frame(self.playback.current_frame);
             true
         } else {
@@ -1195,6 +1242,27 @@ impl ExrApp {
     /// to the next frame once its absolute deadline (`anchor + n·period`) passes —
     /// drift-free pacing. Decode-bound playback (stutter) naturally drops the
     /// effective fps: the next request waits for the previous frame to land.
+    /// Drive eager precache (#56, step 4) while idle. `pump_decode` already fills
+    /// the whole budget when `precache` is on (playing or not), and chains itself
+    /// from `apply_load_result` as each frame lands; this kicks that chain when
+    /// the app is otherwise idle (paused) and keeps the frame loop alive until the
+    /// resident span covers the budget. A no-op once the range is fully cached.
+    fn tick_precache(&mut self, ctx: &egui::Context) {
+        if !self.precache || !self.playback.is_active() || self.precache_filled {
+            return;
+        }
+        self.pump_decode();
+        if self.inflight.is_empty() {
+            // Nothing left to fetch within the budget — the resident span is as
+            // full as it fits. Latch so we stop re-pumping (and re-evicting) until
+            // the playhead moves; otherwise a range larger than RAM churns on the
+            // budget's edge wobble.
+            self.precache_filled = true;
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
+    }
+
     fn tick_playback(&mut self, ctx: &egui::Context) {
         use crate::playback::{Pacing, PlayState};
         if !self.playback.is_active() || self.playback.state != PlayState::Playing {
@@ -1928,6 +1996,9 @@ impl eframe::App for ExrApp {
         // sequence is loaded, so single-image behavior is unchanged.
         self.handle_playback_keys(ui.ctx());
         self.tick_playback(ui.ctx());
+        // Eager precache (#56, step 4): fill the in/out range while idle when the
+        // user has enabled it. No-op unless precache is on and a sequence loaded.
+        self.tick_precache(ui.ctx());
         // Pick up frames a render writes while we're open (#101); no-op unless the
         // user enabled Watch and a sequence is loaded.
         self.tick_render_watch(ui.ctx());
@@ -1970,8 +2041,10 @@ impl ExrApp {
                 LoadMsg::Loaded(res) => self.apply_load_result(*res),
             }
         }
-        if self.loading_a || self.loading_b {
+        if self.loading_a || self.loading_b || !self.inflight.is_empty() {
             // egui is reactive; keep polling the worker until the decode lands.
+            // `inflight` covers silent precache prefetch (#56, step 4), which
+            // doesn't set `loading_a` but still has results to drain.
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
 
@@ -2979,6 +3052,28 @@ impl ExrApp {
 
                 ui.separator();
 
+                // Eager precache kill-switch (#56, step 4). On → fill the whole
+                // in/out range into the ring up front (bounded by RAM); the
+                // cache-fill bar under the scrubber shows how much is resident.
+                if ui
+                    .checkbox(&mut self.precache, "Precache")
+                    .on_hover_text(
+                        "Cache the whole in/out range up front so it plays and \
+                         loops with no decoding. Fills to the RAM budget; the bar \
+                         under the scrubber shows the cached span.",
+                    )
+                    .changed()
+                    && self.precache
+                {
+                    // Kick the fill immediately; the chain self-sustains from
+                    // `apply_load_result` as each frame lands.
+                    self.precache_filled = false;
+                    self.pump_decode();
+                    ui.ctx().request_repaint();
+                }
+
+                ui.separator();
+
                 // Render-watch (#101): pick up frames as a render writes them.
                 if ui
                     .checkbox(&mut self.watch_enabled, "Watch")
@@ -3054,6 +3149,29 @@ impl ExrApp {
                 egui::pos2(x_of(out_pt), rect.bottom()),
             );
             painter.rect_filled(trim, 3.0, visuals.selection.bg_fill.gamma_multiply(0.4));
+            // Cache-fill bar (#56, step 4): a thin green strip along the bottom of
+            // the track marking which frames are resident in the T1 ring. Each
+            // resident frame fills its own equal slot (`[f, f+1)` over `span + 1`
+            // slots, so the last frame `hi` gets a real slot too) — contiguous
+            // residency reads as one solid bar; the gap to a full green bar is the
+            // part of the range that doesn't fit the RAM budget (or hasn't decoded
+            // yet). `resident_frames` is allocation-free for this per-repaint walk.
+            let strip_top = rect.bottom() - 4.0;
+            let nslots = f64::from(span) + 1.0; // frames lo..=hi inclusive
+            let slot_x = |f: u32| {
+                rect.left() + ((f64::from(f.saturating_sub(lo)) / nslots) as f32) * rect.width()
+            };
+            let fill = egui::Color32::from_rgb(64, 168, 96);
+            for f in self.frame_cache.resident_frames(crate::cache::Slot::A) {
+                if f < in_pt || f > out_pt {
+                    continue; // only the trimmed range is the precache target
+                }
+                let seg = egui::Rect::from_min_max(
+                    egui::pos2(slot_x(f), strip_top),
+                    egui::pos2(slot_x(f + 1).min(rect.right()), rect.bottom()),
+                );
+                painter.rect_filled(seg, 0.0, fill);
+            }
             // Holes: distinct vertical marks across the full span.
             if let Some(seq) = self.playback.sequence.as_ref() {
                 let hole_color = egui::Color32::from_rgb(206, 92, 60);
@@ -4273,26 +4391,123 @@ mod tests {
         let mut app = ExrApp::default();
         app.detect_sequence(&dir.path().join("s.0001.exr"));
 
-        // Stopped → full decode (the readout/AOV switch need all channels).
-        assert!(!app.decode_beauty_only(), "not playing ⇒ full decode");
+        let cur = app.playback.current_frame; // playhead (frame 1)
+        let ahead = cur + 1; // a prefetch frame
+
+        // Stopped, no precache → full decode for every frame (readout/AOV need
+        // all channels).
+        assert!(!app.decode_beauty_only(cur), "not playing ⇒ full decode");
+        assert!(!app.decode_beauty_only(ahead), "not playing ⇒ full decode");
 
         app.playback_toggle(); // start playing
         assert!(app.playback.is_playing());
         app.viewer.active_layer = 0;
         assert!(
-            app.decode_beauty_only(),
+            app.decode_beauty_only(cur),
             "playing + beauty layer ⇒ beauty-only"
         );
 
         // Viewing a non-beauty AOV: a beauty-only frame wouldn't carry it, so
         // playback stays full-decode for correctness.
         app.viewer.active_layer = 2;
-        assert!(!app.decode_beauty_only(), "non-beauty active layer ⇒ full");
+        assert!(
+            !app.decode_beauty_only(cur),
+            "non-beauty active layer ⇒ full"
+        );
 
         // Kill-switch forces always-full.
         app.viewer.active_layer = 0;
         app.beauty_preview = false;
-        assert!(!app.decode_beauty_only(), "kill-switch off ⇒ full");
+        assert!(!app.decode_beauty_only(cur), "kill-switch off ⇒ full");
+
+        // Precache while *settled* (#56, step 4): prefetched frames decode beauty
+        // for future playback, but the playhead itself stays full so its sampling
+        // + AOV switch are correct.
+        app.beauty_preview = true;
+        app.playback.state = PlayState::Paused;
+        app.precache = true;
+        assert!(
+            !app.decode_beauty_only(cur),
+            "precache: the settled playhead stays full"
+        );
+        assert!(
+            app.decode_beauty_only(ahead),
+            "precache: prefetched frames are beauty for future playback"
+        );
+    }
+
+    #[test]
+    fn precache_prefetches_the_range_while_paused() {
+        let dir = tempfile::tempdir().unwrap();
+        let f1 = dir.path().join("s.0001.exr");
+        write_rgba_exr(&f1);
+        for n in 2..=5 {
+            write_rgba_exr(&dir.path().join(format!("s.000{n}.exr")));
+        }
+        let mut app = ExrApp::default();
+        app.detect_sequence(&f1);
+        app.frame_cache_cap = 8; // budget comfortably exceeds the 5-frame range
+        // Playhead (frame 1) resident, so it isn't what gets pumped.
+        app.frame_cache.insert(
+            crate::cache::Slot::A,
+            1,
+            std::sync::Arc::new(ExrData::load(&f1).unwrap()),
+        );
+        assert_eq!(app.playback.current_frame, 1);
+        app.playback.state = PlayState::Paused;
+
+        // A plain paused decode prefetches nothing (just the playhead, already here).
+        app.precache = false;
+        app.pump_decode();
+        assert!(
+            app.inflight.is_empty(),
+            "paused + no precache ⇒ no prefetch"
+        );
+
+        // Precache fills ahead into the range even while paused.
+        app.precache = true;
+        app.pump_decode();
+        assert!(
+            app.inflight.contains(&2),
+            "precache prefetches the next in-range frame while paused"
+        );
+    }
+
+    #[test]
+    fn precache_latches_when_filled_and_resets_on_playhead_move() {
+        let dir = tempfile::tempdir().unwrap();
+        let f1 = dir.path().join("s.0001.exr");
+        write_rgba_exr(&f1);
+        for n in 2..=3 {
+            write_rgba_exr(&dir.path().join(format!("s.000{n}.exr")));
+        }
+        let mut app = ExrApp::default();
+        app.detect_sequence(&f1);
+        app.frame_cache_cap = 8; // the 3-frame range fits comfortably
+        app.precache = true;
+
+        // Whole range resident → tick_precache finds nothing to fetch and latches,
+        // so it stops re-pumping (and the decode→evict churn stops).
+        for n in 1..=3 {
+            app.frame_cache.insert(
+                crate::cache::Slot::A,
+                n,
+                std::sync::Arc::new(ExrData::load(&f1).unwrap()),
+            );
+        }
+        let ctx = egui::Context::default();
+        app.tick_precache(&ctx);
+        assert!(
+            app.precache_filled,
+            "latches once the range is fully resident"
+        );
+        // Latched: a second tick submits nothing.
+        app.tick_precache(&ctx);
+        assert!(app.inflight.is_empty(), "no churn while latched");
+
+        // A scrub (playhead move) clears the latch so the new window refills.
+        app.playback_scrub_to(2);
+        assert!(!app.precache_filled, "playhead move clears the latch");
     }
 
     #[test]
@@ -4322,7 +4537,7 @@ mod tests {
             "readout suppressed until the full frame lands"
         );
         // And the re-decode it pumped is a *full* decode, not beauty-only.
-        assert!(!app.decode_beauty_only());
+        assert!(!app.decode_beauty_only(app.playback.current_frame));
 
         // Deliver the full frame: cache upgrades, sampling re-enables.
         let full = ExrData::load(&f1).unwrap();
