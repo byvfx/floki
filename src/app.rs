@@ -3328,6 +3328,9 @@ impl ExrApp {
                     self.viewer.lut_domain_max = self.lut_domain_max;
                     self.viewer.ocio_active = self.ocio_enabled && self.ocio_ready;
                     self.viewer.ocio_render_gen = self.ocio_render_gen;
+                    // INV-SAMPLE (#7): suppress the pixel readout while a sequence
+                    // is advancing or a seek's frame is still in flight.
+                    self.viewer.suppress_sampling = self.playback.sampling_suppressed();
                     // Diff controls: push the persisted state into the viewer, let
                     // the mode-param UI mutate it during `ui`, then read it back so
                     // `save` persists the latest. Kept identical both ways, so no

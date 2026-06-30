@@ -185,6 +185,19 @@ impl Playback {
         self.state == PlayState::Playing
     }
 
+    /// Whether the pixel readout / color sampler should be suppressed
+    /// (INV-SAMPLE, #7): true while a sequence is loaded **and** either the clock
+    /// is advancing or a seek's frame is still in flight. In both cases the
+    /// displayed frame can lag the playhead, so a sample would either disagree
+    /// with the playhead label or cost a full ~600 MB `ExrData` scan on every
+    /// hover. The readout re-enables once the clock stops and the awaited frame
+    /// has landed (`pending` cleared on swap). Gated on `is_active()` so
+    /// single-image sampling stays live **by construction**.
+    #[must_use]
+    pub fn sampling_suppressed(&self) -> bool {
+        self.is_active() && (self.is_playing() || self.pending.is_some())
+    }
+
     /// Enter sequence mode: adopt `seq`, reset in/out to the full range, place
     /// the playhead at `start` (clamped), and reset the clock. Prefs are kept.
     pub fn enter(&mut self, seq: Sequence, start: u32) {
@@ -305,6 +318,7 @@ impl Playback {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use std::time::Instant;
 
     #[test]
@@ -321,6 +335,46 @@ mod tests {
         assert_eq!(pb.state, PlayState::Stopped);
         assert_eq!(pb.measured_fps, 0.0, "stop clears the stale rate");
         assert!(pb.anchor.is_none());
+    }
+
+    #[test]
+    fn sampling_suppressed_tracks_play_and_pending() {
+        // No sequence loaded → never suppressed, even with state/pending set
+        // (single-image sampling stays live by construction).
+        let mut pb = Playback {
+            state: PlayState::Playing,
+            pending: Some(7),
+            ..Default::default()
+        };
+        assert!(
+            !pb.sampling_suppressed(),
+            "no sequence ⇒ readout always live"
+        );
+
+        // Enter a 2-frame sequence; stopped → live readout.
+        let seq = Sequence {
+            frames: vec![PathBuf::from("f.0001.exr"), PathBuf::from("f.0002.exr")],
+            range: (1, 2),
+            holes: vec![],
+        };
+        pb.enter(seq, 1);
+        assert!(!pb.sampling_suppressed());
+
+        // Advancing clock → suppressed.
+        pb.start_playing(Instant::now());
+        assert!(pb.is_playing());
+        assert!(pb.sampling_suppressed());
+
+        // Paused but a seek's frame is still decoding → still suppressed (the
+        // displayed frame can lag the playhead until it lands).
+        pb.state = PlayState::Paused;
+        pb.pending = Some(2);
+        assert!(pb.sampling_suppressed());
+
+        // Settled: paused and the awaited frame landed (`pending` cleared on swap)
+        // → readout re-enabled.
+        pb.pending = None;
+        assert!(!pb.sampling_suppressed());
     }
 
     #[test]

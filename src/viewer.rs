@@ -399,6 +399,11 @@ pub struct ExrViewer {
     pub last_hover_pos_img: Option<(usize, usize)>,
     pub last_sampled_val_a: Option<[f32; 4]>,
     pub last_sampled_val_b: Option<[f32; 4]>,
+    /// When set (by the app from `Playback::sampling_suppressed`), the canvas
+    /// pixel readout is suppressed: no sampling, the cached values are cleared so
+    /// the status bar shows nothing stale, and a hover hint explains why
+    /// (INV-SAMPLE, #7). Always false outside sequence playback.
+    pub suppress_sampling: bool,
 
     /// Natural (unclipped) height of the contextual mode-param row, recorded each
     /// frame it renders so the slide-in animation knows how far to grow. Transient
@@ -522,6 +527,7 @@ impl Default for ExrViewer {
             last_hover_pos_img: None,
             last_sampled_val_a: None,
             last_sampled_val_b: None,
+            suppress_sampling: false,
             row2_full_height: 0.0,
             last_canvas_rect: None,
             last_image_rect: None,
@@ -2126,6 +2132,23 @@ impl ExrViewer {
         tex_size: egui::Vec2,
         tex_size_b: Option<egui::Vec2>,
     ) {
+        // INV-SAMPLE (#7): while a sequence is advancing (or a seek's frame is
+        // still decoding), suppress the readout — the displayed frame can lag the
+        // playhead and sampling a full ~600 MB `ExrData` on every hover is
+        // wasteful. Clear the cached sample so the status bar shows nothing stale,
+        // and hint why. Re-enables automatically once paused and the frame lands.
+        if self.suppress_sampling {
+            self.last_hover_pos_img = None;
+            self.last_sampled_val_a = None;
+            self.last_sampled_val_b = None;
+            if self.show_tooltip {
+                response
+                    .clone()
+                    .on_hover_text_at_pointer("readout paused during playback / seek");
+            }
+            return;
+        }
+
         let mut hovered_pixel = None;
         if let Some(pos) = response.hover_pos() {
             let mut hover_x = None;
