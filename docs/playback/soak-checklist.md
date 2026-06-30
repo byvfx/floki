@@ -1,9 +1,11 @@
 # Playback soak checklist (#100 validation)
 
-> Run this **before** building #94. It validates the shipped player (#7 Phases 0–5 + the INV-SAMPLE
-> gap-close #127 + the debug overlay #128) on real footage, on both budget regimes. The goal is to
-> turn "playback works on my test clip" into "playback holds under the flagged risks" — and to file
-> every failure as a **#99 blocker** before more features land on top.
+> Run this **before** building #94. It validates the sequence player (#7 Phases 0–5) plus the debug
+> overlay (#128, shipped) on real footage, on both budget regimes. The **INV-SAMPLE suppression**
+> checks below land with #127 (recovered as #131) — run that section once it's merged; until then the
+> readout samples on every hover. The goal is to turn "playback works on my test clip" into "playback
+> holds under the flagged risks" — and to file every failure as a **#99 blocker** before more features
+> land on top.
 >
 > Sequenced from [hardening-plan.md](hardening-plan.md) step 2. Read [memory-contract](memory-contract.md)
 > (budgets / INV-SAMPLE) and [concurrency-contract](concurrency-contract.md) (epochs) for the *why*
@@ -28,7 +30,8 @@
    | `evictions` | cumulative; **rate** matters — a high steady rate during smooth play = thrash |
    | `dropped-epoch` | superseded decodes; a few per scrub is healthy, a flood = epoch storm |
 
-3. Reset counters by reopening the overlay (evictions/dropped reset on open; fps resets on stop).
+3. The `evictions` / `dropped-epoch` counters reset when a **new sequence is detected** (each freshly
+   opened sequence starts clean); `fps` resets on stop. To zero them mid-soak, re-open the sequence.
 
 ## Footage matrix
 
@@ -86,8 +89,8 @@ These are the four risks called out in the hardening plan. Each gets a deliberat
 
 ## INV-SAMPLE (#127) confirmation
 
-- [ ] **During play**, hover the image: readout shows the suppressed state (`—` / "readout paused
-      during playback / seek"), **not** a live pixel value. No per-hover hitch (no full-frame scan).
+- [ ] **During play**, hover the image: the readout shows **no live pixel value** (a `—` / paused-
+      readout state), and there's no per-hover hitch (no full-frame scan).
 - [ ] **During a pending scrub**, the playhead label and the painted pixels never disagree visibly.
 - [ ] **Paused on a resident frame**, hover: readout is **live** again and matches the displayed frame.
 - [ ] **Pause on an evicted frame** (scrub far, pause): the frame re-decodes (`pending` → resident),
