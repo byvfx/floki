@@ -19,8 +19,16 @@ use crate::resource_monitor::Sample;
 /// GPU OOM, so we stay well under the reported budget proactively.
 pub const VRAM_HEADROOM_PCT: u64 = 80;
 
-/// Percent of total system RAM the T1 ring may claim.
-pub const RAM_HEADROOM_PCT: u64 = 70;
+/// Percent of *currently-free* system RAM the T1 ring may claim, leaving the
+/// rest as headroom for the OS, other apps, and floki's own non-cache memory.
+///
+/// Sized from *free* RAM rather than total deliberately: a "% of total minus
+/// used" model collapses to near-zero the moment other apps push total usage
+/// past the ceiling — on a loaded workstation (e.g. 80+ GB held by other DCC
+/// apps) the cache cratered to ~3 frames while tens of GB sat physically free.
+/// Sizing from free RAM scales the ring with what is actually available and
+/// degrades smoothly under external pressure instead of falling off a cliff.
+pub const RAM_FREE_PCT: u64 = 60;
 
 /// Conservative VRAM budget (bytes) assumed when the platform can't report a GPU
 /// working-set size (`Sample::gpu_budget == None` — non-Metal backends). 1 GiB
@@ -64,10 +72,14 @@ pub fn max_t2(sample: &Sample, width: usize, height: usize) -> usize {
     usize::try_from(available / per_frame).unwrap_or(usize::MAX)
 }
 
-/// Max number of T1 CPU frames (full `ExrData`, all layers) that fit the system
-/// RAM budget remaining after current usage, given one frame's measured size
-/// (`ExrData::approx_bytes()`). Sequences are homogeneous, so a single
-/// measurement sizes the ring.
+/// Max number of T1 CPU frames (full `ExrData`, all layers) that fit a
+/// [`RAM_FREE_PCT`] slice of *currently-free* system RAM, given one frame's
+/// measured size (`ExrData::approx_bytes()`). Sequences are homogeneous, so a
+/// single measurement sizes the ring.
+///
+/// Free RAM is `sys_total - sys_used`; claiming a fraction of it (rather than a
+/// fraction of *total* minus used) keeps the ring usable when external apps hold
+/// most of the machine — see [`RAM_FREE_PCT`] for why.
 ///
 /// Returns `0` if not even one frame fits (caller refuses sequence mode and
 /// shows a single frame — see the memory contract).
@@ -76,8 +88,8 @@ pub fn max_t1(sample: &Sample, frame_bytes: usize) -> usize {
     if frame_bytes == 0 {
         return 0;
     }
-    let available =
-        with_headroom(sample.sys_total, RAM_HEADROOM_PCT).saturating_sub(sample.sys_used);
+    let free = sample.sys_total.saturating_sub(sample.sys_used);
+    let available = with_headroom(free, RAM_FREE_PCT);
     usize::try_from(available / frame_bytes as u64).unwrap_or(usize::MAX)
 }
 
@@ -155,33 +167,46 @@ mod tests {
     }
 
     #[test]
-    fn max_t1_divides_headroomed_ram_by_frame() {
-        // 20 GB total, 4 GB used, 70% headroom = 14 GB; 14-4 = 10 GB free;
-        // 1 GB/frame -> 10 frames.
+    fn max_t1_takes_a_slice_of_free_ram() {
+        // 20 GB total, 4 GB used -> 16 GB free; 60% of free = 9.6 GB;
+        // 1 GB/frame -> 9 frames.
         let s = sample(20_000_000_000, 4_000_000_000, None, None);
-        assert_eq!(max_t1(&s, 1_000_000_000), 10);
+        assert_eq!(max_t1(&s, 1_000_000_000), 9);
+    }
+
+    #[test]
+    fn max_t1_sizes_from_free_ram_not_a_total_ceiling() {
+        // Regression for the loaded-workstation cliff: 128 GB machine with
+        // ~89.7 GB held by *other* apps still has ~38.2 GB physically free.
+        // The old "70% of total - used" model returned ~0 here (89.7 GB is past
+        // the 89.5 GB ceiling), collapsing the ring to a handful of frames.
+        // Sizing from free RAM keeps a real read-ahead window: 38.2 GB free *
+        // 60% = 22.92 GB; 1.3 GB/frame -> 17 frames.
+        let s = sample(127_900_000_000, 89_700_000_000, None, None);
+        assert_eq!(max_t1(&s, 1_300_000_000), 17);
     }
 
     #[test]
     fn t1_capacity_is_stable_as_the_cache_fills() {
-        // 20 GB total, 70% headroom = 14 GB; 1 GB/frame. With 2 GB of *other*
-        // usage the ring may hold 12 frames — and that figure is unchanged
-        // whether the cache currently holds 0 or 5 of those frames.
+        // 20 GB total; 1 GB/frame. With 2 GB of *other* usage, free is 18 GB
+        // (the cache's own bytes are added back so they don't count against it);
+        // 60% of 18 GB = 10.8 GB -> 10 frames — unchanged whether the cache
+        // currently holds 0 or 5 of those frames.
         let frame = 1_000_000_000usize;
         let empty = sample(20_000_000_000, 2_000_000_000, None, None);
-        assert_eq!(t1_capacity(&empty, frame, 0), 12);
+        assert_eq!(t1_capacity(&empty, frame, 0), 10);
         let half_full = sample(20_000_000_000, 2_000_000_000 + 5 * frame as u64, None, None);
         assert_eq!(
             t1_capacity(&half_full, frame, 5 * frame as u64),
-            12,
+            10,
             "capacity doesn't chase the cache's own growth"
         );
     }
 
     #[test]
     fn max_t1_zero_when_nothing_fits() {
-        // Used already exceeds the headroomed budget.
-        let s = sample(20_000_000_000, 18_000_000_000, None, None);
+        // Almost no free RAM: 0.5 GB free, 60% = 0.3 GB < one 1 GB frame -> 0.
+        let s = sample(20_000_000_000, 19_500_000_000, None, None);
         assert_eq!(max_t1(&s, 1_000_000_000), 0);
         // Degenerate frame size.
         let s2 = sample(20_000_000_000, 0, None, None);

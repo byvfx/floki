@@ -80,7 +80,60 @@ shipped (#128); the soak is now a runnable checklist: **[soak-checklist.md](soak
   - Single global rayon pool — decode vs UI-thread texture packing starvation under heavy T2 builds.
 - File every bug as a **#99 blocker**.
 
-### 3. #94 — user-controllable scrub proxies + on-disk proxy cache
+**Findings so far (off-Metal Windows, ~300–600 MB on-disk all-AOV frames decoding to ~1.3 GB
+resident):**
+- **Decode-bound, not broken.** Stutter held `0.6 / 24` fps, drop-frames `6.2 / 24` — pacing path
+  confirmed correct (drop-frames stops the clock waiting on decode), but neither nears target because
+  single-worker all-AOV decode throughput is the wall. No OOM, epochs healthy.
+- **The RAM budget was a cliff.** `T1` collapsed `7 → 3` frames when external usage rose just 1.4 GB,
+  because the old `70% of total − used` model throttles to ~0 once other apps cross the ceiling — even
+  with ~40 GB physically free. **Fixed:** `max_t1` now takes a slice of *free* RAM (`budget.rs`,
+  `RAM_FREE_PCT`); the same machine would hold ~17–18 frames and shrink smoothly under pressure.
+- **Fix confirmed on Metal (8 GB Mac, ~95 MB/frame light sequence):** `T1 27 / 27`, decoder idle,
+  smooth playback. The free-RAM model yields 27 frames where the old total-ceiling model gave ~20 —
+  graceful degradation on a small machine, as intended.
+
+### 3. Beauty-only fast decode for playback T1 (decode-wall lever; likely do before #94)
+
+The single biggest cost in both decode time *and* T1 size is that every frame decodes **all AOVs**
+(~1.3 GB resident for a 500 MB file). For *playback preview* only the beauty/active layer is shown.
+
+- Use the `exr` crate's **partial-channel read** to decode just the beauty (RGBA / active) layer for
+  the playback ring — potentially a **5–10× cut in decode time and resident bytes at once**, hitting
+  both the decode wall and the cache cap. Full-res (unlike #94's downscaled proxy), single-layer.
+- **Coheres with #127:** sampling is already suppressed during play, so the other AOVs aren't needed
+  while moving. On **pause**, the existing ensure-T1-on-settle path does a *full* all-AOV re-decode of
+  the settled frame, restoring sampling and AOV-switching. Beauty-while-moving, full-when-stopped.
+- Open questions: how "beauty" is identified (RGBA / named layer / first-layer heuristic — VFX EXRs
+  vary); whether this is a new **decode mode** on T1 or a distinct preview tier; relation to #94 (they
+  are complementary speed/quality points — beauty-full-res vs. tiny-downscaled).
+- Pure-ish: the partial-read path is unit-testable on a fixture EXR; the play/pause decode-mode switch
+  needs manual verification. Arguably **higher-leverage and lower-effort than #94** — sequence it first.
+
+### 4. Eager precache + cache-fill indicator (PDplayer / OpenRV-style)
+
+Today the scheduler prefetches a *sliding window* ahead of the playhead (#57 decode-ahead). Review
+tools also offer an **eager precache**: fill the whole in/out range into the cache up front, so once
+it's green the entire span plays — and loops — glass-smooth with the decoder idle (exactly the Mac
+result above, but for the *whole* range rather than a window).
+
+- **Eager fill:** on sequence load or an explicit "cache" action, request *every* in-range frame into
+  T1 (and T2 up to VRAM budget) at a background priority, instead of only the decode-ahead window.
+  Expressible on the existing want-list (all in-range frames at P1) — mechanism, not a rewrite.
+- **Cache-fill indicator:** the classic colored bar under the scrubber showing per-frame residency
+  (T1 / T2), filling as it caches. User-facing transport feature; the #128 debug overlay already has
+  the residency data, this surfaces it on the timeline.
+- **Budget-bounded, honestly:** if the range exceeds `max_t1`, precache fills to the cap and the bar
+  shows the resident span — it does not pretend to hold what won't fit. This is precisely why the
+  budget fix and **beauty-only decode (step 3)** matter: together they decide how much of a shot
+  actually fits in RAM, i.e. how much of the bar can go green.
+- **Interaction with pacing/loop:** a fully-green range needs no re-decode at the loop wrap — the
+  stutter-vs-drop-frames distinction collapses to "always real-time" within the cached span.
+- Open questions: auto-precache-on-open vs explicit button; whether precache targets in/out or the
+  full range; eviction policy while precaching (don't evict already-green frames the user is about to
+  loop over). Pure-ish: the want-list shape is headless-testable; the bar + fill UX needs manual check.
+
+### 5. #94 — user-controllable scrub proxies + on-disk proxy cache
 
 - Produce T0 proxies for sequence frames (the real scrub-proxy work); paint the proxy on a fast scrub
   when the full frame isn't resident, for instant feedback.
@@ -90,14 +143,14 @@ shipped (#128); the soak is now a runnable checklist: **[soak-checklist.md](soak
   doesn't re-downsample.
 - Then **#75** — "loading full resolution" indicator while the proxy shows.
 
-### 4. #112 — contact-sheet-during-playback — **re-measure before designing**
+### 6. #112 — contact-sheet-during-playback — **re-measure before designing**
 
 The issue text is **stale**: #59 deleted the `textures.fill(None)` full-invalidation and the CPU OCIO
 bake it blames, and #67 added GPU thumbnails (its option D). The per-frame freeze may already be
 largely gone. Re-measure with the sheet open over a playing sequence first; the remaining work is
 likely a **frame-keyed GPU thumbnail cache** + not invalidating the whole sheet on every swap.
 
-### 5. #98 — locked-step A/B sequence playback (largest net-new; last)
+### 7. #98 — locked-step A/B sequence playback (largest net-new; last)
 
 Two sequences in lockstep (frame N of A alongside frame N of B, with a user offset) for side-by-side /
 wipe / diff review over time. The groundwork was built for this (`(Slot, frame)` cache keys,
@@ -106,6 +159,22 @@ Net-new: B sequence detection + state, two-slot scheduling/decode interleave (st
 time — #57), per-slot T2 pre-upload, the two-slot VRAM/RAM budget split (`max_t1` halves per slot), and
 the frame-offset alignment control. Pure-logic-first: the A/B want-list and offset mapping are
 headless-testable; only the live two-slot T2 interleave needs manual GPU verification.
+
+## Parking lot (back-burner — interesting, not scheduled)
+
+Ideas worth keeping but explicitly *not* on the critical path. Recorded so they aren't lost.
+
+- **Offline proxy-bake tool.** A standalone tool/command that pre-generates on-disk proxies for a
+  sequence ahead of time (batch, not lazy) — the eager sibling of step 5's lazy on-disk proxy cache.
+  Re-open a baked sequence and it scrubs instantly with zero re-downsample. Shares the cache key
+  (path + mtime + size params) so the live cache and the baked files interoperate.
+- **Proxies embedded *in* the EXR.** OpenEXR already supports multi-resolution images natively —
+  **mipmapped/ripmapped tiled EXRs** carry multiple LOD levels in one standard file, and multi-part
+  EXRs can hold a separate low-res part. So a proxy could live as the smallest mip level of a *standard*
+  EXR (no format fork — any compliant reader sees it). The real blocker is the Rust **`exr` crate**:
+  cheaply reading *only* a low LOD level (without decoding full-res) may not be exposed → an upstream
+  contribution or a reader fork, not a new format. Upside: one file, no sidecar proxies to manage,
+  proxy travels with the frame. Revisit once #94 / the offline bake tool prove the proxy UX is worth it.
 
 ## Open questions to settle in-flight
 
