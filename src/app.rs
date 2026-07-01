@@ -222,6 +222,16 @@ pub struct ExrApp {
     #[serde(default)]
     precache: bool,
 
+    /// User-assigned cap on the RAM the T1 ring may use, in **gigabytes**; `0.0`
+    /// (the default) means "auto" — size purely from the live free-RAM budget
+    /// (#56). A non-zero value is a *ceiling* applied on top of the auto figure
+    /// (`budget::apply_user_ram_cap`), never an override, so it can only shrink
+    /// the ring, not push it past free RAM. Handy for bounding RAM on a shared
+    /// box and for dogfooding the eviction paths on a unified-memory Mac.
+    /// Persisted.
+    #[serde(default)]
+    ram_budget_gb: f32,
+
     /// Runtime latch: set once eager precache (#56, step 4) has filled the in/out
     /// range as far as the RAM budget allows, so `tick_precache` stops re-pumping.
     /// Without it, a range larger than the budget churns — the live cap wobbles by
@@ -405,6 +415,7 @@ impl Default for ExrApp {
             t2_enabled: true,
             beauty_preview: true,
             precache: false,
+            ram_budget_gb: 0.0,
             precache_filled: false,
             watch_enabled: false,
             watch_follow: false,
@@ -963,6 +974,16 @@ impl ExrApp {
     fn prefetch_depth(&self) -> usize {
         const MAX_PREFETCH: usize = 16;
         self.frame_cache_cap.saturating_sub(1).min(MAX_PREFETCH)
+    }
+
+    /// The user-assigned T1 RAM budget in bytes, or `None` for "auto" (the live
+    /// free-RAM budget). Applied as a ceiling in the cap computation (#56).
+    fn ram_budget_bytes(&self) -> Option<u64> {
+        if self.ram_budget_gb > 0.0 {
+            Some((f64::from(self.ram_budget_gb) * (1u64 << 30) as f64) as u64)
+        } else {
+            None
+        }
     }
 
     /// Whether decoding `frame` should be **beauty-only** (#56, hardening step 3).
@@ -2547,8 +2568,12 @@ impl ExrApp {
                 // each status tick; shrinks under other memory pressure.
                 if let Some(bytes) = self.frame_bytes {
                     let cache_bytes = self.frame_cache.len() as u64 * bytes as u64;
+                    let auto = crate::budget::t1_capacity(&sample, bytes, cache_bytes);
+                    // A user-assigned RAM budget (if any) caps the auto figure —
+                    // never raises it — then floor at 2 so playback still runs.
                     self.frame_cache_cap =
-                        crate::budget::t1_capacity(&sample, bytes, cache_bytes).max(2);
+                        crate::budget::apply_user_ram_cap(auto, self.ram_budget_bytes(), bytes)
+                            .max(2);
                 }
 
                 // Resize the T2 GPU-texture ring to the live VRAM budget (#56).
@@ -3071,6 +3096,30 @@ impl ExrApp {
                     self.pump_decode();
                     ui.ctx().request_repaint();
                 }
+
+                ui.separator();
+
+                // User-assigned RAM budget for the T1 ring (#56). 0 = Auto (size
+                // from free RAM). A ceiling only — capped by the auto figure so it
+                // can't OOM; lets you bound RAM on a shared box or dogfood eviction.
+                ui.label("RAM");
+                ui.add(
+                    egui::DragValue::new(&mut self.ram_budget_gb)
+                        .range(0.0..=256.0)
+                        .speed(0.25)
+                        .custom_formatter(|n, _| {
+                            if n <= 0.0 {
+                                "Auto".to_string()
+                            } else {
+                                format!("{n:.1} GB")
+                            }
+                        }),
+                )
+                .on_hover_text(
+                    "Cap the RAM the frame cache may use (0 = Auto, sized from free \
+                     RAM). A ceiling only — it can't exceed what's free. Lower it to \
+                     bound RAM on a shared box, or to dogfood the eviction paths.",
+                );
 
                 ui.separator();
 
@@ -4434,6 +4483,16 @@ mod tests {
             app.decode_beauty_only(ahead),
             "precache: prefetched frames are beauty for future playback"
         );
+    }
+
+    #[test]
+    fn ram_budget_bytes_maps_gb_with_zero_as_auto() {
+        let mut app = ExrApp::default();
+        assert_eq!(app.ram_budget_bytes(), None, "0 GB → auto (no cap)");
+        app.ram_budget_gb = 4.0;
+        assert_eq!(app.ram_budget_bytes(), Some(4 * (1 << 30)), "4 GB → 4 GiB");
+        app.ram_budget_gb = 0.5;
+        assert_eq!(app.ram_budget_bytes(), Some(1 << 29), "0.5 GB → 512 MiB");
     }
 
     #[test]
