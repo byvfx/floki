@@ -108,6 +108,30 @@ pub fn t1_capacity(sample: &Sample, frame_bytes: usize, cache_bytes: u64) -> usi
     max_t1(&adjusted, frame_bytes)
 }
 
+/// Cap an auto-derived T1 frame count by an optional **user-assigned RAM budget**
+/// (bytes). The user budget is a *ceiling*, not an override: the effective cap is
+/// the smaller of the auto (free-RAM) figure and what the user budget affords, so
+/// a generous setting can never push the ring past free RAM and risk an OOM,
+/// while a small setting deliberately constrains it — useful for capping RAM on a
+/// shared workstation and for dogfooding the eviction/degradation paths on a
+/// machine (e.g. Apple unified memory) that otherwise never feels the pressure.
+///
+/// `None` (or a zero/degenerate frame size) leaves the auto figure untouched.
+#[must_use]
+pub fn apply_user_ram_cap(
+    auto_frames: usize,
+    user_budget: Option<u64>,
+    frame_bytes: usize,
+) -> usize {
+    match user_budget {
+        Some(budget) if frame_bytes > 0 => {
+            let user_frames = usize::try_from(budget / frame_bytes as u64).unwrap_or(usize::MAX);
+            auto_frames.min(user_frames)
+        }
+        _ => auto_frames,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,5 +235,28 @@ mod tests {
         // Degenerate frame size.
         let s2 = sample(20_000_000_000, 0, None, None);
         assert_eq!(max_t1(&s2, 0), 0);
+    }
+
+    #[test]
+    fn user_ram_cap_is_a_ceiling_never_an_override() {
+        let frame = 1_000_000_000usize; // 1 GB/frame
+        // A small user budget deliberately constrains a generous auto figure:
+        // 4 GB / 1 GB = 4 frames < the 30 the machine could hold.
+        assert_eq!(
+            apply_user_ram_cap(30, Some(4_000_000_000), frame),
+            4,
+            "user budget caps below the auto figure"
+        );
+        // A generous user budget can't push *past* the auto (free-RAM) figure —
+        // that's what protects against OOM.
+        assert_eq!(
+            apply_user_ram_cap(10, Some(64_000_000_000), frame),
+            10,
+            "user budget never exceeds the auto free-RAM cap"
+        );
+        // No user budget → auto untouched.
+        assert_eq!(apply_user_ram_cap(12, None, frame), 12);
+        // Degenerate frame size → auto untouched (no divide).
+        assert_eq!(apply_user_ram_cap(12, Some(4_000_000_000), 0), 12);
     }
 }
