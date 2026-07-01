@@ -54,6 +54,12 @@ fn ret_true() -> bool {
     true
 }
 
+/// A `ram_budget_gb` below this counts as **Auto** (no cap), both in the display
+/// and in [`ExrApp::ram_budget_bytes`]. It matches the control's one-decimal
+/// formatting: any value that would render as `0.0 GB` instead reads `Auto` and
+/// applies no cap, so the label never disagrees with the behavior.
+const RAM_BUDGET_AUTO_BELOW_GB: f32 = 0.05;
+
 /// Job sent to the dedicated EXR worker thread via `load_tx`.
 struct LoadJob {
     path: PathBuf,
@@ -222,12 +228,14 @@ pub struct ExrApp {
     #[serde(default)]
     precache: bool,
 
-    /// User-assigned cap on the RAM the T1 ring may use, in **gigabytes**; `0.0`
-    /// (the default) means "auto" — size purely from the live free-RAM budget
-    /// (#56). A non-zero value is a *ceiling* applied on top of the auto figure
-    /// (`budget::apply_user_ram_cap`), never an override, so it can only shrink
-    /// the ring, not push it past free RAM. Handy for bounding RAM on a shared
-    /// box and for dogfooding the eviction paths on a unified-memory Mac.
+    /// User-assigned cap on the RAM the T1 ring may use. The unit is **gibibytes**
+    /// (1024³ bytes) — labeled `GB` in the UI to match floki's other memory
+    /// readouts (`resource_monitor::fmt_bytes` is also 1024-based). Below
+    /// [`RAM_BUDGET_AUTO_BELOW_GB`] means "auto" — size purely from the live
+    /// free-RAM budget (#56). A larger value is a *ceiling* applied on top of the
+    /// auto figure (`budget::apply_user_ram_cap`), never an override, so it can
+    /// only shrink the ring, not push it past free RAM. Handy for bounding RAM on
+    /// a shared box and for dogfooding the eviction paths on a unified-memory Mac.
     /// Persisted.
     #[serde(default)]
     ram_budget_gb: f32,
@@ -978,11 +986,16 @@ impl ExrApp {
 
     /// The user-assigned T1 RAM budget in bytes, or `None` for "auto" (the live
     /// free-RAM budget). Applied as a ceiling in the cap computation (#56).
+    ///
+    /// Values below the control's display threshold (i.e. anything that renders
+    /// as `Auto`) return `None`, so what the UI shows always matches what is
+    /// applied — a hand-edited or float-rounded tiny positive can't silently
+    /// impose an ultra-low cap while displaying `Auto`.
     fn ram_budget_bytes(&self) -> Option<u64> {
-        if self.ram_budget_gb > 0.0 {
-            Some((f64::from(self.ram_budget_gb) * (1u64 << 30) as f64) as u64)
-        } else {
+        if self.ram_budget_gb < RAM_BUDGET_AUTO_BELOW_GB {
             None
+        } else {
+            Some((f64::from(self.ram_budget_gb) * (1u64 << 30) as f64) as u64)
         }
     }
 
@@ -3108,7 +3121,7 @@ impl ExrApp {
                         .range(0.0..=256.0)
                         .speed(0.25)
                         .custom_formatter(|n, _| {
-                            if n <= 0.0 {
+                            if n < f64::from(RAM_BUDGET_AUTO_BELOW_GB) {
                                 "Auto".to_string()
                             } else {
                                 format!("{n:.1} GB")
@@ -4493,6 +4506,14 @@ mod tests {
         assert_eq!(app.ram_budget_bytes(), Some(4 * (1 << 30)), "4 GB → 4 GiB");
         app.ram_budget_gb = 0.5;
         assert_eq!(app.ram_budget_bytes(), Some(1 << 29), "0.5 GB → 512 MiB");
+        // A tiny positive (below the display threshold, renders as "Auto") must
+        // behave as auto, not as an ultra-low cap.
+        app.ram_budget_gb = 0.01;
+        assert_eq!(
+            app.ram_budget_bytes(),
+            None,
+            "sub-display-threshold value reads Auto and applies no cap"
+        );
     }
 
     #[test]
