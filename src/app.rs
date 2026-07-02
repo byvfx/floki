@@ -1501,6 +1501,47 @@ impl ExrApp {
         self.rescan_and_apply();
     }
 
+    /// Resize the T1 (RAM) and T2 (VRAM) rings to the live resource budgets
+    /// (#56). Runs every frame from `ui()` — `ResourceMonitor::sample` is
+    /// internally throttled so the cost is a struct copy — and lives here, not
+    /// in a draw method: the caps are overcommit protection, and must keep
+    /// running through any UI restructure (#150).
+    fn tick_budgets(&mut self) {
+        let Some(gpu) = &self.gpu_resources else {
+            return;
+        };
+        let sample = self.resource_monitor.sample(&gpu.render_state().device);
+        self.dbg_last_sample = Some(sample); // stash for the status bar + debug overlay
+
+        // T1: recomputed each tick; shrinks under other memory pressure.
+        if let Some(bytes) = self.frame_bytes {
+            let cache_bytes = self.frame_cache.len() as u64 * bytes as u64;
+            let auto = crate::budget::t1_capacity(&sample, bytes, cache_bytes);
+            // A user-assigned RAM budget (if any) caps the auto figure —
+            // never raises it — then floor at 2 so playback still runs.
+            self.frame_cache_cap =
+                crate::budget::apply_user_ram_cap(auto, self.ram_budget_bytes(), bytes).max(2);
+        }
+
+        // T2: conservative — capped low, and disabled (→ lazy path) unless at
+        // least a couple of frames comfortably fit, since a wgpu OOM aborts
+        // the process. Off entirely when the user disables it or no sequence
+        // is loaded.
+        const T2_HARD_CAP: usize = 8;
+        let t2_cap = if self.t2_enabled && self.playback.is_active() {
+            self.exr_data
+                .as_ref()
+                .and_then(|d| d.logical_size(self.viewer.active_layer))
+                .map_or(0, |(w, h)| {
+                    let fits = crate::budget::max_t2(&sample, w, h);
+                    if fits < 2 { 0 } else { fits.min(T2_HARD_CAP) }
+                })
+        } else {
+            0
+        };
+        self.viewer.set_t2_cap(t2_cap);
+    }
+
     /// The ctx-free, un-throttled core of the render-watch: re-scan the group,
     /// diff against the baseline, and apply. Returns whether a change was applied
     /// (the first call only baselines). Separated so it's unit-testable without an
@@ -2128,6 +2169,8 @@ impl eframe::App for ExrApp {
         // Pick up frames a render writes while we're open (#101); no-op unless the
         // user enabled Watch and a sequence is loaded.
         self.tick_render_watch(ui.ctx());
+        // Keep the T1/T2 rings sized to the live RAM/VRAM budgets (#56, #150).
+        self.tick_budgets();
 
         // Snapshot to clipboard (#19): request a framebuffer screenshot on the
         // hotkey and consume the reply when it arrives.
@@ -2772,45 +2815,13 @@ impl ExrApp {
                 ui.label(egui::RichText::new(status).weak());
             }
 
-            // Discrete RAM/VRAM readout, right-aligned (#51). `sample()` is throttled
-            // internally, so this is cheap per frame; request a slow repaint so the
-            // numbers keep ticking while the app is otherwise idle.
-            if let Some(gpu) = &self.gpu_resources {
-                let sample = self.resource_monitor.sample(&gpu.render_state().device);
-                self.dbg_last_sample = Some(sample); // stash for the debug overlay
+            // Discrete RAM/VRAM readout, right-aligned (#51). The sample is taken
+            // (and the T1/T2 budgets recomputed) by `tick_budgets` each frame;
+            // request a slow repaint so the numbers keep ticking while the app
+            // is otherwise idle.
+            if let Some(sample) = self.dbg_last_sample {
                 ui.ctx()
                     .request_repaint_after(std::time::Duration::from_secs(1));
-
-                // Resize the T1 ring to the live RAM budget (#56). Recomputed
-                // each status tick; shrinks under other memory pressure.
-                if let Some(bytes) = self.frame_bytes {
-                    let cache_bytes = self.frame_cache.len() as u64 * bytes as u64;
-                    let auto = crate::budget::t1_capacity(&sample, bytes, cache_bytes);
-                    // A user-assigned RAM budget (if any) caps the auto figure —
-                    // never raises it — then floor at 2 so playback still runs.
-                    self.frame_cache_cap =
-                        crate::budget::apply_user_ram_cap(auto, self.ram_budget_bytes(), bytes)
-                            .max(2);
-                }
-
-                // Resize the T2 GPU-texture ring to the live VRAM budget (#56).
-                // Conservative: capped low, and disabled (→ lazy path) unless at
-                // least a couple of frames comfortably fit, since a wgpu OOM
-                // aborts the process. Off entirely when the user disables it or
-                // no sequence is loaded.
-                const T2_HARD_CAP: usize = 8;
-                let t2_cap = if self.t2_enabled && self.playback.is_active() {
-                    self.exr_data
-                        .as_ref()
-                        .and_then(|d| d.logical_size(self.viewer.active_layer))
-                        .map_or(0, |(w, h)| {
-                            let fits = crate::budget::max_t2(&sample, w, h);
-                            if fits < 2 { 0 } else { fits.min(T2_HARD_CAP) }
-                        })
-                } else {
-                    0
-                };
-                self.viewer.set_t2_cap(t2_cap);
                 use crate::resource_monitor::fmt_bytes;
                 // floki's tracked image footprint leads the readout: it drops to 0
                 // on unload, whereas process RSS lags (the allocator keeps freed
