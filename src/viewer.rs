@@ -1604,9 +1604,19 @@ impl ExrViewer {
     /// between A and B on `blink_interval`, requesting repaints to keep cycling.
     fn apply_blink_mode(&mut self, ui: &egui::Ui, has_b: bool) {
         if self.blink_state && has_b {
-            ui.ctx().request_repaint();
             let time = ui.input(|i| i.time);
-            if ((time / self.blink_interval as f64) as usize).is_multiple_of(2) {
+            let interval = f64::from(self.blink_interval);
+            let phase = (time / interval) as usize;
+            // Wake exactly at the next A/B flip instead of repainting at the
+            // full refresh rate between flips (#146): the image only changes
+            // every `blink_interval`, but a bare request_repaint re-ran the
+            // whole frame (including the OCIO passes) continuously.
+            let next_flip = (phase + 1) as f64 * interval;
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_secs_f64(
+                    (next_flip - time).max(0.0),
+                ));
+            if phase.is_multiple_of(2) {
                 self.compare_mode = CompareMode::SingleA;
             } else {
                 self.compare_mode = CompareMode::SingleB;
@@ -2433,6 +2443,8 @@ impl ExrViewer {
                 ui.ctx().content_rect().width(),
                 ui.ctx().content_rect().height(),
             ],
+            display_min: [disp_rect.min.x, disp_rect.min.y],
+            display_max: [disp_rect.max.x, disp_rect.max.y],
             exposure: self.exposure,
             gamma: self.gamma,
             diff_multiplier: self.diff_multiplier,
@@ -2453,7 +2465,8 @@ impl ExrViewer {
             skip_checker: 0,
             diff_metric: self.diff_metric.as_u32(),
             diff_floor: self.diff_floor,
-            _pad2: 0,
+            // Per-draw value comes from the `overscan_factor` cell below.
+            overscan_factor: 1.0,
             lut_domain_min: self.lut_domain_min,
             lut_domain_max: self.lut_domain_max,
             bg_checker_dark: rgb3_to_vec4(self.background.checker_dark),
@@ -2484,6 +2497,12 @@ impl ExrViewer {
         // Per-frame ring allocator: bumped by each `draw_gpu` call. Up to ~4
         // draws per frame fit well within the 16-slot ring (2 KB total).
         let uniform_offset = std::cell::Cell::new(0u32);
+        // Blend factor for fragments outside the display window (#146): the
+        // shader dims the data-window overscan in the same draw, replacing the
+        // old two-draw scheme (whole image at dim opacity + display window
+        // redrawn at full). 1.0 = no dim (OCIO dims in the blit; side-by-side
+        // opts out); set per branch below before the draw_all call.
+        let overscan_factor = std::cell::Cell::new(1.0f32);
         let ocio_active = self.ocio_active;
         // Under OCIO, draw_gpu accumulates pass-1 draws here instead of emitting a
         // callback per call; a single OcioCallback covering the whole frame (both
@@ -2508,6 +2527,7 @@ impl ExrViewer {
             u.is_diff_mode = if is_diff { 1 } else { 0 };
             u.is_composite = if is_composite { 1 } else { 0 };
             u.opacity = opacity;
+            u.overscan_factor = overscan_factor.get();
 
             // OCIO path: pass 1 must emit scene-linear, so bypass the built-in
             // display chain (sRGB/gamma/.cube LUT). Exposure stays (linear).
@@ -2871,12 +2891,21 @@ impl ExrViewer {
             };
 
             if !ocio_handled {
-                if self.overscan_opacity > 0.0 && !is_sbs {
-                    draw_all(&unclipped_painter, self.overscan_opacity);
+                // One draw for everything (#146): the shader blends fragments
+                // outside the display window at `overscan_factor`, so the old
+                // dim pre-pass (which re-ran the full fragment shader over the
+                // whole display window every repaint) is gone. Side-by-Side
+                // renders at full brightness with the full-canvas clip; with
+                // opacity 0 the overscan is hidden, so keep the display-window
+                // scissor and skip the dim entirely.
+                if is_sbs {
+                    draw_all(&unclipped_painter, 1.0);
+                } else if self.overscan_opacity > 0.0 {
+                    overscan_factor.set(self.overscan_opacity);
+                    draw_all(&unclipped_painter, 1.0);
+                } else {
+                    draw_all(&painter, 1.0);
                 }
-                // Side-by-Side renders at full brightness with the full-canvas
-                // clip (no display-window clip), so overscan dimming is skipped.
-                draw_all(if is_sbs { &unclipped_painter } else { &painter }, 1.0);
             }
         }
     }

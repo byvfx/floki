@@ -268,6 +268,9 @@ fn uniforms_for(tone: &ThumbnailTone, out_w: usize, out_h: usize) -> crate::gpu:
         rect_max: [out_w as f32, out_h as f32],
         screen_size: [out_w as f32, out_h as f32],
         wipe_center: [0.0, 0.0],
+        // Whole target counts as "inside" — no overscan dim on thumbnails.
+        display_min: [0.0, 0.0],
+        display_max: [out_w as f32, out_h as f32],
         exposure: tone.exposure,
         gamma: tone.gamma,
         diff_multiplier: 0.0,
@@ -283,7 +286,7 @@ fn uniforms_for(tone: &ThumbnailTone, out_w: usize, out_h: usize) -> crate::gpu:
         skip_checker: 0,
         diff_metric: 0,
         diff_floor: 0.0,
-        _pad2: 0,
+        overscan_factor: 1.0,
         lut_domain_min: tone.lut_domain_min,
         lut_domain_max: tone.lut_domain_max,
         bg_checker_dark: rgb3_to_vec4(bg.checker_dark),

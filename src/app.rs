@@ -305,6 +305,10 @@ pub struct ExrApp {
     /// Last snapshot outcome, shown briefly in the status bar (transient).
     #[serde(skip)]
     snapshot_status: Option<String>,
+    /// Receives the finalize outcome from the snapshot worker thread (#146):
+    /// clipboard copy + PNG encode/write run off the UI thread.
+    #[serde(skip)]
+    snapshot_rx: Option<std::sync::mpsc::Receiver<String>>,
 
     /// Throttled RAM/GPU-memory sampler for the bottom-bar readout (#51).
     #[serde(skip)]
@@ -470,6 +474,7 @@ impl Default for ExrApp {
             last_watch_poll: None,
             snapshot_pending: false,
             snapshot_status: None,
+            snapshot_rx: None,
             resource_monitor: crate::resource_monitor::ResourceMonitor::default(),
             show_help: false,
             show_settings: false,
@@ -736,6 +741,14 @@ impl ExrApp {
     /// Snapshot to clipboard (#19): drive the hotkey trigger and consume the
     /// `Event::Screenshot` reply. Called once per frame from [`Self::ui`].
     fn process_snapshot(&mut self, ctx: &egui::Context) {
+        // Deliver the off-thread finalize outcome (#146).
+        if let Some(rx) = &self.snapshot_rx
+            && let Ok(status) = rx.try_recv()
+        {
+            self.snapshot_status = Some(status);
+            self.snapshot_rx = None;
+        }
+
         // Cmd/Ctrl+Shift+S requests a snapshot (S avoids the viewer's plain R/G/B/A/C
         // channel keys). The menu button calls `request_snapshot` directly.
         let hotkey =
@@ -776,8 +789,11 @@ impl ExrApp {
         ctx.request_repaint();
     }
 
-    /// Crop the captured framebuffer to the image canvas, copy it to the clipboard,
-    /// and (when enabled) save a timestamped PNG. Records a status string.
+    /// Crop the captured framebuffer to the image canvas, then copy it to the
+    /// clipboard and (when enabled) save a timestamped PNG **off-thread** —
+    /// arboard + PNG encode/write are a several-hundred-ms stall at 4K, and this
+    /// runs in the frame that receives `Event::Screenshot`, mid-playback if
+    /// playing (#146). The outcome arrives over `snapshot_rx`.
     fn finish_snapshot(&mut self, image: &egui::ColorImage, pixels_per_point: f32) {
         // Crop to the active image area (#52), falling back to the full canvas.
         let Some(rect) = self.viewer.last_image_rect.or(self.viewer.last_canvas_rect) else {
@@ -785,22 +801,32 @@ impl ExrApp {
         };
         let cropped = crate::snapshot::crop_to_rect(image, rect, pixels_per_point);
 
-        let mut parts = Vec::new();
-        match crate::snapshot::copy_to_clipboard(&cropped) {
-            Ok(()) => parts.push("copied to clipboard".to_string()),
-            Err(e) => parts.push(format!("clipboard failed: {e}")),
-        }
-        if self.save_snapshots {
-            let secs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            match crate::snapshot::save_png(&cropped, secs) {
-                Ok(path) => parts.push(format!("saved {}", path.display())),
-                Err(e) => parts.push(format!("save failed: {e}")),
+        let save = self.save_snapshots;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.snapshot_rx = Some(rx);
+        self.snapshot_status = Some("Snapshot: saving…".to_string());
+        let repaint_ctx = self.repaint_ctx.clone();
+        std::thread::spawn(move || {
+            let mut parts = Vec::new();
+            match crate::snapshot::copy_to_clipboard(&cropped) {
+                Ok(()) => parts.push("copied to clipboard".to_string()),
+                Err(e) => parts.push(format!("clipboard failed: {e}")),
             }
-        }
-        self.snapshot_status = Some(format!("Snapshot: {}", parts.join(", ")));
+            if save {
+                let secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                match crate::snapshot::save_png(&cropped, secs) {
+                    Ok(path) => parts.push(format!("saved {}", path.display())),
+                    Err(e) => parts.push(format!("save failed: {e}")),
+                }
+            }
+            let _ = tx.send(format!("Snapshot: {}", parts.join(", ")));
+            if let Some(ctx) = &repaint_ctx {
+                ctx.request_repaint();
+            }
+        });
     }
 
     fn apply_lut_load_result(&mut self, res: LutLoadResult) {
@@ -1604,6 +1630,22 @@ impl ExrApp {
             // never raises it — then floor at 2 so playback still runs.
             self.frame_cache_cap =
                 crate::budget::apply_user_ram_cap(auto, self.ram_budget_bytes(), bytes).max(2);
+            // Enforce a shrink now, not on the next decode: eviction otherwise
+            // only runs on insert, so with precache latched (nothing in flight)
+            // external memory pressure lowered the cap while the ring kept every
+            // frame indefinitely — the memory contract's live-pressure
+            // degradation never fired (#146).
+            if self.frame_cache.len() > self.frame_cache_cap {
+                let loop_wrap = (self.playback.loop_mode == crate::playback::LoopMode::Loop)
+                    .then_some((self.playback.in_point, self.playback.out_point));
+                self.dbg_evictions = self.dbg_evictions.saturating_add(self.frame_cache.evict_to(
+                    self.frame_cache_cap,
+                    self.playback.current_frame,
+                    self.playback.direction,
+                    self.playback.is_playing(),
+                    loop_wrap,
+                ) as u64);
+            }
         }
 
         // T2: conservative — capped low, and disabled (→ lazy path) unless at
@@ -1923,6 +1965,22 @@ impl ExrApp {
     /// playback cache hit (#56) can show a resident frame without cloning its
     /// pixel buffers — the same `Arc` is held by the T1 ring and the active slot.
     fn swap_image_arc(&mut self, data: std::sync::Arc<ExrData>, is_b: bool) {
+        // Same Arc as already displayed (scrub-return, settle onto the shown
+        // frame): the pixels are identical, so skip the invalidations — on a T2
+        // miss they'd force a full re-pack + re-upload of the same data (#146).
+        let same = if is_b {
+            self.exr_data_b
+                .as_ref()
+                .is_some_and(|cur| std::sync::Arc::ptr_eq(cur, &data))
+        } else {
+            self.exr_data
+                .as_ref()
+                .is_some_and(|cur| std::sync::Arc::ptr_eq(cur, &data))
+        };
+        if same {
+            self.error_msg = None;
+            return;
+        }
         if is_b {
             self.exr_data_b = Some(data);
             // The texture caches only rebuild on a layer-count change, so a new B
@@ -3546,23 +3604,37 @@ impl ExrApp {
             // Cache-fill bar (#56, step 4): a thin green strip along the bottom of
             // the track marking which frames are resident in the T1 ring. Each
             // resident frame fills its own equal slot (`[f, f+1)` over `span + 1`
-            // slots, so the last frame `hi` gets a real slot too) — contiguous
-            // residency reads as one solid bar; the gap to a full green bar is the
-            // part of the range that doesn't fit the RAM budget (or hasn't decoded
-            // yet). `resident_frames` is allocation-free for this per-repaint walk.
+            // slots, so the last frame `hi` gets a real slot too). Contiguous
+            // runs are coalesced into single rects before painting: with a large
+            // RAM budget the ring holds thousands of frames, and one rect per
+            // frame tessellated thousands of shapes per repaint (#146) — a small
+            // sort is far cheaper. The gap to a full green bar is the part of
+            // the range that doesn't fit the RAM budget (or hasn't decoded yet).
             let strip_top = rect.bottom() - 4.0;
             let nslots = f64::from(span) + 1.0; // frames lo..=hi inclusive
             let slot_x = |f: u32| {
                 rect.left() + ((f64::from(f.saturating_sub(lo)) / nslots) as f32) * rect.width()
             };
             let fill = egui::Color32::from_rgb(64, 168, 96);
-            for f in self.frame_cache.resident_frames(crate::cache::Slot::A) {
-                if f < in_pt || f > out_pt {
-                    continue; // only the trimmed range is the precache target
+            let mut resident: Vec<u32> = self
+                .frame_cache
+                .resident_frames(crate::cache::Slot::A)
+                // only the trimmed range is the precache target
+                .filter(|&f| f >= in_pt && f <= out_pt)
+                .collect();
+            resident.sort_unstable();
+            let mut i = 0;
+            while i < resident.len() {
+                let start = resident[i];
+                let mut end = start;
+                while i + 1 < resident.len() && resident[i + 1] == end + 1 {
+                    i += 1;
+                    end = resident[i];
                 }
+                i += 1;
                 let seg = egui::Rect::from_min_max(
-                    egui::pos2(slot_x(f), strip_top),
-                    egui::pos2(slot_x(f + 1).min(rect.right()), rect.bottom()),
+                    egui::pos2(slot_x(start), strip_top),
+                    egui::pos2(slot_x(end + 1).min(rect.right()), rect.bottom()),
                 );
                 painter.rect_filled(seg, 0.0, fill);
             }
