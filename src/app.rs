@@ -305,8 +305,12 @@ pub struct ExrApp {
     /// Last snapshot outcome, shown briefly in the status bar (transient).
     #[serde(skip)]
     snapshot_status: Option<String>,
-    /// Receives the finalize outcome from the snapshot worker thread (#146):
-    /// clipboard copy + PNG encode/write run off the UI thread.
+    /// Receives the finalize outcome from the snapshot worker threads (#146):
+    /// clipboard copy + PNG encode/write run off the UI thread. The channel is
+    /// persistent (workers clone `snapshot_tx`), so overlapping snapshots each
+    /// deliver their status in order.
+    #[serde(skip)]
+    snapshot_tx: Option<std::sync::mpsc::Sender<String>>,
     #[serde(skip)]
     snapshot_rx: Option<std::sync::mpsc::Receiver<String>>,
 
@@ -474,6 +478,7 @@ impl Default for ExrApp {
             last_watch_poll: None,
             snapshot_pending: false,
             snapshot_status: None,
+            snapshot_tx: None,
             snapshot_rx: None,
             resource_monitor: crate::resource_monitor::ResourceMonitor::default(),
             show_help: false,
@@ -737,12 +742,12 @@ impl ExrApp {
     /// Snapshot to clipboard (#19): drive the hotkey trigger and consume the
     /// `Event::Screenshot` reply. Called once per frame from [`Self::ui`].
     fn process_snapshot(&mut self, ctx: &egui::Context) {
-        // Deliver the off-thread finalize outcome (#146).
-        if let Some(rx) = &self.snapshot_rx
-            && let Ok(status) = rx.try_recv()
-        {
-            self.snapshot_status = Some(status);
-            self.snapshot_rx = None;
+        // Deliver the off-thread finalize outcomes (#146); with overlapping
+        // snapshots the latest status wins.
+        if let Some(rx) = &self.snapshot_rx {
+            while let Ok(status) = rx.try_recv() {
+                self.snapshot_status = Some(status);
+            }
         }
 
         // Cmd/Ctrl+Shift+S requests a snapshot (S avoids the viewer's plain R/G/B/A/C
@@ -798,8 +803,18 @@ impl ExrApp {
         let cropped = crate::snapshot::crop_to_rect(image, rect, pixels_per_point);
 
         let save = self.save_snapshots;
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.snapshot_rx = Some(rx);
+        // One persistent channel; workers clone the sender. Replacing the
+        // receiver per snapshot would silently drop the status of a finalize
+        // still in flight when a second snapshot fires.
+        if self.snapshot_rx.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.snapshot_tx = Some(tx);
+            self.snapshot_rx = Some(rx);
+        }
+        let tx = self
+            .snapshot_tx
+            .clone()
+            .expect("snapshot channel initialized above");
         self.snapshot_status = Some("Snapshot: saving…".to_string());
         let repaint_ctx = self.repaint_ctx.clone();
         std::thread::spawn(move || {
@@ -845,13 +860,13 @@ impl ExrApp {
                 if let Some(gpu) = &self.gpu_resources {
                     let gpu_state = gpu.gpu_state.clone();
                     let rs = gpu.render_state();
-                    // Explicitly destroy the old LUT texture before
-                    // replacing it, so GPU memory is released in this
-                    // submission cycle rather than waiting for the next
-                    // driver GC sweep.
-                    if let Some(old_tex) = self.lut_texture.take() {
-                        old_tex.destroy();
-                    }
+                    // Drop-only, never `destroy()` (#120): a recorded-but-
+                    // unsubmitted draw can still reference the old LUT bind
+                    // group when the load lands mid-frame, and destroying an
+                    // in-flight texture aborts the submit on Vulkan. Dropping
+                    // the handle lets wgpu reclaim it when the last reference
+                    // ends — a .cube LUT is well under a megabyte, so deferred
+                    // reclaim costs nothing.
                     let (bg, tex) = gpu_state.create_lut_bind_group(&rs.device, &rs.queue, &lut);
                     self.lut_bg = Some(bg);
                     self.lut_texture = Some(tex);
@@ -873,9 +888,8 @@ impl ExrApp {
             Err(e) => {
                 self.lut_error = Some(e);
                 self.lut_bg = None;
-                if let Some(old_tex) = self.lut_texture.take() {
-                    old_tex.destroy();
-                }
+                // Drop-only, same #120 hazard as the success arm.
+                self.lut_texture = None;
                 self.enable_lut = false;
                 self.lut_domain_min = [0.0, 0.0, 0.0, 0.0];
                 self.lut_domain_max = [1.0, 1.0, 1.0, 0.0];
