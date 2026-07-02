@@ -395,6 +395,11 @@ pub struct ExrApp {
     /// Result receiver: the worker sends completed `LoadResult`s back here.
     #[serde(skip)]
     load_rx: Option<std::sync::mpsc::Receiver<LoadMsg>>,
+    /// Cloned into the decode worker so it can wake the UI the moment a result
+    /// lands (#137) instead of the result waiting out the 50 ms in-flight poll.
+    /// `None` only in tests, which drain the channel directly.
+    #[serde(skip)]
+    repaint_ctx: Option<egui::Context>,
 
     // Async LUT loading: .cube parsing runs on a worker thread (see
     // `reload_lut`); the parsed CubeLut arrives over `lut_load_rx` and the
@@ -491,6 +496,7 @@ impl Default for ExrApp {
             loading_b: false,
             load_tx: None,
             load_rx: None,
+            repaint_ctx: None,
             lut_loading: false,
             lut_pending_auto_enable: false,
             lut_load_tx: None,
@@ -509,6 +515,10 @@ impl ExrApp {
         } else {
             Self::default()
         };
+
+        // Wire the repaint handle before anything can spawn the decode worker,
+        // so the worker can wake the UI when a result lands (#137).
+        app.repaint_ctx = Some(cc.egui_ctx.clone());
 
         app.gpu_resources = cc
             .wgpu_render_state
@@ -698,10 +708,16 @@ impl ExrApp {
         let path = self.lut_path.clone();
         self.lut_loading = true;
         self.lut_error = None;
+        let repaint_ctx = self.repaint_ctx.clone();
         std::thread::spawn(move || {
             let result = crate::color::cube::CubeLut::load(&path)
                 .map_err(|e| format!("Failed to load LUT: {e}"));
             let _ = tx.send(LutLoadResult { path, result });
+            // Wake the UI so the parsed LUT applies immediately (#137) instead
+            // of waiting for the next input-driven repaint.
+            if let Some(ctx) = &repaint_ctx {
+                ctx.request_repaint();
+            }
         });
     }
 
@@ -904,6 +920,16 @@ impl ExrApp {
             let (job_tx, job_rx) = std::sync::mpsc::channel::<LoadJob>();
             let (result_tx, result_rx) = std::sync::mpsc::channel::<LoadMsg>();
             let epoch_signal = std::sync::Arc::clone(&self.epoch_signal);
+            let repaint_ctx = self.repaint_ctx.clone();
+            // Wake the UI as soon as a result is queued (#137). Without this the
+            // result waits for the next scheduled repaint — up to the full 50 ms
+            // in-flight poll — on top of decode time, and the one-outstanding
+            // pump leaves the worker idle for that window too.
+            let wake_ui = move || {
+                if let Some(ctx) = &repaint_ctx {
+                    ctx.request_repaint();
+                }
+            };
             std::thread::spawn(move || {
                 for job in job_rx {
                     // Drop a sequence job a newer seek/scrub already superseded,
@@ -931,6 +957,7 @@ impl ExrApp {
                             path: job.path.clone(),
                             proxy,
                         });
+                        wake_ui();
                     }
                     // Beauty-only for playback prefetch while moving (#56, step 3):
                     // one layer, faster decode + smaller resident frame. Full
@@ -949,6 +976,7 @@ impl ExrApp {
                         open_gen: job.open_gen,
                         result,
                     })));
+                    wake_ui();
                 }
             });
             self.load_tx = Some(job_tx);
@@ -2220,7 +2248,9 @@ impl ExrApp {
         // Once-per-second decode trace for RUST_LOG=floki=debug diagnosis.
         self.trace_playback_state();
         if self.loading_a || self.loading_b || !self.inflight.is_empty() {
-            // egui is reactive; keep polling the worker until the decode lands.
+            // Fallback only: the worker wakes the UI directly when a result
+            // lands (#137). This poll covers a worker that dies mid-decode (the
+            // watchdog path) and tests that run without a live worker wake.
             // `inflight` covers silent precache prefetch (#56, step 4), which
             // doesn't set `loading_a` but still has results to drain.
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
