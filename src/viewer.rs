@@ -665,7 +665,9 @@ impl ExrViewer {
     /// exposure / gamma / sRGB tone pipeline, so they regenerate next frame.
     /// (The central viewport is GPU-only and reads the live uniform each frame, so
     /// it needs no invalidation; only the baked thumbnails do.)
-    fn invalidate_tone(&mut self) {
+    /// `pub(crate)`: the app calls this when LUT state changes (toggle/reload,
+    /// #147) — the LUT is baked into thumbnails exactly like exposure/gamma.
+    pub(crate) fn invalidate_tone(&mut self) {
         self.thumbnails.fill(None);
         self.thumbnails_b.fill(None);
         // GPU thumbnails bake the tone into a cached texture (unlike the live

@@ -847,6 +847,9 @@ impl ExrApp {
                 self.lut_domain_max = [1.0, 1.0, 1.0, 0.0];
             }
         }
+        // Both arms change what an enabled LUT renders as (new contents, or
+        // force-disabled on error); cached thumbnails baked the old state (#147).
+        self.viewer.invalidate_tone();
     }
 
     /// Begin loading an EXR into slot A or B. The decode runs on a worker thread
@@ -2710,7 +2713,14 @@ impl ExrApp {
                             lut_reload_requested = true;
                         }
                     });
-                    ui.checkbox(&mut self.enable_lut, "Enable Custom LUT");
+                    // Thumbnails bake the LUT into their cached pixels like
+                    // exposure/gamma, so the toggle must invalidate them (#147).
+                    if ui
+                        .checkbox(&mut self.enable_lut, "Enable Custom LUT")
+                        .changed()
+                    {
+                        self.viewer.invalidate_tone();
+                    }
                     if let Some(err) = &self.lut_error {
                         ui.label(egui::RichText::new(err).color(egui::Color32::RED));
                     }
