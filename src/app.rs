@@ -395,6 +395,11 @@ pub struct ExrApp {
     /// Result receiver: the worker sends completed `LoadResult`s back here.
     #[serde(skip)]
     load_rx: Option<std::sync::mpsc::Receiver<LoadMsg>>,
+    /// Cloned into the decode worker so it can wake the UI the moment a result
+    /// lands (#137) instead of the result waiting out the 50 ms in-flight poll.
+    /// `None` only in tests, which drain the channel directly.
+    #[serde(skip)]
+    repaint_ctx: Option<egui::Context>,
 
     // Async LUT loading: .cube parsing runs on a worker thread (see
     // `reload_lut`); the parsed CubeLut arrives over `lut_load_rx` and the
@@ -491,6 +496,7 @@ impl Default for ExrApp {
             loading_b: false,
             load_tx: None,
             load_rx: None,
+            repaint_ctx: None,
             lut_loading: false,
             lut_pending_auto_enable: false,
             lut_load_tx: None,
@@ -509,6 +515,10 @@ impl ExrApp {
         } else {
             Self::default()
         };
+
+        // Wire the repaint handle before anything can spawn the decode worker,
+        // so the worker can wake the UI when a result lands (#137).
+        app.repaint_ctx = Some(cc.egui_ctx.clone());
 
         app.gpu_resources = cc
             .wgpu_render_state
@@ -698,10 +708,16 @@ impl ExrApp {
         let path = self.lut_path.clone();
         self.lut_loading = true;
         self.lut_error = None;
+        let repaint_ctx = self.repaint_ctx.clone();
         std::thread::spawn(move || {
             let result = crate::color::cube::CubeLut::load(&path)
                 .map_err(|e| format!("Failed to load LUT: {e}"));
             let _ = tx.send(LutLoadResult { path, result });
+            // Wake the UI so the parsed LUT applies immediately (#137) instead
+            // of waiting for the next input-driven repaint.
+            if let Some(ctx) = &repaint_ctx {
+                ctx.request_repaint();
+            }
         });
     }
 
@@ -904,6 +920,16 @@ impl ExrApp {
             let (job_tx, job_rx) = std::sync::mpsc::channel::<LoadJob>();
             let (result_tx, result_rx) = std::sync::mpsc::channel::<LoadMsg>();
             let epoch_signal = std::sync::Arc::clone(&self.epoch_signal);
+            let repaint_ctx = self.repaint_ctx.clone();
+            // Wake the UI as soon as a result is queued (#137). Without this the
+            // result waits for the next scheduled repaint — up to the full 50 ms
+            // in-flight poll — on top of decode time, and the one-outstanding
+            // pump leaves the worker idle for that window too.
+            let wake_ui = move || {
+                if let Some(ctx) = &repaint_ctx {
+                    ctx.request_repaint();
+                }
+            };
             std::thread::spawn(move || {
                 for job in job_rx {
                     // Drop a sequence job a newer seek/scrub already superseded,
@@ -931,6 +957,7 @@ impl ExrApp {
                             path: job.path.clone(),
                             proxy,
                         });
+                        wake_ui();
                     }
                     // Beauty-only for playback prefetch while moving (#56, step 3):
                     // one layer, faster decode + smaller resident frame. Full
@@ -949,6 +976,7 @@ impl ExrApp {
                         open_gen: job.open_gen,
                         result,
                     })));
+                    wake_ui();
                 }
             });
             self.load_tx = Some(job_tx);
@@ -1223,6 +1251,16 @@ impl ExrApp {
         let (lo, hi) = (self.playback.in_point, self.playback.out_point);
         let next = (i64::from(self.playback.current_frame) + i64::from(delta))
             .clamp(i64::from(lo), i64::from(hi)) as u32;
+        // Clamped at a range boundary: a held arrow key would otherwise re-seek
+        // the same frame every key-repeat, superseding its own decode (#139).
+        // Same narrowing as `playback_scrub_to`: an errored frame (not pending,
+        // not resident) still falls through so the step retries it.
+        if next == self.playback.current_frame
+            && (self.playback.pending == Some(next)
+                || self.frame_cache.contains(crate::cache::Slot::A, next))
+        {
+            return;
+        }
         self.playback.current_frame = next;
         self.invalidate_inflight(); // a seek supersedes any in-flight decode
         self.request_sequence_frame(next);
@@ -1236,6 +1274,20 @@ impl ExrApp {
         }
         self.playback.state = crate::playback::PlayState::Paused;
         let next = frame.clamp(self.playback.in_point, self.playback.out_point);
+        // A held-but-stationary drag re-lands on the current frame every UI
+        // frame (`dragged()` is true even with zero pointer movement). Re-running
+        // the seek would bump the epoch each time, so the held frame's decode is
+        // dropped on arrival and resubmitted forever — never displayed or cached
+        // until release (#139). A same-frame scrub is a no-op while the frame is
+        // in flight or already resident; a frame that is neither (its decode
+        // errored — errors clear `pending` without a T1 insert) falls through so
+        // the seek doubles as a retry.
+        if next == self.playback.current_frame
+            && (self.playback.pending == Some(next)
+                || self.frame_cache.contains(crate::cache::Slot::A, next))
+        {
+            return;
+        }
         self.playback.current_frame = next;
         self.invalidate_inflight(); // a scrub supersedes any in-flight decode
         self.request_sequence_frame(next);
@@ -1396,8 +1448,24 @@ impl ExrApp {
         }
         // Keep the decode-ahead ring filling even between advances.
         self.pump_decode();
-        // Keep the clock ticking even while idle between frames.
-        ctx.request_repaint_after(period);
+        // Wake at the next absolute deadline (`anchor + n·period`), not a full
+        // period from now: `request_repaint_after(period)` added the wake-up
+        // slop (timer/vsync quantization) to every frame, capping effective
+        // fps below target no matter how fast decode was (#138). While a
+        // decode holds the stutter clock, the worker wake (#137) and the
+        // in-flight poll drive repaints instead — schedule the period only as
+        // a lazy fallback rather than spinning on the overdue deadline.
+        let decode_bound = matches!(self.playback.pacing, Pacing::Stutter)
+            && (self.playback.pending.is_some() || self.loading_a);
+        let wait = if decode_bound {
+            period
+        } else {
+            let now = std::time::Instant::now();
+            self.playback.anchor.map_or(period, |anchor| {
+                (anchor + period * self.playback.frames_since_anchor).saturating_duration_since(now)
+            })
+        };
+        ctx.request_repaint_after(wait);
     }
 
     /// Stutter pacing: advance only when the playhead frame is ready (not awaiting
@@ -1499,6 +1567,47 @@ impl ExrApp {
         self.last_watch_poll = Some(now);
         ctx.request_repaint_after(WATCH_INTERVAL); // keep the cadence ticking
         self.rescan_and_apply();
+    }
+
+    /// Resize the T1 (RAM) and T2 (VRAM) rings to the live resource budgets
+    /// (#56). Runs every frame from `ui()` — `ResourceMonitor::sample` is
+    /// internally throttled so the cost is a struct copy — and lives here, not
+    /// in a draw method: the caps are overcommit protection, and must keep
+    /// running through any UI restructure (#150).
+    fn tick_budgets(&mut self) {
+        let Some(gpu) = &self.gpu_resources else {
+            return;
+        };
+        let sample = self.resource_monitor.sample(&gpu.render_state().device);
+        self.dbg_last_sample = Some(sample); // stash for the status bar + debug overlay
+
+        // T1: recomputed each tick; shrinks under other memory pressure.
+        if let Some(bytes) = self.frame_bytes {
+            let cache_bytes = self.frame_cache.len() as u64 * bytes as u64;
+            let auto = crate::budget::t1_capacity(&sample, bytes, cache_bytes);
+            // A user-assigned RAM budget (if any) caps the auto figure —
+            // never raises it — then floor at 2 so playback still runs.
+            self.frame_cache_cap =
+                crate::budget::apply_user_ram_cap(auto, self.ram_budget_bytes(), bytes).max(2);
+        }
+
+        // T2: conservative — capped low, and disabled (→ lazy path) unless at
+        // least a couple of frames comfortably fit, since a wgpu OOM aborts
+        // the process. Off entirely when the user disables it or no sequence
+        // is loaded.
+        const T2_HARD_CAP: usize = 8;
+        let t2_cap = if self.t2_enabled && self.playback.is_active() {
+            self.exr_data
+                .as_ref()
+                .and_then(|d| d.logical_size(self.viewer.active_layer))
+                .map_or(0, |(w, h)| {
+                    let fits = crate::budget::max_t2(&sample, w, h);
+                    if fits < 2 { 0 } else { fits.min(T2_HARD_CAP) }
+                })
+        } else {
+            0
+        };
+        self.viewer.set_t2_cap(t2_cap);
     }
 
     /// The ctx-free, un-throttled core of the render-watch: re-scan the group,
@@ -1671,12 +1780,18 @@ impl ExrApp {
                     }
                     self.frame_cache
                         .insert(crate::cache::Slot::A, res.frame, arc.clone());
+                    // In Loop mode eviction distance follows the play direction
+                    // around the loop, so prefetch wrapped past the out point
+                    // isn't classified "behind" and evicted on arrival (#140).
+                    let loop_wrap = (self.playback.loop_mode == crate::playback::LoopMode::Loop)
+                        .then_some((self.playback.in_point, self.playback.out_point));
                     self.dbg_evictions =
                         self.dbg_evictions.saturating_add(self.frame_cache.evict_to(
                             self.frame_cache_cap,
                             self.playback.current_frame,
                             self.playback.direction,
                             self.playback.is_playing(),
+                            loop_wrap,
                         ) as u64);
                     // Show it only if it's the frame the playhead is waiting on;
                     // a prefetched frame ahead of the playhead is just cached.
@@ -2128,6 +2243,8 @@ impl eframe::App for ExrApp {
         // Pick up frames a render writes while we're open (#101); no-op unless the
         // user enabled Watch and a sequence is loaded.
         self.tick_render_watch(ui.ctx());
+        // Keep the T1/T2 rings sized to the live RAM/VRAM budgets (#56, #150).
+        self.tick_budgets();
 
         // Snapshot to clipboard (#19): request a framebuffer screenshot on the
         // hotkey and consume the reply when it arrives.
@@ -2177,7 +2294,9 @@ impl ExrApp {
         // Once-per-second decode trace for RUST_LOG=floki=debug diagnosis.
         self.trace_playback_state();
         if self.loading_a || self.loading_b || !self.inflight.is_empty() {
-            // egui is reactive; keep polling the worker until the decode lands.
+            // Fallback only: the worker wakes the UI directly when a result
+            // lands (#137). This poll covers a worker that dies mid-decode (the
+            // watchdog path) and tests that run without a live worker wake.
             // `inflight` covers silent precache prefetch (#56, step 4), which
             // doesn't set `loading_a` but still has results to drain.
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
@@ -2772,45 +2891,13 @@ impl ExrApp {
                 ui.label(egui::RichText::new(status).weak());
             }
 
-            // Discrete RAM/VRAM readout, right-aligned (#51). `sample()` is throttled
-            // internally, so this is cheap per frame; request a slow repaint so the
-            // numbers keep ticking while the app is otherwise idle.
-            if let Some(gpu) = &self.gpu_resources {
-                let sample = self.resource_monitor.sample(&gpu.render_state().device);
-                self.dbg_last_sample = Some(sample); // stash for the debug overlay
+            // Discrete RAM/VRAM readout, right-aligned (#51). The sample is taken
+            // (and the T1/T2 budgets recomputed) by `tick_budgets` each frame;
+            // request a slow repaint so the numbers keep ticking while the app
+            // is otherwise idle.
+            if let Some(sample) = self.dbg_last_sample {
                 ui.ctx()
                     .request_repaint_after(std::time::Duration::from_secs(1));
-
-                // Resize the T1 ring to the live RAM budget (#56). Recomputed
-                // each status tick; shrinks under other memory pressure.
-                if let Some(bytes) = self.frame_bytes {
-                    let cache_bytes = self.frame_cache.len() as u64 * bytes as u64;
-                    let auto = crate::budget::t1_capacity(&sample, bytes, cache_bytes);
-                    // A user-assigned RAM budget (if any) caps the auto figure —
-                    // never raises it — then floor at 2 so playback still runs.
-                    self.frame_cache_cap =
-                        crate::budget::apply_user_ram_cap(auto, self.ram_budget_bytes(), bytes)
-                            .max(2);
-                }
-
-                // Resize the T2 GPU-texture ring to the live VRAM budget (#56).
-                // Conservative: capped low, and disabled (→ lazy path) unless at
-                // least a couple of frames comfortably fit, since a wgpu OOM
-                // aborts the process. Off entirely when the user disables it or
-                // no sequence is loaded.
-                const T2_HARD_CAP: usize = 8;
-                let t2_cap = if self.t2_enabled && self.playback.is_active() {
-                    self.exr_data
-                        .as_ref()
-                        .and_then(|d| d.logical_size(self.viewer.active_layer))
-                        .map_or(0, |(w, h)| {
-                            let fits = crate::budget::max_t2(&sample, w, h);
-                            if fits < 2 { 0 } else { fits.min(T2_HARD_CAP) }
-                        })
-                } else {
-                    0
-                };
-                self.viewer.set_t2_cap(t2_cap);
                 use crate::resource_monitor::fmt_bytes;
                 // floki's tracked image footprint leads the readout: it drops to 0
                 // on unload, whereas process RSS lags (the allocator keeps freed
@@ -3765,8 +3852,17 @@ impl ExrApp {
                                     );
                                 });
 
-                                self.viewer
-                                    .calculate_histogram(exr_data, self.exr_data_b.as_deref());
+                                // Recomputing full-res bins on every frame swap
+                                // would block the UI thread at playback rate and
+                                // contend with decode for the rayon pool (#141).
+                                // INV-SAMPLE already suppresses the pixel readout
+                                // while playing/pending — mirror it: hold the last
+                                // computed bins and recompute once on settle (the
+                                // swap invalidated the key).
+                                if !self.playback.sampling_suppressed() {
+                                    self.viewer
+                                        .calculate_histogram(exr_data, self.exr_data_b.as_deref());
+                                }
 
                                 if let Some(bins) = &self.viewer.histogram {
                                     let (rect, _resp) = ui.allocate_exact_size(
@@ -4628,6 +4724,80 @@ mod tests {
         app.playback_scrub_to(1);
         app.playback_step(-1);
         assert_eq!(app.playback.current_frame, 1);
+    }
+
+    /// A held-but-stationary scrub re-lands on the same frame every UI frame
+    /// (`dragged()` stays true with zero pointer movement). Each re-seek used to
+    /// bump the epoch, so the held frame's decode was dropped on arrival and
+    /// resubmitted forever — never displayed or cached until release (#139).
+    /// Same-frame scrubs and boundary-clamped steps must be no-ops.
+    #[test]
+    fn stationary_scrub_hold_does_not_supersede_its_own_decode() {
+        let dir = tempfile::tempdir().unwrap();
+        touch_sequence(dir.path(), 5);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&dir.path().join("s.0001.exr"));
+
+        // The drag lands on frame 3: a real seek — decode in flight.
+        app.playback_scrub_to(3);
+        let epoch = app.playback.epoch;
+        assert_eq!(app.playback.pending, Some(3));
+
+        // The user holds the drag without moving: the same frame re-lands on
+        // every subsequent UI frame. The in-flight decode must survive.
+        for _ in 0..3 {
+            app.playback_scrub_to(3);
+        }
+        assert_eq!(
+            app.playback.epoch, epoch,
+            "stationary hold must not supersede the held frame's decode"
+        );
+        assert_eq!(app.playback.pending, Some(3), "still awaiting the decode");
+
+        // Key-repeat at a range boundary clamps to the same frame — also a no-op.
+        app.playback_scrub_to(99); // land on the out point (frame 5)
+        let epoch = app.playback.epoch;
+        app.playback_step(1);
+        assert_eq!(app.playback.current_frame, 5);
+        assert_eq!(
+            app.playback.epoch, epoch,
+            "boundary-clamped step must not supersede the out point's decode"
+        );
+    }
+
+    /// The same-frame no-op must not swallow retries: a decode *error* clears
+    /// `pending` without inserting into T1, so scrubbing onto the errored frame
+    /// again has to fall through and re-request it.
+    #[test]
+    fn same_frame_scrub_retries_after_a_decode_error() {
+        let dir = tempfile::tempdir().unwrap();
+        touch_sequence(dir.path(), 5);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&dir.path().join("s.0001.exr"));
+
+        app.playback_scrub_to(3);
+        assert_eq!(app.playback.pending, Some(3));
+
+        // The decode fails: pending clears, nothing lands in T1.
+        app.apply_load_result(LoadResult {
+            path: dir.path().join("s.0003.exr"),
+            is_b: false,
+            seq_frame: true,
+            frame: 3,
+            epoch: app.playback.epoch,
+            open_gen: 0,
+            result: Err("truncated exr".to_string()),
+        });
+        assert_eq!(app.playback.pending, None);
+        assert_eq!(app.error_msg.as_deref(), Some("truncated exr"));
+
+        // Scrubbing onto the same frame is a retry, not a no-op.
+        app.playback_scrub_to(3);
+        assert_eq!(
+            app.playback.pending,
+            Some(3),
+            "errored frame re-requested by a same-frame scrub"
+        );
     }
 
     #[test]

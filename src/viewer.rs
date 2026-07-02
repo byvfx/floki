@@ -2998,7 +2998,11 @@ impl ExrViewer {
 
     /// Set the VRAM-budgeted T2 capacity (frames). `0` disables pre-upload and
     /// drops the ring → the lazy per-swap path. Shrinking evicts immediately.
+    /// Called every frame from `tick_budgets` — an unchanged cap is a no-op.
     pub(crate) fn set_t2_cap(&mut self, cap: usize) {
+        if cap == self.t2_cap {
+            return;
+        }
         self.t2_cap = cap;
         if cap == 0 {
             self.clear_t2();

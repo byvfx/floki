@@ -5,8 +5,9 @@
 //! cloning its pixel buffers, and a scrub-back or loop replay is an instant cache
 //! hit instead of a re-decode. Bounded by a frame-count capacity derived from the
 //! RAM budget (`crate::budget::max_t1`); eviction is **directional-ring + LRU**:
-//! during linear play drop frames behind the playhead first, while scrubbing drop
-//! by absolute distance — LRU breaks ties. See `docs/playback/memory-contract.md`.
+//! during linear play drop frames behind the playhead first (measured around the
+//! loop when `LoopMode::Loop` wraps, #140), while scrubbing drop by absolute
+//! distance — LRU breaks ties. See `docs/playback/memory-contract.md`.
 //!
 //! Keyed on `(Slot, frame)` so locked-step A/B (#7, Phase 5) is an extension, not
 //! a rewrite; Phase 3 only ever stores `Slot::A` frames.
@@ -116,6 +117,10 @@ impl FrameCache {
     /// Evict frames until at most `capacity` remain (capacity is floored at 1),
     /// protecting the active frame `(Slot::A, playhead)`. Victim selection is the
     /// directional-ring + LRU policy in [`FrameCache::pick_victim`].
+    ///
+    /// `loop_wrap` is the in/out range when playing with `LoopMode::Loop`, so
+    /// eviction distance follows the play direction *around* the loop; pass
+    /// `None` for Once/PingPong and while paused.
     /// Returns the number of frames evicted (for instrumentation).
     pub fn evict_to(
         &mut self,
@@ -123,11 +128,12 @@ impl FrameCache {
         playhead: u32,
         direction: Direction,
         playing: bool,
+        loop_wrap: Option<(u32, u32)>,
     ) -> usize {
         let cap = capacity.max(1);
         let mut evicted = 0;
         while self.entries.len() > cap {
-            match self.pick_victim(playhead, direction, playing) {
+            match self.pick_victim(playhead, direction, playing, loop_wrap) {
                 Some(victim) => {
                     self.entries.remove(&victim);
                     evicted += 1;
@@ -143,9 +149,17 @@ impl FrameCache {
     /// frame is left. Higher "evictability" wins; LRU (smaller `last_used`)
     /// breaks ties.
     ///
-    /// - **Playing** (linear): frames *behind* the playhead in the play direction
-    ///   are evicted first (furthest-behind first); frames *ahead* are kept until
-    ///   no behind frames remain, then furthest-ahead goes first.
+    /// - **Playing, Loop** (`loop_wrap = Some((in, out))`): distance is measured
+    ///   in the play direction *around* the loop (modulo the span). A frame just
+    ///   behind the playhead is nearly a full lap from being shown again, so it
+    ///   is evicted first, while prefetch wrapped past the out point ranks "just
+    ///   ahead" and survives. The plain behind test below used to classify
+    ///   wrapped prefetch as furthest-behind and evict it the moment it landed —
+    ///   decode churn near the out point and a guaranteed miss at the wrap (#140).
+    /// - **Playing** (linear — Once/PingPong): frames *behind* the playhead in
+    ///   the play direction are evicted first (furthest-behind first); frames
+    ///   *ahead* are kept until no behind frames remain, then furthest-ahead
+    ///   goes first.
     /// - **Scrubbing/paused**: evict by absolute distance from the playhead
     ///   (bidirectional), furthest first.
     fn pick_victim(
@@ -153,6 +167,7 @@ impl FrameCache {
         playhead: u32,
         direction: Direction,
         playing: bool,
+        loop_wrap: Option<(u32, u32)>,
     ) -> Option<(Slot, u32)> {
         // Rank "behind" frames above "ahead" frames during play by adding this
         // offset, so any behind frame outranks every ahead frame.
@@ -162,6 +177,22 @@ impl FrameCache {
             let dist = u64::from(frame.abs_diff(playhead));
             if !playing {
                 return dist; // scrub: pure distance, either side.
+            }
+            if let Some((lo, hi)) = loop_wrap
+                && (lo..=hi).contains(&playhead)
+            {
+                // A leftover from an old trim, outside the loop: never shown
+                // again on this lap — evict before anything in range.
+                if !(lo..=hi).contains(&frame) {
+                    return BEHIND_BIAS + dist;
+                }
+                let len = i64::from(hi) - i64::from(lo) + 1;
+                let delta = i64::from(frame) - i64::from(playhead);
+                let fwd = match direction {
+                    Direction::Forward => delta.rem_euclid(len),
+                    Direction::Reverse => (-delta).rem_euclid(len),
+                };
+                return fwd as u64;
             }
             let behind = match direction {
                 Direction::Forward => frame < playhead,
@@ -255,7 +286,7 @@ mod tests {
         let mut c = FrameCache::new();
         fill(&mut c, Slot::A, &[10, 11, 12]);
         // Capacity 1 with playhead on 11: everything else goes, 11 stays.
-        c.evict_to(1, 11, Direction::Forward, true);
+        c.evict_to(1, 11, Direction::Forward, true, None);
         assert_eq!(c.len(), 1);
         assert!(c.contains(Slot::A, 11), "active frame is never evicted");
     }
@@ -268,7 +299,7 @@ mod tests {
         // Trim to 3: the two behind frames (furthest first: 3 then 4) are dropped.
         // The returned count (used by the #100 debug overlay) reflects that.
         assert_eq!(
-            c.evict_to(3, 5, Direction::Forward, true),
+            c.evict_to(3, 5, Direction::Forward, true, None),
             2,
             "evicted count"
         );
@@ -288,7 +319,7 @@ mod tests {
         let mut c = FrameCache::new();
         // All ahead of playhead 5.
         fill(&mut c, Slot::A, &[5, 6, 7, 8]);
-        c.evict_to(2, 5, Direction::Forward, true);
+        c.evict_to(2, 5, Direction::Forward, true, None);
         // Keep playhead + nearest ahead; drop the furthest-ahead (8 then 7).
         assert!(c.contains(Slot::A, 5) && c.contains(Slot::A, 6));
         assert!(!c.contains(Slot::A, 7) && !c.contains(Slot::A, 8));
@@ -299,7 +330,7 @@ mod tests {
         let mut c = FrameCache::new();
         // Playhead 5, playing in reverse: 6,7 are "behind", 3,4 ahead.
         fill(&mut c, Slot::A, &[3, 4, 5, 6, 7]);
-        c.evict_to(3, 5, Direction::Reverse, true);
+        c.evict_to(3, 5, Direction::Reverse, true, None);
         assert!(c.contains(Slot::A, 5));
         assert!(
             c.contains(Slot::A, 3) && c.contains(Slot::A, 4),
@@ -316,7 +347,7 @@ mod tests {
         let mut c = FrameCache::new();
         // Playhead 5; not playing -> bidirectional distance.
         fill(&mut c, Slot::A, &[1, 4, 5, 6, 9]);
-        c.evict_to(3, 5, Direction::Forward, false);
+        c.evict_to(3, 5, Direction::Forward, false, None);
         // Furthest from 5 are 1 (dist 4) and 9 (dist 4); both dropped.
         assert!(c.contains(Slot::A, 5));
         assert!(
@@ -337,8 +368,69 @@ mod tests {
         c.insert(Slot::A, 4, frame()); // inserted earlier
         c.insert(Slot::A, 6, frame()); // inserted later
         c.get(Slot::A, 6); // touch 6 so 4 is least-recently-used
-        c.evict_to(2, 5, Direction::Forward, false);
+        c.evict_to(2, 5, Direction::Forward, false, None);
         assert!(c.contains(Slot::A, 6), "recently used survives the tie");
         assert!(!c.contains(Slot::A, 4), "LRU loses the tie");
+    }
+
+    /// #140 regression: with the playhead near the out point in Loop mode, the
+    /// scheduler wraps the prefetch window past the boundary. Those wrapped
+    /// frames used to be classified "behind" (plain `frame < playhead`) and
+    /// evicted the moment they landed — decode churn near the out point and a
+    /// guaranteed miss at every wrap. In ring distance they are "just ahead"
+    /// and must survive; the frames just behind the playhead go first.
+    #[test]
+    fn loop_play_keeps_wrapped_prefetch_and_evicts_just_behind() {
+        let mut c = FrameCache::new();
+        // Loop [1,10], playhead 9 forward. Wrapped prefetch 1,2 has landed;
+        // 7,8 were just shown. Ring distances from 9: 10→1, 1→2, 2→3, 7→8, 8→9.
+        fill(&mut c, Slot::A, &[7, 8, 9, 10, 1, 2]);
+        c.evict_to(4, 9, Direction::Forward, true, Some((1, 10)));
+        assert!(c.contains(Slot::A, 9), "playhead protected");
+        assert!(
+            c.contains(Slot::A, 10) && c.contains(Slot::A, 1) && c.contains(Slot::A, 2),
+            "wrapped prefetch is 'just ahead' around the loop — kept"
+        );
+        assert!(
+            !c.contains(Slot::A, 7) && !c.contains(Slot::A, 8),
+            "just-behind frames are a full lap away — evicted first"
+        );
+    }
+
+    /// Reverse Loop play mirrors the wrap: prefetch below the in point wraps to
+    /// the out point and must survive over frames just above the playhead.
+    #[test]
+    fn reverse_loop_play_keeps_prefetch_wrapped_to_the_out_point() {
+        let mut c = FrameCache::new();
+        // Loop [1,10], playhead 2 reverse. Prefetch 1,10,9 (wrapping); 3,4 just shown.
+        fill(&mut c, Slot::A, &[4, 3, 2, 1, 10, 9]);
+        c.evict_to(4, 2, Direction::Reverse, true, Some((1, 10)));
+        assert!(c.contains(Slot::A, 2), "playhead protected");
+        assert!(
+            c.contains(Slot::A, 1) && c.contains(Slot::A, 10) && c.contains(Slot::A, 9),
+            "prefetch wrapped past the in point kept"
+        );
+        assert!(
+            !c.contains(Slot::A, 3) && !c.contains(Slot::A, 4),
+            "just-behind (higher) frames evicted first"
+        );
+    }
+
+    /// Frames left outside the loop range by a trim are never shown again on
+    /// this lap: they outrank everything in range for eviction.
+    #[test]
+    fn loop_play_evicts_out_of_range_leftovers_first() {
+        let mut c = FrameCache::new();
+        // Loop trimmed to [1,10]; frame 12 is a leftover from the old range.
+        fill(&mut c, Slot::A, &[12, 8, 9, 10, 1]);
+        c.evict_to(4, 9, Direction::Forward, true, Some((1, 10)));
+        assert!(
+            !c.contains(Slot::A, 12),
+            "out-of-range leftover evicted before any in-range frame"
+        );
+        assert!(
+            c.contains(Slot::A, 8) && c.contains(Slot::A, 10) && c.contains(Slot::A, 1),
+            "in-range frames kept"
+        );
     }
 }
