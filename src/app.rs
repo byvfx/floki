@@ -3836,8 +3836,17 @@ impl ExrApp {
                                     );
                                 });
 
-                                self.viewer
-                                    .calculate_histogram(exr_data, self.exr_data_b.as_deref());
+                                // Recomputing full-res bins on every frame swap
+                                // would block the UI thread at playback rate and
+                                // contend with decode for the rayon pool (#141).
+                                // INV-SAMPLE already suppresses the pixel readout
+                                // while playing/pending — mirror it: hold the last
+                                // computed bins and recompute once on settle (the
+                                // swap invalidated the key).
+                                if !self.playback.sampling_suppressed() {
+                                    self.viewer
+                                        .calculate_histogram(exr_data, self.exr_data_b.as_deref());
+                                }
 
                                 if let Some(bins) = &self.viewer.histogram {
                                     let (rect, _resp) = ui.allocate_exact_size(
