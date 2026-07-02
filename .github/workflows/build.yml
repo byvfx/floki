@@ -125,6 +125,12 @@ jobs:
   build-ocio:
     name: OCIO vendored build (${{ matrix.os }})
     needs: test
+    # On a tag push this job's Release step (softprops/action-gh-release) creates
+    # the GitHub Release, which needs write access to repository contents. The
+    # repo's default workflow-token permission is read-only, so grant it here
+    # explicitly — least-privilege: only this job, only the `contents` scope.
+    permissions:
+      contents: write
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
