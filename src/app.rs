@@ -1251,6 +1251,11 @@ impl ExrApp {
         let (lo, hi) = (self.playback.in_point, self.playback.out_point);
         let next = (i64::from(self.playback.current_frame) + i64::from(delta))
             .clamp(i64::from(lo), i64::from(hi)) as u32;
+        // Clamped at a range boundary: a held arrow key would otherwise re-seek
+        // the same frame every key-repeat, superseding its own decode (#139).
+        if next == self.playback.current_frame {
+            return;
+        }
         self.playback.current_frame = next;
         self.invalidate_inflight(); // a seek supersedes any in-flight decode
         self.request_sequence_frame(next);
@@ -1264,6 +1269,15 @@ impl ExrApp {
         }
         self.playback.state = crate::playback::PlayState::Paused;
         let next = frame.clamp(self.playback.in_point, self.playback.out_point);
+        // A held-but-stationary drag re-lands on the current frame every UI
+        // frame (`dragged()` is true even with zero pointer movement). Re-running
+        // the seek would bump the epoch each time, so the held frame's decode is
+        // dropped on arrival and resubmitted forever — never displayed or cached
+        // until release (#139). A same-frame scrub is a no-op: the landing that
+        // set `current_frame` already requested it.
+        if next == self.playback.current_frame {
+            return;
+        }
         self.playback.current_frame = next;
         self.invalidate_inflight(); // a scrub supersedes any in-flight decode
         self.request_sequence_frame(next);
@@ -4685,6 +4699,45 @@ mod tests {
         app.playback_scrub_to(1);
         app.playback_step(-1);
         assert_eq!(app.playback.current_frame, 1);
+    }
+
+    /// A held-but-stationary scrub re-lands on the same frame every UI frame
+    /// (`dragged()` stays true with zero pointer movement). Each re-seek used to
+    /// bump the epoch, so the held frame's decode was dropped on arrival and
+    /// resubmitted forever — never displayed or cached until release (#139).
+    /// Same-frame scrubs and boundary-clamped steps must be no-ops.
+    #[test]
+    fn stationary_scrub_hold_does_not_supersede_its_own_decode() {
+        let dir = tempfile::tempdir().unwrap();
+        touch_sequence(dir.path(), 5);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&dir.path().join("s.0001.exr"));
+
+        // The drag lands on frame 3: a real seek — decode in flight.
+        app.playback_scrub_to(3);
+        let epoch = app.playback.epoch;
+        assert_eq!(app.playback.pending, Some(3));
+
+        // The user holds the drag without moving: the same frame re-lands on
+        // every subsequent UI frame. The in-flight decode must survive.
+        for _ in 0..3 {
+            app.playback_scrub_to(3);
+        }
+        assert_eq!(
+            app.playback.epoch, epoch,
+            "stationary hold must not supersede the held frame's decode"
+        );
+        assert_eq!(app.playback.pending, Some(3), "still awaiting the decode");
+
+        // Key-repeat at a range boundary clamps to the same frame — also a no-op.
+        app.playback_scrub_to(99); // land on the out point (frame 5)
+        let epoch = app.playback.epoch;
+        app.playback_step(1);
+        assert_eq!(app.playback.current_frame, 5);
+        assert_eq!(
+            app.playback.epoch, epoch,
+            "boundary-clamped step must not supersede the out point's decode"
+        );
     }
 
     #[test]
