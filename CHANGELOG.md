@@ -5,6 +5,27 @@ All notable changes to Floki are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.1] - 2026-07-02
+
+A stability patch for the 1.9.0 playback release: several ways sequence playback
+could freeze mid-shot (image frozen, UI still responsive, only reopening the file
+helped) are fixed, and playback now recovers on its own if a decode ever gets stuck.
+
+### Fixed
+- **Playback freezes during play and scrubbing.** Multiple causes in the playback
+  cache and decode pipeline are addressed: eager precache no longer decode/evict
+  churns forever when the in/out range is larger than the RAM budget (it stops once
+  the cache is full); playing prefetches the window *ahead* of the playhead instead
+  of wrapping to the far side and starving it; settling or scrubbing onto a
+  beauty-only cached frame now actually submits its full re-decode instead of
+  stalling; and rapid scrubbing no longer floods the decode worker with soon-stale
+  jobs — the worker skips superseded frames before decoding, so the frame you land
+  on appears right away.
+- **Self-recovery.** A decode-stall watchdog and automatic decode-worker respawn
+  recover a stuck or crashed decode on their own, instead of freezing until the file
+  is reopened. `Stop` also clears any awaited decode so the readout and the next
+  `Play` aren't left waiting on a frame that never lands.
+
 ## [1.9.0] - 2026-06-30
 
 The **image-sequence playback** release. Floki becomes a sequence review player:
@@ -422,6 +443,7 @@ Initial release.
 - Cross-platform GitHub Actions builds (Linux, Windows, macOS).
 
 [Unreleased]: https://github.com/byvfx/floki/compare/v1.9.0...HEAD
+[1.9.1]: https://github.com/byvfx/floki/compare/v1.9.0...v1.9.1
 [1.9.0]: https://github.com/byvfx/floki/compare/v1.8.0...v1.9.0
 [1.8.0]: https://github.com/byvfx/floki/compare/v1.7.2...v1.8.0
 [1.7.2]: https://github.com/byvfx/floki/compare/v1.7.1...v1.7.2
