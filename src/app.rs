@@ -1253,7 +1253,12 @@ impl ExrApp {
             .clamp(i64::from(lo), i64::from(hi)) as u32;
         // Clamped at a range boundary: a held arrow key would otherwise re-seek
         // the same frame every key-repeat, superseding its own decode (#139).
-        if next == self.playback.current_frame {
+        // Same narrowing as `playback_scrub_to`: an errored frame (not pending,
+        // not resident) still falls through so the step retries it.
+        if next == self.playback.current_frame
+            && (self.playback.pending == Some(next)
+                || self.frame_cache.contains(crate::cache::Slot::A, next))
+        {
             return;
         }
         self.playback.current_frame = next;
@@ -1273,9 +1278,14 @@ impl ExrApp {
         // frame (`dragged()` is true even with zero pointer movement). Re-running
         // the seek would bump the epoch each time, so the held frame's decode is
         // dropped on arrival and resubmitted forever — never displayed or cached
-        // until release (#139). A same-frame scrub is a no-op: the landing that
-        // set `current_frame` already requested it.
-        if next == self.playback.current_frame {
+        // until release (#139). A same-frame scrub is a no-op while the frame is
+        // in flight or already resident; a frame that is neither (its decode
+        // errored — errors clear `pending` without a T1 insert) falls through so
+        // the seek doubles as a retry.
+        if next == self.playback.current_frame
+            && (self.playback.pending == Some(next)
+                || self.frame_cache.contains(crate::cache::Slot::A, next))
+        {
             return;
         }
         self.playback.current_frame = next;
@@ -4752,6 +4762,41 @@ mod tests {
         assert_eq!(
             app.playback.epoch, epoch,
             "boundary-clamped step must not supersede the out point's decode"
+        );
+    }
+
+    /// The same-frame no-op must not swallow retries: a decode *error* clears
+    /// `pending` without inserting into T1, so scrubbing onto the errored frame
+    /// again has to fall through and re-request it.
+    #[test]
+    fn same_frame_scrub_retries_after_a_decode_error() {
+        let dir = tempfile::tempdir().unwrap();
+        touch_sequence(dir.path(), 5);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&dir.path().join("s.0001.exr"));
+
+        app.playback_scrub_to(3);
+        assert_eq!(app.playback.pending, Some(3));
+
+        // The decode fails: pending clears, nothing lands in T1.
+        app.apply_load_result(LoadResult {
+            path: dir.path().join("s.0003.exr"),
+            is_b: false,
+            seq_frame: true,
+            frame: 3,
+            epoch: app.playback.epoch,
+            open_gen: 0,
+            result: Err("truncated exr".to_string()),
+        });
+        assert_eq!(app.playback.pending, None);
+        assert_eq!(app.error_msg.as_deref(), Some("truncated exr"));
+
+        // Scrubbing onto the same frame is a retry, not a no-op.
+        app.playback_scrub_to(3);
+        assert_eq!(
+            app.playback.pending,
+            Some(3),
+            "errored frame re-requested by a same-frame scrub"
         );
     }
 
