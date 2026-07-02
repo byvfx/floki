@@ -1770,12 +1770,18 @@ impl ExrApp {
                     }
                     self.frame_cache
                         .insert(crate::cache::Slot::A, res.frame, arc.clone());
+                    // In Loop mode eviction distance follows the play direction
+                    // around the loop, so prefetch wrapped past the out point
+                    // isn't classified "behind" and evicted on arrival (#140).
+                    let loop_wrap = (self.playback.loop_mode == crate::playback::LoopMode::Loop)
+                        .then_some((self.playback.in_point, self.playback.out_point));
                     self.dbg_evictions =
                         self.dbg_evictions.saturating_add(self.frame_cache.evict_to(
                             self.frame_cache_cap,
                             self.playback.current_frame,
                             self.playback.direction,
                             self.playback.is_playing(),
+                            loop_wrap,
                         ) as u64);
                     // Show it only if it's the frame the playhead is waiting on;
                     // a prefetched frame ahead of the playhead is just cached.
