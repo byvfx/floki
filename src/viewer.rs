@@ -661,6 +661,25 @@ impl ExrViewer {
         }
     }
 
+    /// Free queued GPU thumbnail texture ids (#67). Invalidation sites have no
+    /// renderer handle, so they defer into `pending_thumb_frees`; this is the
+    /// one place that holds the renderer. Runs every frame from [`Self::ui`]
+    /// (and again inside the contact sheet after its own invalidations). With
+    /// no GPU nothing was ever registered — just clear the queue.
+    fn drain_thumb_frees(&mut self, gpu_resources: Option<&crate::gpu::GpuResources>) {
+        if self.pending_thumb_frees.is_empty() {
+            return;
+        }
+        if let Some(gpu) = gpu_resources {
+            let mut renderer = gpu.render_state().renderer.write();
+            for id in self.pending_thumb_frees.drain(..) {
+                renderer.free_texture(&id);
+            }
+        } else {
+            self.pending_thumb_frees.clear();
+        }
+    }
+
     /// Invalidate cached contact-sheet thumbnails whose pixels depend on the
     /// exposure / gamma / sRGB tone pipeline, so they regenerate next frame.
     /// (The central viewport is GPU-only and reads the live uniform each frame, so
@@ -1684,20 +1703,9 @@ impl ExrViewer {
             self.gpu_thumb_bg = Some(self.background.clone());
         }
 
-        // Drain deferred `free_texture`s (#67): invalidation sites have no renderer
-        // handle, so they queue evicted GPU thumbnail ids here; this is the one site
-        // that holds the renderer. With no GPU nothing was ever registered — just
-        // clear the queue.
-        if !self.pending_thumb_frees.is_empty() {
-            if let Some(gpu) = gpu_resources {
-                let mut renderer = gpu.render_state().renderer.write();
-                for id in self.pending_thumb_frees.drain(..) {
-                    renderer.free_texture(&id);
-                }
-            } else {
-                self.pending_thumb_frees.clear();
-            }
-        }
+        // Drain any ids queued by the invalidations just above so they're freed
+        // this frame (the steady-state drain runs in `ui()`, #148).
+        self.drain_thumb_frees(gpu_resources);
 
         // Tone snapshot for the GPU thumbnail render. `enable_lut` now honours the
         // user `.cube` LUT: Phase 2 threads the real LUT bind group through to the
@@ -1906,6 +1914,12 @@ impl ExrViewer {
         lut_bg_opt: Option<std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>>,
     ) {
         self.handle_hotkeys(ui, exr_data_b.is_some());
+
+        // Free queued GPU thumbnail ids every frame (#148): invalidations fire
+        // with the contact sheet closed too (tone changes, frame swaps), and
+        // draining only in the sheet draw kept one stale generation of
+        // thumbnail textures in VRAM until the sheet was next opened.
+        self.drain_thumb_frees(gpu_resources);
 
         self.invalidate_thumbnails_on_ocio_change();
 
@@ -2550,12 +2564,27 @@ impl ExrViewer {
             // `min_uniform_buffer_offset_alignment` (typically 256), so every
             // dynamic offset is valid — the raw Uniforms struct (128 bytes)
             // is written at the start of each padded slot.
-            let offset = uniform_offset.get();
+            // The viewport allocates slots below the reserved offscreen slot
+            // (#148). On overflow, saturate to the last viewport slot instead
+            // of writing past the ring: the overflowing draws share uniforms
+            // (wrong image placement for one frame) but there's no wgpu
+            // validation error mid-frame. Debug builds still assert so an
+            // overflow is caught in development (relevant once #104's N-way
+            // compare raises the per-frame draw count).
+            let ring_cap = crate::gpu::UNIFORM_RING_OFFSCREEN_SLOT as u32 * uniform_stride;
+            let mut offset = uniform_offset.get();
+            if offset + uniform_stride > ring_cap {
+                debug_assert!(
+                    false,
+                    "uniform ring buffer overflow: too many draws this frame"
+                );
+                log::error!(
+                    target: "floki::gpu",
+                    "uniform ring overflow: too many draws this frame; reusing the last slot"
+                );
+                offset = ring_cap - uniform_stride;
+            }
             uniform_offset.set(offset + uniform_stride);
-            debug_assert!(
-                offset + uniform_stride <= crate::gpu::UNIFORM_RING_SLOTS as u32 * uniform_stride,
-                "uniform ring buffer overflow: too many draws this frame"
-            );
             queue.write_buffer(&uniform_buffer, offset as u64, bytemuck::bytes_of(&u));
 
             let bg_b = bg_b_opt.unwrap_or_else(|| default_tex_bg.clone());

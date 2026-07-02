@@ -157,7 +157,14 @@ pub fn generate_ocio(
     u.srgb = 0;
     u.gamma = 1.0;
     u.skip_checker = 1;
-    queue.write_buffer(&gpu_state.uniform_buffer, 0, bytemuck::bytes_of(&u));
+    // Reserved offscreen slot — never slot 0, which belongs to the viewport's
+    // deferred egui-pass draws (#148).
+    let uniform_offset = crate::gpu::UNIFORM_RING_OFFSCREEN_SLOT as u32 * gpu_state.uniform_stride;
+    queue.write_buffer(
+        &gpu_state.uniform_buffer,
+        u64::from(uniform_offset),
+        bytemuck::bytes_of(&u),
+    );
 
     let lut = lut_bg
         .filter(|_| tone.enable_lut)
@@ -196,7 +203,7 @@ pub fn generate_ocio(
             rp.set_pipeline(&gpu_state.pipeline_linear);
             rp.set_bind_group(0, &source_bg, &[]);
             rp.set_bind_group(1, gpu_state.default_tex_bind_group.as_ref(), &[]);
-            rp.set_bind_group(2, &gpu_state.uniform_bind_group, &[0]);
+            rp.set_bind_group(2, &gpu_state.uniform_bind_group, &[uniform_offset]);
             rp.set_bind_group(3, lut, &[]);
             rp.draw(0..6, 0..1);
         }
@@ -352,9 +359,15 @@ fn render_pixels<R>(
     });
     let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
 
-    // Write the uniforms to slot 0 of the persistent ring buffer; we bind with a
-    // dynamic offset of 0 below.
-    queue.write_buffer(&gpu_state.uniform_buffer, 0, bytemuck::bytes_of(uniforms));
+    // Write the uniforms to the reserved offscreen ring slot — never slot 0,
+    // which belongs to the viewport's deferred egui-pass draws (#148); bind
+    // with the matching dynamic offset below.
+    let uniform_offset = crate::gpu::UNIFORM_RING_OFFSCREEN_SLOT as u32 * gpu_state.uniform_stride;
+    queue.write_buffer(
+        &gpu_state.uniform_buffer,
+        u64::from(uniform_offset),
+        bytemuck::bytes_of(uniforms),
+    );
 
     let mut encoder =
         device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
@@ -378,7 +391,7 @@ fn render_pixels<R>(
         rp.set_pipeline(&gpu_state.thumbnail_pipeline);
         rp.set_bind_group(0, &source_bg, &[]);
         rp.set_bind_group(1, gpu_state.default_tex_bind_group.as_ref(), &[]);
-        rp.set_bind_group(2, &gpu_state.uniform_bind_group, &[0]);
+        rp.set_bind_group(2, &gpu_state.uniform_bind_group, &[uniform_offset]);
         rp.set_bind_group(
             3,
             lut_bg.unwrap_or(gpu_state.default_lut_bind_group.as_ref()),

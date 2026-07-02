@@ -256,6 +256,14 @@ fn fs_main(i: VOut) -> @location(0) vec4<f32> {
 /// 256-byte stride (worst-case alignment) the buffer is 4 KB.
 pub const UNIFORM_RING_SLOTS: u64 = 16;
 
+/// Ring slot reserved for offscreen generators (contact-sheet thumbnails).
+/// They write + submit immediately, while the viewport's draws are deferred to
+/// the egui render pass — sharing slot 0 was safe only while the sheet and the
+/// canvas were mutually exclusive; any future same-frame combination would
+/// silently draw the viewport with thumbnail uniforms (#148). The viewport's
+/// per-frame allocator uses slots `0..UNIFORM_RING_OFFSCREEN_SLOT`.
+pub const UNIFORM_RING_OFFSCREEN_SLOT: u64 = UNIFORM_RING_SLOTS - 1;
+
 /// Round `size` up to the next multiple of `align` (must be a power of two).
 fn align_to(size: u32, align: u32) -> u32 {
     (size + align - 1) & !(align - 1)
