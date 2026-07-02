@@ -157,6 +157,14 @@ pub struct ExrApp {
     /// frame; cleared on every seek so superseded decodes can't be miscounted.
     #[serde(skip)]
     inflight: std::collections::HashSet<u32>,
+    /// Latest playback epoch, shared with the decode worker so it can skip a
+    /// sequence job a newer seek/scrub already superseded **before** paying the
+    /// decode. Rapid scrubbing otherwise floods the worker's FIFO channel with
+    /// soon-stale jobs; draining them one full decode at a time (each then dropped
+    /// by [`Self::apply_load_result`]'s epoch check) strands the awaited frame
+    /// behind the backlog for seconds — the scrub freeze.
+    #[serde(skip)]
+    epoch_signal: std::sync::Arc<std::sync::atomic::AtomicU64>,
 
     /// Playback debug overlay (#100): a toggleable window showing live cache /
     /// budget / pacing state, so real-footage soak testing is observable rather
@@ -172,6 +180,20 @@ pub struct ExrApp {
     dbg_evictions: u64,
     #[serde(skip)]
     dbg_dropped_epoch: u64,
+
+    /// Wall-clock instant the most recent **sequence** decode job was submitted
+    /// to the worker. Anchors the decode stall watchdog ([`Self::tick_decode_watchdog`]):
+    /// with playback work outstanding and no result past an adaptive timeout,
+    /// playback is force-recovered instead of freezing until the file is reopened.
+    #[serde(skip)]
+    decode_submit_at: Option<std::time::Instant>,
+    /// Turnaround of the last completed sequence decode. Scales the stall
+    /// watchdog's timeout so a genuinely slow big-frame decode never trips it.
+    #[serde(skip)]
+    last_decode_dur: Option<std::time::Duration>,
+    /// Throttle for the once-per-second playback state trace ([`Self::trace_playback_state`]).
+    #[serde(skip)]
+    dbg_last_trace: Option<std::time::Instant>,
 
     recent_files: Vec<PathBuf>,
     theme: ThemeChoice,
@@ -407,10 +429,14 @@ impl Default for ExrApp {
             frame_cache_cap: 8,
             frame_bytes: None,
             inflight: std::collections::HashSet::new(),
+            epoch_signal: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             show_playback_debug: false,
             dbg_last_sample: None,
             dbg_evictions: 0,
             dbg_dropped_epoch: 0,
+            decode_submit_at: None,
+            last_decode_dur: None,
+            dbg_last_trace: None,
             recent_files: Vec::new(),
             theme: ThemeChoice::default(),
             diff_colormap: crate::gradient::Colormap::default(),
@@ -833,8 +859,7 @@ impl ExrApp {
         }
         self.error_msg = None;
 
-        let tx = self.ensure_worker();
-        let _ = tx.send(LoadJob {
+        self.submit_job(LoadJob {
             path,
             is_b,
             seq_frame: false,
@@ -849,6 +874,26 @@ impl ExrApp {
         });
     }
 
+    /// Send a decode job to the worker, **respawning it if it has died** (#…).
+    /// A dead worker's `job_rx` has been dropped, so `send` fails and hands the
+    /// job back inside the `SendError`; drop the stale channels so the next
+    /// [`Self::ensure_worker`] spawns a fresh thread, then resend. Without this a
+    /// crashed/wedged worker silently swallows every subsequent job and playback
+    /// (and even reopening) would decode nothing — the unrecoverable-freeze class.
+    fn submit_job(&mut self, job: LoadJob) {
+        let tx = self.ensure_worker();
+        if let Err(err) = tx.send(job) {
+            log::warn!(
+                target: "floki::playback",
+                "decode worker channel closed; respawning worker and resending job"
+            );
+            self.load_tx = None;
+            self.load_rx = None;
+            let tx = self.ensure_worker();
+            let _ = tx.send(err.0);
+        }
+    }
+
     /// Lazily create the load channel + spawn the single dedicated worker thread,
     /// returning a sender for [`LoadJob`]s. The worker processes jobs one at a
     /// time, so rapidly queued requests serialize instead of spawning many
@@ -858,8 +903,21 @@ impl ExrApp {
         if self.load_rx.is_none() {
             let (job_tx, job_rx) = std::sync::mpsc::channel::<LoadJob>();
             let (result_tx, result_rx) = std::sync::mpsc::channel::<LoadMsg>();
+            let epoch_signal = std::sync::Arc::clone(&self.epoch_signal);
             std::thread::spawn(move || {
                 for job in job_rx {
+                    // Drop a sequence job a newer seek/scrub already superseded,
+                    // **before** paying the decode (#…). Rapid scrubbing queues
+                    // many soon-stale jobs in this FIFO channel; decoding each one
+                    // (only for `apply_load_result` to drop it by epoch) strands
+                    // the awaited frame behind the backlog for seconds. Skipping
+                    // drains the backlog in microseconds. Opens are generation-
+                    // keyed, not epoch-keyed, so they are never skipped here.
+                    if job.seq_frame
+                        && job.epoch < epoch_signal.load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        continue;
+                    }
                     // Slot-A first-paint proxy (#33): a fast low-res read so the
                     // image appears before the full decode lands. Skipped for
                     // slot B (a reference) and for playback frames (#7), which
@@ -1030,20 +1088,41 @@ impl ExrApp {
         if !self.playback.is_active() || !self.inflight.is_empty() || self.loading_a {
             return;
         }
-        // Precache (#56, step 4): fill the whole budget (no 16-frame window cap),
-        // playing or paused, so the in/out range goes fully resident. Otherwise
-        // prefetch the sliding window while playing; paused decodes just the
-        // playhead.
-        let depth = if self.precache {
-            self.frame_cache_cap.saturating_sub(1)
-        } else if self.playback.is_playing() {
+        // Depth priority:
+        // - **Playing** → the sliding prefetch window ahead of the playhead, even
+        //   with precache on. Whole-budget depth here is actively harmful when the
+        //   range exceeds the budget: `next_want` loop-wraps to the far side and
+        //   the single worker burns its bandwidth decoding frames *behind* the
+        //   playhead (evict-churn) instead of the ones just ahead, so play goes
+        //   decode-bound and stalls.
+        // - **Idle + precache, not yet filled** (#56, step 4) → fill the whole
+        //   budget so the range goes as resident as it fits, for instant scrubbing.
+        //   Gated on `!precache_filled`: once latched (cache full / nothing more
+        //   fits), a whole-budget window keeps asking for far frames that
+        //   `evict_to` immediately drops — and because `apply_load_result` re-pumps
+        //   after every result, that decode→evict churn runs forever while idle,
+        //   independent of the `tick_precache` latch. A `pending` playhead still
+        //   gets through at depth 0 (its P1 slot in `next_want`).
+        // - **Idle otherwise** → just the playhead.
+        let depth = if self.playback.is_playing() {
             self.prefetch_depth()
+        } else if self.precache && !self.precache_filled {
+            self.frame_cache_cap.saturating_sub(1)
         } else {
             0
         };
         // The single highest-priority frame to fetch: allocation-free and
         // short-circuiting (it skips holes via the decodable predicate), so a
         // large precache depth doesn't build a full want-list every pump.
+        //
+        // A frame we are explicitly `pending` on counts as **not** resident, even
+        // if a *beauty-only* copy is already cached: settling/scrubbing onto a
+        // beauty ring frame marks it pending to upgrade it to a full all-AOV
+        // decode (INV-SAMPLE, #7), but `contains` is fidelity-blind, so without
+        // this the pump treats it as resident and never submits the upgrade —
+        // `pending` sticks forever and playback freezes. During play `pending` is
+        // cleared on a beauty cache hit, so this only affects the awaited frame.
+        let pending = self.playback.pending;
         let want = crate::scheduler::next_want(
             self.playback.current_frame,
             self.playback.in_point,
@@ -1051,7 +1130,7 @@ impl ExrApp {
             self.playback.direction,
             self.playback.loop_mode,
             depth,
-            |f| self.frame_cache.contains(crate::cache::Slot::A, f),
+            |f| self.frame_cache.contains(crate::cache::Slot::A, f) && Some(f) != pending,
             |f| self.playback.frame_path(f).is_some(),
         );
         let Some(w) = want else {
@@ -1067,8 +1146,8 @@ impl ExrApp {
         if Some(w) == self.playback.pending {
             self.loading_a = true;
         }
-        let tx = self.ensure_worker();
-        let _ = tx.send(LoadJob {
+        let beauty_only = self.decode_beauty_only(w);
+        self.submit_job(LoadJob {
             path,
             is_b: false,
             seq_frame: true,
@@ -1076,8 +1155,10 @@ impl ExrApp {
             epoch: self.playback.epoch,
             // Seq-frames supersede by epoch, not open generation.
             open_gen: 0,
-            beauty_only: self.decode_beauty_only(w),
+            beauty_only,
         });
+        // Anchor the stall watchdog: one decode is now outstanding.
+        self.decode_submit_at = Some(std::time::Instant::now());
     }
 
     /// Pre-upload T2 GPU textures (#56) for the on-screen frame and the next few
@@ -1121,6 +1202,10 @@ impl ExrApp {
     /// Called on every seek / scrub / direction change (#57).
     fn invalidate_inflight(&mut self) {
         self.playback.bump_epoch();
+        // Publish the new epoch so the worker skips the jobs this just superseded
+        // (a scrub backlog) instead of decoding each one only to drop it.
+        self.epoch_signal
+            .store(self.playback.epoch, std::sync::atomic::Ordering::Relaxed);
         self.inflight.clear();
         self.loading_a = false;
         self.playback.pending = None;
@@ -1286,11 +1371,13 @@ impl ExrApp {
             return;
         }
         self.pump_decode();
-        if self.inflight.is_empty() {
-            // Nothing left to fetch within the budget — the resident span is as
-            // full as it fits. Latch so we stop re-pumping (and re-evicting) until
-            // the playhead moves; otherwise a range larger than RAM churns on the
-            // budget's edge wobble.
+        // Latch (stop re-pumping) once the resident span is as full as it fits:
+        // either nothing more is wanted, **or** the cache is already at capacity.
+        // The capacity check is essential when the in/out range exceeds the RAM
+        // budget: there `next_want` always finds a non-resident frame (it loop-
+        // wraps to the far side), so `inflight` is never empty and the old
+        // nothing-wanted latch never fired — precache churned decode→evict forever.
+        if self.inflight.is_empty() || self.frame_cache.len() >= self.frame_cache_cap {
             self.precache_filled = true;
         } else {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
@@ -1566,6 +1653,11 @@ impl ExrApp {
                 return; // a seek/scrub/direction change superseded this decode.
             }
             self.inflight.remove(&res.frame);
+            // The worker delivered a matching result — record turnaround so the
+            // stall watchdog can scale its timeout off real decode cost.
+            if let Some(t) = self.decode_submit_at {
+                self.last_decode_dur = Some(std::time::Instant::now().duration_since(t));
+            }
             match res.result {
                 Ok(data) => {
                     let arc = std::sync::Arc::new(data);
@@ -2060,6 +2152,11 @@ impl eframe::App for ExrApp {
 
 impl ExrApp {
     fn poll_async_loads(&mut self, ctx: &egui::Context) {
+        // Keep the worker's epoch signal current each frame so any queued seq job
+        // superseded by a seek/scrub is skipped before its decode (belt-and-braces
+        // alongside the immediate publish in `invalidate_inflight`).
+        self.epoch_signal
+            .store(self.playback.epoch, std::sync::atomic::Ordering::Relaxed);
         // Drain async image messages (collect first so the `load_rx` borrow ends
         // before the `&mut self` apply calls). A slot-A load delivers a `Proxy`
         // first (when available), then `Loaded` with the full decode.
@@ -2075,6 +2172,10 @@ impl ExrApp {
                 LoadMsg::Loaded(res) => self.apply_load_result(*res),
             }
         }
+        // Recover a permanently stuck playback decode instead of freezing.
+        self.tick_decode_watchdog();
+        // Once-per-second decode trace for RUST_LOG=floki=debug diagnosis.
+        self.trace_playback_state();
         if self.loading_a || self.loading_b || !self.inflight.is_empty() {
             // egui is reactive; keep polling the worker until the decode lands.
             // `inflight` covers silent precache prefetch (#56, step 4), which
@@ -2095,6 +2196,109 @@ impl ExrApp {
         if self.lut_loading {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
+    }
+
+    /// Recover from a permanently stuck playback decode. Liveness assumes every
+    /// submitted sequence frame's result comes back; if the worker dies or wedges
+    /// mid-decode, or a result is otherwise lost, `inflight`/`pending` stay set,
+    /// `pump_decode` is gated forever, and playback freezes until the file is
+    /// reopened (the reported Windows symptom: frozen image, live UI, unrecovered
+    /// by Stop/Play/scrub). This detects "work outstanding but no progress past an
+    /// adaptive timeout" and force-recovers: respawn the worker, supersede the
+    /// stale state, and re-request the playhead.
+    ///
+    /// The timeout scales off the last good decode (with a generous floor), so a
+    /// slow big-frame decode never trips it — it fires only on a true stall. If a
+    /// specific frame keeps wedging the decoder it will re-fire each timeout
+    /// (leaking the old wedged thread), but the UI stays responsive and playback
+    /// self-heals rather than dying — strictly better than the hard freeze.
+    fn tick_decode_watchdog(&mut self) {
+        if !self.playback.is_active() {
+            return;
+        }
+        // Only sequence work counts: `loading_a` is also set by a non-seq open,
+        // which is not a playback stall. `inflight`/`pending` cover every seq case
+        // (awaited playhead and silent precache prefetch).
+        let outstanding = !self.inflight.is_empty() || self.playback.pending.is_some();
+        let Some(submitted) = self.decode_submit_at.filter(|_| outstanding) else {
+            return;
+        };
+        // Generous and decode-scaled: only a genuine wedge waits this long.
+        const FLOOR: std::time::Duration = std::time::Duration::from_secs(10);
+        let timeout = self.last_decode_dur.map_or(FLOOR, |d| (d * 6).max(FLOOR));
+        let now = std::time::Instant::now();
+        let waited = now.duration_since(submitted);
+        if waited < timeout {
+            return;
+        }
+        log::warn!(
+            target: "floki::playback",
+            "decode stall watchdog: no result for {waited:?} with work outstanding \
+             (inflight={:?}, pending={:?}, loading_a={}, epoch={}); respawning worker \
+             and re-requesting frame {}",
+            self.inflight,
+            self.playback.pending,
+            self.loading_a,
+            self.playback.epoch,
+            self.playback.current_frame,
+        );
+        // The worker may be dead or wedged mid-decode: drop the channels so the
+        // next submit spawns a fresh thread. A wedged old thread finishes its
+        // decode, fails to send (result_rx dropped), and exits.
+        self.load_tx = None;
+        self.load_rx = None;
+        // Supersede the stuck state (bumps the epoch so any late result is
+        // dropped) and re-drive the pump for the current playhead.
+        self.invalidate_inflight();
+        self.request_sequence_frame(self.playback.current_frame);
+        // Reset the stall clock so a recovery that (for any reason) still can't
+        // submit waits a full timeout before firing again, rather than spinning
+        // every frame — bumping the epoch and dropping the worker on each tick.
+        self.decode_submit_at = Some(now);
+    }
+
+    /// Throttled (once/second) debug trace of the playback decode state — the
+    /// exact fields the stall watchdog acts on. Lets a freeze be diagnosed from
+    /// `RUST_LOG=floki=debug` even when the watchdog's own recovery doesn't fire,
+    /// which is the case if the stuck state doesn't match its trigger condition.
+    /// Zero-cost when debug logging is disabled.
+    fn trace_playback_state(&mut self) {
+        use crate::playback::PlayState;
+        if !self.playback.is_active() || !log::log_enabled!(log::Level::Debug) {
+            return;
+        }
+        let outstanding = !self.inflight.is_empty() || self.playback.pending.is_some();
+        // Only trace while there is something that *should* be progressing.
+        if self.playback.state != PlayState::Playing && !outstanding && !self.loading_a {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if self
+            .dbg_last_trace
+            .is_some_and(|t| now.duration_since(t) < std::time::Duration::from_secs(1))
+        {
+            return;
+        }
+        self.dbg_last_trace = Some(now);
+        let mut inflight: Vec<u32> = self.inflight.iter().copied().collect();
+        inflight.sort_unstable();
+        log::debug!(
+            target: "floki::playback",
+            "state={:?} frame={} pending={:?} loading_a={} inflight={inflight:?} epoch={} \
+             worker={} submit_age={:?} last_decode={:?} precache={}/{} t1={}/{}",
+            self.playback.state,
+            self.playback.current_frame,
+            self.playback.pending,
+            self.loading_a,
+            self.playback.epoch,
+            if self.load_rx.is_some() { "alive" } else { "dead" },
+            self.decode_submit_at.map(|t| now.duration_since(t)),
+            self.last_decode_dur,
+            self.precache,
+            self.precache_filled,
+            self.frame_cache.len(),
+            self.frame_cache_cap,
+        );
     }
 
     fn draw_help_window(&mut self, ctx: &egui::Context) {
@@ -2833,6 +3037,12 @@ impl ExrApp {
         inflight.sort_unstable();
         let sample = self.dbg_last_sample;
         let (evictions, dropped) = (self.dbg_evictions, self.dbg_dropped_epoch);
+        let loading_a = self.loading_a;
+        let worker_alive = self.load_rx.is_some();
+        let since_submit = self
+            .decode_submit_at
+            .map(|t| std::time::Instant::now().duration_since(t));
+        let last_decode = self.last_decode_dur;
 
         let mut open = true;
         egui::Window::new("Playback debug")
@@ -2883,7 +3093,20 @@ impl ExrApp {
 
                         ui.label("worker");
                         let pend = pending.map_or_else(|| "—".to_string(), |f| f.to_string());
-                        ui.label(format!("in-flight {inflight:?}  ·  pending {pend}"));
+                        ui.label(format!(
+                            "in-flight {inflight:?}  ·  pending {pend}  ·  loading_a {loading_a}  ·  {}",
+                            if worker_alive { "alive" } else { "dead" }
+                        ));
+                        ui.end_row();
+
+                        ui.label("decode");
+                        let submit = since_submit.map_or_else(
+                            || "idle".to_string(),
+                            |d| format!("{:.1}s ago", d.as_secs_f32()),
+                        );
+                        let last = last_decode
+                            .map_or_else(|| "—".to_string(), |d| format!("{:.2}s", d.as_secs_f32()));
+                        ui.label(format!("submitted {submit}  ·  last {last}"));
                         ui.end_row();
 
                         if let Some(s) = sample {
@@ -4498,6 +4721,212 @@ mod tests {
         );
     }
 
+    // --- Decode-stall recovery (Windows freeze, unrecoverable-hang class) -----
+
+    /// Put `app` into sequence mode over `count` touched frames, playing, with a
+    /// wedged decode: frame 1 submitted but never returned, so `inflight`/`pending`
+    /// stay set and `pump_decode` is gated. Returns the pre-stall epoch.
+    fn stuck_playing_app(dir: &std::path::Path, count: u32) -> ExrApp {
+        touch_sequence(dir, count);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&dir.join("s.0001.exr"));
+        app.playback.start_playing(std::time::Instant::now());
+        app.inflight.insert(1);
+        app.playback.pending = Some(1);
+        app.loading_a = true;
+        app
+    }
+
+    #[test]
+    fn watchdog_recovers_a_stuck_decode() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = stuck_playing_app(dir.path(), 3);
+        let e0 = app.playback.epoch;
+        // Backdate the submission past the floor timeout so the watchdog fires.
+        app.decode_submit_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(30));
+        app.last_decode_dur = None; // no measurement → 10s floor applies
+
+        app.tick_decode_watchdog();
+
+        assert_ne!(
+            app.playback.epoch, e0,
+            "watchdog supersedes the stuck decode (bumps the epoch)"
+        );
+        assert!(
+            app.load_rx.is_some(),
+            "worker is live again after recovery (respawned via re-request)"
+        );
+        assert!(
+            app.inflight.contains(&1),
+            "the playhead is re-requested, so the pump is unblocked again"
+        );
+        let waited = app.decode_submit_at.map(|t| t.elapsed()).unwrap();
+        assert!(
+            waited < std::time::Duration::from_secs(5),
+            "the stall clock is reset on recovery"
+        );
+    }
+
+    #[test]
+    fn watchdog_holds_within_the_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = stuck_playing_app(dir.path(), 3);
+        let e0 = app.playback.epoch;
+        // A fresh submission: a genuinely slow decode must not be force-recovered.
+        app.decode_submit_at = Some(std::time::Instant::now());
+        app.last_decode_dur = None;
+
+        app.tick_decode_watchdog();
+
+        assert_eq!(app.playback.epoch, e0, "no recovery before the timeout");
+        assert!(app.inflight.contains(&1), "in-flight decode left untouched");
+        assert_eq!(app.playback.pending, Some(1), "still awaiting the frame");
+    }
+
+    #[test]
+    fn watchdog_is_a_noop_without_outstanding_work() {
+        let dir = tempfile::tempdir().unwrap();
+        touch_sequence(dir.path(), 3);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&dir.path().join("s.0001.exr"));
+        let e0 = app.playback.epoch;
+        // Old submit clock but nothing outstanding (settled): must not fire.
+        app.decode_submit_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
+
+        app.tick_decode_watchdog();
+
+        assert_eq!(app.playback.epoch, e0, "idle transport is never recovered");
+    }
+
+    #[test]
+    fn stale_epoch_result_leaves_the_live_inflight_intact() {
+        // The epoch-mismatch drop in `apply_load_result` returns *before*
+        // `inflight.remove`. That is correct precisely because a re-requested same
+        // frame number under the new epoch must not be evicted by its own stale
+        // predecessor — otherwise the pump would leak. This guards that invariant.
+        let dir = tempfile::tempdir().unwrap();
+        let f1 = dir.path().join("s.0001.exr");
+        write_rgba_exr(&f1);
+        for n in 2..=3 {
+            write_rgba_exr(&dir.path().join(format!("s.{n:04}.exr")));
+        }
+        let mut app = ExrApp {
+            exr_data: Some(std::sync::Arc::new(ExrData::load(&f1).unwrap())),
+            ..Default::default()
+        };
+        app.detect_sequence(&f1);
+        // Seek to frame 2: bumps the epoch and re-requests 2 at the live epoch.
+        app.playback_step(1);
+        let live_epoch = app.playback.epoch;
+        assert!(
+            app.inflight.contains(&2),
+            "frame 2 in flight at the live epoch"
+        );
+        let dropped_before = app.dbg_dropped_epoch;
+
+        // A stale result for frame 2 (a pre-seek decode) arrives late.
+        app.apply_load_result(LoadResult {
+            path: dir.path().join("s.0002.exr"),
+            is_b: false,
+            seq_frame: true,
+            frame: 2,
+            epoch: live_epoch.wrapping_sub(1),
+            open_gen: 0,
+            result: Ok(ExrData::load(&f1).unwrap()),
+        });
+        assert_eq!(
+            app.dbg_dropped_epoch,
+            dropped_before + 1,
+            "the stale result is dropped"
+        );
+        assert!(
+            app.inflight.contains(&2),
+            "the stale drop must not evict the live in-flight frame"
+        );
+        assert_eq!(
+            app.playback.pending,
+            Some(2),
+            "still awaiting the live frame"
+        );
+
+        // The live-epoch result then lands and clears the in-flight entry — proof
+        // there was no permanent leak.
+        app.apply_load_result(LoadResult {
+            path: dir.path().join("s.0002.exr"),
+            is_b: false,
+            seq_frame: true,
+            frame: 2,
+            epoch: live_epoch,
+            open_gen: 0,
+            result: Ok(ExrData::load(&f1).unwrap()),
+        });
+        assert!(
+            !app.inflight.contains(&2),
+            "the live result clears the in-flight entry"
+        );
+        assert_eq!(
+            app.playback.pending, None,
+            "pending cleared on the live frame"
+        );
+    }
+
+    #[test]
+    fn submit_job_respawns_a_dead_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let f1 = dir.path().join("s.0001.exr");
+        write_rgba_exr(&f1);
+        let mut app = ExrApp::default();
+        // Wire a dead job channel (receiver dropped) so the next send fails, as it
+        // would if the worker thread had exited.
+        let (dead_tx, dead_rx) = std::sync::mpsc::channel::<LoadJob>();
+        drop(dead_rx);
+        let (_orphan_tx, orphan_rx) = std::sync::mpsc::channel::<LoadMsg>();
+        app.load_tx = Some(dead_tx);
+        app.load_rx = Some(orphan_rx);
+
+        app.submit_job(LoadJob {
+            path: f1,
+            is_b: false,
+            seq_frame: false,
+            frame: 0,
+            epoch: 0,
+            open_gen: app.open_gen_a,
+            beauty_only: false,
+        });
+
+        // The dead channel was replaced and a fresh worker spawned; it processes
+        // the resent job and delivers a result over the new receiver.
+        let got = app
+            .load_rx
+            .as_ref()
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(10));
+        assert!(
+            got.is_ok(),
+            "respawned worker delivered a result for the resent job"
+        );
+    }
+
+    #[test]
+    fn scrub_publishes_the_epoch_to_the_worker_signal() {
+        // Rapid scrubbing floods the worker's FIFO queue with soon-stale jobs; the
+        // worker skips any whose epoch is below this shared signal, so the backlog
+        // drains without full decodes. Each scrub must publish the bumped epoch.
+        let dir = tempfile::tempdir().unwrap();
+        touch_sequence(dir.path(), 5);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&dir.path().join("s.0001.exr"));
+
+        let before = app.epoch_signal.load(std::sync::atomic::Ordering::Relaxed);
+        app.playback_scrub_to(3);
+        let after = app.epoch_signal.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            after, app.playback.epoch,
+            "a scrub publishes its bumped epoch to the worker signal"
+        );
+        assert_ne!(after, before, "the published epoch advanced");
+    }
+
     #[test]
     fn ram_budget_bytes_maps_gb_with_zero_as_auto() {
         let mut app = ExrApp::default();
@@ -4591,6 +5020,85 @@ mod tests {
     }
 
     #[test]
+    fn precache_latches_when_budget_full_even_if_range_exceeds_it() {
+        // Regression for the Windows playback freeze: with the in/out range larger
+        // than the RAM budget, `next_want` always finds a non-resident frame (it
+        // loop-wraps to the far side), so the old "latch when nothing is wanted"
+        // never fired and precache churned decode→evict forever, starving the
+        // playhead's own frames. The latch must also fire when the cache is full.
+        let dir = tempfile::tempdir().unwrap();
+        let f1 = dir.path().join("s.0001.exr");
+        write_rgba_exr(&f1);
+        for n in 2..=5 {
+            write_rgba_exr(&dir.path().join(format!("s.{n:04}.exr")));
+        }
+        let mut app = ExrApp::default();
+        app.detect_sequence(&f1); // playhead = 1, paused
+        app.frame_cache_cap = 3; // budget (3) < 5-frame range
+        app.precache = true;
+
+        // Cache at capacity, but holding frames *outside* the playhead's prefetch
+        // window (window ahead of frame 1 is 2,3; we hold 1,4,5), so `next_want`
+        // still wants an in-window frame. Pre-fix this state churned forever.
+        for n in [1u32, 4, 5] {
+            app.frame_cache.insert(
+                crate::cache::Slot::A,
+                n,
+                std::sync::Arc::new(ExrData::load(&f1).unwrap()),
+            );
+        }
+        assert_eq!(
+            app.frame_cache.len(),
+            app.frame_cache_cap,
+            "cache at capacity"
+        );
+
+        let ctx = egui::Context::default();
+        app.tick_precache(&ctx);
+        assert!(
+            app.precache_filled,
+            "latches when the budget is full even though the range isn't fully resident"
+        );
+        assert!(
+            !app.inflight.is_empty(),
+            "latched on the capacity check (a frame was still wanted), not nothing-wanted"
+        );
+    }
+
+    #[test]
+    fn latched_precache_does_not_churn_via_the_apply_pump_loop() {
+        // Once precache has latched (cache full, range > budget), `pump_decode`
+        // must submit nothing — otherwise the apply→pump loop (which re-pumps after
+        // every result, bypassing the `tick_precache` latch) keeps fetching far
+        // frames that `evict_to` immediately drops: decode→evict churn forever
+        // while stopped, pegging the worker. Regression for the stopped-churn hang.
+        let dir = tempfile::tempdir().unwrap();
+        let f1 = dir.path().join("s.0001.exr");
+        write_rgba_exr(&f1);
+        for n in 2..=5 {
+            write_rgba_exr(&dir.path().join(format!("s.{n:04}.exr")));
+        }
+        let mut app = ExrApp::default();
+        app.detect_sequence(&f1); // playhead 1, stopped
+        app.frame_cache_cap = 3; // budget < 5-frame range
+        app.precache = true;
+        app.precache_filled = true; // already latched by an earlier fill
+        for n in [1u32, 4, 5] {
+            app.frame_cache.insert(
+                crate::cache::Slot::A,
+                n,
+                std::sync::Arc::new(ExrData::load(&f1).unwrap()),
+            );
+        }
+
+        app.pump_decode();
+        assert!(
+            app.inflight.is_empty(),
+            "a latched precache submits nothing on re-pump (no decode/evict churn)"
+        );
+    }
+
+    #[test]
     fn settling_on_a_beauty_only_frame_awaits_a_full_redecode() {
         let dir = tempfile::tempdir().unwrap();
         let f1 = dir.path().join("s.0001.exr");
@@ -4612,6 +5120,17 @@ mod tests {
         // the readout is suppressed until the full all-AOV frame lands.
         assert!(app.exr_data.is_some(), "beauty frame shown immediately");
         assert_eq!(app.playback.pending, Some(1), "full re-decode awaited");
+        // Regression: the upgrade must be *submitted*, not merely marked pending.
+        // `contains` is fidelity-blind, so a beauty-resident playhead must still be
+        // pumped — otherwise `pending` sticks forever and playback freezes.
+        assert!(
+            app.inflight.contains(&1),
+            "the full re-decode is actually submitted to the worker"
+        );
+        assert!(
+            app.loading_a,
+            "the awaited playhead drives the loading state"
+        );
         assert!(
             app.playback.sampling_suppressed(),
             "readout suppressed until the full frame lands"

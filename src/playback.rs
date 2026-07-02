@@ -245,12 +245,18 @@ impl Playback {
     /// `measured_fps` reflects the *last* playback, so it's cleared here — a
     /// stopped transport reads `0.0` rather than a stale rate. The caller sets the
     /// playhead (stop rewinds to the in point).
+    ///
+    /// Also drops any awaited decode (`pending`): a stopped transport must not
+    /// stay sampling-suppressed (INV-SAMPLE, #7), and a lingering `pending` would
+    /// gate the next Play's first advance (`tick_stutter` holds while
+    /// `pending.is_some()`) on a frame whose result may never arrive.
     pub fn stop(&mut self) {
         self.state = PlayState::Stopped;
         self.anchor = None;
         self.frames_since_anchor = 0;
         self.measured_fps = 0.0;
         self.last_shown = None;
+        self.pending = None;
     }
 
     /// Frame period for the target fps (clamped so fps can't be ≤ 0).
@@ -335,6 +341,18 @@ mod tests {
         assert_eq!(pb.state, PlayState::Stopped);
         assert_eq!(pb.measured_fps, 0.0, "stop clears the stale rate");
         assert!(pb.anchor.is_none());
+    }
+
+    #[test]
+    fn stop_clears_the_awaited_frame() {
+        // A lingering `pending` after Stop would keep the readout suppressed and
+        // gate the next Play's first advance (`tick_stutter` holds while
+        // `pending.is_some()`) on a frame whose result may never arrive.
+        let mut pb = Playback::default();
+        pb.start_playing(Instant::now());
+        pb.pending = Some(7);
+        pb.stop();
+        assert_eq!(pb.pending, None, "stop drops the awaited decode");
     }
 
     #[test]
