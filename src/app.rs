@@ -272,6 +272,13 @@ pub struct ExrApp {
     #[serde(skip)]
     precache_filled: bool,
 
+    /// A timeline drag is in progress (#143). While held, seeks decode
+    /// beauty-only like playback does — the readout is suppressed or showing
+    /// the beauty layer anyway — and the release settles the landing frame to
+    /// a full all-AOV decode via `settle_to_full` (INV-SAMPLE, #7).
+    #[serde(skip)]
+    scrub_active: bool,
+
     /// Render-watch (#101): poll the sequence directory and pick up frames as a
     /// render writes them — new frames extend the range, re-rendered frames drop
     /// from cache and re-decode. Off by default (it costs a periodic `read_dir`,
@@ -456,6 +463,7 @@ impl Default for ExrApp {
             precache: false,
             ram_budget_gb: 0.0,
             precache_filled: false,
+            scrub_active: false,
             watch_enabled: false,
             watch_follow: false,
             watch_sigs: Vec::new(),
@@ -1045,8 +1053,10 @@ impl ExrApp {
             // moving, but on settle it must be upgraded to a full all-AOV decode
             // so the readout + AOV switch are correct (INV-SAMPLE, #7). Show it
             // now for instant feedback, but keep the playhead awaited so sampling
-            // stays suppressed until the full frame lands.
-            let needs_full = !self.playback.is_playing() && data.beauty_only;
+            // stays suppressed until the full frame lands. An active timeline
+            // drag counts as moving (#143): upgrading every touched frame
+            // mid-drag would spam full decodes; the release settles instead.
+            let needs_full = !self.playback.is_playing() && !self.scrub_active && data.beauty_only;
             self.loading_a = false;
             self.viewer.set_t2_frame(Some(frame)); // bind this frame's T2 texture
             self.swap_image_arc(data, false);
@@ -1093,17 +1103,19 @@ impl ExrApp {
     /// beauty/first layer — a beauty-only frame holds just that layer, so it would
     /// be wrong to serve a different active AOV from it. Then:
     ///
-    /// - **Playing** → every ring frame is beauty (the readout is suppressed while
-    ///   moving, so the other AOVs aren't needed — INV-SAMPLE, #7).
+    /// - **Playing or an active timeline drag** (#143) → every ring frame is
+    ///   beauty (the readout is suppressed while moving — or, for a landed scrub
+    ///   frame, correct for the beauty layer that's showing — INV-SAMPLE, #7).
+    ///   The drag release settles the landing frame to full (`settle_to_full`).
     /// - **Settled + precache** (#56, step 4) → the *prefetched* frames are beauty
     ///   for future playback, but the playhead itself stays **full** so its
     ///   sampling + AOV switch are correct.
-    /// - Otherwise (a plain paused/scrubbing decode) → full.
+    /// - Otherwise (a plain paused seek) → full.
     fn decode_beauty_only(&self, frame: u32) -> bool {
         if !self.beauty_preview || self.viewer.active_layer != 0 {
             return false;
         }
-        if self.playback.is_playing() {
+        if self.playback.is_playing() || self.scrub_active {
             return true;
         }
         self.precache && frame != self.playback.current_frame
@@ -3591,12 +3603,21 @@ impl ExrApp {
         }
 
         // Scrub on click or drag, clamped to the trim by `playback_scrub_to`.
+        // While the drag is held, seeks decode beauty-only for responsiveness
+        // (#143); the release settles the landing frame to a full decode.
+        if resp.drag_started() {
+            self.scrub_active = true;
+        }
         if (resp.clicked() || resp.dragged())
             && let Some(pos) = resp.interact_pointer_pos()
         {
             let t = f64::from((pos.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
             let frame = lo + (t * f64::from(span)).round() as u32;
             self.playback_scrub_to(frame);
+        }
+        if resp.drag_stopped() {
+            self.scrub_active = false;
+            self.settle_to_full();
         }
     }
 
@@ -4898,6 +4919,51 @@ mod tests {
         assert!(
             app.decode_beauty_only(ahead),
             "precache: prefetched frames are beauty for future playback"
+        );
+
+        // An active timeline drag behaves like playing (#143): the held seek
+        // decodes beauty-only for responsiveness; the release settles to full.
+        app.precache = false;
+        app.scrub_active = true;
+        assert!(
+            app.decode_beauty_only(cur),
+            "active scrub ⇒ beauty-only decode"
+        );
+        app.scrub_active = false;
+        assert!(!app.decode_beauty_only(cur), "released ⇒ full decode again");
+    }
+
+    /// #143: mid-drag, a resident beauty ring frame displays without being
+    /// marked for a full upgrade (that would spam full decodes per touched
+    /// frame); the drag release settles the landing frame to full instead.
+    #[test]
+    fn active_scrub_shows_resident_beauty_and_settles_full_on_release() {
+        let dir = tempfile::tempdir().unwrap();
+        touch_sequence(dir.path(), 5);
+        let f3 = dir.path().join("s.0003.exr");
+        write_rgba_exr(&f3);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&dir.path().join("s.0001.exr"));
+
+        let beauty = std::sync::Arc::new(ExrData::load_beauty(&f3).unwrap());
+        assert!(beauty.beauty_only);
+        app.frame_cache.insert(crate::cache::Slot::A, 3, beauty);
+
+        // Mid-drag: the resident beauty frame shows immediately, no upgrade.
+        app.scrub_active = true;
+        app.playback_scrub_to(3);
+        assert_eq!(
+            app.playback.pending, None,
+            "beauty ring frame displays without a mid-drag full upgrade"
+        );
+
+        // Release: the landing frame settles to a full all-AOV decode.
+        app.scrub_active = false;
+        app.settle_to_full();
+        assert_eq!(
+            app.playback.pending,
+            Some(3),
+            "release re-requests the landing frame in full"
         );
     }
 
