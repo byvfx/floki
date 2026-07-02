@@ -21,6 +21,16 @@ Keep the single dedicated worker (`app.rs`), one in-flight decode at a time. Cha
   (`Mutex<Option<Request>>` + `Condvar`, or a capacity-1 rendezvous).
 - On finishing a frame, the worker asks the UI-side **scheduler** for the next.
 
+> **Implemented deviation (#153):** the shipped code kept the unbounded FIFO channel and
+> added a worker-side **epoch skip** (`epoch_signal: AtomicU64`, published by
+> `invalidate_inflight` and every `poll_async_loads`): queued sequence jobs superseded by a
+> newer seek are dropped *before* their decode. Combined with the one-outstanding pump
+> (`pump_decode` submits at most one job), this is near-equivalent to the mailbox for
+> sequence frames. The accepted gap: **explicit opens are generation-keyed, never
+> epoch-skipped**, so a slot-B reference opened mid-playback queues ahead of the next
+> playhead frame — one full decode of priority inversion. Revisit the mailbox if that
+> becomes noticeable in review sessions.
+
 ### The scheduler (pure, unit-testable)
 Inputs: `playhead + direction + resident set + budget` → an **ordered want-list**. Priorities:
 

@@ -734,10 +734,6 @@ impl ExrApp {
         });
     }
 
-    /// Apply a completed [`LutLoadResult`] from the worker thread: create the
-    /// GPU bind group, capture the domain bounds, and update `lut_bg` /
-    /// `lut_error` / `enable_lut`. Ignores stale results (a newer reload of a
-    /// different path superseded this one).
     /// Snapshot to clipboard (#19): drive the hotkey trigger and consume the
     /// `Event::Screenshot` reply. Called once per frame from [`Self::ui`].
     fn process_snapshot(&mut self, ctx: &egui::Context) {
@@ -829,6 +825,10 @@ impl ExrApp {
         });
     }
 
+    /// Apply a completed [`LutLoadResult`] from the worker thread: create the
+    /// GPU bind group, capture the domain bounds, and update `lut_bg` /
+    /// `lut_error` / `enable_lut`. Ignores stale results (a newer reload of a
+    /// different path superseded this one).
     fn apply_lut_load_result(&mut self, res: LutLoadResult) {
         // Discard stale results from a superseded reload.
         if res.path != self.lut_path {

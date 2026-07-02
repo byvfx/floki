@@ -22,7 +22,7 @@ hardening a working sequence player. Verified present and matching the contracts
 | Transport UI (timeline w/ holes, in/out, play/step/reverse/loop, fps, T2 kill-switch) | DONE | `app.rs` `draw_transport_bar` |
 | `swap_image_arc` Arc refactor; A-plays / B-holds | DONE | `app.rs` |
 
-~77 tests (52 headless across `sequence`/`playback`/`cache`/`scheduler`/`budget`, ~25 app-level).
+~240 tests as of 2026-07 (headless across `sequence`/`playback`/`cache`/`scheduler`/`budget`/`layer`/`render_program`, ~60 app-level).
 
 So the remaining work is: **close the one real gap → validate on real footage → layer on the feel
 features → the one big net-new feature (locked-step A/B).**

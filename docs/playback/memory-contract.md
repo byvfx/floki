@@ -15,7 +15,7 @@ A frame may be resident at several tiers at once.
 |------|------|-----------|----------|----------|---------|
 | **T0 Proxy** | `ProxyImage` low-res RGBA32F (`proxy.rs`) | 5–20 MB | worker (`from_exr_fast_read`) | CPU | scrub preview / fallback paint |
 | **T1 CPU frame** | full `ExrData`, ALL layers (`exr_loader.rs`) | 0.6–1.3 GB | worker (`ExrData::load`) | RAM | **only sampling source** + upload source for T2 |
-| **T2 GPU texture** | `Rgba32Float`, **active layer only** | ~134 MB | UI thread (`generate_gpu_texture`) | VRAM | instant paint on `swap_image_data` |
+| **T2 GPU texture** | `Rgba32Float`, **active layer only** | ~134 MB | UI thread (`build_layer_texture`) | VRAM | instant paint on `swap_image_data` |
 | **T3 active** | the `ExrData` promoted into `self.exr_data` | (== one T1) | UI thread (swap) | — | what renderer + sampler see this frame |
 
 T1 frames are held as `Arc<ExrData>` so a frame can be both **active (T3)** and **resident (T1)**
@@ -59,8 +59,16 @@ A free-relative slice keeps a usable read-ahead window and shrinks smoothly unde
 A T1 frame **behind** the playhead whose T2 is already built is evicted first (its pixels are in
 VRAM; only the *active* frame needs CPU for sampling).
 
+> **Implemented deviation (#153):** T1 eviction is T2-blind — `FrameCache::pick_victim`
+> ranks purely by direction/distance/LRU and never consults the T2 ring. At T2's cap (≤ 8
+> frames, all inside the prefetch window the T1 policy already protects last) the refinement
+> wasn't worth coupling the tiers; revisit if T2 grows.
+
 ### Eviction = directional-ring + LRU tiebreak
-- **Linear play:** evict opposite the play direction.
+- **Linear play:** evict opposite the play direction. In **Loop** mode "behind" is measured
+  *around* the loop (distance in the play direction modulo the in/out span, #140), so
+  prefetch wrapped past the out point ranks just-ahead instead of furthest-behind; trim
+  leftovers outside the in/out range evict first.
 - **Scrub (random):** weight by absolute distance from the playhead (bidirectional).
 
 ## INV-SAMPLE — the single invariant everything protects
@@ -90,7 +98,7 @@ the rest lazily; **T1 is untouched**.
 | Condition | Behavior |
 |-----------|----------|
 | `budget < 1 × T2` | Disable pre-upload; decode-on-demand (today's behavior, clock-driven); surface "insufficient VRAM, X fps". |
-| `budget < 1 × T1` | Refuse sequence mode; show single frame + reason. |
+| `budget < 1 × T1` | Implemented as: **floor the T1 cap at 2** (`tick_budgets`, `app.rs`) so playback still runs — degraded to a 2-frame ring — rather than refusing sequence mode outright (#153). |
 | 8K / huge frames | Windows collapse to 1–2; stutter, not crash. |
 | Live VRAM pressure | Recompute the budget each second; shrink the T2 ring **before** the next upload. |
 

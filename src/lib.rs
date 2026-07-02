@@ -14,22 +14,21 @@ pub mod exr_loader;
 
 mod annotation;
 mod background;
-// Pure ring-cache budget math (#56). `max_t1` sizes the T1 ring (Phase 3);
-// `max_t2` waits for the T2 pre-upload in Phase 4, hence the module-wide allow.
-#[allow(dead_code)]
+// Pure ring-cache budget math (#56): `t1_capacity` sizes the T1 ring,
+// `max_t2` the T2 pre-upload ring (both live in `tick_budgets`).
 mod budget;
-// T1 ring cache for sequence playback (#56). The core (get/insert/evict) is used
-// now; `resident` feeds the Phase 4 scheduler and `Slot::B` the Phase 5 A/B work.
-#[allow(dead_code)]
+// T1 ring cache for sequence playback (#56).
 mod cache;
 mod color;
 mod gpu;
 mod gradient;
-// Comp layer model — the review-player spine (#103). Pure data model, no wiring
-// yet; consumers land in #104 / #98 / #102 / #112.
+// Comp layer model — the review-player spine (#103), consumed by the viewer via
+// the render program (#114); N-way compare (#104) extends it.
 mod layer;
 // Sequence-playback transport state + pure frame-advance logic (#7).
 mod playback;
+// Pure pixel access over decoded EXR channels + thumbnail decimation (#153).
+mod pixels;
 mod proxy;
 mod render_math;
 // Resolves the A/B viewer state into a render program via the layer model (#114).
