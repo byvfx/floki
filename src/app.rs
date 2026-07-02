@@ -1424,8 +1424,24 @@ impl ExrApp {
         }
         // Keep the decode-ahead ring filling even between advances.
         self.pump_decode();
-        // Keep the clock ticking even while idle between frames.
-        ctx.request_repaint_after(period);
+        // Wake at the next absolute deadline (`anchor + n·period`), not a full
+        // period from now: `request_repaint_after(period)` added the wake-up
+        // slop (timer/vsync quantization) to every frame, capping effective
+        // fps below target no matter how fast decode was (#138). While a
+        // decode holds the stutter clock, the worker wake (#137) and the
+        // in-flight poll drive repaints instead — schedule the period only as
+        // a lazy fallback rather than spinning on the overdue deadline.
+        let decode_bound = matches!(self.playback.pacing, Pacing::Stutter)
+            && (self.playback.pending.is_some() || self.loading_a);
+        let wait = if decode_bound {
+            period
+        } else {
+            let now = std::time::Instant::now();
+            self.playback.anchor.map_or(period, |anchor| {
+                (anchor + period * self.playback.frames_since_anchor).saturating_duration_since(now)
+            })
+        };
+        ctx.request_repaint_after(wait);
     }
 
     /// Stutter pacing: advance only when the playhead frame is ready (not awaiting
