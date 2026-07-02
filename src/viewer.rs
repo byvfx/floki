@@ -33,88 +33,13 @@ fn rgb3_to_vec4(c: [f32; 3]) -> [f32; 4] {
     [c[0], c[1], c[2], 0.0]
 }
 
-/// Sample a single channel at `(x, y)`. The `sample_data` match is invariant
-/// for the whole channel — in hot pixel loops, prefer pre-extracting the F32
-/// slice (the common case) via [`sample_channel_f32`] to avoid the per-pixel
-/// enum dispatch. This function is the fallback for F16/U32 channels and the
-/// single source of truth for the sampling logic (previously duplicated 8× as
-/// inline `get_val` closures).
-/// Read one float component from a channel at `(x, y)`, handling F32 (fast
-/// path), F16, and U32 `FlatSamples`. Returns 0.0 for a missing channel.
-/// `pub(crate)` so the proxy downsample path ([`crate::proxy`]) reuses the
-/// single tested implementation instead of duplicating the enum match.
-pub(crate) fn sample_channel(
-    chan: Option<&exr::image::AnyChannel<exr::image::FlatSamples>>,
-    x: usize,
-    y: usize,
-    width: usize,
-) -> f32 {
-    if let Some(c) = chan {
-        let index = y * width + x;
-        match &c.sample_data {
-            exr::image::FlatSamples::F16(s) => s[index].to_f32(),
-            exr::image::FlatSamples::F32(s) => s[index],
-            exr::image::FlatSamples::U32(s) => s[index] as f32 / u32::MAX as f32,
-        }
-    } else {
-        0.0
-    }
-}
-
-/// If the channel is F32 (the common EXR case), return its slice for direct
-/// indexing — eliminates the per-pixel `FlatSamples` enum match in hot loops.
-/// Non-F32 channels return `None`; fall back to [`sample_channel`] for those.
-pub(crate) fn sample_channel_f32(
-    chan: Option<&exr::image::AnyChannel<exr::image::FlatSamples>>,
-) -> Option<&[f32]> {
-    chan.and_then(|c| match &c.sample_data {
-        exr::image::FlatSamples::F32(s) => Some(s.as_slice()),
-        _ => None,
-    })
-}
-
-/// Read a pixel from a pre-extracted F32 slice, falling back to
-/// [`sample_channel`] for non-F32 channels. Used in hot pixel loops to skip
-/// the enum match on the F32 fast path.
-#[inline]
-pub(crate) fn pixel_val(
-    f32_slice: Option<&[f32]>,
-    chan: Option<&exr::image::AnyChannel<exr::image::FlatSamples>>,
-    x: usize,
-    y: usize,
-    width: usize,
-) -> f32 {
-    if let Some(s) = f32_slice {
-        s[y * width + x]
-    } else {
-        sample_channel(chan, x, y, width)
-    }
-}
+// Pure pixel access + thumbnail decimation live in `crate::pixels` (#153), so
+// `gpu/` and `proxy` never import from this UI module.
+use crate::pixels::{pixel_val, sample_channel, sample_channel_f32, thumb_dims};
 
 /// Contact-sheet thumbnail box, in pixels: both the on-screen cell size and the
 /// resolution thumbnails are baked at (longest edge), so the two never drift.
 const THUMB_BOX: usize = 256;
-
-/// Output dimensions and source stride for a CPU texture bake. With `max_dim ==
-/// None` (the full-res CPU-display fallback) this is the source size at stride 1.
-/// With `Some(d)` (contact-sheet thumbnails) the source is point-decimated so the
-/// longest edge is at most `d` — the per-pixel tone pipeline then runs over the
-/// small output instead of the full frame, which is the difference between
-/// processing ~34k pixels and ~8M for a 4K layer (re-baked on every frame swap
-/// while the sheet is open). Aspect is preserved within rounding.
-pub(crate) fn thumb_dims(
-    width: usize,
-    height: usize,
-    max_dim: Option<usize>,
-) -> (usize, usize, usize) {
-    match max_dim {
-        Some(d) if d > 0 && width.max(height) > d => {
-            let stride = width.max(height).div_ceil(d);
-            (width.div_ceil(stride), height.div_ceil(stride), stride)
-        }
-        _ => (width.max(1), height.max(1), 1),
-    }
-}
 
 /// Which channel(s) the canvas isolates. `RGB` shows full colour; the rest show
 /// a single channel as grayscale. Encoded for the shader via [`Self::as_u32`].
@@ -661,11 +586,32 @@ impl ExrViewer {
         }
     }
 
+    /// Free queued GPU thumbnail texture ids (#67). Invalidation sites have no
+    /// renderer handle, so they defer into `pending_thumb_frees`; this is the
+    /// one place that holds the renderer. Runs every frame from [`Self::ui`]
+    /// (and again inside the contact sheet after its own invalidations). With
+    /// no GPU nothing was ever registered — just clear the queue.
+    fn drain_thumb_frees(&mut self, gpu_resources: Option<&crate::gpu::GpuResources>) {
+        if self.pending_thumb_frees.is_empty() {
+            return;
+        }
+        if let Some(gpu) = gpu_resources {
+            let mut renderer = gpu.render_state().renderer.write();
+            for id in self.pending_thumb_frees.drain(..) {
+                renderer.free_texture(&id);
+            }
+        } else {
+            self.pending_thumb_frees.clear();
+        }
+    }
+
     /// Invalidate cached contact-sheet thumbnails whose pixels depend on the
     /// exposure / gamma / sRGB tone pipeline, so they regenerate next frame.
     /// (The central viewport is GPU-only and reads the live uniform each frame, so
     /// it needs no invalidation; only the baked thumbnails do.)
-    fn invalidate_tone(&mut self) {
+    /// `pub(crate)`: the app calls this when LUT state changes (toggle/reload,
+    /// #147) — the LUT is baked into thumbnails exactly like exposure/gamma.
+    pub(crate) fn invalidate_tone(&mut self) {
         self.thumbnails.fill(None);
         self.thumbnails_b.fill(None);
         // GPU thumbnails bake the tone into a cached texture (unlike the live
@@ -1602,9 +1548,19 @@ impl ExrViewer {
     /// between A and B on `blink_interval`, requesting repaints to keep cycling.
     fn apply_blink_mode(&mut self, ui: &egui::Ui, has_b: bool) {
         if self.blink_state && has_b {
-            ui.ctx().request_repaint();
             let time = ui.input(|i| i.time);
-            if ((time / self.blink_interval as f64) as usize).is_multiple_of(2) {
+            let interval = f64::from(self.blink_interval);
+            let phase = (time / interval) as usize;
+            // Wake exactly at the next A/B flip instead of repainting at the
+            // full refresh rate between flips (#146): the image only changes
+            // every `blink_interval`, but a bare request_repaint re-ran the
+            // whole frame (including the OCIO passes) continuously.
+            let next_flip = (phase + 1) as f64 * interval;
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_secs_f64(
+                    (next_flip - time).max(0.0),
+                ));
+            if phase.is_multiple_of(2) {
                 self.compare_mode = CompareMode::SingleA;
             } else {
                 self.compare_mode = CompareMode::SingleB;
@@ -1672,20 +1628,9 @@ impl ExrViewer {
             self.gpu_thumb_bg = Some(self.background.clone());
         }
 
-        // Drain deferred `free_texture`s (#67): invalidation sites have no renderer
-        // handle, so they queue evicted GPU thumbnail ids here; this is the one site
-        // that holds the renderer. With no GPU nothing was ever registered — just
-        // clear the queue.
-        if !self.pending_thumb_frees.is_empty() {
-            if let Some(gpu) = gpu_resources {
-                let mut renderer = gpu.render_state().renderer.write();
-                for id in self.pending_thumb_frees.drain(..) {
-                    renderer.free_texture(&id);
-                }
-            } else {
-                self.pending_thumb_frees.clear();
-            }
-        }
+        // Drain any ids queued by the invalidations just above so they're freed
+        // this frame (the steady-state drain runs in `ui()`, #148).
+        self.drain_thumb_frees(gpu_resources);
 
         // Tone snapshot for the GPU thumbnail render. `enable_lut` now honours the
         // user `.cube` LUT: Phase 2 threads the real LUT bind group through to the
@@ -1894,6 +1839,12 @@ impl ExrViewer {
         lut_bg_opt: Option<std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>>,
     ) {
         self.handle_hotkeys(ui, exr_data_b.is_some());
+
+        // Free queued GPU thumbnail ids every frame (#148): invalidations fire
+        // with the contact sheet closed too (tone changes, frame swaps), and
+        // draining only in the sheet draw kept one stale generation of
+        // thumbnail textures in VRAM until the sheet was next opened.
+        self.drain_thumb_frees(gpu_resources);
 
         self.invalidate_thumbnails_on_ocio_change();
 
@@ -2431,6 +2382,8 @@ impl ExrViewer {
                 ui.ctx().content_rect().width(),
                 ui.ctx().content_rect().height(),
             ],
+            display_min: [disp_rect.min.x, disp_rect.min.y],
+            display_max: [disp_rect.max.x, disp_rect.max.y],
             exposure: self.exposure,
             gamma: self.gamma,
             diff_multiplier: self.diff_multiplier,
@@ -2451,7 +2404,8 @@ impl ExrViewer {
             skip_checker: 0,
             diff_metric: self.diff_metric.as_u32(),
             diff_floor: self.diff_floor,
-            _pad2: 0,
+            // Per-draw value comes from the `overscan_factor` cell below.
+            overscan_factor: 1.0,
             lut_domain_min: self.lut_domain_min,
             lut_domain_max: self.lut_domain_max,
             bg_checker_dark: rgb3_to_vec4(self.background.checker_dark),
@@ -2482,6 +2436,12 @@ impl ExrViewer {
         // Per-frame ring allocator: bumped by each `draw_gpu` call. Up to ~4
         // draws per frame fit well within the 16-slot ring (2 KB total).
         let uniform_offset = std::cell::Cell::new(0u32);
+        // Blend factor for fragments outside the display window (#146): the
+        // shader dims the data-window overscan in the same draw, replacing the
+        // old two-draw scheme (whole image at dim opacity + display window
+        // redrawn at full). 1.0 = no dim (OCIO dims in the blit; side-by-side
+        // opts out); set per branch below before the draw_all call.
+        let overscan_factor = std::cell::Cell::new(1.0f32);
         let ocio_active = self.ocio_active;
         // Under OCIO, draw_gpu accumulates pass-1 draws here instead of emitting a
         // callback per call; a single OcioCallback covering the whole frame (both
@@ -2506,6 +2466,7 @@ impl ExrViewer {
             u.is_diff_mode = if is_diff { 1 } else { 0 };
             u.is_composite = if is_composite { 1 } else { 0 };
             u.opacity = opacity;
+            u.overscan_factor = overscan_factor.get();
 
             // OCIO path: pass 1 must emit scene-linear, so bypass the built-in
             // display chain (sRGB/gamma/.cube LUT). Exposure stays (linear).
@@ -2528,12 +2489,27 @@ impl ExrViewer {
             // `min_uniform_buffer_offset_alignment` (typically 256), so every
             // dynamic offset is valid — the raw Uniforms struct (128 bytes)
             // is written at the start of each padded slot.
-            let offset = uniform_offset.get();
+            // The viewport allocates slots below the reserved offscreen slot
+            // (#148). On overflow, saturate to the last viewport slot instead
+            // of writing past the ring: the overflowing draws share uniforms
+            // (wrong image placement for one frame) but there's no wgpu
+            // validation error mid-frame. Debug builds still assert so an
+            // overflow is caught in development (relevant once #104's N-way
+            // compare raises the per-frame draw count).
+            let ring_cap = crate::gpu::UNIFORM_RING_OFFSCREEN_SLOT as u32 * uniform_stride;
+            let mut offset = uniform_offset.get();
+            if offset + uniform_stride > ring_cap {
+                debug_assert!(
+                    false,
+                    "uniform ring buffer overflow: too many draws this frame"
+                );
+                log::error!(
+                    target: "floki::gpu",
+                    "uniform ring overflow: too many draws this frame; reusing the last slot"
+                );
+                offset = ring_cap - uniform_stride;
+            }
             uniform_offset.set(offset + uniform_stride);
-            debug_assert!(
-                offset + uniform_stride <= crate::gpu::UNIFORM_RING_SLOTS as u32 * uniform_stride,
-                "uniform ring buffer overflow: too many draws this frame"
-            );
             queue.write_buffer(&uniform_buffer, offset as u64, bytemuck::bytes_of(&u));
 
             let bg_b = bg_b_opt.unwrap_or_else(|| default_tex_bg.clone());
@@ -2869,12 +2845,21 @@ impl ExrViewer {
             };
 
             if !ocio_handled {
-                if self.overscan_opacity > 0.0 && !is_sbs {
-                    draw_all(&unclipped_painter, self.overscan_opacity);
+                // One draw for everything (#146): the shader blends fragments
+                // outside the display window at `overscan_factor`, so the old
+                // dim pre-pass (which re-ran the full fragment shader over the
+                // whole display window every repaint) is gone. Side-by-Side
+                // renders at full brightness with the full-canvas clip; with
+                // opacity 0 the overscan is hidden, so keep the display-window
+                // scissor and skip the dim entirely.
+                if is_sbs {
+                    draw_all(&unclipped_painter, 1.0);
+                } else if self.overscan_opacity > 0.0 {
+                    overscan_factor.set(self.overscan_opacity);
+                    draw_all(&unclipped_painter, 1.0);
+                } else {
+                    draw_all(&painter, 1.0);
                 }
-                // Side-by-Side renders at full brightness with the full-canvas
-                // clip (no display-window clip), so overscan dimming is skipped.
-                draw_all(if is_sbs { &unclipped_painter } else { &painter }, 1.0);
             }
         }
     }
@@ -3674,31 +3659,6 @@ mod gui_tests {
     use eframe::egui;
     use egui_kittest::Harness;
     use exr::prelude::*;
-
-    #[test]
-    fn thumb_dims_decimates_to_the_box_and_preserves_aspect() {
-        use super::thumb_dims;
-        // No cap (CPU-display fallback): full res, stride 1.
-        assert_eq!(thumb_dims(4096, 2160, None), (4096, 2160, 1));
-        // Image already within the box: untouched.
-        assert_eq!(thumb_dims(200, 100, Some(256)), (200, 100, 1));
-        // 4K landscape -> longest edge capped at the box, aspect preserved.
-        let (w, h, stride) = thumb_dims(4096, 2160, Some(256));
-        assert!(w <= 256 && h <= 256, "longest edge within the box: {w}x{h}");
-        assert_eq!(stride, 16, "4096.div_ceil(256)");
-        assert!(
-            (w as f32 / h as f32 - 4096.0 / 2160.0).abs() < 0.05,
-            "aspect kept"
-        );
-        // Portrait caps the height instead.
-        let (w, h, _) = thumb_dims(1080, 1920, Some(256));
-        assert!(
-            w <= 256 && h <= 256 && h >= w,
-            "portrait stays portrait: {w}x{h}"
-        );
-        // Degenerate: never produces a zero dimension.
-        assert_eq!(thumb_dims(0, 0, Some(256)), (1, 1, 1));
-    }
 
     #[test]
     fn t2_victim_evicts_furthest_and_protects_on_screen() {

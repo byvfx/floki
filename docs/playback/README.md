@@ -26,7 +26,7 @@ regresses the single-image standalone app**.
 
 ## The one fact that shapes the whole design
 
-GPU texture creation (`generate_gpu_texture`, `viewer.rs`) needs `gpu_resources` +
+GPU texture creation (`prebuild_t2` → `build_layer_texture`, `viewer.rs`) needs `gpu_resources` +
 `queue.write_texture` → it is **UI-thread only**. The load worker can only produce CPU-side
 `ExrData` (+ `ProxyImage`). The sampler (`sample_pixel`, `viewer.rs`, reached via
 `self.viewer.ui(ui, data, …)` in `app.rs`, where `data` is the active slot's `&ExrData`) reads
@@ -51,7 +51,7 @@ A single frame may be resident at several tiers at once.
 |------|------|-----------|----------|----------|---------|
 | **T0 Proxy** | `ProxyImage` low-res RGBA32F (`proxy.rs`) | 5–20 MB | worker (`from_exr_fast_read`) | CPU | scrub preview / fallback paint |
 | **T1 CPU frame** | full `ExrData`, ALL layers (`exr_loader.rs`) | 0.6–1.3 GB | worker (`ExrData::load`) | RAM | **only sampling source** + upload source for T2 |
-| **T2 GPU texture** | `Rgba32Float`, **active layer only** | ~134 MB | UI thread (`generate_gpu_texture`) | VRAM | instant paint on `swap_image_data` |
+| **T2 GPU texture** | `Rgba32Float`, **active layer only** | ~134 MB | UI thread (`build_layer_texture`) | VRAM | instant paint on `swap_image_data` |
 | **T3 active** | the `ExrData` promoted into `self.exr_data` | (== one T1) | UI thread (swap) | — | what renderer + sampler see this frame |
 
 See [memory-contract.md](memory-contract.md) for budgets, eviction, and the **INV-SAMPLE**

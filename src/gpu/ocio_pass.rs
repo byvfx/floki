@@ -334,6 +334,17 @@ impl Drop for OcioTargets {
         // submission cycle, not deferred to the next driver GC sweep. On a
         // window-resize drag loop this prevents a memory spike (each resize
         // creates ~83 MB of 4K Rgba16Float + display textures).
+        //
+        // SAFETY-BY-ORDERING (#148, same force-destroy class as #120): this is
+        // sound only while no recorded-but-unsubmitted command buffer still
+        // references these textures at drop time. Both drop sites hold that
+        // today — `resources.rs` drops in `update()` before this frame's
+        // `prepare` records anything, and the resize path in `prepare` replaces
+        // the targets before the dirty-render encodes. If a future change can
+        // rebuild the OCIO pass after a callback was queued (or run a second
+        // callback into the resize branch in one frame), switch this to
+        // drop-only like T2 eviction — a destroy of an in-flight texture aborts
+        // the submit on Vulkan (see the note at viewer.rs `T2Texture`).
         self._scene.destroy();
         self._display.destroy();
     }
@@ -676,6 +687,14 @@ impl eframe::egui_wgpu::CallbackTrait for OcioCallback {
         let Some(targets) = callback_resources.get::<OcioTargets>() else {
             return;
         };
+        // Nothing has rendered into the display texture yet (the OCIO config is
+        // still loading): blitting would show the zero-initialized texture —
+        // alpha 0.0 reads as "covered, transparent", a transient background
+        // flash over the canvas instead of the alpha=-1 no-image sentinel the
+        // first real pass 1 clears to (#148).
+        if targets.last_render_sig.is_none() {
+            return;
+        }
         // Override egui's per-primitive viewport to full screen so the screen-aligned display
         // texture maps 1:1; egui's scissor (the callback clip rect) limits what's shown.
         render_pass.set_viewport(

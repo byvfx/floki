@@ -272,6 +272,13 @@ pub struct ExrApp {
     #[serde(skip)]
     precache_filled: bool,
 
+    /// A timeline drag is in progress (#143). While held, seeks decode
+    /// beauty-only like playback does — the readout is suppressed or showing
+    /// the beauty layer anyway — and the release settles the landing frame to
+    /// a full all-AOV decode via `settle_to_full` (INV-SAMPLE, #7).
+    #[serde(skip)]
+    scrub_active: bool,
+
     /// Render-watch (#101): poll the sequence directory and pick up frames as a
     /// render writes them — new frames extend the range, re-rendered frames drop
     /// from cache and re-decode. Off by default (it costs a periodic `read_dir`,
@@ -298,6 +305,14 @@ pub struct ExrApp {
     /// Last snapshot outcome, shown briefly in the status bar (transient).
     #[serde(skip)]
     snapshot_status: Option<String>,
+    /// Receives the finalize outcome from the snapshot worker threads (#146):
+    /// clipboard copy + PNG encode/write run off the UI thread. The channel is
+    /// persistent (workers clone `snapshot_tx`), so overlapping snapshots each
+    /// deliver their status in order.
+    #[serde(skip)]
+    snapshot_tx: Option<std::sync::mpsc::Sender<String>>,
+    #[serde(skip)]
+    snapshot_rx: Option<std::sync::mpsc::Receiver<String>>,
 
     /// Throttled RAM/GPU-memory sampler for the bottom-bar readout (#51).
     #[serde(skip)]
@@ -456,12 +471,15 @@ impl Default for ExrApp {
             precache: false,
             ram_budget_gb: 0.0,
             precache_filled: false,
+            scrub_active: false,
             watch_enabled: false,
             watch_follow: false,
             watch_sigs: Vec::new(),
             last_watch_poll: None,
             snapshot_pending: false,
             snapshot_status: None,
+            snapshot_tx: None,
+            snapshot_rx: None,
             resource_monitor: crate::resource_monitor::ResourceMonitor::default(),
             show_help: false,
             show_settings: false,
@@ -721,13 +739,17 @@ impl ExrApp {
         });
     }
 
-    /// Apply a completed [`LutLoadResult`] from the worker thread: create the
-    /// GPU bind group, capture the domain bounds, and update `lut_bg` /
-    /// `lut_error` / `enable_lut`. Ignores stale results (a newer reload of a
-    /// different path superseded this one).
     /// Snapshot to clipboard (#19): drive the hotkey trigger and consume the
     /// `Event::Screenshot` reply. Called once per frame from [`Self::ui`].
     fn process_snapshot(&mut self, ctx: &egui::Context) {
+        // Deliver the off-thread finalize outcomes (#146); with overlapping
+        // snapshots the latest status wins.
+        if let Some(rx) = &self.snapshot_rx {
+            while let Ok(status) = rx.try_recv() {
+                self.snapshot_status = Some(status);
+            }
+        }
+
         // Cmd/Ctrl+Shift+S requests a snapshot (S avoids the viewer's plain R/G/B/A/C
         // channel keys). The menu button calls `request_snapshot` directly.
         let hotkey =
@@ -768,8 +790,11 @@ impl ExrApp {
         ctx.request_repaint();
     }
 
-    /// Crop the captured framebuffer to the image canvas, copy it to the clipboard,
-    /// and (when enabled) save a timestamped PNG. Records a status string.
+    /// Crop the captured framebuffer to the image canvas, then copy it to the
+    /// clipboard and (when enabled) save a timestamped PNG **off-thread** —
+    /// arboard + PNG encode/write are a several-hundred-ms stall at 4K, and this
+    /// runs in the frame that receives `Event::Screenshot`, mid-playback if
+    /// playing (#146). The outcome arrives over `snapshot_rx`.
     fn finish_snapshot(&mut self, image: &egui::ColorImage, pixels_per_point: f32) {
         // Crop to the active image area (#52), falling back to the full canvas.
         let Some(rect) = self.viewer.last_image_rect.or(self.viewer.last_canvas_rect) else {
@@ -777,24 +802,48 @@ impl ExrApp {
         };
         let cropped = crate::snapshot::crop_to_rect(image, rect, pixels_per_point);
 
-        let mut parts = Vec::new();
-        match crate::snapshot::copy_to_clipboard(&cropped) {
-            Ok(()) => parts.push("copied to clipboard".to_string()),
-            Err(e) => parts.push(format!("clipboard failed: {e}")),
+        let save = self.save_snapshots;
+        // One persistent channel; workers clone the sender. Replacing the
+        // receiver per snapshot would silently drop the status of a finalize
+        // still in flight when a second snapshot fires.
+        if self.snapshot_rx.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.snapshot_tx = Some(tx);
+            self.snapshot_rx = Some(rx);
         }
-        if self.save_snapshots {
-            let secs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            match crate::snapshot::save_png(&cropped, secs) {
-                Ok(path) => parts.push(format!("saved {}", path.display())),
-                Err(e) => parts.push(format!("save failed: {e}")),
+        let tx = self
+            .snapshot_tx
+            .clone()
+            .expect("snapshot channel initialized above");
+        self.snapshot_status = Some("Snapshot: saving…".to_string());
+        let repaint_ctx = self.repaint_ctx.clone();
+        std::thread::spawn(move || {
+            let mut parts = Vec::new();
+            match crate::snapshot::copy_to_clipboard(&cropped) {
+                Ok(()) => parts.push("copied to clipboard".to_string()),
+                Err(e) => parts.push(format!("clipboard failed: {e}")),
             }
-        }
-        self.snapshot_status = Some(format!("Snapshot: {}", parts.join(", ")));
+            if save {
+                let secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                match crate::snapshot::save_png(&cropped, secs) {
+                    Ok(path) => parts.push(format!("saved {}", path.display())),
+                    Err(e) => parts.push(format!("save failed: {e}")),
+                }
+            }
+            let _ = tx.send(format!("Snapshot: {}", parts.join(", ")));
+            if let Some(ctx) = &repaint_ctx {
+                ctx.request_repaint();
+            }
+        });
     }
 
+    /// Apply a completed [`LutLoadResult`] from the worker thread: create the
+    /// GPU bind group, capture the domain bounds, and update `lut_bg` /
+    /// `lut_error` / `enable_lut`. Ignores stale results (a newer reload of a
+    /// different path superseded this one).
     fn apply_lut_load_result(&mut self, res: LutLoadResult) {
         // Discard stale results from a superseded reload.
         if res.path != self.lut_path {
@@ -811,13 +860,13 @@ impl ExrApp {
                 if let Some(gpu) = &self.gpu_resources {
                     let gpu_state = gpu.gpu_state.clone();
                     let rs = gpu.render_state();
-                    // Explicitly destroy the old LUT texture before
-                    // replacing it, so GPU memory is released in this
-                    // submission cycle rather than waiting for the next
-                    // driver GC sweep.
-                    if let Some(old_tex) = self.lut_texture.take() {
-                        old_tex.destroy();
-                    }
+                    // Drop-only, never `destroy()` (#120): a recorded-but-
+                    // unsubmitted draw can still reference the old LUT bind
+                    // group when the load lands mid-frame, and destroying an
+                    // in-flight texture aborts the submit on Vulkan. Dropping
+                    // the handle lets wgpu reclaim it when the last reference
+                    // ends — a .cube LUT is well under a megabyte, so deferred
+                    // reclaim costs nothing.
                     let (bg, tex) = gpu_state.create_lut_bind_group(&rs.device, &rs.queue, &lut);
                     self.lut_bg = Some(bg);
                     self.lut_texture = Some(tex);
@@ -839,14 +888,16 @@ impl ExrApp {
             Err(e) => {
                 self.lut_error = Some(e);
                 self.lut_bg = None;
-                if let Some(old_tex) = self.lut_texture.take() {
-                    old_tex.destroy();
-                }
+                // Drop-only, same #120 hazard as the success arm.
+                self.lut_texture = None;
                 self.enable_lut = false;
                 self.lut_domain_min = [0.0, 0.0, 0.0, 0.0];
                 self.lut_domain_max = [1.0, 1.0, 1.0, 0.0];
             }
         }
+        // Both arms change what an enabled LUT renders as (new contents, or
+        // force-disabled on error); cached thumbnails baked the old state (#147).
+        self.viewer.invalidate_tone();
     }
 
     /// Begin loading an EXR into slot A or B. The decode runs on a worker thread
@@ -1042,8 +1093,10 @@ impl ExrApp {
             // moving, but on settle it must be upgraded to a full all-AOV decode
             // so the readout + AOV switch are correct (INV-SAMPLE, #7). Show it
             // now for instant feedback, but keep the playhead awaited so sampling
-            // stays suppressed until the full frame lands.
-            let needs_full = !self.playback.is_playing() && data.beauty_only;
+            // stays suppressed until the full frame lands. An active timeline
+            // drag counts as moving (#143): upgrading every touched frame
+            // mid-drag would spam full decodes; the release settles instead.
+            let needs_full = !self.playback.is_playing() && !self.scrub_active && data.beauty_only;
             self.loading_a = false;
             self.viewer.set_t2_frame(Some(frame)); // bind this frame's T2 texture
             self.swap_image_arc(data, false);
@@ -1090,17 +1143,19 @@ impl ExrApp {
     /// beauty/first layer — a beauty-only frame holds just that layer, so it would
     /// be wrong to serve a different active AOV from it. Then:
     ///
-    /// - **Playing** → every ring frame is beauty (the readout is suppressed while
-    ///   moving, so the other AOVs aren't needed — INV-SAMPLE, #7).
+    /// - **Playing or an active timeline drag** (#143) → every ring frame is
+    ///   beauty (the readout is suppressed while moving — or, for a landed scrub
+    ///   frame, correct for the beauty layer that's showing — INV-SAMPLE, #7).
+    ///   The drag release settles the landing frame to full (`settle_to_full`).
     /// - **Settled + precache** (#56, step 4) → the *prefetched* frames are beauty
     ///   for future playback, but the playhead itself stays **full** so its
     ///   sampling + AOV switch are correct.
-    /// - Otherwise (a plain paused/scrubbing decode) → full.
+    /// - Otherwise (a plain paused seek) → full.
     fn decode_beauty_only(&self, frame: u32) -> bool {
         if !self.beauty_preview || self.viewer.active_layer != 0 {
             return false;
         }
-        if self.playback.is_playing() {
+        if self.playback.is_playing() || self.scrub_active {
             return true;
         }
         self.precache && frame != self.playback.current_frame
@@ -1589,6 +1644,22 @@ impl ExrApp {
             // never raises it — then floor at 2 so playback still runs.
             self.frame_cache_cap =
                 crate::budget::apply_user_ram_cap(auto, self.ram_budget_bytes(), bytes).max(2);
+            // Enforce a shrink now, not on the next decode: eviction otherwise
+            // only runs on insert, so with precache latched (nothing in flight)
+            // external memory pressure lowered the cap while the ring kept every
+            // frame indefinitely — the memory contract's live-pressure
+            // degradation never fired (#146).
+            if self.frame_cache.len() > self.frame_cache_cap {
+                let loop_wrap = (self.playback.loop_mode == crate::playback::LoopMode::Loop)
+                    .then_some((self.playback.in_point, self.playback.out_point));
+                self.dbg_evictions = self.dbg_evictions.saturating_add(self.frame_cache.evict_to(
+                    self.frame_cache_cap,
+                    self.playback.current_frame,
+                    self.playback.direction,
+                    self.playback.is_playing(),
+                    loop_wrap,
+                ) as u64);
+            }
         }
 
         // T2: conservative — capped low, and disabled (→ lazy path) unless at
@@ -1908,6 +1979,22 @@ impl ExrApp {
     /// playback cache hit (#56) can show a resident frame without cloning its
     /// pixel buffers — the same `Arc` is held by the T1 ring and the active slot.
     fn swap_image_arc(&mut self, data: std::sync::Arc<ExrData>, is_b: bool) {
+        // Same Arc as already displayed (scrub-return, settle onto the shown
+        // frame): the pixels are identical, so skip the invalidations — on a T2
+        // miss they'd force a full re-pack + re-upload of the same data (#146).
+        let same = if is_b {
+            self.exr_data_b
+                .as_ref()
+                .is_some_and(|cur| std::sync::Arc::ptr_eq(cur, &data))
+        } else {
+            self.exr_data
+                .as_ref()
+                .is_some_and(|cur| std::sync::Arc::ptr_eq(cur, &data))
+        };
+        if same {
+            self.error_msg = None;
+            return;
+        }
         if is_b {
             self.exr_data_b = Some(data);
             // The texture caches only rebuild on a layer-count change, so a new B
@@ -2710,7 +2797,14 @@ impl ExrApp {
                             lut_reload_requested = true;
                         }
                     });
-                    ui.checkbox(&mut self.enable_lut, "Enable Custom LUT");
+                    // Thumbnails bake the LUT into their cached pixels like
+                    // exposure/gamma, so the toggle must invalidate them (#147).
+                    if ui
+                        .checkbox(&mut self.enable_lut, "Enable Custom LUT")
+                        .changed()
+                    {
+                        self.viewer.invalidate_tone();
+                    }
                     if let Some(err) = &self.lut_error {
                         ui.label(egui::RichText::new(err).color(egui::Color32::RED));
                     }
@@ -3524,23 +3618,37 @@ impl ExrApp {
             // Cache-fill bar (#56, step 4): a thin green strip along the bottom of
             // the track marking which frames are resident in the T1 ring. Each
             // resident frame fills its own equal slot (`[f, f+1)` over `span + 1`
-            // slots, so the last frame `hi` gets a real slot too) — contiguous
-            // residency reads as one solid bar; the gap to a full green bar is the
-            // part of the range that doesn't fit the RAM budget (or hasn't decoded
-            // yet). `resident_frames` is allocation-free for this per-repaint walk.
+            // slots, so the last frame `hi` gets a real slot too). Contiguous
+            // runs are coalesced into single rects before painting: with a large
+            // RAM budget the ring holds thousands of frames, and one rect per
+            // frame tessellated thousands of shapes per repaint (#146) — a small
+            // sort is far cheaper. The gap to a full green bar is the part of
+            // the range that doesn't fit the RAM budget (or hasn't decoded yet).
             let strip_top = rect.bottom() - 4.0;
             let nslots = f64::from(span) + 1.0; // frames lo..=hi inclusive
             let slot_x = |f: u32| {
                 rect.left() + ((f64::from(f.saturating_sub(lo)) / nslots) as f32) * rect.width()
             };
             let fill = egui::Color32::from_rgb(64, 168, 96);
-            for f in self.frame_cache.resident_frames(crate::cache::Slot::A) {
-                if f < in_pt || f > out_pt {
-                    continue; // only the trimmed range is the precache target
+            let mut resident: Vec<u32> = self
+                .frame_cache
+                .resident_frames(crate::cache::Slot::A)
+                // only the trimmed range is the precache target
+                .filter(|&f| f >= in_pt && f <= out_pt)
+                .collect();
+            resident.sort_unstable();
+            let mut i = 0;
+            while i < resident.len() {
+                let start = resident[i];
+                let mut end = start;
+                while i + 1 < resident.len() && resident[i + 1] == end + 1 {
+                    i += 1;
+                    end = resident[i];
                 }
+                i += 1;
                 let seg = egui::Rect::from_min_max(
-                    egui::pos2(slot_x(f), strip_top),
-                    egui::pos2(slot_x(f + 1).min(rect.right()), rect.bottom()),
+                    egui::pos2(slot_x(start), strip_top),
+                    egui::pos2(slot_x(end + 1).min(rect.right()), rect.bottom()),
                 );
                 painter.rect_filled(seg, 0.0, fill);
             }
@@ -3581,12 +3689,21 @@ impl ExrApp {
         }
 
         // Scrub on click or drag, clamped to the trim by `playback_scrub_to`.
+        // While the drag is held, seeks decode beauty-only for responsiveness
+        // (#143); the release settles the landing frame to a full decode.
+        if resp.drag_started() {
+            self.scrub_active = true;
+        }
         if (resp.clicked() || resp.dragged())
             && let Some(pos) = resp.interact_pointer_pos()
         {
             let t = f64::from((pos.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
             let frame = lo + (t * f64::from(span)).round() as u32;
             self.playback_scrub_to(frame);
+        }
+        if resp.drag_stopped() {
+            self.scrub_active = false;
+            self.settle_to_full();
         }
     }
 
@@ -4888,6 +5005,51 @@ mod tests {
         assert!(
             app.decode_beauty_only(ahead),
             "precache: prefetched frames are beauty for future playback"
+        );
+
+        // An active timeline drag behaves like playing (#143): the held seek
+        // decodes beauty-only for responsiveness; the release settles to full.
+        app.precache = false;
+        app.scrub_active = true;
+        assert!(
+            app.decode_beauty_only(cur),
+            "active scrub ⇒ beauty-only decode"
+        );
+        app.scrub_active = false;
+        assert!(!app.decode_beauty_only(cur), "released ⇒ full decode again");
+    }
+
+    /// #143: mid-drag, a resident beauty ring frame displays without being
+    /// marked for a full upgrade (that would spam full decodes per touched
+    /// frame); the drag release settles the landing frame to full instead.
+    #[test]
+    fn active_scrub_shows_resident_beauty_and_settles_full_on_release() {
+        let dir = tempfile::tempdir().unwrap();
+        touch_sequence(dir.path(), 5);
+        let f3 = dir.path().join("s.0003.exr");
+        write_rgba_exr(&f3);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&dir.path().join("s.0001.exr"));
+
+        let beauty = std::sync::Arc::new(ExrData::load_beauty(&f3).unwrap());
+        assert!(beauty.beauty_only);
+        app.frame_cache.insert(crate::cache::Slot::A, 3, beauty);
+
+        // Mid-drag: the resident beauty frame shows immediately, no upgrade.
+        app.scrub_active = true;
+        app.playback_scrub_to(3);
+        assert_eq!(
+            app.playback.pending, None,
+            "beauty ring frame displays without a mid-drag full upgrade"
+        );
+
+        // Release: the landing frame settles to a full all-AOV decode.
+        app.scrub_active = false;
+        app.settle_to_full();
+        assert_eq!(
+            app.playback.pending,
+            Some(3),
+            "release re-requests the landing frame in full"
         );
     }
 

@@ -157,7 +157,14 @@ pub fn generate_ocio(
     u.srgb = 0;
     u.gamma = 1.0;
     u.skip_checker = 1;
-    queue.write_buffer(&gpu_state.uniform_buffer, 0, bytemuck::bytes_of(&u));
+    // Reserved offscreen slot — never slot 0, which belongs to the viewport's
+    // deferred egui-pass draws (#148).
+    let uniform_offset = crate::gpu::UNIFORM_RING_OFFSCREEN_SLOT as u32 * gpu_state.uniform_stride;
+    queue.write_buffer(
+        &gpu_state.uniform_buffer,
+        u64::from(uniform_offset),
+        bytemuck::bytes_of(&u),
+    );
 
     let lut = lut_bg
         .filter(|_| tone.enable_lut)
@@ -196,7 +203,7 @@ pub fn generate_ocio(
             rp.set_pipeline(&gpu_state.pipeline_linear);
             rp.set_bind_group(0, &source_bg, &[]);
             rp.set_bind_group(1, gpu_state.default_tex_bind_group.as_ref(), &[]);
-            rp.set_bind_group(2, &gpu_state.uniform_bind_group, &[0]);
+            rp.set_bind_group(2, &gpu_state.uniform_bind_group, &[uniform_offset]);
             rp.set_bind_group(3, lut, &[]);
             rp.draw(0..6, 0..1);
         }
@@ -231,24 +238,24 @@ fn decimate_source(
         return None;
     }
 
-    let (out_w, out_h, stride) = crate::viewer::thumb_dims(width, height, Some(max_dim));
+    let (out_w, out_h, stride) = crate::pixels::thumb_dims(width, height, Some(max_dim));
 
     let mut pixels = vec![0.0f32; out_w * out_h * 4];
-    let r_s = crate::viewer::sample_channel_f32(r_chan);
-    let g_s = crate::viewer::sample_channel_f32(g_chan);
-    let b_s = crate::viewer::sample_channel_f32(b_chan);
-    let a_s = crate::viewer::sample_channel_f32(a_chan);
+    let r_s = crate::pixels::sample_channel_f32(r_chan);
+    let g_s = crate::pixels::sample_channel_f32(g_chan);
+    let b_s = crate::pixels::sample_channel_f32(b_chan);
+    let a_s = crate::pixels::sample_channel_f32(a_chan);
     let has_alpha = a_chan.is_some();
     for oy in 0..out_h {
         let y = (oy * stride).min(height - 1);
         for ox in 0..out_w {
             let x = (ox * stride).min(width - 1);
             let i = (oy * out_w + ox) * 4;
-            pixels[i] = crate::viewer::pixel_val(r_s, r_chan, x, y, width);
-            pixels[i + 1] = crate::viewer::pixel_val(g_s, g_chan, x, y, width);
-            pixels[i + 2] = crate::viewer::pixel_val(b_s, b_chan, x, y, width);
+            pixels[i] = crate::pixels::pixel_val(r_s, r_chan, x, y, width);
+            pixels[i + 1] = crate::pixels::pixel_val(g_s, g_chan, x, y, width);
+            pixels[i + 2] = crate::pixels::pixel_val(b_s, b_chan, x, y, width);
             pixels[i + 3] = if has_alpha {
-                crate::viewer::pixel_val(a_s, a_chan, x, y, width)
+                crate::pixels::pixel_val(a_s, a_chan, x, y, width)
             } else {
                 1.0
             };
@@ -268,6 +275,9 @@ fn uniforms_for(tone: &ThumbnailTone, out_w: usize, out_h: usize) -> crate::gpu:
         rect_max: [out_w as f32, out_h as f32],
         screen_size: [out_w as f32, out_h as f32],
         wipe_center: [0.0, 0.0],
+        // Whole target counts as "inside" — no overscan dim on thumbnails.
+        display_min: [0.0, 0.0],
+        display_max: [out_w as f32, out_h as f32],
         exposure: tone.exposure,
         gamma: tone.gamma,
         diff_multiplier: 0.0,
@@ -283,7 +293,7 @@ fn uniforms_for(tone: &ThumbnailTone, out_w: usize, out_h: usize) -> crate::gpu:
         skip_checker: 0,
         diff_metric: 0,
         diff_floor: 0.0,
-        _pad2: 0,
+        overscan_factor: 1.0,
         lut_domain_min: tone.lut_domain_min,
         lut_domain_max: tone.lut_domain_max,
         bg_checker_dark: rgb3_to_vec4(bg.checker_dark),
@@ -349,9 +359,15 @@ fn render_pixels<R>(
     });
     let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
 
-    // Write the uniforms to slot 0 of the persistent ring buffer; we bind with a
-    // dynamic offset of 0 below.
-    queue.write_buffer(&gpu_state.uniform_buffer, 0, bytemuck::bytes_of(uniforms));
+    // Write the uniforms to the reserved offscreen ring slot — never slot 0,
+    // which belongs to the viewport's deferred egui-pass draws (#148); bind
+    // with the matching dynamic offset below.
+    let uniform_offset = crate::gpu::UNIFORM_RING_OFFSCREEN_SLOT as u32 * gpu_state.uniform_stride;
+    queue.write_buffer(
+        &gpu_state.uniform_buffer,
+        u64::from(uniform_offset),
+        bytemuck::bytes_of(uniforms),
+    );
 
     let mut encoder =
         device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
@@ -375,7 +391,7 @@ fn render_pixels<R>(
         rp.set_pipeline(&gpu_state.thumbnail_pipeline);
         rp.set_bind_group(0, &source_bg, &[]);
         rp.set_bind_group(1, gpu_state.default_tex_bind_group.as_ref(), &[]);
-        rp.set_bind_group(2, &gpu_state.uniform_bind_group, &[0]);
+        rp.set_bind_group(2, &gpu_state.uniform_bind_group, &[uniform_offset]);
         rp.set_bind_group(
             3,
             lut_bg.unwrap_or(gpu_state.default_lut_bind_group.as_ref()),

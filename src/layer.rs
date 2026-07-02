@@ -45,10 +45,10 @@
 //! `(LayerId, source_frame)` — see [`Layer::cache_key`]. `LayerId` is stable
 //! across reordering, so moving a layer in the stack never invalidates its cache.
 
-// Design-spike module: this lands the pure model + its tests ahead of consumers.
-// Wiring follows in the build phases — N-way compare (#104), locked-step A/B
-// (#98), the CC/adjustment suite (#102), and the per-layer thumbnail cache (#112)
-// — so most public items are intentionally unused for now.
+// The render program (#114) consumes this model for the A/B stack; the rest of
+// the surface (groups, trims, per-layer CC) is landed ahead of its consumers —
+// N-way compare (#104), locked-step A/B (#98), the CC/adjustment suite (#102),
+// and the per-layer thumbnail cache (#112) — so unused items remain by design.
 #![allow(dead_code)]
 
 use crate::viewer::BlendMode;

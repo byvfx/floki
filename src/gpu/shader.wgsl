@@ -9,6 +9,11 @@ struct Uniforms {
     rect_max: vec2<f32>,
     screen_size: vec2<f32>,
     wipe_center: vec2<f32>,
+    // Display-window bounds in screen points (#146). Fragments outside blend at
+    // `overscan_factor` instead of `opacity` — single-draw overscan dim. Keep in
+    // lockstep with `Uniforms` in src/gpu/mod.rs.
+    display_min: vec2<f32>,
+    display_max: vec2<f32>,
     // 4-byte aligned fields
     exposure: f32,
     gamma: f32,
@@ -33,7 +38,9 @@ struct Uniforms {
     // subtracted from the gained magnitude. Keep in lockstep with src/gpu/mod.rs.
     diff_metric: u32,
     diff_floor: f32,
-    _pad2: u32,
+    // Blend factor outside the display window (#146): 1.0 = no dim (thumbnails,
+    // side-by-side, OCIO pass 1 — the blit dims there), 0.0 = hidden.
+    overscan_factor: f32,
     // .cube LUT domain bounds (xyz + pad). The lookup coordinate is remapped from
     // [domain_min, domain_max] to [0, 1] before sampling the 3D LUT texture, so
     // non-unit-domain LUTs (HDR/film looks) sample correctly. Defaults to identity.
@@ -132,6 +139,15 @@ fn linear_to_srgb(l: f32) -> f32 {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    // Single-draw overscan dim (#146): fragments outside the display window
+    // blend at `overscan_factor` instead of `opacity`, replacing the old
+    // two-draw scheme (whole image at dim opacity + display window redrawn at
+    // full). `mix(rect_min, rect_max, uv)` is this fragment's screen point.
+    let frag_pt = mix(uniforms.rect_min, uniforms.rect_max, in.uv);
+    let od_inside = frag_pt.x >= uniforms.display_min.x && frag_pt.x <= uniforms.display_max.x
+                 && frag_pt.y >= uniforms.display_min.y && frag_pt.y <= uniforms.display_max.y;
+    let eff_opacity = select(uniforms.overscan_factor, uniforms.opacity, od_inside);
+
     var color_a = textureSample(tex_a, samp_a, in.uv);
     var color_b = vec4<f32>(0.0);
     
@@ -162,7 +178,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             let mr = clamp((dr * gain - nfloor) / denom, 0.0, 1.0);
             let mg = clamp((dg * gain - nfloor) / denom, 0.0, 1.0);
             let mb = clamp((db * gain - nfloor) / denom, 0.0, 1.0);
-            return vec4<f32>(mr, mg, mb, uniforms.opacity);
+            return vec4<f32>(mr, mg, mb, eff_opacity);
         }
         var d = max(dr, max(dg, db));
         if uniforms.diff_metric == 1u {
@@ -171,7 +187,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         }
         let m = clamp((d * gain - nfloor) / denom, 0.0, 1.0);
         let heat = textureSample(colormap_tex, colormap_samp, vec2<f32>(m, 0.5)).rgb;
-        return vec4<f32>(heat, uniforms.opacity);
+        return vec4<f32>(heat, eff_opacity);
     }
 
     // Premultiplied-alpha compositing. Keep the `blend_mode` switch in lockstep
@@ -312,7 +328,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // Under OCIO (skip_checker==1) emit the real image alpha so the display-space
     // checker + overscan dim (in the blit pass) have a coverage/alpha signal. The
-    // `opacity` dim is applied post-OCIO in that case, not here.
-    let out_a = select(uniforms.opacity, a, uniforms.skip_checker == 1u);
+    // opacity/overscan dim is applied post-OCIO in that case, not here.
+    let out_a = select(eff_opacity, a, uniforms.skip_checker == 1u);
     return vec4<f32>(r, g, b, out_a);
 }

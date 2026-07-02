@@ -97,11 +97,11 @@ impl ProxyImage {
         for y in 0..full_height {
             for x in 0..full_width {
                 let i = (y * full_width + x) * 4;
-                full[i] = crate::viewer::sample_channel(r_chan, x, y, full_width);
-                full[i + 1] = crate::viewer::sample_channel(g_chan, x, y, full_width);
-                full[i + 2] = crate::viewer::sample_channel(b_chan, x, y, full_width);
+                full[i] = crate::pixels::sample_channel(r_chan, x, y, full_width);
+                full[i + 1] = crate::pixels::sample_channel(g_chan, x, y, full_width);
+                full[i + 2] = crate::pixels::sample_channel(b_chan, x, y, full_width);
                 full[i + 3] = a_chan
-                    .map(|c| crate::viewer::sample_channel(Some(c), x, y, full_width))
+                    .map(|c| crate::pixels::sample_channel(Some(c), x, y, full_width))
                     .unwrap_or(1.0);
             }
         }
@@ -276,7 +276,7 @@ impl ProxyImage {
 }
 
 /// Read one sample from native-endian block bytes, normalising to `f32` exactly
-/// as [`crate::viewer::sample_channel`] does (U32 scaled by `u32::MAX`). Returns
+/// as [`crate::pixels::sample_channel`] does (U32 scaled by `u32::MAX`). Returns
 /// `0.0` if the slice is too short (the caller already bounds-checks the row).
 fn read_sample(bytes: &[u8], ty: SampleType) -> f32 {
     match ty {
@@ -295,7 +295,7 @@ fn read_sample(bytes: &[u8], ty: SampleType) -> f32 {
     }
 }
 
-// Channel sampling reuses [`crate::viewer::sample_channel`] (the single,
+// Channel sampling reuses [`crate::pixels::sample_channel`] (the single,
 // tested implementation that handles F32/F16/U32 `FlatSamples`) rather than
 // duplicating the enum match here. It's `pub(crate)` for that reason.
 

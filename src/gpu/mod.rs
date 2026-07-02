@@ -17,6 +17,12 @@ pub struct Uniforms {
     pub rect_max: [f32; 2],
     pub screen_size: [f32; 2],
     pub wipe_center: [f32; 2],
+    /// Display-window bounds in screen points (#146). Fragments outside this
+    /// rect blend at `overscan_factor` instead of `opacity`, so the data-window
+    /// overscan dims in the same draw — replacing the old two-draw scheme
+    /// (whole image at dim opacity + display window redrawn at full).
+    pub display_min: [f32; 2],
+    pub display_max: [f32; 2],
     // 4-byte aligned fields
     pub exposure: f32,
     pub gamma: f32,
@@ -40,7 +46,10 @@ pub struct Uniforms {
     /// magnitude. Keep in lockstep with `Uniforms` in `shader.wgsl`.
     pub diff_metric: u32,
     pub diff_floor: f32,
-    pub _pad2: u32,
+    /// Blend factor for fragments outside `display_min..display_max` (#146):
+    /// `1.0` = no dim (thumbnails, side-by-side, OCIO pass 1 — the blit dims
+    /// there), `0.0` = hidden, in between = the overscan dim.
+    pub overscan_factor: f32,
     /// `.cube` LUT domain bounds (xyz + pad). The lookup coordinate is remapped
     /// from `[domain_min, domain_max]` to `[0, 1]` before sampling the 3D LUT
     /// texture, so non-unit-domain LUTs (common for HDR/film looks) sample
@@ -131,10 +140,9 @@ pub struct GpuState {
     /// frame. The bind group is created once and rebound with a dynamic offset.
     pub uniform_buffer: wgpu::Buffer,
     pub uniform_bind_group: wgpu::BindGroup,
-    /// Stride per uniform slot in bytes, padded up to the device's
-    /// `min_uniform_buffer_offset_alignment` (typically 256). The raw
-    /// `Uniforms` struct is 128 bytes, but dynamic offsets must be aligned,
-    /// so each slot is padded.
+    /// Stride per uniform slot in bytes: the raw `Uniforms` struct size padded
+    /// up to the device's `min_uniform_buffer_offset_alignment` (typically
+    /// 256), since dynamic offsets must be aligned.
     pub uniform_stride: u32,
     /// Same shader/layout as `pipeline` but renders into an `Rgba32Float` offscreen target
     /// (the OCIO "pass 1" scene-linear buffer). Drive it with `srgb=0, gamma=1, enable_lut=0`
@@ -247,6 +255,14 @@ fn fs_main(i: VOut) -> @location(0) vec4<f32> {
 /// frame (A/B/diff/composite/side-by-side) — 16 gives ample headroom. At
 /// 256-byte stride (worst-case alignment) the buffer is 4 KB.
 pub const UNIFORM_RING_SLOTS: u64 = 16;
+
+/// Ring slot reserved for offscreen generators (contact-sheet thumbnails).
+/// They write + submit immediately, while the viewport's draws are deferred to
+/// the egui render pass — sharing slot 0 was safe only while the sheet and the
+/// canvas were mutually exclusive; any future same-frame combination would
+/// silently draw the viewport with thumbnail uniforms (#148). The viewport's
+/// per-frame allocator uses slots `0..UNIFORM_RING_OFFSCREEN_SLOT`.
+pub const UNIFORM_RING_OFFSCREEN_SLOT: u64 = UNIFORM_RING_SLOTS - 1;
 
 /// Round `size` up to the next multiple of `align` (must be a power of two).
 fn align_to(size: u32, align: u32) -> u32 {
@@ -975,7 +991,7 @@ mod tests {
             "Uniforms size ({size}) must be a multiple of 16"
         );
         assert_eq!(
-            size, 192,
+            size, 208,
             "Uniforms layout changed — update shader.wgsl to match"
         );
     }
@@ -1004,6 +1020,8 @@ mod tests {
             rect_min: [1.0, 2.0],
             rect_max: [3.0, 4.0],
             screen_size: [800.0, 600.0],
+            display_min: [1.0, 2.0],
+            display_max: [3.0, 4.0],
             exposure: 1.5,
             gamma: 2.2,
             diff_multiplier: 4.0,
@@ -1020,7 +1038,7 @@ mod tests {
             skip_checker: 1,
             diff_metric: 1,
             diff_floor: 0.05,
-            _pad2: 0,
+            overscan_factor: 1.0,
             lut_domain_min: [-0.5, -0.5, -0.5, 0.0],
             lut_domain_max: [1.5, 1.5, 1.5, 0.0],
             bg_checker_dark: [0.1, 0.1, 0.1, 0.0],

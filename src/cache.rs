@@ -12,7 +12,7 @@
 //! Keyed on `(Slot, frame)` so locked-step A/B (#7, Phase 5) is an extension, not
 //! a rewrite; Phase 3 only ever stores `Slot::A` frames.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::exr_loader::ExrData;
@@ -49,6 +49,9 @@ impl FrameCache {
         self.entries.len()
     }
 
+    /// API completeness alongside [`FrameCache::len`] (and keeps
+    /// `clippy::len_without_is_empty` satisfied); no runtime caller today.
+    #[allow(dead_code)]
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
@@ -85,12 +88,6 @@ impl FrameCache {
                 last_used: self.tick,
             },
         );
-    }
-
-    /// The set of resident frame numbers for a slot (input to the scheduler).
-    #[must_use]
-    pub fn resident(&self, slot: Slot) -> HashSet<u32> {
-        self.resident_frames(slot).collect()
     }
 
     /// Resident frame numbers for a slot, **without allocating** — for callers
@@ -275,10 +272,10 @@ mod tests {
         let mut c = FrameCache::new();
         fill(&mut c, Slot::A, &[1, 2, 3]);
         fill(&mut c, Slot::B, &[9]);
-        let mut a: Vec<u32> = c.resident(Slot::A).into_iter().collect();
+        let mut a: Vec<u32> = c.resident_frames(Slot::A).collect();
         a.sort_unstable();
         assert_eq!(a, vec![1, 2, 3]);
-        assert_eq!(c.resident(Slot::B).into_iter().collect::<Vec<_>>(), vec![9]);
+        assert_eq!(c.resident_frames(Slot::B).collect::<Vec<_>>(), vec![9]);
     }
 
     #[test]
