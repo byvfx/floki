@@ -5,6 +5,52 @@ All notable changes to Floki are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.2] - 2026-07-02
+
+A playback-responsiveness patch, from a full codebase audit
+([docs/audit-2026-07.md](docs/audit-2026-07.md)). Playback now paces at the
+target frame rate, scrubbing heavy multi-AOV sequences is dramatically
+snappier, and looped playback no longer stutters at the wrap.
+
+### Fixed
+- **Playback ran below the target fps even with every frame cached.** The frame
+  clock re-armed a full period after each tick instead of at the next absolute
+  deadline, so every frame paid the timer/vsync wake-up slop (24 fps paced out
+  at ~20 on a 60 Hz display); and completed decodes sat unread for up to 50 ms
+  because the worker couldn't wake the UI. The clock now schedules to the
+  deadline and the decode worker requests a repaint the moment a result lands.
+- **Holding the scrubber still re-decoded the held frame forever.** A
+  stationary drag superseded its own decode every UI frame, so the frame under
+  the cursor never displayed until release. Same-frame seeks (and held arrow
+  keys at a range boundary) are no-ops now — while still retrying frames whose
+  decode failed.
+- **Looped playback stuttered at every wrap.** Prefetch wrapped past the out
+  point was misclassified as "behind" and evicted the moment it landed, so the
+  decoder churned near the out point and the wrap always landed on a cache
+  miss. Loop eviction now measures distance around the loop.
+- **Contact-sheet thumbnails went stale when the `.cube` LUT was toggled or
+  reloaded**, showing pre-toggle pixels until an unrelated change forced a
+  re-render.
+- **A loading OCIO config could flash the background over the canvas** for a
+  frame; the blit now waits for the first real render.
+- **Reloading a `.cube` LUT mid-frame could crash on Vulkan** (the old LUT
+  texture was destroyed while a recorded draw could still reference it).
+
+### Performance
+- **Scrubbing decodes only the beauty layer while the drag is held**, with the
+  landing frame upgraded to a full all-AOV decode on release — heavy multi-AOV
+  EXRs scrub at beauty-decode speed instead of full-frame speed.
+- **The histogram no longer recomputes at full resolution on every playback
+  frame** while the side panel is open; it refreshes when playback settles.
+- **The overscan dim renders in a single draw.** The non-OCIO path previously
+  drew the whole image twice per repaint (once dimmed, once clipped to the
+  display window); the shader now dims outside the display window per fragment.
+- Blink compare mode wakes exactly at the next A/B flip instead of repainting
+  at the full refresh rate; snapshots finalize (clipboard + PNG) off the UI
+  thread; the timeline's cache strip draws contiguous runs as single rects; and
+  the RAM budget enforces cache shrinks immediately under memory pressure
+  instead of waiting for the next decode.
+
 ## [1.9.1] - 2026-07-02
 
 A stability patch for the 1.9.0 playback release: several ways sequence playback
