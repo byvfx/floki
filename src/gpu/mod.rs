@@ -209,6 +209,18 @@ fn blit_background(screen_pt: vec2<f32>, guv: vec2<f32>) -> vec3<f32> {
     return select(bu.bg_checker_light.rgb, bu.bg_checker_dark.rgb, is_dark);
 }
 
+// TPDF output dither — kept in lockstep with `shader.wgsl` so the OCIO display
+// path breaks up dark-gradient banding the same way the non-OCIO path does.
+fn hash12(p: vec2<f32>) -> f32 {
+    var p3 = fract(vec3<f32>(p.xyx) * 0.1031);
+    p3 = p3 + dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+fn tpdf_dither(p: vec2<f32>, chan: f32) -> f32 {
+    let q = p + vec2<f32>(chan * 37.0, chan * 17.0);
+    return hash12(q) - hash12(q + vec2<f32>(11.3, 7.7));
+}
+
 @fragment
 fn fs_main(i: VOut) -> @location(0) vec4<f32> {
     // Pass 1 clears the scene target's alpha to a negative sentinel; the image quad(s)
@@ -246,6 +258,15 @@ fn fs_main(i: VOut) -> @location(0) vec4<f32> {
               && screen_pt2.y >= bu.display_min.y && screen_pt2.y <= bu.display_max.y;
     let dim = select(bu.overscan_factor, 1.0, inside);
     rgb = rgb * dim;
+
+    // Dither before the 8-bit output quantization (this blit writes the final
+    // OCIO display color to the 8-bit surface), keyed on the framebuffer pixel.
+    let dp = i.pos.xy;
+    rgb = rgb + vec3<f32>(
+        tpdf_dither(dp, 0.0),
+        tpdf_dither(dp, 1.0),
+        tpdf_dither(dp, 2.0),
+    ) / 255.0;
 
     return vec4<f32>(rgb, 1.0);
 }
@@ -502,7 +523,10 @@ impl GpuState {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
+                // f32 ramp (#157): the LUT stores gradient values at full float
+                // precision, so dark ramps don't carry 8-bit LUT-side banding.
+                // The layout binds it filterable (FLOAT32_FILTERABLE, enabled).
+                format: wgpu::TextureFormat::Rgba32Float,
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             })
@@ -882,23 +906,23 @@ impl GpuState {
     }
 
     /// Upload a freshly baked diff colormap into the persistent colormap texture.
-    /// `rgba` must be `COLORMAP_LUT_SIZE * 4` bytes (the output of
-    /// [`crate::gradient::Gradient::bake`]). Cheap (~1 KB) — called only when the
+    /// `rgba` must be `COLORMAP_LUT_SIZE * 4` f32s (the output of
+    /// [`crate::gradient::Gradient::bake`]). Cheap (~4 KB) — called only when the
     /// active gradient changes.
-    pub fn write_colormap(&self, queue: &wgpu::Queue, rgba: &[u8]) {
+    pub fn write_colormap(&self, queue: &wgpu::Queue, rgba: &[f32]) {
         write_lut_row(queue, &self.colormap_texture, rgba);
     }
 
     /// Upload a freshly baked background gradient into its persistent texture.
     /// Same contract as [`Self::write_colormap`].
-    pub fn write_bg_gradient(&self, queue: &wgpu::Queue, rgba: &[u8]) {
+    pub fn write_bg_gradient(&self, queue: &wgpu::Queue, rgba: &[f32]) {
         write_lut_row(queue, &self.bg_gradient_texture, rgba);
     }
 }
 
-/// Write a baked `COLORMAP_LUT_SIZE × 1` RGBA8 LUT row into `tex`. Shared by the
-/// colormap and background-gradient textures (seed + updates).
-fn write_lut_row(queue: &wgpu::Queue, tex: &wgpu::Texture, rgba: &[u8]) {
+/// Write a baked `COLORMAP_LUT_SIZE × 1` `Rgba32Float` LUT row into `tex`. Shared
+/// by the colormap and background-gradient textures (seed + updates).
+fn write_lut_row(queue: &wgpu::Queue, tex: &wgpu::Texture, rgba: &[f32]) {
     let width = crate::gradient::COLORMAP_LUT_SIZE as u32;
     queue.write_texture(
         wgpu::TexelCopyTextureInfo {
@@ -907,10 +931,10 @@ fn write_lut_row(queue: &wgpu::Queue, tex: &wgpu::Texture, rgba: &[u8]) {
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
         },
-        rgba,
+        bytemuck::cast_slice(rgba),
         wgpu::TexelCopyBufferLayout {
             offset: 0,
-            bytes_per_row: Some(width * 4),
+            bytes_per_row: Some(width * 4 * 4),
             rows_per_image: Some(1),
         },
         wgpu::Extent3d {

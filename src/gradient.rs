@@ -74,15 +74,20 @@ impl Gradient {
 
     /// Bake the gradient to an `n×1` row of RGBA8 texels (alpha = 255) for upload
     /// as a 1-D colormap LUT. Index `i` samples `t = i / (n-1)`.
-    pub fn bake(&self, n: usize) -> Vec<u8> {
+    /// Bake the ramp to an `n`-entry RGBA-f32 LUT row for GPU upload (an
+    /// `Rgba32Float` texture). Full float precision: the old 8-bit bake quantized
+    /// the ramp *values*, which showed as banding in dark gradients that output
+    /// dithering alone couldn't fully recover — f32 keeps the ramp smooth (#157).
+    /// RGB is clamped to `[0, 1]`; alpha is opaque.
+    pub fn bake(&self, n: usize) -> Vec<f32> {
         let mut out = Vec::with_capacity(n * 4);
         let denom = (n.saturating_sub(1)).max(1) as f32;
         for i in 0..n {
             let c = self.sample(i as f32 / denom);
-            out.push((c[0].clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
-            out.push((c[1].clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
-            out.push((c[2].clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
-            out.push(255);
+            out.push(c[0].clamp(0.0, 1.0));
+            out.push(c[1].clamp(0.0, 1.0));
+            out.push(c[2].clamp(0.0, 1.0));
+            out.push(1.0);
         }
         out
     }
@@ -310,8 +315,8 @@ mod tests {
     fn bake_length_and_alpha() {
         let baked = Colormap::Viridis.gradient().bake(COLORMAP_LUT_SIZE);
         assert_eq!(baked.len(), COLORMAP_LUT_SIZE * 4);
-        assert!(baked.chunks(4).all(|px| px[3] == 255));
-        // Endpoints match the gradient's first/last stop.
-        assert_eq!(&baked[0..3], &[68, 1, 84]);
+        assert!(baked.chunks(4).all(|px| px[3] == 1.0));
+        // First texel is the gradient's first stop, at full float precision.
+        assert_eq!(&baked[0..3], &Colormap::Viridis.gradient().sample(0.0)[..]);
     }
 }

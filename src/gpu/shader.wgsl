@@ -137,6 +137,24 @@ fn linear_to_srgb(l: f32) -> f32 {
     }
 }
 
+// Hash a screen point to a uniform value in [0, 1) (Dave Hoskins' `hash12` —
+// no `sin`, so it's stable across GPUs unlike the classic `fract(sin(...))`).
+fn hash12(p: vec2<f32>) -> f32 {
+    var p3 = fract(vec3<f32>(p.xyx) * 0.1031);
+    p3 = p3 + dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+// Triangular-PDF (TPDF) dither in (-1, 1) LSB — the difference of two
+// independent uniforms. Added before the 8-bit output quantization, it turns
+// hard gradient bands into imperceptible noise (the standard fix for banding on
+// a smooth ramp written to an 8-bit target). Keyed on the framebuffer pixel and
+// a per-channel offset so the three channels get independent noise.
+fn tpdf_dither(p: vec2<f32>, chan: f32) -> f32 {
+    let q = p + vec2<f32>(chan * 37.0, chan * 17.0);
+    return hash12(q) - hash12(q + vec2<f32>(11.3, 7.7));
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Single-draw overscan dim (#146): fragments outside the display window
@@ -324,6 +342,19 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         r = linear_to_srgb(r);
         g = linear_to_srgb(g);
         b = linear_to_srgb(b);
+    }
+
+    // Dither before the 8-bit output quantization to break up gradient banding
+    // (worst in dark background ramps). Only on the non-OCIO path: here fs_main
+    // writes the final display-encoded color to the 8-bit target, so this is the
+    // quantization point. Under OCIO (skip_checker==1) this shader emits a
+    // scene-linear intermediate — dithering there would inject huge relative
+    // noise — so the OCIO blit owns its own output dither.
+    if uniforms.skip_checker == 0u {
+        let p = in.position.xy;
+        r = r + tpdf_dither(p, 0.0) / 255.0;
+        g = g + tpdf_dither(p, 1.0) / 255.0;
+        b = b + tpdf_dither(p, 2.0) / 255.0;
     }
 
     // Under OCIO (skip_checker==1) emit the real image alpha so the display-space
