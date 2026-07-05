@@ -15,7 +15,7 @@ A frame may be resident at several tiers at once.
 |------|------|-----------|----------|----------|---------|
 | **T0 Proxy** | `ProxyImage` low-res RGBA32F (`proxy.rs`) | 5–20 MB | worker (`from_exr_fast_read`) | CPU | scrub preview / fallback paint |
 | **T1 CPU frame** | full `ExrData`, ALL layers (`exr_loader.rs`) | 0.6–1.3 GB | worker (`ExrData::load`) | RAM | **only sampling source** + upload source for T2 |
-| **T2 GPU texture** | `Rgba32Float`, **active layer only** | ~134 MB | UI thread (`build_layer_texture`) | VRAM | instant paint on `swap_image_data` |
+| **T2 GPU texture** | `Rgba16Float` for f16 sources (`Rgba32Float` for f32/u32), **active layer only** | ~66 MB (16F) / ~133 MB (32F) | UI thread (`build_layer_texture`) | VRAM | instant paint on `swap_image_data` |
 | **T3 active** | the `ExrData` promoted into `self.exr_data` | (== one T1) | UI thread (swap) | — | what renderer + sampler see this frame |
 
 T1 frames are held as `Arc<ExrData>` so a frame can be both **active (T3)** and **resident (T1)**
@@ -31,7 +31,9 @@ They bind different tiers from different sources.
 
 ```
 budget       = recommendedMaxWorkingSetSize × headroom − baseline_vram
-per_frame_t2 = w × h × 16            # Rgba32Float, 16 bytes/pixel
+per_frame_t2 = w × h × 16            # 16 B/px: conservatively budgets for Rgba32Float.
+                                     # f16 sources upload as Rgba16Float (8 B/px), so the
+                                     # ring stays well under the real VRAM cost (#142).
 max_t2       = floor(budget / per_frame_t2)
 ```
 

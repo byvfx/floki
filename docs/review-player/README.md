@@ -72,10 +72,10 @@ list) are unconfirmed and marked as such.
 | Color sampler, histogram, contact-sheet thumbnails | ✅ | |
 | Exposure + gamma (incl. in OCIO view) | ✅ | gamma-in-OCIO fixed in #93/#95 |
 | Transport: play/pause/stop/step, loop, ping-pong, in/out trim, stutter **+ drop-frames** pacing | ✅ | #7 Phase 5 (PR #97) |
+| **Live render-watch** | ✅ | #101 (off-thread scan #145) |
 | Color corrections: contrast / hue / saturation / white balance / **soft-clip** | ⚠️ | only exposure + gamma today → **#102** |
 | Annotations: animated **brush-sequence** + **text** layers | ⚠️ | static annotations/swatches exist → layer model (**#103**) |
 | Compare count | ⚠️ | 2-slot (A/B); Chaos does up to 4 → **#104** |
-| **Live render-watch** | ❌ | **#101** |
 | **MP4 / ProRes export** | ❌ | **#8** |
 | **N-way compare** (up to 4) | ❌ | **#104** |
 | **Layer / composite stack** (per-layer xform, infinite canvas, layer types) | ❌ | **#103** |
@@ -135,8 +135,9 @@ single-image or playback paths. Epic: **#99**.
 1. **Playback hardening — #100.** Validate #7 Phases 0–5 on real Win + Mac footage
    (the "make sure playback works well" gate). Folds in **#94** (proxy controls + on-disk
    cache) and **#75** (loading-full-res indicator).
-2. **Live render-watch — #101.** Auto-load new/updated frames as a render writes them;
-   invalidate cache on mtime/size change; live timeline range. *Toolkit-independent.*
+2. **Live render-watch — #101.** ✅ **Shipped.** Auto-loads new/updated frames as a
+   render writes them (off-thread directory scan, #145); invalidates cache on mtime/size
+   change; live timeline range. *Toolkit-independent.*
 3. **MP4 / ProRes export — #8.** Encode the trimmed, color-managed sequence out.
    *Toolkit-independent.*
 4. **Real-time color-correction suite — #102.** contrast / hue / saturation / white
