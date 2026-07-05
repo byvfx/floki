@@ -26,6 +26,7 @@ use crate::exr_loader::ExrData;
 use crate::gradient::{Colormap, DiffMetric, Gradient};
 use crate::render_program;
 use eframe::egui;
+use exr::prelude::f16;
 use rayon::prelude::*;
 
 /// Widen a linear RGB triple to the `vec4` the GPU uniforms expect (w unused).
@@ -516,6 +517,10 @@ pub struct ExrViewer {
     /// lives in the unit-tested [`T2Ring`]; the app drives it every frame via
     /// `set_t2_cap`/`set_t2_frame`/`prebuild_t2` (#153).
     t2: T2Ring<T2Texture>,
+    /// Reused staging buffer for the Rgba16Float pack (#142 U3): holds one
+    /// layer's interleaved half bit-patterns, so `build_layer_texture` doesn't
+    /// page-fault a fresh ~66 MB allocation every build during playback.
+    t2_staging: Vec<u16>,
     /// Diff visualization controls (see issue #15). The active colormap, the
     /// magnitude metric, and the noise floor. Hydrated from `ExrApp` each frame so
     /// they persist across sessions; mutated here by the mode-param UI.
@@ -680,6 +685,7 @@ impl Default for ExrViewer {
             gpu_textures: Vec::new(),
             gpu_textures_b: Vec::new(),
             t2: T2Ring::new(),
+            t2_staging: Vec::new(),
             diff_colormap: Colormap::BlackBody,
             diff_metric: DiffMetric::MaxChannel,
             diff_floor: 0.0,
@@ -2173,7 +2179,12 @@ impl ExrViewer {
                     self.gpu_textures[self.active_layer] = Some(t2.bind_group.clone());
                 }
                 if self.gpu_textures[self.active_layer].is_none()
-                    && let Some(t2) = Self::build_layer_texture(gpu, exr_data, self.active_layer)
+                    && let Some(t2) = Self::build_layer_texture(
+                        gpu,
+                        exr_data,
+                        self.active_layer,
+                        &mut self.t2_staging,
+                    )
                 {
                     self.gpu_textures[self.active_layer] = Some(t2.bind_group.clone());
                     // Cache the freshly-built texture into the T2 ring for the
@@ -2191,7 +2202,8 @@ impl ExrViewer {
                         .min(data_b.logical_layers.len().saturating_sub(1));
                     if self.gpu_textures_b[layer_b].is_none() {
                         self.gpu_textures_b[layer_b] =
-                            Self::build_layer_texture(gpu, data_b, layer_b).map(|t2| t2.bind_group);
+                            Self::build_layer_texture(gpu, data_b, layer_b, &mut self.t2_staging)
+                                .map(|t2| t2.bind_group);
                     }
                 }
             }
@@ -3089,84 +3101,123 @@ impl ExrViewer {
         gpu_resources: &crate::gpu::GpuResources,
         exr_data: &ExrData,
         layer_index: usize,
+        staging: &mut Vec<u16>,
     ) -> Option<T2Texture> {
         let render_state = gpu_resources.render_state();
         let (layer, r_chan, g_chan, b_chan, a_chan) = exr_data.logical_channels(layer_index)?;
         let width = layer.size.0;
         let height = layer.size.1;
 
-        // Pack into Rgba32Float
-        let mut pixels = vec![0.0f32; width * height * 4];
-
-        // Hoist the FlatSamples enum match out of the pixel loop: extract F32
-        // slices (the common case) for direct indexing. Non-F32 channels
-        // (rare: F16/U32) fall back to sample_channel per pixel.
-        let r_s = sample_channel_f32(r_chan);
-        let g_s = sample_channel_f32(g_chan);
-        let b_s = sample_channel_f32(b_chan);
-        let a_s = sample_channel_f32(a_chan);
-        let has_alpha = a_chan.is_some();
-
-        // Pack rows in parallel (mirrors the CPU fallback's par_chunks_mut
-        // pattern). For a 4K layer this is ~8M iterations with 4 channel
-        // reads each — single-threaded was a noticeable stall on layer switch.
-        pixels
-            .par_chunks_mut(width * 4)
-            .enumerate()
-            .for_each(|(y, row)| {
-                for x in 0..width {
-                    let i = x * 4;
-                    row[i] = pixel_val(r_s, r_chan, x, y, width);
-                    row[i + 1] = pixel_val(g_s, g_chan, x, y, width);
-                    row[i + 2] = pixel_val(b_s, b_chan, x, y, width);
-                    row[i + 3] = if has_alpha {
-                        pixel_val(a_s, a_chan, x, y, width)
-                    } else {
-                        1.0
-                    };
-                }
-            });
-
+        use eframe::egui_wgpu::wgpu;
         let device = &render_state.device;
         let queue = &render_state.queue;
 
-        let texture = device.create_texture(&eframe::egui_wgpu::wgpu::TextureDescriptor {
+        // Choose the upload format from the source channel types (#142). EXR
+        // beauty data is overwhelmingly F16: packing + uploading it as
+        // Rgba16Float is lossless and halves the bandwidth and VRAM vs
+        // Rgba32Float. A present F32/U32 channel keeps 32F to preserve precision.
+        // Both bind as `texture_2d<f32>` under the same filterable:false layout,
+        // so nothing downstream (shader, sampler, bind group) changes.
+        let use_f16 = crate::pixels::all_channels_f16([r_chan, g_chan, b_chan, a_chan]);
+        let has_alpha = a_chan.is_some();
+        let format = if use_f16 {
+            wgpu::TextureFormat::Rgba16Float
+        } else {
+            wgpu::TextureFormat::Rgba32Float
+        };
+
+        let extent = wgpu::Extent3d {
+            width: width as u32,
+            height: height as u32,
+            depth_or_array_layers: 1,
+        };
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Exr GPU Texture"),
-            size: eframe::egui_wgpu::wgpu::Extent3d {
-                width: width as u32,
-                height: height as u32,
-                depth_or_array_layers: 1,
-            },
+            size: extent,
             mip_level_count: 1,
             sample_count: 1,
-            dimension: eframe::egui_wgpu::wgpu::TextureDimension::D2,
-            format: eframe::egui_wgpu::wgpu::TextureFormat::Rgba32Float,
-            usage: eframe::egui_wgpu::wgpu::TextureUsages::TEXTURE_BINDING
-                | eframe::egui_wgpu::wgpu::TextureUsages::COPY_DST,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
+        let dst = wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        };
+        // Row stride: 4 channels × the format's bytes-per-channel (2 for 16F, 4 for 32F).
+        let buf_layout = |bytes_per_channel: usize| wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some((width * 4 * bytes_per_channel) as u32),
+            rows_per_image: Some(height as u32),
+        };
 
-        queue.write_texture(
-            eframe::egui_wgpu::wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: eframe::egui_wgpu::wgpu::Origin3d::ZERO,
-                aspect: eframe::egui_wgpu::wgpu::TextureAspect::All,
-            },
-            bytemuck::cast_slice(&pixels),
-            eframe::egui_wgpu::wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some((width * 4 * 4) as u32),
-                rows_per_image: Some(height as u32),
-            },
-            eframe::egui_wgpu::wgpu::Extent3d {
-                width: width as u32,
-                height: height as u32,
-                depth_or_array_layers: 1,
-            },
-        );
+        // Pack rows in parallel (a 4K layer is ~8M pixels — single-threaded was a
+        // noticeable stall on layer switch).
+        if use_f16 {
+            // Fast path (#142 U2): copy half bit-patterns straight from the source
+            // slices — `to_bits` is a reinterpret, so this skips the per-pixel
+            // `to_f32` widening the F32 path pays. Absent channels default: rgb → 0
+            // (half `0x0000`), alpha → 1.0.
+            let r_s = crate::pixels::f16_slice(r_chan);
+            let g_s = crate::pixels::f16_slice(g_chan);
+            let b_s = crate::pixels::f16_slice(b_chan);
+            let a_s = crate::pixels::f16_slice(a_chan);
+            let one = f16::from_f32(1.0).to_bits();
+            // Reuse the per-viewer staging buffer (#142 U3): every element is
+            // overwritten below, so the `resize` fill is inert and — during
+            // playback of a fixed-size sequence — a no-op, avoiding a fresh
+            // ~66 MB page-faulted allocation per build.
+            staging.resize(width * height * 4, 0);
+            let pixels = staging.as_mut_slice();
+            pixels
+                .par_chunks_mut(width * 4)
+                .enumerate()
+                .for_each(|(y, row)| {
+                    for x in 0..width {
+                        let idx = y * width + x;
+                        let i = x * 4;
+                        row[i] = r_s.map_or(0, |s| s[idx].to_bits());
+                        row[i + 1] = g_s.map_or(0, |s| s[idx].to_bits());
+                        row[i + 2] = b_s.map_or(0, |s| s[idx].to_bits());
+                        row[i + 3] = if has_alpha {
+                            a_s.map_or(one, |s| s[idx].to_bits())
+                        } else {
+                            one
+                        };
+                    }
+                });
+            queue.write_texture(dst, bytemuck::cast_slice(&*pixels), buf_layout(2), extent);
+        } else {
+            // F32/U32 sources: hoist the F32 slices (direct index) and widen the
+            // rest per pixel via `sample_channel`.
+            let r_s = sample_channel_f32(r_chan);
+            let g_s = sample_channel_f32(g_chan);
+            let b_s = sample_channel_f32(b_chan);
+            let a_s = sample_channel_f32(a_chan);
+            let mut pixels = vec![0.0f32; width * height * 4];
+            pixels
+                .par_chunks_mut(width * 4)
+                .enumerate()
+                .for_each(|(y, row)| {
+                    for x in 0..width {
+                        let i = x * 4;
+                        row[i] = pixel_val(r_s, r_chan, x, y, width);
+                        row[i + 1] = pixel_val(g_s, g_chan, x, y, width);
+                        row[i + 2] = pixel_val(b_s, b_chan, x, y, width);
+                        row[i + 3] = if has_alpha {
+                            pixel_val(a_s, a_chan, x, y, width)
+                        } else {
+                            1.0
+                        };
+                    }
+                });
+            queue.write_texture(dst, bytemuck::cast_slice(&pixels), buf_layout(4), extent);
+        }
 
-        let view = texture.create_view(&eframe::egui_wgpu::wgpu::TextureViewDescriptor::default());
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         // GpuState is app-owned (#54) — read it directly off `GpuResources`
         // instead of the renderer typemap lookup.
@@ -3237,7 +3288,9 @@ impl ExrViewer {
         if self.t2.contains(frame) {
             return false;
         }
-        let Some(t2) = Self::build_layer_texture(gpu, exr_data, self.active_layer) else {
+        let Some(t2) =
+            Self::build_layer_texture(gpu, exr_data, self.active_layer, &mut self.t2_staging)
+        else {
             return false;
         };
         self.t2.insert(frame, t2);
