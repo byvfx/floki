@@ -209,6 +209,18 @@ fn blit_background(screen_pt: vec2<f32>, guv: vec2<f32>) -> vec3<f32> {
     return select(bu.bg_checker_light.rgb, bu.bg_checker_dark.rgb, is_dark);
 }
 
+// TPDF output dither — kept in lockstep with `shader.wgsl` so the OCIO display
+// path breaks up dark-gradient banding the same way the non-OCIO path does.
+fn hash12(p: vec2<f32>) -> f32 {
+    var p3 = fract(vec3<f32>(p.xyx) * 0.1031);
+    p3 = p3 + dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+fn tpdf_dither(p: vec2<f32>, chan: f32) -> f32 {
+    let q = p + vec2<f32>(chan * 37.0, chan * 17.0);
+    return hash12(q) - hash12(q + vec2<f32>(11.3, 7.7));
+}
+
 @fragment
 fn fs_main(i: VOut) -> @location(0) vec4<f32> {
     // Pass 1 clears the scene target's alpha to a negative sentinel; the image quad(s)
@@ -246,6 +258,15 @@ fn fs_main(i: VOut) -> @location(0) vec4<f32> {
               && screen_pt2.y >= bu.display_min.y && screen_pt2.y <= bu.display_max.y;
     let dim = select(bu.overscan_factor, 1.0, inside);
     rgb = rgb * dim;
+
+    // Dither before the 8-bit output quantization (this blit writes the final
+    // OCIO display color to the 8-bit surface), keyed on the framebuffer pixel.
+    let dp = i.pos.xy;
+    rgb = rgb + vec3<f32>(
+        tpdf_dither(dp, 0.0),
+        tpdf_dither(dp, 1.0),
+        tpdf_dither(dp, 2.0),
+    ) / 255.0;
 
     return vec4<f32>(rgb, 1.0);
 }
