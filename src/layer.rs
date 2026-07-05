@@ -45,11 +45,13 @@
 //! `(LayerId, source_frame)` — see [`Layer::cache_key`]. `LayerId` is stable
 //! across reordering, so moving a layer in the stack never invalidates its cache.
 
-// The render program (#114) consumes this model for the A/B stack; the rest of
-// the surface (groups, trims, per-layer CC) is landed ahead of its consumers —
-// N-way compare (#104), locked-step A/B (#98), the CC/adjustment suite (#102),
-// and the per-layer thumbnail cache (#112) — so unused items remain by design.
-#![allow(dead_code)]
+// The render program (#114) consumes this model for the A/B stack today; the
+// rest of the layer surface (adjustments, stack query/editing) is landed ahead
+// of its consumers — N-way compare (#104), locked-step A/B (#98), the
+// CC/adjustment suite (#102), the per-layer thumbnail cache (#112). Those items
+// carry item-level `#[allow(dead_code)]`, so a *new* accidental dead item
+// anywhere else in the module is still flagged — the module-wide allow that used
+// to mask everything is gone (#153).
 
 use crate::viewer::BlendMode;
 
@@ -133,6 +135,7 @@ pub enum LayerSource {
     /// A color correction applied to the composited result of the layers *below*
     /// it. Parameters are supplied by the CC suite (#102); the model carries only
     /// identity + opacity so the composite order is fully expressible today.
+    #[allow(dead_code)] // constructed by push_adjustment; landed ahead of #102
     Adjustment,
 }
 
@@ -158,6 +161,7 @@ pub struct Layer {
 impl Layer {
     /// The cache key for this layer at a resolved source frame — the
     /// generalization of the T1/T2 `(Slot, frame)` key (`src/cache.rs`).
+    #[allow(dead_code)] // consumed when the ring generalizes its key in #104
     #[must_use]
     pub fn cache_key(&self, source_frame: u32) -> (LayerId, u32) {
         (self.id, source_frame)
@@ -220,16 +224,19 @@ impl LayerStack {
         Self::default()
     }
 
+    #[allow(dead_code)] // stack query API; landed ahead of #104
     #[must_use]
     pub fn len(&self) -> usize {
         self.layers.len()
     }
 
+    #[allow(dead_code)] // stack query API; landed ahead of #104
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.layers.is_empty()
     }
 
+    #[allow(dead_code)] // read back by the arrangement UI; landed ahead of #104/#98
     #[must_use]
     pub fn layout(&self) -> Layout {
         self.layout
@@ -240,10 +247,12 @@ impl LayerStack {
     }
 
     /// Layers bottom-to-top.
+    #[allow(dead_code)] // stack query API; landed ahead of #104
     pub fn iter(&self) -> impl Iterator<Item = &Layer> {
         self.layers.iter()
     }
 
+    #[allow(dead_code)] // stack query API; landed ahead of #104
     #[must_use]
     pub fn get(&self, id: LayerId) -> Option<&Layer> {
         self.layers.iter().find(|l| l.id == id)
@@ -279,6 +288,7 @@ impl LayerStack {
     }
 
     /// Append an adjustment layer on top, returning its stable [`LayerId`].
+    #[allow(dead_code)] // adjustment-layer constructor; landed ahead of #102
     pub fn push_adjustment(&mut self, name: impl Into<String>) -> LayerId {
         let id = self.alloc_id();
         self.layers.push(Layer {
@@ -296,6 +306,7 @@ impl LayerStack {
     }
 
     /// Remove a layer by id, returning whether it was present.
+    #[allow(dead_code)] // stack editing; landed ahead of #104
     pub fn remove(&mut self, id: LayerId) -> bool {
         let before = self.layers.len();
         self.layers.retain(|l| l.id != id);
@@ -304,6 +315,7 @@ impl LayerStack {
 
     /// Move a layer to absolute stack index `to` (clamped), preserving its id and
     /// cache. Returns whether the layer was found.
+    #[allow(dead_code)] // stack editing; landed ahead of #104
     pub fn move_to(&mut self, id: LayerId, to: usize) -> bool {
         let Some(from) = self.layers.iter().position(|l| l.id == id) else {
             return false;

@@ -33,6 +33,31 @@ fn rgb3_to_vec4(c: [f32; 3]) -> [f32; 4] {
     [c[0], c[1], c[2], 0.0]
 }
 
+/// The unscaled canvas bounds that "Frame" (F) fits into the viewport. Every mode
+/// except Side-by-Side draws B over A in the same rect, so the extent is just the
+/// A image; Side-by-Side lays A and B out horizontally (B height-normalized to A
+/// when enabled), so framing must fit their *combined* width or the second image
+/// spills off-screen. Mirrors the SBS layout in [`ExrViewer::emit_mode_draws`],
+/// measured in unscaled space (the `scale` cancels out of the fit ratio).
+fn framing_bounds(
+    mode: CompareMode,
+    normalize_sbs: bool,
+    tex_size: egui::Vec2,
+    tex_size_b: Option<egui::Vec2>,
+) -> egui::Vec2 {
+    let Some(size_b) = tex_size_b.filter(|_| mode == CompareMode::SideBySide) else {
+        return tex_size; // single image, or B not loaded
+    };
+    // Normalized B is scaled so its height matches A's; otherwise B keeps its own
+    // size. Guard a degenerate zero-height B (never produced by a real texture).
+    let b = if normalize_sbs && size_b.y > 0.0 {
+        egui::vec2(size_b.x * (tex_size.y / size_b.y), tex_size.y)
+    } else {
+        size_b
+    };
+    egui::vec2(tex_size.x + b.x, tex_size.y.max(b.y))
+}
+
 // Pure pixel access + thumbnail decimation live in `crate::pixels` (#153), so
 // `gpu/` and `proxy` never import from this UI module.
 use crate::pixels::{pixel_val, sample_channel, sample_channel_f32, thumb_dims};
@@ -176,6 +201,269 @@ fn t2_victim(frames: impl Iterator<Item = u32>, on_screen: Option<u32>) -> Optio
         .max_by_key(|&f| f.abs_diff(anchor))
 }
 
+/// Frame-keyed GPU-texture ring with a pure map policy (#153): cap-shrink
+/// eviction, layer-switch invalidation, and on-screen protection, factored out
+/// of [`ExrViewer`] so the risky part is unit-testable. Generic over the payload
+/// `T` — production stores [`T2Texture`] (which needs a GPU device), but the
+/// policy has no GPU dependency, so the tests use a trivial payload.
+///
+/// Eviction is **drop-only**: removing an entry drops its `T`, which for
+/// `T2Texture` releases the VRAM reference (wgpu reclaims once no view is bound).
+/// We never `Texture::destroy()` — see [`T2Texture`] for why a synchronous
+/// destroy aborts the process on Vulkan.
+struct T2Ring<T> {
+    /// Pre-built payloads keyed by sequence frame number.
+    map: std::collections::HashMap<u32, T>,
+    /// The active layer the ring was built for; a change invalidates it.
+    layer: usize,
+    /// Max frames the ring may hold (VRAM-budgeted by the app). `0` disables it.
+    cap: usize,
+    /// The on-screen frame — never evicted (its texture is bound for paint).
+    frame: Option<u32>,
+}
+
+impl<T> T2Ring<T> {
+    fn new() -> Self {
+        Self {
+            map: std::collections::HashMap::new(),
+            layer: 0,
+            cap: 0,
+            frame: None,
+        }
+    }
+
+    fn cap(&self) -> usize {
+        self.cap
+    }
+
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    fn contains(&self, frame: u32) -> bool {
+        self.map.contains_key(&frame)
+    }
+
+    fn get(&self, frame: u32) -> Option<&T> {
+        self.map.get(&frame)
+    }
+
+    /// Set the on-screen frame (bound for paint, never evicted).
+    fn set_frame(&mut self, frame: Option<u32>) {
+        self.frame = frame;
+    }
+
+    /// Ring a payload for `frame`. Does not evict — the caller pairs this with
+    /// [`Self::evict_to_cap`] so a freshly-built and a pre-built insert share one
+    /// eviction pass.
+    fn insert(&mut self, frame: u32, value: T) {
+        self.map.insert(frame, value);
+    }
+
+    /// Drop a single frame's payload, if present — a re-rendered frame (#101).
+    fn evict_frame(&mut self, frame: u32) {
+        self.map.remove(&frame);
+    }
+
+    /// Drop the whole ring (new sequence / disabled / layer switch).
+    fn clear(&mut self) {
+        self.map.clear();
+    }
+
+    /// Invalidate the ring when the active layer changed (textures are
+    /// per-layer). Returns whether it cleared.
+    fn ensure_layer(&mut self, active: usize) -> bool {
+        if self.layer != active {
+            self.map.clear();
+            self.layer = active;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Set the capacity; an unchanged cap is a no-op. Shrinking to `0` clears the
+    /// ring (→ the lazy per-swap path); otherwise it evicts to the new cap.
+    fn set_cap(&mut self, cap: usize) {
+        if cap == self.cap {
+            return;
+        }
+        self.cap = cap;
+        if cap == 0 {
+            self.map.clear();
+        } else {
+            self.evict_to_cap();
+        }
+    }
+
+    /// Evict frames furthest from the on-screen frame until within the cap
+    /// (floored at 1, so the on-screen frame always survives). Drop-only. Returns
+    /// how many were evicted.
+    fn evict_to_cap(&mut self) -> usize {
+        let cap = self.cap.max(1);
+        let mut evicted = 0;
+        while self.map.len() > cap {
+            let Some(victim) = t2_victim(self.map.keys().copied(), self.frame) else {
+                break; // only the on-screen frame remains
+            };
+            self.map.remove(&victim);
+            evicted += 1;
+        }
+        evicted
+    }
+}
+
+/// Per-frame GPU draw context for the canvas (#152): the base uniforms plus the
+/// persistent ring buffer, LUT/default bind groups, and the interior-mutable
+/// per-frame accumulators (`uniform_offset` ring allocator, `overscan_factor`,
+/// `ocio_sig`, `ocio_draws`). It replaces the old `draw_gpu` closure + its loose
+/// `Cell`/`RefCell` captures, so [`ExrViewer::emit_mode_draws`] can dispatch the
+/// compare modes as a plain method call and the OCIO tail can read the
+/// accumulators back after the draws land.
+struct DrawCtx<'a> {
+    render_state: &'a eframe::egui_wgpu::RenderState,
+    /// The per-frame base uniforms; [`Self::draw`] copies and overrides per draw.
+    uniform_data: crate::gpu::Uniforms,
+    /// Persistent uniform ring buffer (app-owned `GpuState`, #54).
+    uniform_buffer: eframe::egui_wgpu::wgpu::Buffer,
+    /// Padded slot stride (device `min_uniform_buffer_offset_alignment`).
+    uniform_stride: u32,
+    /// Active `.cube` LUT bind group (or `GpuState`'s default when none).
+    active_lut_bg: std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>,
+    /// Fallback B-texture bind group when a draw has no B image.
+    default_tex_bg: std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>,
+    /// Whether OCIO is active — draws accumulate into `ocio_draws` instead of
+    /// emitting a per-call callback.
+    ocio_active: bool,
+    /// Ring allocator, bumped by each draw (below the reserved offscreen slot).
+    uniform_offset: std::cell::Cell<u32>,
+    /// Overscan dim factor for the next draw (`1.0` = none); set per branch.
+    overscan_factor: std::cell::Cell<f32>,
+    /// Running FNV-1a hash of everything affecting the OCIO render, so the
+    /// display transform is skipped on repaints that change nothing.
+    ocio_sig: std::cell::Cell<u64>,
+    /// Accumulated OCIO pass-1 draws; drained into one `OcioCallback` per frame.
+    ocio_draws: std::cell::RefCell<Vec<crate::gpu::ocio_pass::OcioPass1Draw>>,
+}
+
+impl DrawCtx<'_> {
+    /// Emit one image draw at `target_rect`, clipped to `clip_rect`. Under OCIO
+    /// (and not diff) the draw is accumulated into `ocio_draws` for the single
+    /// per-frame pass; otherwise an `ExrCallback` paints it immediately.
+    #[allow(clippy::too_many_arguments)] // intrinsic to one placed GPU draw
+    fn draw(
+        &self,
+        painter: &egui::Painter,
+        bg_a: std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>,
+        bg_b_opt: Option<std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>>,
+        clip_rect: egui::Rect,
+        target_rect: egui::Rect,
+        is_diff: bool,
+        is_composite: bool,
+        opacity: f32,
+    ) {
+        let mut u = self.uniform_data;
+        u.rect_min = [target_rect.min.x, target_rect.min.y];
+        u.rect_max = [target_rect.max.x, target_rect.max.y];
+        u.is_diff_mode = if is_diff { 1 } else { 0 };
+        u.is_composite = if is_composite { 1 } else { 0 };
+        u.opacity = opacity;
+        u.overscan_factor = self.overscan_factor.get();
+
+        // OCIO path: pass 1 must emit scene-linear, so bypass the built-in
+        // display chain (sRGB/gamma/.cube LUT). Exposure stays (linear).
+        if self.ocio_active {
+            u.srgb = 0;
+            u.gamma = 1.0;
+            u.enable_lut = 0;
+            // Don't bake the checker into scene-linear; it's composited
+            // in display space (blit pass) after the OCIO transform.
+            u.skip_checker = 1;
+        }
+
+        let queue = &self.render_state.queue;
+
+        // Write this draw's uniform data into the persistent ring buffer
+        // at the current offset, then bump the allocator. This replaces
+        // the per-draw `create_buffer_init` + `create_bind_group` (two
+        // wgpu object allocations + a staging copy per draw per frame).
+        // `uniform_stride` is padded to the device's
+        // `min_uniform_buffer_offset_alignment` (typically 256), so every
+        // dynamic offset is valid — the raw Uniforms struct (128 bytes)
+        // is written at the start of each padded slot.
+        // The viewport allocates slots below the reserved offscreen slot
+        // (#148). On overflow, saturate to the last viewport slot instead
+        // of writing past the ring: the overflowing draws share uniforms
+        // (wrong image placement for one frame) but there's no wgpu
+        // validation error mid-frame. Debug builds still assert so an
+        // overflow is caught in development (relevant once #104's N-way
+        // compare raises the per-frame draw count).
+        let ring_cap = crate::gpu::UNIFORM_RING_OFFSCREEN_SLOT as u32 * self.uniform_stride;
+        let mut offset = self.uniform_offset.get();
+        if offset + self.uniform_stride > ring_cap {
+            debug_assert!(
+                false,
+                "uniform ring buffer overflow: too many draws this frame"
+            );
+            log::error!(
+                target: "floki::gpu",
+                "uniform ring overflow: too many draws this frame; reusing the last slot"
+            );
+            offset = ring_cap - self.uniform_stride;
+        }
+        self.uniform_offset.set(offset + self.uniform_stride);
+        queue.write_buffer(&self.uniform_buffer, offset as u64, bytemuck::bytes_of(&u));
+
+        let bg_b = bg_b_opt.unwrap_or_else(|| self.default_tex_bg.clone());
+        let final_clip_rect = painter.clip_rect().intersect(clip_rect);
+
+        // Diff is a false-color heat-map visualization (display-space,
+        // not color-managed), so it always uses the normal pipeline —
+        // even under OCIO it is NOT accumulated into the OCIO pass.
+        if self.ocio_active && !is_diff {
+            // Fold this draw's inputs (uniform bytes + texture pointers) into
+            // the per-frame render signature; OcioCallback re-renders only
+            // when this changes.
+            let mut h = self.ocio_sig.get();
+            for chunk in bytemuck::bytes_of(&u).chunks(8) {
+                let mut b = [0u8; 8];
+                b[..chunk.len()].copy_from_slice(chunk);
+                h = (h ^ u64::from_le_bytes(b)).wrapping_mul(0x100000001b3);
+            }
+            for p in [
+                std::sync::Arc::as_ptr(&bg_a) as *const () as u64,
+                std::sync::Arc::as_ptr(&bg_b) as *const () as u64,
+                std::sync::Arc::as_ptr(&self.active_lut_bg) as *const () as u64,
+            ] {
+                h = (h ^ p).wrapping_mul(0x100000001b3);
+            }
+            self.ocio_sig.set(h);
+
+            // Accumulate; the single per-frame OcioCallback is emitted
+            // after the draws so one OCIO pass covers the whole frame.
+            self.ocio_draws
+                .borrow_mut()
+                .push(crate::gpu::ocio_pass::OcioPass1Draw {
+                    bg_a,
+                    bg_b,
+                    uniform_offset: offset,
+                    lut_bg: self.active_lut_bg.clone(),
+                });
+            return;
+        }
+
+        let callback = crate::gpu::ExrCallback {
+            bg_a,
+            bg_b,
+            uniform_offset: offset,
+            lut_bg: self.active_lut_bg.clone(),
+        };
+        painter.with_clip_rect(final_clip_rect).add(
+            eframe::egui_wgpu::Callback::new_paint_callback(final_clip_rect, callback),
+        );
+    }
+}
+
 /// All canvas state for one A/B pair: view transform, tone controls, the active
 /// [`CompareMode`], the texture caches described in the module docs, plus
 /// sampling/histogram/contact-sheet state. Driven each frame by [`Self::ui`].
@@ -222,17 +510,12 @@ pub struct ExrViewer {
 
     /// T2 GPU-texture ring (#56): pre-built active-layer textures keyed by frame
     /// number, so a sequence frame swap binds an already-uploaded texture instead
-    /// of re-packing + re-uploading on the UI thread. Valid only for `t2_layer`;
-    /// cleared on a layer switch. Empty / unused for a single image.
-    t2_ring: std::collections::HashMap<u32, T2Texture>,
-    /// The active layer `t2_ring` was built for; a change invalidates the ring.
-    t2_layer: usize,
-    /// Max frames the ring may hold (VRAM-budgeted by the app each frame). `0`
-    /// disables T2 entirely → the lazy per-swap path (the safe fallback).
-    t2_cap: usize,
-    /// The sequence frame on screen, so `ui()` binds its T2 texture. `None` for a
-    /// single image (lazy path).
-    t2_frame: Option<u32>,
+    /// of re-packing + re-uploading on the UI thread. Valid only for its built
+    /// layer; cleared on a layer switch. Empty / unused for a single image. The
+    /// map policy (cap-shrink eviction, layer invalidation, on-screen protection)
+    /// lives in the unit-tested [`T2Ring`]; the app drives it every frame via
+    /// `set_t2_cap`/`set_t2_frame`/`prebuild_t2` (#153).
+    t2: T2Ring<T2Texture>,
     /// Diff visualization controls (see issue #15). The active colormap, the
     /// magnitude metric, and the noise floor. Hydrated from `ExrApp` each frame so
     /// they persist across sessions; mutated here by the mode-param UI.
@@ -396,10 +679,7 @@ impl Default for ExrViewer {
             gpu_thumb_bg: None,
             gpu_textures: Vec::new(),
             gpu_textures_b: Vec::new(),
-            t2_ring: std::collections::HashMap::new(),
-            t2_layer: 0,
-            t2_cap: 0,
-            t2_frame: None,
+            t2: T2Ring::new(),
             diff_colormap: Colormap::BlackBody,
             diff_metric: DiffMetric::MaxChannel,
             diff_floor: 0.0,
@@ -1883,12 +2163,12 @@ impl ExrViewer {
             if let Some(gpu) = gpu_resources {
                 // A layer switch invalidates the per-frame T2 ring (textures are
                 // per-layer). Do this before binding/building below.
-                self.ensure_t2_layer();
+                self.t2.ensure_layer(self.active_layer);
                 // T2 (#56): bind the on-screen frame's pre-built texture if it is
                 // resident, so the swap is an instant bind, not a re-upload.
-                if self.t2_cap > 0
-                    && let Some(frame) = self.t2_frame
-                    && let Some(t2) = self.t2_ring.get(&frame)
+                if self.t2.cap() > 0
+                    && let Some(frame) = self.t2.frame
+                    && let Some(t2) = self.t2.get(frame)
                 {
                     self.gpu_textures[self.active_layer] = Some(t2.bind_group.clone());
                 }
@@ -1898,11 +2178,11 @@ impl ExrViewer {
                     self.gpu_textures[self.active_layer] = Some(t2.bind_group.clone());
                     // Cache the freshly-built texture into the T2 ring for the
                     // on-screen frame (a lazy first paint feeds the ring).
-                    if self.t2_cap > 0
-                        && let Some(frame) = self.t2_frame
+                    if self.t2.cap() > 0
+                        && let Some(frame) = self.t2.frame
                     {
-                        self.t2_ring.insert(frame, t2);
-                        self.evict_t2();
+                        self.t2.insert(frame, t2);
+                        self.t2.evict_to_cap();
                     }
                 }
                 if let Some(data_b) = exr_data_b {
@@ -1927,7 +2207,7 @@ impl ExrViewer {
                 // crop the framebuffer screenshot to just the image area.
                 self.last_canvas_rect = Some(rect);
 
-                self.handle_canvas_interaction(ui, rect, &response, tex_size);
+                self.handle_canvas_interaction(ui, rect, &response, tex_size, tex_size_b);
                 // Render Image
                 let image_size = tex_size * self.scale;
 
@@ -2322,30 +2602,12 @@ impl ExrViewer {
     /// paint callbacks for the active compare mode. Under OCIO the per-image
     /// pass-1 draws are accumulated into a single display-transform pass. Also
     /// handles the wipe-handle drag/scroll interaction (hence `&mut self`).
-    fn draw_canvas_gpu(
-        &mut self,
-        ui: &egui::Ui,
-        layout: &CanvasLayout,
-        exr_data_b: Option<&ExrData>,
-        gpu_resources: &crate::gpu::GpuResources,
-        lut_bg_opt: Option<std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>>,
-    ) {
+    /// Re-bake and upload the diff-colormap and background-gradient LUTs when
+    /// their ramps change. The GPU textures are updated in place (stable handles
+    /// off the app-owned `GpuState`, #54), so no bind-group rebuild is needed.
+    /// Split out of `draw_canvas_gpu` (#152) to keep it focused on draw emission.
+    fn sync_gradient_luts(&mut self, gpu_resources: &crate::gpu::GpuResources) {
         let render_state = gpu_resources.render_state();
-        let CanvasLayout {
-            rect,
-            disp_rect,
-            image_rect,
-            image_size,
-            tex_size,
-            tex_size_b,
-            ..
-        } = *layout;
-        let unclipped_painter = ui.painter().with_clip_rect(rect);
-        let painter = ui.painter().with_clip_rect(rect.intersect(disp_rect));
-
-        // Re-bake + upload the diff colormap and background gradient LUTs only when
-        // their ramps change. The GPU textures are updated in place (stable
-        // handles), so no bind-group rebuild is needed — see `GpuState`.
         let colormap_dirty = self.colormap_sig.as_ref() != Some(&self.diff_colormap);
         let bg_gradient_dirty = self.bg_gradient_sig.as_ref() != Some(&self.background.gradient);
         if colormap_dirty {
@@ -2363,8 +2625,6 @@ impl ExrViewer {
             self.bg_gradient_sig = Some(self.background.gradient.clone());
         }
         if colormap_dirty || bg_gradient_dirty {
-            // GpuState is app-owned (#54) — read it directly off
-            // `GpuResources` instead of the per-frame renderer typemap lookup.
             let gpu_state = gpu_resources.gpu_state.as_ref();
             if colormap_dirty {
                 gpu_state.write_colormap(&render_state.queue, &self.colormap_lut);
@@ -2373,15 +2633,23 @@ impl ExrViewer {
                 gpu_state.write_bg_gradient(&render_state.queue, &self.bg_gradient_lut);
             }
         }
+    }
 
-        // GPU RENDER PATH
-        let uniform_data = crate::gpu::Uniforms {
+    /// Assemble the per-frame base [`crate::gpu::Uniforms`] shared by every draw
+    /// this frame; `draw_gpu` copies it and overrides the per-draw fields (rect,
+    /// diff/composite flags, opacity, overscan). Pure — reads the viewer's tone,
+    /// compare, LUT-domain and background state plus the frame geometry. Split out
+    /// of `draw_canvas_gpu` (#152).
+    fn build_frame_uniforms(
+        &self,
+        image_rect: egui::Rect,
+        disp_rect: egui::Rect,
+        screen_size: [f32; 2],
+    ) -> crate::gpu::Uniforms {
+        crate::gpu::Uniforms {
             rect_min: [image_rect.min.x, image_rect.min.y],
             rect_max: [image_rect.max.x, image_rect.max.y],
-            screen_size: [
-                ui.ctx().content_rect().width(),
-                ui.ctx().content_rect().height(),
-            ],
+            screen_size,
             display_min: [disp_rect.min.x, disp_rect.min.y],
             display_max: [disp_rect.max.x, disp_rect.max.y],
             exposure: self.exposure,
@@ -2404,7 +2672,7 @@ impl ExrViewer {
             skip_checker: 0,
             diff_metric: self.diff_metric.as_u32(),
             diff_floor: self.diff_floor,
-            // Per-draw value comes from the `overscan_factor` cell below.
+            // Per-draw value comes from the `overscan_factor` cell in `draw_gpu`.
             overscan_factor: 1.0,
             lut_domain_min: self.lut_domain_min,
             lut_domain_max: self.lut_domain_max,
@@ -2415,150 +2683,246 @@ impl ExrViewer {
             bg_grad_angle: self.background.gradient_angle,
             bg_checker_size: self.background.checker_size,
             _pad3: 0,
-        };
+        }
+    }
 
-        // Acquire the persistent uniform ring buffer + the active LUT bind group
-        // from the app-owned `GpuState` (#54). No per-frame renderer typemap
-        // lookup: `GpuState` lives on `GpuResources`. `draw_gpu` writes per-draw
-        // uniform data into the ring buffer via `queue.write_buffer` at a
-        // dynamic offset — no per-frame `create_buffer_init` + `create_bind_group`
-        // allocation. The bind group itself lives in `GpuState` and is fetched by
-        // the paint callbacks via `callback_resources`.
-        let gpu_state = gpu_resources.gpu_state.as_ref();
-        let (uniform_buffer, uniform_stride, active_lut_bg, default_tex_bg) = {
-            (
-                gpu_state.uniform_buffer.clone(),
-                gpu_state.uniform_stride,
-                lut_bg_opt.unwrap_or_else(|| gpu_state.default_lut_bind_group.clone()),
-                gpu_state.default_tex_bind_group.clone(),
-            )
-        };
-        // Per-frame ring allocator: bumped by each `draw_gpu` call. Up to ~4
-        // draws per frame fit well within the 16-slot ring (2 KB total).
-        let uniform_offset = std::cell::Cell::new(0u32);
-        // Blend factor for fragments outside the display window (#146): the
-        // shader dims the data-window overscan in the same draw, replacing the
-        // old two-draw scheme (whole image at dim opacity + display window
-        // redrawn at full). 1.0 = no dim (OCIO dims in the blit; side-by-side
-        // opts out); set per branch below before the draw_all call.
-        let overscan_factor = std::cell::Cell::new(1.0f32);
-        let ocio_active = self.ocio_active;
-        // Under OCIO, draw_gpu accumulates pass-1 draws here instead of emitting a
-        // callback per call; a single OcioCallback covering the whole frame (both
-        // side-by-side images included) is emitted after draw_all.
-        let ocio_draws: std::cell::RefCell<Vec<crate::gpu::ocio_pass::OcioPass1Draw>> =
-            std::cell::RefCell::new(Vec::new());
-        // Running FNV-1a hash of everything that affects the OCIO render (uniforms +
-        // texture identities) so the (expensive) display transform is skipped on
-        // repaints that change nothing — hover, menus, animations.
-        let ocio_sig = std::cell::Cell::new(0xcbf29ce484222325u64);
-        let draw_gpu = |painter: &egui::Painter,
-                        bg_a: std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>,
-                        bg_b_opt: Option<std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>>,
-                        clip_rect: egui::Rect,
-                        target_rect: egui::Rect,
-                        is_diff: bool,
-                        is_composite: bool,
-                        opacity: f32| {
-            let mut u = uniform_data;
-            u.rect_min = [target_rect.min.x, target_rect.min.y];
-            u.rect_max = [target_rect.max.x, target_rect.max.y];
-            u.is_diff_mode = if is_diff { 1 } else { 0 };
-            u.is_composite = if is_composite { 1 } else { 0 };
-            u.opacity = opacity;
-            u.overscan_factor = overscan_factor.get();
+    /// Wipe-mode handle interaction: drag the center handle to move the split,
+    /// scroll while hovering it to rotate. Mutates `wipe_center`/`wipe_angle`.
+    /// Split out of `draw_canvas_gpu` (#152).
+    fn handle_wipe_interaction(&mut self, ui: &egui::Ui, image_rect: egui::Rect) {
+        let center_screen = egui::pos2(
+            image_rect.min.x + image_rect.width() * self.wipe_center[0],
+            image_rect.min.y + image_rect.height() * self.wipe_center[1],
+        );
+        let handle_rect = egui::Rect::from_center_size(center_screen, egui::vec2(24.0, 24.0));
+        let handle_id = ui.id().with("wipe_handle");
+        let response = ui.interact(handle_rect, handle_id, egui::Sense::drag());
 
-            // OCIO path: pass 1 must emit scene-linear, so bypass the built-in
-            // display chain (sRGB/gamma/.cube LUT). Exposure stays (linear).
-            if ocio_active {
-                u.srgb = 0;
-                u.gamma = 1.0;
-                u.enable_lut = 0;
-                // Don't bake the checker into scene-linear; it's composited
-                // in display space (blit pass) after the OCIO transform.
-                u.skip_checker = 1;
+        if response.dragged() {
+            let delta = response.drag_delta();
+            self.wipe_center[0] =
+                (self.wipe_center[0] + delta.x / image_rect.width()).clamp(0.0, 1.0);
+            self.wipe_center[1] =
+                (self.wipe_center[1] + delta.y / image_rect.height()).clamp(0.0, 1.0);
+        }
+        if response.hovered() {
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            if scroll != 0.0 {
+                self.wipe_angle = (self.wipe_angle + scroll * 2.0).clamp(-180.0, 180.0);
             }
+        }
+    }
 
-            let queue = &render_state.queue;
-
-            // Write this draw's uniform data into the persistent ring buffer
-            // at the current offset, then bump the allocator. This replaces
-            // the per-draw `create_buffer_init` + `create_bind_group` (two
-            // wgpu object allocations + a staging copy per draw per frame).
-            // `uniform_stride` is padded to the device's
-            // `min_uniform_buffer_offset_alignment` (typically 256), so every
-            // dynamic offset is valid — the raw Uniforms struct (128 bytes)
-            // is written at the start of each padded slot.
-            // The viewport allocates slots below the reserved offscreen slot
-            // (#148). On overflow, saturate to the last viewport slot instead
-            // of writing past the ring: the overflowing draws share uniforms
-            // (wrong image placement for one frame) but there's no wgpu
-            // validation error mid-frame. Debug builds still assert so an
-            // overflow is caught in development (relevant once #104's N-way
-            // compare raises the per-frame draw count).
-            let ring_cap = crate::gpu::UNIFORM_RING_OFFSCREEN_SLOT as u32 * uniform_stride;
-            let mut offset = uniform_offset.get();
-            if offset + uniform_stride > ring_cap {
-                debug_assert!(
+    /// Dispatch the active compare mode's draws through `ctx` (#152), one per
+    /// `Arrangement` arm: Stacked (single / composite), Wipe (one shader draw plus
+    /// the handle overlay), SideBySide (two placed draws plus the divider), and
+    /// Diff. Extracted from the old `draw_all` closure. `p`/`opac` are the target
+    /// painter and layer opacity; `bg_a` is the active-layer A bind group.
+    #[allow(clippy::too_many_arguments)] // frame ctx + program + geometry + painter
+    fn emit_mode_draws(
+        &self,
+        ctx: &DrawCtx,
+        program: &crate::render_program::RenderProgram,
+        layout: &CanvasLayout,
+        exr_data_b: Option<&ExrData>,
+        bg_a: &std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>,
+        p: &egui::Painter,
+        opac: f32,
+    ) {
+        let CanvasLayout {
+            rect,
+            image_rect,
+            image_size,
+            tex_size,
+            tex_size_b,
+            ..
+        } = *layout;
+        // Slot-B GPU bind group for the active layer, clamped to B's count.
+        let pick_b = || {
+            exr_data_b.and_then(|d| {
+                self.gpu_textures_b[self
+                    .active_layer
+                    .min(d.logical_layers.len().saturating_sub(1))]
+                .clone()
+            })
+        };
+        match program.arrangement {
+            // Single (one draw) and Composite (B over A in the blend shader).
+            render_program::Arrangement::Stacked => {
+                if program.is_composite {
+                    if let Some(bg_b) = pick_b() {
+                        ctx.draw(
+                            p,
+                            bg_a.clone(),
+                            Some(bg_b),
+                            rect,
+                            image_rect,
+                            false,
+                            true,
+                            opac,
+                        );
+                    }
+                } else if let Some(draw) = program.draws.first() {
+                    match draw.input {
+                        render_program::ProgramInput::A => {
+                            ctx.draw(p, bg_a.clone(), None, rect, image_rect, false, false, opac);
+                        }
+                        render_program::ProgramInput::B => {
+                            if let Some(bg_b) = pick_b() {
+                                ctx.draw(p, bg_b, None, rect, image_rect, false, false, opac);
+                            }
+                        }
+                    }
+                }
+            }
+            render_program::Arrangement::Wipe { .. } => {
+                let bg_b_opt = pick_b();
+                // Single draw call: the shader handles the wipe split. Bind the
+                // real B texture so the shader can sample it when is_wipe_mode is
+                // set; falls back to the default texture if no B image is loaded.
+                ctx.draw(
+                    p,
+                    bg_a.clone(),
+                    bg_b_opt,
+                    rect,
+                    image_rect,
                     false,
-                    "uniform ring buffer overflow: too many draws this frame"
+                    false,
+                    opac,
                 );
-                log::error!(
-                    target: "floki::gpu",
-                    "uniform ring overflow: too many draws this frame; reusing the last slot"
+
+                // Draw the rotated wipe line and handle.
+                let center_screen = egui::pos2(
+                    image_rect.min.x + image_rect.width() * self.wipe_center[0],
+                    image_rect.min.y + image_rect.height() * self.wipe_center[1],
                 );
-                offset = ring_cap - uniform_stride;
+                let angle_rad = self.wipe_angle.to_radians();
+                // Line direction is perpendicular to the normal (cos, sin).
+                let dir = egui::vec2(-angle_rad.sin(), angle_rad.cos());
+                let max_dist = image_rect.width().hypot(image_rect.height());
+                let p1 = center_screen + dir * max_dist;
+                let p2 = center_screen - dir * max_dist;
+
+                let alpha = (self.wipe_line_opacity * 255.0) as u8;
+                let color = egui::Color32::from_white_alpha(alpha);
+
+                p.line_segment([p1, p2], (2.0, color));
+                p.circle_filled(center_screen, 8.0, color);
             }
-            uniform_offset.set(offset + uniform_stride);
-            queue.write_buffer(&uniform_buffer, offset as u64, bytemuck::bytes_of(&u));
+            render_program::Arrangement::SideBySide => {
+                let bg_b_opt = pick_b();
+                if let (Some(bg_b), Some(size_b)) = (bg_b_opt, tex_size_b) {
+                    let mut image_size_b = size_b * self.scale;
+                    if self.normalize_side_by_side {
+                        let scale_b = (tex_size.y * self.scale) / size_b.y;
+                        image_size_b = size_b * scale_b;
+                    }
+                    let combined_width = image_size.x + image_size_b.x;
+                    let combined_height = image_size.y.max(image_size_b.y);
+                    let combined_rect = egui::Rect::from_center_size(
+                        rect.center() + self.translation,
+                        egui::vec2(combined_width, combined_height),
+                    );
+                    let mut image_rect_a = egui::Rect::from_min_size(combined_rect.min, image_size);
+                    image_rect_a.set_center(egui::pos2(
+                        image_rect_a.center().x,
+                        combined_rect.center().y,
+                    ));
+                    let mut image_rect_b = egui::Rect::from_min_size(
+                        egui::pos2(combined_rect.min.x + image_size.x, combined_rect.min.y),
+                        image_size_b,
+                    );
+                    image_rect_b.set_center(egui::pos2(
+                        image_rect_b.center().x,
+                        combined_rect.center().y,
+                    ));
 
-            let bg_b = bg_b_opt.unwrap_or_else(|| default_tex_bg.clone());
-            let final_clip_rect = painter.clip_rect().intersect(clip_rect);
-
-            // Diff is a false-color heat-map visualization (display-space,
-            // not color-managed), so it always uses the normal pipeline —
-            // even under OCIO it is NOT accumulated into the OCIO pass.
-            if ocio_active && !is_diff {
-                // Fold this draw's inputs (uniform bytes + texture pointers) into
-                // the per-frame render signature; OcioCallback re-renders only
-                // when this changes.
-                let mut h = ocio_sig.get();
-                for chunk in bytemuck::bytes_of(&u).chunks(8) {
-                    let mut b = [0u8; 8];
-                    b[..chunk.len()].copy_from_slice(chunk);
-                    h = (h ^ u64::from_le_bytes(b)).wrapping_mul(0x100000001b3);
+                    ctx.draw(
+                        p,
+                        bg_a.clone(),
+                        None,
+                        rect,
+                        image_rect_a,
+                        false,
+                        false,
+                        opac,
+                    );
+                    ctx.draw(p, bg_b, None, rect, image_rect_b, false, false, opac);
+                    p.line_segment(
+                        [
+                            egui::pos2(image_rect_b.min.x, combined_rect.min.y),
+                            egui::pos2(image_rect_b.min.x, combined_rect.max.y),
+                        ],
+                        (2.0, egui::Color32::GRAY),
+                    );
+                } else {
+                    ctx.draw(p, bg_a.clone(), None, rect, image_rect, false, false, opac);
                 }
-                for p in [
-                    std::sync::Arc::as_ptr(&bg_a) as *const () as u64,
-                    std::sync::Arc::as_ptr(&bg_b) as *const () as u64,
-                    std::sync::Arc::as_ptr(&active_lut_bg) as *const () as u64,
-                ] {
-                    h = (h ^ p).wrapping_mul(0x100000001b3);
-                }
-                ocio_sig.set(h);
-
-                // Accumulate; the single per-frame OcioCallback is emitted
-                // after draw_all so one OCIO pass covers the whole frame.
-                ocio_draws
-                    .borrow_mut()
-                    .push(crate::gpu::ocio_pass::OcioPass1Draw {
-                        bg_a,
-                        bg_b,
-                        uniform_offset: offset,
-                        lut_bg: active_lut_bg.clone(),
-                    });
-                return;
             }
+            render_program::Arrangement::Diff => {
+                if let Some(bg_b) = pick_b() {
+                    ctx.draw(
+                        p,
+                        bg_a.clone(),
+                        Some(bg_b),
+                        rect,
+                        image_rect,
+                        true,
+                        false,
+                        opac,
+                    );
+                }
+            }
+        }
+    }
 
-            let callback = crate::gpu::ExrCallback {
-                bg_a,
-                bg_b,
-                uniform_offset: offset,
-                lut_bg: active_lut_bg.clone(),
-            };
-            painter.with_clip_rect(final_clip_rect).add(
-                eframe::egui_wgpu::Callback::new_paint_callback(final_clip_rect, callback),
-            );
+    fn draw_canvas_gpu(
+        &mut self,
+        ui: &egui::Ui,
+        layout: &CanvasLayout,
+        exr_data_b: Option<&ExrData>,
+        gpu_resources: &crate::gpu::GpuResources,
+        lut_bg_opt: Option<std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>>,
+    ) {
+        let render_state = gpu_resources.render_state();
+        // `image_size`/`tex_size`/`tex_size_b` are pulled from `layout` inside
+        // `emit_mode_draws`; here we only need the frame rects.
+        let CanvasLayout {
+            rect,
+            disp_rect,
+            image_rect,
+            ..
+        } = *layout;
+        let unclipped_painter = ui.painter().with_clip_rect(rect);
+        let painter = ui.painter().with_clip_rect(rect.intersect(disp_rect));
+
+        // Re-bake + upload the diff colormap and background gradient LUTs only
+        // when their ramps change (stable GPU handles, no bind-group rebuild).
+        self.sync_gradient_luts(gpu_resources);
+
+        // GPU RENDER PATH: the per-frame base uniforms shared by every draw.
+        let content = ui.ctx().content_rect();
+        let uniform_data =
+            self.build_frame_uniforms(image_rect, disp_rect, [content.width(), content.height()]);
+
+        // Build the per-frame draw context: the persistent uniform ring buffer
+        // + LUT/default bind groups from the app-owned `GpuState` (#54, no
+        // per-frame renderer typemap lookup), plus the interior-mutable per-frame
+        // accumulators. `DrawCtx::draw` writes each draw into the ring buffer at a
+        // dynamic offset — no per-draw `create_buffer_init` + `create_bind_group`.
+        let gpu_state = gpu_resources.gpu_state.as_ref();
+        let ctx = DrawCtx {
+            render_state,
+            uniform_data,
+            uniform_buffer: gpu_state.uniform_buffer.clone(),
+            uniform_stride: gpu_state.uniform_stride,
+            active_lut_bg: lut_bg_opt.unwrap_or_else(|| gpu_state.default_lut_bind_group.clone()),
+            default_tex_bg: gpu_state.default_tex_bind_group.clone(),
+            ocio_active: self.ocio_active,
+            uniform_offset: std::cell::Cell::new(0u32),
+            overscan_factor: std::cell::Cell::new(1.0f32),
+            ocio_sig: std::cell::Cell::new(0xcbf29ce484222325u64),
+            ocio_draws: std::cell::RefCell::new(Vec::new()),
         };
 
         let bg_a_opt = self.gpu_textures[self.active_layer].clone();
@@ -2574,189 +2938,15 @@ impl ExrViewer {
                 self.compare_mode
             };
 
-            // Wipe interaction logic (drag to move, scroll to rotate)
+            // Wipe interaction (drag the handle to move, scroll to rotate).
             if self.compare_mode == CompareMode::Wipe {
-                let center_screen = egui::pos2(
-                    image_rect.min.x + image_rect.width() * self.wipe_center[0],
-                    image_rect.min.y + image_rect.height() * self.wipe_center[1],
-                );
-                let handle_rect =
-                    egui::Rect::from_center_size(center_screen, egui::vec2(24.0, 24.0));
-                let handle_id = ui.id().with("wipe_handle");
-                let response = ui.interact(handle_rect, handle_id, egui::Sense::drag());
-
-                if response.dragged() {
-                    let delta = response.drag_delta();
-                    self.wipe_center[0] =
-                        (self.wipe_center[0] + delta.x / image_rect.width()).clamp(0.0, 1.0);
-                    self.wipe_center[1] =
-                        (self.wipe_center[1] + delta.y / image_rect.height()).clamp(0.0, 1.0);
-                }
-                if response.hovered() {
-                    let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-                    if scroll != 0.0 {
-                        self.wipe_angle = (self.wipe_angle + scroll * 2.0).clamp(-180.0, 180.0);
-                    }
-                }
+                self.handle_wipe_interaction(ui, image_rect);
             }
 
             // Resolve the layer model into the render program the draw paths
             // dispatch on. `comp_mode` already folds in the blink override, so
             // blink alternates A/B through the model.
             let program = self.render_program(comp_mode);
-
-            let draw_all = |p: &egui::Painter, opac: f32| {
-                // Slot-B GPU bind group for the active layer, clamped to B's count.
-                let pick_b = || {
-                    exr_data_b.and_then(|d| {
-                        self.gpu_textures_b[self
-                            .active_layer
-                            .min(d.logical_layers.len().saturating_sub(1))]
-                        .clone()
-                    })
-                };
-                match program.arrangement {
-                    // Single (one draw) and Composite (B over A in the blend shader).
-                    render_program::Arrangement::Stacked => {
-                        if program.is_composite {
-                            if let Some(bg_b) = pick_b() {
-                                draw_gpu(
-                                    p,
-                                    bg_a.clone(),
-                                    Some(bg_b),
-                                    rect,
-                                    image_rect,
-                                    false,
-                                    true,
-                                    opac,
-                                );
-                            }
-                        } else if let Some(draw) = program.draws.first() {
-                            match draw.input {
-                                render_program::ProgramInput::A => {
-                                    draw_gpu(
-                                        p,
-                                        bg_a.clone(),
-                                        None,
-                                        rect,
-                                        image_rect,
-                                        false,
-                                        false,
-                                        opac,
-                                    );
-                                }
-                                render_program::ProgramInput::B => {
-                                    if let Some(bg_b) = pick_b() {
-                                        draw_gpu(
-                                            p, bg_b, None, rect, image_rect, false, false, opac,
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    render_program::Arrangement::Wipe { .. } => {
-                        let bg_b_opt = pick_b();
-                        // Single draw call: the shader handles the wipe split.
-                        // Bind the real B texture so the shader can sample it when
-                        // is_wipe_mode is set; falls back to the default texture if
-                        // no B image is loaded.
-                        draw_gpu(
-                            p,
-                            bg_a.clone(),
-                            bg_b_opt,
-                            rect,
-                            image_rect,
-                            false,
-                            false,
-                            opac,
-                        );
-
-                        // Draw the rotated wipe line and handle
-                        let center_screen = egui::pos2(
-                            image_rect.min.x + image_rect.width() * self.wipe_center[0],
-                            image_rect.min.y + image_rect.height() * self.wipe_center[1],
-                        );
-                        let angle_rad = self.wipe_angle.to_radians();
-                        // Line direction is perpendicular to the normal (cos, sin)
-                        let dir = egui::vec2(-angle_rad.sin(), angle_rad.cos());
-                        let max_dist = image_rect.width().hypot(image_rect.height());
-                        let p1 = center_screen + dir * max_dist;
-                        let p2 = center_screen - dir * max_dist;
-
-                        let alpha = (self.wipe_line_opacity * 255.0) as u8;
-                        let color = egui::Color32::from_white_alpha(alpha);
-
-                        p.line_segment([p1, p2], (2.0, color));
-                        p.circle_filled(center_screen, 8.0, color);
-                    }
-                    render_program::Arrangement::SideBySide => {
-                        let bg_b_opt = pick_b();
-                        if let (Some(bg_b), Some(size_b)) = (bg_b_opt, tex_size_b) {
-                            let mut image_size_b = size_b * self.scale;
-                            if self.normalize_side_by_side {
-                                let scale_b = (tex_size.y * self.scale) / size_b.y;
-                                image_size_b = size_b * scale_b;
-                            }
-                            let combined_width = image_size.x + image_size_b.x;
-                            let combined_height = image_size.y.max(image_size_b.y);
-                            let combined_rect = egui::Rect::from_center_size(
-                                rect.center() + self.translation,
-                                egui::vec2(combined_width, combined_height),
-                            );
-                            let mut image_rect_a =
-                                egui::Rect::from_min_size(combined_rect.min, image_size);
-                            image_rect_a.set_center(egui::pos2(
-                                image_rect_a.center().x,
-                                combined_rect.center().y,
-                            ));
-                            let mut image_rect_b = egui::Rect::from_min_size(
-                                egui::pos2(combined_rect.min.x + image_size.x, combined_rect.min.y),
-                                image_size_b,
-                            );
-                            image_rect_b.set_center(egui::pos2(
-                                image_rect_b.center().x,
-                                combined_rect.center().y,
-                            ));
-
-                            draw_gpu(
-                                p,
-                                bg_a.clone(),
-                                None,
-                                rect,
-                                image_rect_a,
-                                false,
-                                false,
-                                opac,
-                            );
-                            draw_gpu(p, bg_b, None, rect, image_rect_b, false, false, opac);
-                            p.line_segment(
-                                [
-                                    egui::pos2(image_rect_b.min.x, combined_rect.min.y),
-                                    egui::pos2(image_rect_b.min.x, combined_rect.max.y),
-                                ],
-                                (2.0, egui::Color32::GRAY),
-                            );
-                        } else {
-                            draw_gpu(p, bg_a.clone(), None, rect, image_rect, false, false, opac);
-                        }
-                    }
-                    render_program::Arrangement::Diff => {
-                        if let Some(bg_b) = pick_b() {
-                            draw_gpu(
-                                p,
-                                bg_a.clone(),
-                                Some(bg_b),
-                                rect,
-                                image_rect,
-                                true,
-                                false,
-                                opac,
-                            );
-                        }
-                    }
-                }
-            };
 
             let is_sbs = matches!(program.arrangement, render_program::Arrangement::SideBySide);
 
@@ -2782,9 +2972,17 @@ impl ExrViewer {
                 let slot = slot_painter.add(egui::Shape::Noop);
                 let cb_clip = slot_painter.clip_rect();
 
-                draw_all(&unclipped_painter, 1.0);
+                self.emit_mode_draws(
+                    &ctx,
+                    &program,
+                    layout,
+                    exr_data_b,
+                    &bg_a,
+                    &unclipped_painter,
+                    1.0,
+                );
 
-                let draws = std::mem::take(&mut *ocio_draws.borrow_mut());
+                let draws = std::mem::take(&mut *ctx.ocio_draws.borrow_mut());
                 if !draws.is_empty() {
                     let display_format = render_state.target_format;
                     let content = ui.ctx().content_rect();
@@ -2813,7 +3011,7 @@ impl ExrViewer {
                     // (bumped by the app on any config / display / view change), so
                     // switching the managed look forces a re-render.
                     let render_sig =
-                        (ocio_sig.get() ^ self.ocio_render_gen).wrapping_mul(0x100000001b3);
+                        (ctx.ocio_sig.get() ^ self.ocio_render_gen).wrapping_mul(0x100000001b3);
                     // Scissor the OCIO transform to the visible image so it skips
                     // the empty background. Side-by-side spans the canvas with two
                     // images, so it opts out (None = whole target).
@@ -2853,12 +3051,28 @@ impl ExrViewer {
                 // opacity 0 the overscan is hidden, so keep the display-window
                 // scissor and skip the dim entirely.
                 if is_sbs {
-                    draw_all(&unclipped_painter, 1.0);
+                    self.emit_mode_draws(
+                        &ctx,
+                        &program,
+                        layout,
+                        exr_data_b,
+                        &bg_a,
+                        &unclipped_painter,
+                        1.0,
+                    );
                 } else if self.overscan_opacity > 0.0 {
-                    overscan_factor.set(self.overscan_opacity);
-                    draw_all(&unclipped_painter, 1.0);
+                    ctx.overscan_factor.set(self.overscan_opacity);
+                    self.emit_mode_draws(
+                        &ctx,
+                        &program,
+                        layout,
+                        exr_data_b,
+                        &bg_a,
+                        &unclipped_painter,
+                        1.0,
+                    );
                 } else {
-                    draw_all(&painter, 1.0);
+                    self.emit_mode_draws(&ctx, &program, layout, exr_data_b, &bg_a, &painter, 1.0);
                 }
             }
         }
@@ -2985,81 +3199,50 @@ impl ExrViewer {
     /// drops the ring → the lazy per-swap path. Shrinking evicts immediately.
     /// Called every frame from `tick_budgets` — an unchanged cap is a no-op.
     pub(crate) fn set_t2_cap(&mut self, cap: usize) {
-        if cap == self.t2_cap {
-            return;
-        }
-        self.t2_cap = cap;
-        if cap == 0 {
-            self.clear_t2();
-        } else {
-            self.evict_t2();
-        }
+        self.t2.set_cap(cap);
     }
 
     /// Tell the viewer which sequence frame is on screen, so `ui()` binds its T2
     /// texture. `None` for a single image (lazy path).
     pub(crate) fn set_t2_frame(&mut self, frame: Option<u32>) {
-        self.t2_frame = frame;
+        self.t2.set_frame(frame);
     }
 
     /// Current T2 capacity in frames (`0` = disabled).
     pub(crate) fn t2_cap(&self) -> usize {
-        self.t2_cap
+        self.t2.cap()
     }
 
     /// Number of GPU textures currently resident in the T2 ring (instrumentation).
     pub(crate) fn t2_len(&self) -> usize {
-        self.t2_ring.len()
+        self.t2.len()
     }
 
     /// Pre-build the T2 texture for `(frame, active layer)` and ring it, evicting
     /// to the cap. Returns `true` if it actually built (so the caller can amortize
     /// uploads across frames). No-op — returns `false` — when disabled, already
     /// resident, or the build fails. UI-thread only. Pass frames already resident
-    /// in the T1 cache; T2 never triggers a decode.
+    /// in the T1 cache; T2 never triggers a decode. The ring bookkeeping is
+    /// [`T2Ring`]'s; only the GPU build stays here.
     pub(crate) fn prebuild_t2(
         &mut self,
         gpu: &crate::gpu::GpuResources,
         exr_data: &ExrData,
         frame: u32,
     ) -> bool {
-        if self.t2_cap == 0 {
+        if self.t2.cap() == 0 {
             return false;
         }
-        self.ensure_t2_layer();
-        if self.t2_ring.contains_key(&frame) {
+        self.t2.ensure_layer(self.active_layer);
+        if self.t2.contains(frame) {
             return false;
         }
         let Some(t2) = Self::build_layer_texture(gpu, exr_data, self.active_layer) else {
             return false;
         };
-        self.t2_ring.insert(frame, t2);
-        self.evict_t2();
+        self.t2.insert(frame, t2);
+        self.t2.evict_to_cap();
         true
-    }
-
-    /// Drop the whole ring when the active layer changes (textures are per-layer).
-    fn ensure_t2_layer(&mut self) {
-        if self.t2_layer != self.active_layer {
-            self.clear_t2();
-            self.t2_layer = self.active_layer;
-        }
-    }
-
-    /// Evict T2 frames furthest from the on-screen frame until within the cap by
-    /// **dropping** their handles; wgpu reclaims the VRAM once the texture has no
-    /// live reference. The on-screen frame is never chosen (its bind group is
-    /// bound for paint). We never call `Texture::destroy()` — see [`T2Texture`]
-    /// for why a synchronous destroy aborts the process on Vulkan.
-    fn evict_t2(&mut self) {
-        let cap = self.t2_cap.max(1);
-        while self.t2_ring.len() > cap {
-            let Some(victim) = t2_victim(self.t2_ring.keys().copied(), self.t2_frame) else {
-                break; // only the on-screen frame remains
-            };
-            // Drop the handle; wgpu frees the texture when no view is still bound.
-            self.t2_ring.remove(&victim);
-        }
     }
 
     /// Drop a single frame's T2 texture, if present. Used by the render-watch
@@ -3068,7 +3251,7 @@ impl ExrViewer {
     /// on screen, the bound bind group keeps the old texture alive until the next
     /// paint rebinds the fresh one — no in-flight draw is ever invalidated.
     pub(crate) fn evict_t2_frame(&mut self, frame: u32) {
-        self.t2_ring.remove(&frame);
+        self.t2.evict_frame(frame);
     }
 
     /// Drop every T2 texture (new sequence / disabled / layer switch). Drop-only:
@@ -3076,9 +3259,10 @@ impl ExrViewer {
     /// group (cloned into `gpu_textures[active_layer]`) and is freed by wgpu once
     /// that binding is replaced — critically, this clear can run *before* the
     /// central panel rebinds for the just-advanced frame, so the bound frame may
-    /// differ from `t2_frame`; dropping is safe for either, a `destroy()` is not.
+    /// differ from the ring's on-screen frame; dropping is safe for either, a
+    /// `destroy()` is not.
     pub(crate) fn clear_t2(&mut self) {
-        self.t2_ring.clear();
+        self.t2.clear();
     }
 
     /// CPU contact-sheet thumbnail bake: decimate `layer_index` to the thumbnail
@@ -3338,10 +3522,19 @@ impl ExrViewer {
         rect: egui::Rect,
         response: &egui::Response,
         tex_size: egui::Vec2,
+        tex_size_b: Option<egui::Vec2>,
     ) {
         if self.first_frame {
-            let scale_x = rect.width() / tex_size.x;
-            let scale_y = rect.height() / tex_size.y;
+            // Fit the whole visible layout, not just A: Side-by-Side is wider than
+            // the A image (A + B), so framing on `tex_size` alone clips B.
+            let fit = framing_bounds(
+                self.compare_mode,
+                self.normalize_side_by_side,
+                tex_size,
+                tex_size_b,
+            );
+            let scale_x = rect.width() / fit.x;
+            let scale_y = rect.height() / fit.y;
             self.scale = scale_x.min(scale_y).min(1.0); // Fit but don't scale up past 1.0 initially
             self.translation = egui::Vec2::ZERO;
             self.first_frame = false;
@@ -3389,7 +3582,9 @@ impl ExrViewer {
         let (rect, response) =
             ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
         self.last_canvas_rect = Some(rect);
-        self.handle_canvas_interaction(ui, rect, &response, tex_size);
+        // Proxy first-paint is always the single slot-A image (no B), so framing
+        // has no combined layout to fit.
+        self.handle_canvas_interaction(ui, rect, &response, tex_size, None);
 
         let image_size = tex_size * self.scale;
         let image_rect = egui::Rect::from_min_size(
@@ -3669,6 +3864,122 @@ mod gui_tests {
         // Only the on-screen frame left -> nothing to evict.
         assert_eq!(t2_victim([5].into_iter(), Some(5)), None);
         assert_eq!(t2_victim(std::iter::empty(), Some(5)), None);
+    }
+
+    // The T2 ring policy (#153), tested with a trivial `()` payload — the map
+    // policy has no GPU dependency, so these run headless like every other test.
+    // Sorted resident frames, to assert which survived eviction.
+    fn resident(ring: &super::T2Ring<()>) -> Vec<u32> {
+        let mut keys: Vec<u32> = ring.map.keys().copied().collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    #[test]
+    fn t2ring_evicts_furthest_and_protects_on_screen() {
+        let mut ring: super::T2Ring<()> = super::T2Ring::new();
+        ring.set_cap(3);
+        ring.set_frame(Some(5));
+        for f in [3, 4, 5, 6, 9] {
+            ring.insert(f, ());
+        }
+        assert_eq!(ring.evict_to_cap(), 2, "over cap by 2");
+        // Furthest from 5 (9, then 3) go first; the on-screen frame is kept.
+        assert_eq!(resident(&ring), vec![4, 5, 6]);
+        assert!(ring.contains(5), "on-screen frame is never evicted");
+    }
+
+    #[test]
+    fn t2ring_shrinking_cap_evicts_down_immediately() {
+        let mut ring: super::T2Ring<()> = super::T2Ring::new();
+        ring.set_cap(6);
+        ring.set_frame(Some(10));
+        for f in [10, 11, 12, 13, 20, 21] {
+            ring.insert(f, ());
+        }
+        ring.set_cap(2); // external memory pressure lowers the cap
+        assert_eq!(ring.len(), 2, "shrink evicts on the cap change, not later");
+        assert!(ring.contains(10), "on-screen frame survives the shrink");
+    }
+
+    #[test]
+    fn t2ring_cap_zero_clears_and_disables() {
+        let mut ring: super::T2Ring<()> = super::T2Ring::new();
+        ring.set_cap(4);
+        ring.set_frame(Some(1));
+        for f in 0..4 {
+            ring.insert(f, ());
+        }
+        ring.set_cap(0);
+        assert_eq!(ring.len(), 0, "cap 0 drops the whole ring");
+        assert_eq!(ring.cap(), 0);
+    }
+
+    #[test]
+    fn t2ring_evict_to_cap_floors_at_one() {
+        // evict_to_cap is only reached with cap >= 1 in production, but the floor
+        // is the safety belt: even at cap 0 the on-screen texture (bound for
+        // paint) must survive rather than be freed mid-frame.
+        let mut ring: super::T2Ring<()> = super::T2Ring::new();
+        ring.cap = 0; // force the degenerate path directly
+        ring.set_frame(Some(2));
+        for f in [1, 2, 3] {
+            ring.insert(f, ());
+        }
+        ring.evict_to_cap();
+        assert_eq!(resident(&ring), vec![2], "floors at the on-screen frame");
+    }
+
+    #[test]
+    fn t2ring_layer_switch_clears_else_noops() {
+        let mut ring: super::T2Ring<()> = super::T2Ring::new();
+        ring.set_cap(4);
+        for f in 0..3 {
+            ring.insert(f, ());
+        }
+        assert!(!ring.ensure_layer(0), "same layer: no clear");
+        assert_eq!(ring.len(), 3);
+        assert!(ring.ensure_layer(1), "layer change invalidates the ring");
+        assert_eq!(ring.len(), 0);
+        assert!(!ring.ensure_layer(1), "stays put on the new layer");
+    }
+
+    #[test]
+    fn framing_bounds_fits_the_combined_layout_only_in_side_by_side() {
+        use super::framing_bounds;
+        let a = egui::vec2(1920.0, 1080.0);
+        let b = egui::vec2(1000.0, 2000.0);
+        // Every non-SBS mode frames the A image, regardless of B or normalize.
+        assert_eq!(framing_bounds(CompareMode::SingleA, true, a, Some(b)), a);
+        assert_eq!(framing_bounds(CompareMode::Composite, false, a, Some(b)), a);
+        assert_eq!(framing_bounds(CompareMode::DiffMatte, true, a, Some(b)), a);
+        // SBS with no B loaded falls back to the single image.
+        assert_eq!(framing_bounds(CompareMode::SideBySide, true, a, None), a);
+        // SBS unnormalized: combined width, tallest height.
+        assert_eq!(
+            framing_bounds(CompareMode::SideBySide, false, a, Some(b)),
+            egui::vec2(2920.0, 2000.0)
+        );
+        // SBS normalized: B scaled to A's height (1080) → width 1000*1080/2000 = 540.
+        let f = framing_bounds(CompareMode::SideBySide, true, a, Some(b));
+        assert!((f.x - 2460.0).abs() < 0.01, "combined width {f:?}");
+        assert!(
+            (f.y - 1080.0).abs() < 0.01,
+            "equal heights when normalized {f:?}"
+        );
+    }
+
+    #[test]
+    fn t2ring_evict_frame_drops_one_and_ignores_absent() {
+        let mut ring: super::T2Ring<()> = super::T2Ring::new();
+        ring.set_cap(4);
+        for f in [7, 8, 9] {
+            ring.insert(f, ());
+        }
+        ring.evict_frame(8); // a re-rendered frame
+        assert_eq!(resident(&ring), vec![7, 9]);
+        ring.evict_frame(100); // absent: no-op, no panic
+        assert_eq!(ring.len(), 2);
     }
 
     /// Tiny 2×2 RGBA EXR fixture so the CPU render path has real data to draw.

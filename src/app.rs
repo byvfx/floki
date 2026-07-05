@@ -101,6 +101,24 @@ struct LutLoadResult {
     result: Result<crate::color::cube::CubeLut, String>,
 }
 
+/// A completed off-thread render-watch scan (#145). The `read_dir` + per-frame
+/// `stat` (a multi-hundred-ms blocking call on a network share) runs on a worker
+/// thread; the UI thread diffs the signatures against its baseline and applies
+/// via [`ExrApp::apply_scan`], which mutates playback state and so must stay
+/// on-thread.
+/// The worker sends `None` when `scan_group` failed (the directory was briefly
+/// unreachable on a share): the UI clears the in-flight flag and keeps its
+/// baseline, so a transient hiccup never drops the cache or reports spurious
+/// removals.
+struct ScanResult {
+    /// The frame the scan was launched from (the sequence's lowest number). The
+    /// UI discards a result whose anchor no longer matches the live sequence — a
+    /// scan that landed after the user opened a different sequence.
+    anchor: PathBuf,
+    group: std::collections::BTreeMap<u32, PathBuf>,
+    sigs: Vec<(u32, crate::sequence::FrameSig)>,
+}
+
 /// Edge length of the baked OCIO 3D LUT (#24). 65³ keeps saturated-highlight error well under
 /// 0.02 vs the analytic ACES transform (33³ measured ~0.04 there); ~4.4 MB as RGBA f32, a
 /// trivial VRAM cost for a viewer.
@@ -297,6 +315,18 @@ pub struct ExrApp {
     /// When the render-watch last polled, to throttle the `read_dir` cadence.
     #[serde(skip)]
     last_watch_poll: Option<std::time::Instant>,
+    /// Result channel for the off-thread render-watch scan (#145). The scan
+    /// (`read_dir` + a `stat` per frame) blocks — hundreds of ms on a network
+    /// share — so it runs on a spawned thread and delivers its result here for
+    /// the UI thread to diff + apply. Persistent (mirrors `snapshot_tx`).
+    #[serde(skip)]
+    scan_tx: Option<std::sync::mpsc::Sender<Option<ScanResult>>>,
+    #[serde(skip)]
+    scan_rx: Option<std::sync::mpsc::Receiver<Option<ScanResult>>>,
+    /// A watch scan is on a worker thread; suppresses launching another until it
+    /// lands, so a slow share can't stack scans (#145).
+    #[serde(skip)]
+    scan_in_flight: bool,
 
     /// A framebuffer screenshot has been requested and we're awaiting its
     /// `Event::Screenshot` reply (transient).
@@ -476,6 +506,9 @@ impl Default for ExrApp {
             watch_follow: false,
             watch_sigs: Vec::new(),
             last_watch_poll: None,
+            scan_tx: None,
+            scan_rx: None,
+            scan_in_flight: false,
             snapshot_pending: false,
             snapshot_status: None,
             snapshot_tx: None,
@@ -1611,6 +1644,10 @@ impl ExrApp {
         if !self.watch_enabled || !self.playback.is_active() {
             return;
         }
+        // Fold in whatever the scan worker finished since the last frame first
+        // (clears `scan_in_flight`), then decide whether to launch another.
+        self.drain_scan_results();
+
         let now = std::time::Instant::now();
         if let Some(last) = self.last_watch_poll {
             let since = now.duration_since(last);
@@ -1619,9 +1656,94 @@ impl ExrApp {
                 return;
             }
         }
+        // Don't stack a second scan on a slow share; retry on the next cadence
+        // tick once the outstanding one lands.
+        if self.scan_in_flight {
+            ctx.request_repaint_after(WATCH_INTERVAL);
+            return;
+        }
         self.last_watch_poll = Some(now);
         ctx.request_repaint_after(WATCH_INTERVAL); // keep the cadence ticking
-        self.rescan_and_apply();
+        self.spawn_scan();
+    }
+
+    /// Launch the render-watch directory scan on a worker thread (#145): the
+    /// `read_dir` + per-frame `stat` blocks (hundreds of ms on a network share)
+    /// and must not run in `update()`. The result is delivered over `scan_rx`
+    /// and folded in by [`Self::drain_scan_results`] on the UI thread — the diff
+    /// and [`Self::apply_scan`] mutate playback state. One scan at a time.
+    fn spawn_scan(&mut self) {
+        let Some(anchor) = self
+            .playback
+            .sequence
+            .as_ref()
+            .and_then(|s| s.frames.first())
+            .cloned()
+        else {
+            return;
+        };
+        // One persistent channel; the worker clones the sender (mirrors
+        // `snapshot_tx`) so a scan still in flight isn't orphaned by a new one.
+        if self.scan_rx.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.scan_tx = Some(tx);
+            self.scan_rx = Some(rx);
+        }
+        let tx = self
+            .scan_tx
+            .clone()
+            .expect("scan channel initialized above");
+        let repaint_ctx = self.repaint_ctx.clone();
+        self.scan_in_flight = true;
+        std::thread::spawn(move || {
+            let msg = crate::sequence::scan_group(&anchor).map(|group| {
+                let sigs = crate::sequence::sigs_of(&group);
+                ScanResult {
+                    anchor,
+                    group,
+                    sigs,
+                }
+            });
+            let _ = tx.send(msg);
+            // Wake the UI to drain the result (mirrors the decode-worker wake).
+            if let Some(ctx) = &repaint_ctx {
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    /// Fold in any render-watch scan the worker finished (#145), clearing the
+    /// in-flight flag. At most one scan is ever outstanding, so this applies the
+    /// newest and drops the rest. A failed scan (empty `scan`) keeps the baseline;
+    /// a scan whose anchor no longer matches the live sequence — it finished after
+    /// the user opened a different one — is discarded.
+    fn drain_scan_results(&mut self) {
+        let mut latest = None;
+        let mut got = false;
+        if let Some(rx) = self.scan_rx.as_ref() {
+            while let Ok(msg) = rx.try_recv() {
+                got = true;
+                latest = Some(msg);
+            }
+        }
+        if got {
+            self.scan_in_flight = false;
+        }
+        let Some(msg) = latest else {
+            return;
+        };
+        let Some(res) = msg else {
+            return; // scan failed — keep the baseline, no cache drop.
+        };
+        let anchor_matches = self
+            .playback
+            .sequence
+            .as_ref()
+            .and_then(|s| s.frames.first())
+            == Some(&res.anchor);
+        if anchor_matches {
+            self.apply_scan_result(res.group, res.sigs);
+        }
     }
 
     /// Resize the T1 (RAM) and T2 (VRAM) rings to the live resource budgets
@@ -1681,10 +1803,13 @@ impl ExrApp {
         self.viewer.set_t2_cap(t2_cap);
     }
 
-    /// The ctx-free, un-throttled core of the render-watch: re-scan the group,
+    /// The ctx-free, synchronous core of the render-watch: re-scan the group,
     /// diff against the baseline, and apply. Returns whether a change was applied
-    /// (the first call only baselines). Separated so it's unit-testable without an
-    /// egui context or wall-clock throttling.
+    /// (the first call only baselines). Runs the FS work inline — production goes
+    /// through the off-thread [`Self::spawn_scan`] path — so the render-watch
+    /// tests exercise the same baseline/diff/apply seam without an egui context,
+    /// a worker thread, or wall-clock throttling.
+    #[cfg(test)]
     fn rescan_and_apply(&mut self) -> bool {
         // Re-scan from any present frame — the group identity (dir / prefix /
         // suffix / extension) is shared by every member.
@@ -1701,7 +1826,17 @@ impl ExrApp {
             return false;
         };
         let sigs_new = crate::sequence::sigs_of(&group);
+        self.apply_scan_result(group, sigs_new)
+    }
 
+    /// Baseline (first scan) or diff-and-apply a completed scan — the shared tail
+    /// of the synchronous [`Self::rescan_and_apply`] (tests) and the async
+    /// [`Self::drain_scan_results`]. Returns whether a change was applied.
+    fn apply_scan_result(
+        &mut self,
+        group: std::collections::BTreeMap<u32, std::path::PathBuf>,
+        sigs_new: Vec<(u32, crate::sequence::FrameSig)>,
+    ) -> bool {
         if self.watch_sigs.is_empty() {
             self.watch_sigs = sigs_new; // first poll: baseline only, nothing to diff.
             return false;
