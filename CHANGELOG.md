@@ -5,6 +5,43 @@ All notable changes to Floki are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.3] - 2026-07-05
+
+More of the July audit ([docs/audit-2026-07.md](docs/audit-2026-07.md)): the
+per-frame texture-upload path is roughly halved for the common case, live
+render-watch no longer hitches playback, and dark viewport gradients no longer
+band.
+
+### Fixed
+- **Dark viewport background gradients banded**, showing visible steps across
+  the gradient backdrop. The gradient LUT is now baked at full float precision
+  instead of 8-bit, and the output is dithered before the 8-bit framebuffer
+  write — on both the colour-managed (OCIO) and non-managed paths.
+- **"Frame" (F) in Side-by-Side fit only the A image**, pushing the B image
+  off-screen. It now frames the combined A+B layout, honouring the size-normalize
+  toggle.
+
+### Performance
+- **The texture-upload path does about half the per-frame work for the common
+  case.** f16 EXR sources — the overwhelming majority of beauty renders — now
+  upload as `Rgba16Float` instead of `Rgba32Float`: lossless, and half the VRAM
+  and bandwidth. A direct half-float fast path skips the per-pixel float
+  widening, and a reused staging buffer replaces a ~66 MB allocation on every
+  texture build during playback (a known stutter source on Windows).
+- **The GPU pre-upload pump is time-budgeted** (~4 ms per frame) rather than a
+  fixed two builds per frame, so a 4K sequence no longer hitches when two large
+  uploads land in the same frame, while lighter footage fills the ring faster.
+- **Render-watch scans the sequence directory off the UI thread.** The 2-second
+  re-scan — a `read_dir` plus a stat per frame — previously ran inside the frame
+  loop: a multi-hundred-millisecond hitch mid-playback on a network share, the
+  actual use case for watching a live render.
+
+### Changed
+- Internal groundwork for the planned Qt port, with no behaviour change: the T2
+  GPU-texture ring is now a pure, unit-tested `T2Ring`; the 490-line
+  `draw_canvas_gpu` is split into focused helpers; and the render-watch
+  scan/apply seam is cleanly separated.
+
 ## [1.9.2] - 2026-07-02
 
 A playback-responsiveness patch, from a full codebase audit
@@ -489,6 +526,8 @@ Initial release.
 - Cross-platform GitHub Actions builds (Linux, Windows, macOS).
 
 [Unreleased]: https://github.com/byvfx/floki/compare/v1.9.0...HEAD
+[1.9.3]: https://github.com/byvfx/floki/compare/v1.9.2...v1.9.3
+[1.9.2]: https://github.com/byvfx/floki/compare/v1.9.1...v1.9.2
 [1.9.1]: https://github.com/byvfx/floki/compare/v1.9.0...v1.9.1
 [1.9.0]: https://github.com/byvfx/floki/compare/v1.8.0...v1.9.0
 [1.8.0]: https://github.com/byvfx/floki/compare/v1.7.2...v1.8.0
