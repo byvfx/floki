@@ -502,7 +502,10 @@ impl GpuState {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
+                // f32 ramp (#157): the LUT stores gradient values at full float
+                // precision, so dark ramps don't carry 8-bit LUT-side banding.
+                // The layout binds it filterable (FLOAT32_FILTERABLE, enabled).
+                format: wgpu::TextureFormat::Rgba32Float,
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             })
@@ -882,23 +885,23 @@ impl GpuState {
     }
 
     /// Upload a freshly baked diff colormap into the persistent colormap texture.
-    /// `rgba` must be `COLORMAP_LUT_SIZE * 4` bytes (the output of
-    /// [`crate::gradient::Gradient::bake`]). Cheap (~1 KB) — called only when the
+    /// `rgba` must be `COLORMAP_LUT_SIZE * 4` f32s (the output of
+    /// [`crate::gradient::Gradient::bake`]). Cheap (~4 KB) — called only when the
     /// active gradient changes.
-    pub fn write_colormap(&self, queue: &wgpu::Queue, rgba: &[u8]) {
+    pub fn write_colormap(&self, queue: &wgpu::Queue, rgba: &[f32]) {
         write_lut_row(queue, &self.colormap_texture, rgba);
     }
 
     /// Upload a freshly baked background gradient into its persistent texture.
     /// Same contract as [`Self::write_colormap`].
-    pub fn write_bg_gradient(&self, queue: &wgpu::Queue, rgba: &[u8]) {
+    pub fn write_bg_gradient(&self, queue: &wgpu::Queue, rgba: &[f32]) {
         write_lut_row(queue, &self.bg_gradient_texture, rgba);
     }
 }
 
-/// Write a baked `COLORMAP_LUT_SIZE × 1` RGBA8 LUT row into `tex`. Shared by the
-/// colormap and background-gradient textures (seed + updates).
-fn write_lut_row(queue: &wgpu::Queue, tex: &wgpu::Texture, rgba: &[u8]) {
+/// Write a baked `COLORMAP_LUT_SIZE × 1` `Rgba32Float` LUT row into `tex`. Shared
+/// by the colormap and background-gradient textures (seed + updates).
+fn write_lut_row(queue: &wgpu::Queue, tex: &wgpu::Texture, rgba: &[f32]) {
     let width = crate::gradient::COLORMAP_LUT_SIZE as u32;
     queue.write_texture(
         wgpu::TexelCopyTextureInfo {
@@ -907,10 +910,10 @@ fn write_lut_row(queue: &wgpu::Queue, tex: &wgpu::Texture, rgba: &[u8]) {
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
         },
-        rgba,
+        bytemuck::cast_slice(rgba),
         wgpu::TexelCopyBufferLayout {
             offset: 0,
-            bytes_per_row: Some(width * 4),
+            bytes_per_row: Some(width * 4 * 4),
             rows_per_image: Some(1),
         },
         wgpu::Extent3d {

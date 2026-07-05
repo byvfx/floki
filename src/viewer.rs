@@ -530,10 +530,10 @@ pub struct ExrViewer {
     /// User-saved named gradients (the preset library shared with the gradient
     /// editor). Round-tripped through `ExrApp` for persistence.
     pub custom_gradients: Vec<(String, Gradient)>,
-    /// Baked 256-entry colormap LUT bytes + the colormap they were baked from, so
-    /// the GPU texture is re-uploaded only when the active gradient changes.
-    /// Transient (rebuilt on demand).
-    colormap_lut: Vec<u8>,
+    /// Baked 256-entry colormap LUT (f32 texels) + the colormap they were baked
+    /// from, so the GPU texture is re-uploaded only when the active gradient
+    /// changes. Transient (rebuilt on demand).
+    colormap_lut: Vec<f32>,
     colormap_sig: Option<Colormap>,
     /// Transient gradient-editor window state. Shared by the diff colormap editor
     /// and the background gradient editor; `gradient_editor_target` says which.
@@ -552,9 +552,9 @@ pub struct ExrViewer {
     /// name. Transient.
     pub show_background_window: bool,
     new_bg_preset_name: String,
-    /// Baked background-gradient LUT bytes + the ramp they were baked from, so the
-    /// GPU texture is re-uploaded only when the gradient ramp changes.
-    bg_gradient_lut: Vec<u8>,
+    /// Baked background-gradient LUT (f32 texels) + the ramp they were baked from,
+    /// so the GPU texture is re-uploaded only when the gradient ramp changes.
+    bg_gradient_lut: Vec<f32>,
     bg_gradient_sig: Option<Gradient>,
     pub blink_state: bool,
     pub blink_interval: f32,
