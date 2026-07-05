@@ -289,6 +289,11 @@ pub struct ExrApp {
     /// the new window refills. Never persisted.
     #[serde(skip)]
     precache_filled: bool,
+    /// The playhead the T2 ring was last pumped for (#142 U4). A full ring plus
+    /// an unchanged playhead means every slot is already built for this frame, so
+    /// the pump skips its want-list allocation — the common paused / settled case.
+    #[serde(skip)]
+    last_t2_pump: Option<u32>,
 
     /// A timeline drag is in progress (#143). While held, seeks decode
     /// beauty-only like playback does — the readout is suppressed or showing
@@ -501,6 +506,7 @@ impl Default for ExrApp {
             precache: false,
             ram_budget_gb: 0.0,
             precache_filled: false,
+            last_t2_pump: None,
             scrub_active: false,
             watch_enabled: false,
             watch_follow: false,
@@ -1285,6 +1291,15 @@ impl ExrApp {
         if !self.playback.is_active() || self.viewer.t2_cap() == 0 {
             return;
         }
+        // Nothing to do when the ring is full and the playhead hasn't moved since
+        // the last pump: every slot is already built for this frame. Skips the
+        // want-list allocation in the paused / settled case (#142 U4). A playhead
+        // move, or a shrunk/evicted ring, drops one of these conditions and pumps.
+        if self.viewer.t2_len() >= self.viewer.t2_cap()
+            && self.last_t2_pump == Some(self.playback.current_frame)
+        {
+            return;
+        }
         let Some(gpu) = self.gpu_resources.as_ref() else {
             return;
         };
@@ -1300,10 +1315,19 @@ impl ExrApp {
             &std::collections::HashSet::new(),
             depth,
         );
+        self.last_t2_pump = Some(self.playback.current_frame);
+        // Budget by time, not a fixed count (#142 U4): one 4K build is 20-60ms on
+        // the UI thread, so a flat "2 builds/frame" is a hiccup generator at 4K
+        // yet leaves throughput unused at 2K. Always allow the first build (the
+        // ring must make progress even when a single build exceeds the slice),
+        // then stop once this pump has spent its budget — so 4K does ~1 build per
+        // frame and lower resolutions amortize more.
+        const PUMP_BUDGET: std::time::Duration = std::time::Duration::from_millis(4);
+        let start = std::time::Instant::now();
         let mut built = 0;
         for w in std::iter::once(self.playback.current_frame).chain(wants) {
-            if built >= 2 {
-                break; // amortize: at most two uploads per frame
+            if built > 0 && start.elapsed() >= PUMP_BUDGET {
+                break;
             }
             if let Some(arc) = self.frame_cache.peek(crate::cache::Slot::A, w)
                 && self.viewer.prebuild_t2(gpu, &arc, w)
