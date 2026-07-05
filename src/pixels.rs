@@ -43,6 +43,33 @@ pub(crate) fn sample_channel_f32(
     })
 }
 
+/// Whether every *present* channel is F16 (absent channels are defaulted — rgb
+/// to 0, alpha to 1 — so they don't force a wider format). EXR beauty data is
+/// overwhelmingly F16, so this is the common case: the layer can pack + upload as
+/// `Rgba16Float` — lossless, and half the bandwidth and VRAM of `Rgba32Float`
+/// (#142). A present F32/U32 channel returns `false` so the caller keeps full
+/// precision.
+pub(crate) fn all_channels_f16(
+    channels: [Option<&exr::image::AnyChannel<exr::image::FlatSamples>>; 4],
+) -> bool {
+    channels
+        .iter()
+        .all(|c| c.is_none_or(|ch| matches!(&ch.sample_data, exr::image::FlatSamples::F16(_))))
+}
+
+/// The F16 sample slice, for a direct half-bit-pattern copy in the `Rgba16Float`
+/// pack (#142) — the half-float analogue of [`sample_channel_f32`]. Copying
+/// `f16::to_bits()` is a pure reinterpret, skipping the per-pixel `to_f32`
+/// widening the F32 path would otherwise pay for a half-float source.
+pub(crate) fn f16_slice(
+    chan: Option<&exr::image::AnyChannel<exr::image::FlatSamples>>,
+) -> Option<&[exr::prelude::f16]> {
+    chan.and_then(|c| match &c.sample_data {
+        exr::image::FlatSamples::F16(s) => Some(s.as_slice()),
+        _ => None,
+    })
+}
+
 /// Read a pixel from a pre-extracted F32 slice, falling back to
 /// [`sample_channel`] for non-F32 channels. Used in hot pixel loops to skip
 /// the enum match on the F32 fast path.
@@ -108,5 +135,47 @@ mod tests {
         );
         // Degenerate: never produces a zero dimension.
         assert_eq!(thumb_dims(0, 0, Some(256)), (1, 1, 1));
+    }
+
+    #[test]
+    fn all_channels_f16_gates_the_16f_pack() {
+        use super::all_channels_f16;
+        use exr::image::{AnyChannel, FlatSamples};
+        use exr::prelude::{Text, f16};
+        let f16c = || {
+            AnyChannel::new(
+                Text::from("X"),
+                FlatSamples::F16(vec![f16::from_f32(0.5); 4]),
+            )
+        };
+        let f32c = || AnyChannel::new(Text::from("X"), FlatSamples::F32(vec![0.5; 4]));
+        let (r, g, b) = (f16c(), f16c(), f16c());
+        // All present channels F16 (alpha absent → defaulted, doesn't force 32F).
+        assert!(all_channels_f16([Some(&r), Some(&g), Some(&b), None]));
+        // A single F32 channel forces 32F.
+        let a32 = f32c();
+        assert!(!all_channels_f16([
+            Some(&r),
+            Some(&g),
+            Some(&b),
+            Some(&a32)
+        ]));
+        // Degenerate all-absent is trivially "f16".
+        assert!(all_channels_f16([None, None, None, None]));
+    }
+
+    #[test]
+    fn f16_slice_extracts_only_f16_channels() {
+        use super::f16_slice;
+        use exr::image::{AnyChannel, FlatSamples};
+        use exr::prelude::{Text, f16};
+        let f16c = AnyChannel::new(
+            Text::from("X"),
+            FlatSamples::F16(vec![f16::from_f32(1.0); 3]),
+        );
+        let f32c = AnyChannel::new(Text::from("X"), FlatSamples::F32(vec![1.0; 3]));
+        assert_eq!(f16_slice(Some(&f16c)).map(<[_]>::len), Some(3));
+        assert!(f16_slice(Some(&f32c)).is_none()); // F32 → not the fast path
+        assert!(f16_slice(None).is_none());
     }
 }
