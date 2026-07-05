@@ -106,14 +106,14 @@ struct LutLoadResult {
 /// thread; the UI thread diffs the signatures against its baseline and applies
 /// via [`ExrApp::apply_scan`], which mutates playback state and so must stay
 /// on-thread.
-/// The worker sends `None` when `scan_group` failed (the directory was briefly
-/// unreachable on a share): the UI clears the in-flight flag and keeps its
-/// baseline, so a transient hiccup never drops the cache or reports spurious
-/// removals.
+/// The worker sends `None` when the scan produced nothing — `scan_group` failed
+/// (the directory was briefly unreachable on a share) or the scan panicked: the
+/// UI clears the in-flight flag and keeps its baseline, so a transient hiccup
+/// never drops the cache or reports spurious removals.
 struct ScanResult {
-    /// The frame the scan was launched from (the sequence's lowest number). The
-    /// UI discards a result whose anchor no longer matches the live sequence — a
-    /// scan that landed after the user opened a different sequence.
+    /// Path of the lowest-numbered frame the scan was launched from. The UI
+    /// discards a result whose anchor no longer matches the live sequence's first
+    /// frame — a scan that finished after the user opened a different sequence.
     anchor: PathBuf,
     group: std::collections::BTreeMap<u32, PathBuf>,
     sigs: Vec<(u32, crate::sequence::FrameSig)>,
@@ -1696,14 +1696,21 @@ impl ExrApp {
         let repaint_ctx = self.repaint_ctx.clone();
         self.scan_in_flight = true;
         std::thread::spawn(move || {
-            let msg = crate::sequence::scan_group(&anchor).map(|group| {
-                let sigs = crate::sequence::sigs_of(&group);
-                ScanResult {
-                    anchor,
-                    group,
-                    sigs,
-                }
-            });
+            // Always deliver exactly one message so the UI can clear
+            // `scan_in_flight`. A panic in the scan (a pathological path) must not
+            // strand the flag `true` forever — killing render-watch for the
+            // session — so it's caught and treated like a failed scan (`None`).
+            let msg = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::sequence::scan_group(&anchor).map(|group| {
+                    let sigs = crate::sequence::sigs_of(&group);
+                    ScanResult {
+                        anchor,
+                        group,
+                        sigs,
+                    }
+                })
+            }))
+            .unwrap_or(None);
             let _ = tx.send(msg);
             // Wake the UI to drain the result (mirrors the decode-worker wake).
             if let Some(ctx) = &repaint_ctx {
