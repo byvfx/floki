@@ -67,6 +67,14 @@ use crate::pixels::{pixel_val, sample_channel, sample_channel_f32, thumb_dims};
 /// resolution thumbnails are baked at (longest edge), so the two never drift.
 const THUMB_BOX: usize = 256;
 
+/// Max contact-sheet thumbnails baked per layout pass (#144). Playback no longer
+/// re-bakes the sheet every frame swap (the app freezes it while the transport is
+/// busy and refreshes on settle), so the remaining bursts are one-off: the settle
+/// refresh, a tone/LUT/OCIO/background wipe, and the first open. Amortizing those
+/// over a few frames — visible cells first — keeps a 40-AOV settle from stalling
+/// the UI thread in a single frame. Off-screen cells wait until scrolled in.
+const THUMB_BAKES_PER_FRAME: usize = 4;
+
 /// Which channel(s) the canvas isolates. `RGB` shows full colour; the rest show
 /// a single channel as grayscale. Encoded for the shader via [`Self::as_u32`].
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
@@ -500,6 +508,10 @@ pub struct ExrViewer {
     /// `draw_contact_sheet` (the only site with the renderer handle). Invalidation
     /// sites can't free directly (no `gpu_resources`), so they push here instead.
     pending_thumb_frees: Vec<egui::TextureId>,
+    /// Cumulative contact-sheet thumbnail bakes, for the playback debug overlay
+    /// (#144). Flat while the sheet is frozen during playback; steps up once per
+    /// settle. A per-frame proxy for "the sheet isn't re-baking every frame".
+    pub(crate) dbg_thumb_bakes: u64,
     /// The background the GPU thumbnails were baked with (#67). The backdrop is
     /// composited into the cached texture, but background edits (settings window /
     /// gradient editor / preset load) don't go through `invalidate_tone`; a
@@ -681,6 +693,7 @@ impl Default for ExrViewer {
             gpu_thumbnails: Vec::new(),
             gpu_thumbnails_b: Vec::new(),
             pending_thumb_frees: Vec::new(),
+            dbg_thumb_bakes: 0,
             gpu_thumb_bg: None,
             gpu_textures: Vec::new(),
             gpu_textures_b: Vec::new(),
@@ -1944,151 +1957,191 @@ impl ExrViewer {
             egui::ScrollArea::vertical()
                 .id_salt(if is_a { "sheet_a" } else { "sheet_b" })
                 .show(ui, |ui| {
+                    // Cap the thumbnails baked per side per frame so a burst
+                    // (settle refresh, tone/OCIO/background wipe, first open)
+                    // spreads over a few frames instead of stalling one (#144).
+                    // Fresh per `ScrollArea::show`: an A/B compare sheet runs this
+                    // closure once per side, so each side gets its own budget.
+                    // Visible cells are served first; off-screen cells never
+                    // consume it.
+                    let mut bake_budget = THUMB_BAKES_PER_FRAME;
+                    let mut needs_more = false;
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing = egui::vec2(16.0, 16.0);
                         for i in 0..l_count {
-                            // Contact-sheet cells are 256px; bake the thumbnail at
-                            // that size rather than full-res (re-baked on every frame
-                            // swap while the sheet is open over a sequence).
-                            // Bake into the dedicated thumbnail cache, NOT the
-                            // full-res `textures` slots — otherwise a closed sheet
-                            // would leave a low-res thumbnail in the CPU-fallback view.
-                            //
-                            // Each path yields `(egui::Image, full_res_size)`: the GPU
-                            // path renders through the display shader into a cached
-                            // Rgba8Unorm texture (#67); the CPU path is the headless /
-                            // OCIO fallback.
-                            let cell: Option<(egui::Image<'_>, egui::Vec2)> = if use_gpu {
+                            // Reserve an EXACTLY uniform 256px cell (square thumb box
+                            // + label strip) BEFORE deciding to bake — the size is
+                            // independent of the thumbnail, so the scroll extent and
+                            // layout stay stable while cells fill in over frames, and
+                            // the rect drives the visibility test. Absolute geometry
+                            // (fixed rects + paint_at) avoids the vertical "staircase"
+                            // auto-layout produced from variable cell heights.
+                            let thumb_box = THUMB_BOX as f32;
+                            let label_height = 30.0;
+                            let (cell_rect, response) = ui.allocate_exact_size(
+                                egui::vec2(thumb_box, thumb_box + label_height),
+                                egui::Sense::click(),
+                            );
+
+                            // Aspect from the layer's FULL-RES size, not the
+                            // decimated thumbnail dims — `thumb_dims` can collapse a
+                            // thin axis to 1px, distorting aspect and diverging from
+                            // the GPU path (which reports full-res). Known before any
+                            // bake so the placeholder is framed correctly too. (#122)
+                            let aspect = data.logical_size(i).map_or(1.0, |(w, h)| {
+                                if h > 0 { w as f32 / h as f32 } else { 1.0 }
+                            });
+                            let (fit_w, fit_h) = if aspect >= 1.0 {
+                                (thumb_box, thumb_box / aspect)
+                            } else {
+                                (thumb_box * aspect, thumb_box)
+                            };
+                            let img_rect = egui::Rect::from_center_size(
+                                egui::pos2(cell_rect.center().x, cell_rect.top() + thumb_box * 0.5),
+                                egui::vec2(fit_w, fit_h),
+                            );
+
+                            // Bake lazily into the dedicated thumbnail cache (NOT the
+                            // full-res `textures` slots — a closed sheet must not
+                            // leave a low-res thumbnail in the CPU-fallback view), but
+                            // only for visible cells and only up to the per-frame
+                            // budget. A visible cell left un-baked requests another
+                            // frame; off-screen cells wait until scrolled in. The GPU
+                            // path (#67) renders through the display shader into a
+                            // cached Rgba8Unorm texture; the CPU path is the headless
+                            // / OCIO-not-ready fallback.
+                            let visible = ui.is_rect_visible(cell_rect);
+                            let image: Option<egui::Image<'_>> = if use_gpu {
                                 let gpu = gpu_resources.expect("use_gpu implies gpu_resources");
-                                let cache = if is_a {
-                                    &mut viewer.gpu_thumbnails
+                                let ocio_active = viewer.ocio_active;
+                                let missing = if is_a {
+                                    viewer.gpu_thumbnails[i].is_none()
                                 } else {
-                                    &mut viewer.gpu_thumbnails_b
+                                    viewer.gpu_thumbnails_b[i].is_none()
                                 };
-                                if cache[i].is_none() {
-                                    cache[i] = if viewer.ocio_active {
-                                        crate::gpu::thumbnail::generate_ocio(
-                                            gpu, data, i, THUMB_BOX, &tone, lut_ref,
-                                        )
+                                if missing && visible {
+                                    if bake_budget > 0 {
+                                        let baked = if ocio_active {
+                                            crate::gpu::thumbnail::generate_ocio(
+                                                gpu, data, i, THUMB_BOX, &tone, lut_ref,
+                                            )
+                                        } else {
+                                            crate::gpu::thumbnail::generate(
+                                                gpu, data, i, THUMB_BOX, &tone, lut_ref,
+                                            )
+                                        };
+                                        let ok = baked.is_some();
+                                        if is_a {
+                                            viewer.gpu_thumbnails[i] = baked;
+                                        } else {
+                                            viewer.gpu_thumbnails_b[i] = baked;
+                                        }
+                                        if ok {
+                                            bake_budget -= 1;
+                                            viewer.dbg_thumb_bakes += 1;
+                                        }
                                     } else {
-                                        crate::gpu::thumbnail::generate(
-                                            gpu, data, i, THUMB_BOX, &tone, lut_ref,
-                                        )
-                                    };
+                                        needs_more = true;
+                                    }
                                 }
-                                cache[i].as_ref().map(|(id, _, size)| {
-                                    (
-                                        egui::Image::new(egui::load::SizedTexture::new(*id, *size)),
-                                        *size,
-                                    )
+                                let slot = if is_a {
+                                    viewer.gpu_thumbnails[i].as_ref()
+                                } else {
+                                    viewer.gpu_thumbnails_b[i].as_ref()
+                                };
+                                slot.map(|(id, _, size)| {
+                                    egui::Image::new(egui::load::SizedTexture::new(*id, *size))
                                 })
                             } else {
-                                let tex_opt = if is_a {
-                                    if viewer.thumbnails[i].is_none() {
-                                        viewer.thumbnails[i] = viewer.generate_texture(
+                                let missing = if is_a {
+                                    viewer.thumbnails[i].is_none()
+                                } else {
+                                    viewer.thumbnails_b[i].is_none()
+                                };
+                                if missing && visible {
+                                    if bake_budget > 0 {
+                                        let baked = viewer.generate_texture(
                                             ui.ctx(),
                                             data,
                                             i,
                                             Some(THUMB_BOX),
                                         );
+                                        let ok = baked.is_some();
+                                        if is_a {
+                                            viewer.thumbnails[i] = baked;
+                                        } else {
+                                            viewer.thumbnails_b[i] = baked;
+                                        }
+                                        if ok {
+                                            bake_budget -= 1;
+                                            viewer.dbg_thumb_bakes += 1;
+                                        }
+                                    } else {
+                                        needs_more = true;
                                     }
+                                }
+                                let tex = if is_a {
                                     viewer.thumbnails[i].as_ref()
                                 } else {
-                                    if viewer.thumbnails_b[i].is_none() {
-                                        viewer.thumbnails_b[i] = viewer.generate_texture(
-                                            ui.ctx(),
-                                            data,
-                                            i,
-                                            Some(THUMB_BOX),
-                                        );
-                                    }
                                     viewer.thumbnails_b[i].as_ref()
                                 };
-                                // Aspect uses the layer's FULL-RES size, not the
-                                // decimated thumbnail dims — `thumb_dims` can collapse
-                                // a thin axis to 1px, distorting aspect and diverging
-                                // from the GPU path (which reports full-res). (#122)
-                                tex_opt.map(|t| {
-                                    let size = data.logical_size(i).map_or_else(
-                                        || t.size_vec2(),
-                                        |(w, h)| egui::vec2(w as f32, h as f32),
-                                    );
-                                    (egui::Image::new(t), size)
-                                })
+                                tex.map(egui::Image::new)
                             };
 
-                            if let Some((image, draw_size)) = cell {
-                                // Reserve an EXACTLY uniform cell, then position the image and
-                                // label by absolute geometry. Auto-layout (allocate_ui /
-                                // vertical_centered) let cell heights vary by a few px (inherited
-                                // item-spacing + variable label line count), and horizontal_wrapped
-                                // then center-aligned those unequal cells by different amounts —
-                                // producing the slight vertical "staircase". Fixed rects + paint_at
-                                // remove that degree of freedom entirely.
-                                let thumb_width = THUMB_BOX as f32;
-                                let thumb_box = THUMB_BOX as f32;
-                                let label_height = 30.0;
-                                let aspect = if draw_size.y > 0.0 {
-                                    draw_size.x / draw_size.y
-                                } else {
-                                    1.0
-                                };
-                                let (fit_w, fit_h) = if aspect >= 1.0 {
-                                    (thumb_box, thumb_box / aspect)
-                                } else {
-                                    (thumb_box * aspect, thumb_box)
-                                };
-                                let name = data
-                                    .logical_layers
-                                    .get(i)
-                                    .map(|l| l.name.as_str())
-                                    .unwrap_or("Unnamed");
+                            let name = data
+                                .logical_layers
+                                .get(i)
+                                .map(|l| l.name.as_str())
+                                .unwrap_or("Unnamed");
 
-                                let (cell_rect, response) = ui.allocate_exact_size(
-                                    egui::vec2(thumb_width, thumb_box + label_height),
-                                    egui::Sense::click(),
-                                );
-
-                                // Image: centered horizontally, centered within the top square box.
-                                let img_rect = egui::Rect::from_center_size(
-                                    egui::pos2(
-                                        cell_rect.center().x,
-                                        cell_rect.top() + thumb_box * 0.5,
-                                    ),
-                                    egui::vec2(fit_w, fit_h),
-                                );
-                                image.paint_at(ui, img_rect);
-
-                                // Label: centered in the strip beneath the box.
-                                ui.painter().text(
-                                    egui::pos2(
-                                        cell_rect.center().x,
-                                        cell_rect.top() + thumb_box + label_height * 0.5,
-                                    ),
-                                    egui::Align2::CENTER_CENTER,
-                                    format!("{i}: {name}"),
-                                    egui::FontId::proportional(14.0),
-                                    ui.visuals().strong_text_color(),
-                                );
-
-                                if response.clicked() {
-                                    viewer.active_layer = i;
-                                    viewer.show_contact_sheet = false;
-                                    viewer.first_frame = true;
-                                    if !is_a {
-                                        viewer.compare_mode = CompareMode::SingleB;
-                                    } else if viewer.compare_mode == CompareMode::SingleB {
-                                        viewer.compare_mode = CompareMode::SingleA;
-                                    }
+                            // Image centered in the top square box; a neutral
+                            // placeholder holds the cell (and reads as "loading")
+                            // until it bakes.
+                            match image {
+                                Some(image) => image.paint_at(ui, img_rect),
+                                None => {
+                                    ui.painter().rect_filled(
+                                        img_rect,
+                                        4.0,
+                                        ui.visuals().extreme_bg_color,
+                                    );
                                 }
-                                if response.hovered() {
-                                    response
-                                        .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                        .on_hover_text("Click to view layer");
+                            }
+
+                            // Label: centered in the strip beneath the box.
+                            ui.painter().text(
+                                egui::pos2(
+                                    cell_rect.center().x,
+                                    cell_rect.top() + thumb_box + label_height * 0.5,
+                                ),
+                                egui::Align2::CENTER_CENTER,
+                                format!("{i}: {name}"),
+                                egui::FontId::proportional(14.0),
+                                ui.visuals().strong_text_color(),
+                            );
+
+                            if response.clicked() {
+                                viewer.active_layer = i;
+                                viewer.show_contact_sheet = false;
+                                viewer.first_frame = true;
+                                if !is_a {
+                                    viewer.compare_mode = CompareMode::SingleB;
+                                } else if viewer.compare_mode == CompareMode::SingleB {
+                                    viewer.compare_mode = CompareMode::SingleA;
                                 }
+                            }
+                            if response.hovered() {
+                                response
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                    .on_hover_text("Click to view layer");
                             }
                         }
                     });
+                    // Visible cells still waiting on the budget: come back next frame
+                    // to finish the burst (#144).
+                    if needs_more {
+                        ui.ctx().request_repaint();
+                    }
                 });
         };
 
@@ -3510,17 +3563,22 @@ impl ExrViewer {
         self.gpu_textures_b.fill(None);
     }
 
-    /// Drop every cached image-A texture so the viewport rebuilds from the newly
-    /// swapped data - the A-side counterpart of [`Self::invalidate_reference_textures`].
-    /// The caches otherwise only refresh when the layer *count* changes, so
-    /// swapping a different A with the same layer count (e.g. the next frame in an
-    /// image sequence, #7) would keep showing the stale image. Clears the GPU bind
-    /// groups and the contact-sheet thumbnails (CPU + GPU). Used by
-    /// [`crate::app::ExrApp::swap_image_data`].
-    pub fn invalidate_active_textures(&mut self) {
+    /// Drop the cached image-A **viewport** bind groups so the central canvas
+    /// rebuilds from the newly swapped data. This is the half of the A swap that
+    /// must run on *every* frame — it's how the next sequence frame actually
+    /// paints. Split from the thumbnail clear so playback can rebuild the viewport
+    /// per frame without re-baking the contact sheet every swap (#144).
+    pub fn invalidate_active_viewport(&mut self) {
+        self.gpu_textures.fill(None);
+    }
+
+    /// Drop the cached image-A contact-sheet **thumbnails** (CPU + GPU) so the
+    /// sheet re-bakes from the newly swapped data. Skipped while the transport is
+    /// busy (`ExrApp::thumbs_suppressed`) and run once on settle (#144), so the
+    /// sheet freezes during playback instead of re-baking every layer per frame.
+    pub fn invalidate_active_thumbnails(&mut self) {
         self.thumbnails.fill(None);
         self.invalidate_gpu_thumbnails(true, false);
-        self.gpu_textures.fill(None);
     }
 
     /// Clear the slot-A proxy (first-paint) texture. Called when the full-res
@@ -4380,6 +4438,57 @@ mod gui_tests {
         assert!(
             h.state().viewer.thumbnails[0].is_some(),
             "thumbnail cache refills after invalidation"
+        );
+    }
+
+    /// #144: the mechanism that lets playback freeze the sheet — a populated
+    /// cache is NOT re-baked on redraw, and only an explicit invalidation (what
+    /// the app does once on settle) triggers a fresh bake. The `dbg_thumb_bakes`
+    /// counter is the same signal the debug overlay shows.
+    #[test]
+    fn contact_sheet_does_not_rebake_until_invalidated() {
+        let dir = tempfile::tempdir().unwrap();
+        let pa = dir.path().join("a.exr");
+        write_rgba_exr(&pa);
+        let a = ExrData::load(&pa).unwrap();
+
+        let mut h = Harness::new_ui_state(
+            |ui, s: &mut SmokeState| {
+                let SmokeState { viewer, a, b } = s;
+                viewer.ui(ui, a, b.as_ref(), None, None);
+            },
+            SmokeState {
+                viewer: ExrViewer::default(),
+                a,
+                b: None,
+            },
+        );
+
+        // Open + lay out (first frame sizes, second bakes the ScrollArea content).
+        h.state_mut().viewer.show_contact_sheet = true;
+        h.run();
+        h.run();
+        let baked = h.state().viewer.dbg_thumb_bakes;
+        assert!(baked > 0, "sheet baked at least one thumbnail");
+
+        // Freeze: with the cache populated and no invalidation, further redraws
+        // must NOT re-bake — this is exactly what lets the app skip invalidation
+        // every playback frame swap.
+        h.run();
+        h.run();
+        assert_eq!(
+            h.state().viewer.dbg_thumb_bakes,
+            baked,
+            "a populated sheet does not re-bake on redraw (the #144 freeze)"
+        );
+
+        // Settle refresh: the one invalidation the app issues on settle re-bakes.
+        h.state_mut().viewer.invalidate_active_thumbnails();
+        h.run();
+        h.run();
+        assert!(
+            h.state().viewer.dbg_thumb_bakes > baked,
+            "an invalidation re-bakes on the next layout pass"
         );
     }
 

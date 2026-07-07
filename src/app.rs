@@ -1419,6 +1419,15 @@ impl ExrApp {
         }
     }
 
+    /// Contact-sheet thumbnails freeze while the transport is busy (#144),
+    /// mirroring the histogram suppression (#141). Otherwise a 40-AOV sheet
+    /// re-bakes every layer on every playback frame swap. This folds an active
+    /// timeline drag (`scrub_active`) into `sampling_suppressed()`, which already
+    /// covers playing and pending; the sheet refreshes once on settle.
+    fn thumbs_suppressed(&self) -> bool {
+        self.playback.sampling_suppressed() || self.scrub_active
+    }
+
     /// On settling from playback (pause / stop / boundary), ensure the playhead
     /// is resident at **full** resolution so the readout + AOV switcher see every
     /// channel (INV-SAMPLE, #7).
@@ -1439,6 +1448,13 @@ impl ExrApp {
             .peek(crate::cache::Slot::A, frame)
             .is_some_and(|d| !d.beauty_only);
         if full_resident {
+            // Playback skipped per-frame thumbnail invalidation (#144); the
+            // displayed frame is already full-res and no decode will land to
+            // trigger a refresh, so refresh the contact sheet now. The non-
+            // resident branch below re-decodes, and that landing swap runs
+            // un-suppressed (`pending` is cleared before it) so it refreshes
+            // naturally — nothing extra needed there.
+            self.viewer.invalidate_active_thumbnails();
             return;
         }
         self.invalidate_inflight();
@@ -2186,7 +2202,15 @@ impl ExrApp {
             // clamp). A true clamp (not reset-to-0) keeps the user's selection
             // when the new image still has that index in range.
             self.viewer.active_layer = self.viewer.active_layer.min(layer_count.saturating_sub(1));
-            self.viewer.invalidate_active_textures();
+            // The viewport must rebuild every swap (that's how the next frame
+            // paints), but the contact-sheet thumbnails freeze while the transport
+            // is busy — otherwise a sheet open over a sequence re-bakes every layer
+            // per frame swap (#144). `settle_to_full` / the settle landing refresh
+            // them once the playhead stops.
+            self.viewer.invalidate_active_viewport();
+            if !self.thumbs_suppressed() {
+                self.viewer.invalidate_active_thumbnails();
+            }
             self.viewer.invalidate_histogram();
             self.viewer.last_sampled_val_a = None;
             self.viewer.last_hover_pos_img = None;
@@ -3390,6 +3414,7 @@ impl ExrApp {
             .decode_submit_at
             .map(|t| std::time::Instant::now().duration_since(t));
         let last_decode = self.last_decode_dur;
+        let thumb_bakes = self.viewer.dbg_thumb_bakes;
 
         let mut open = true;
         egui::Window::new("Playback debug")
@@ -3482,6 +3507,12 @@ impl ExrApp {
 
                         ui.label("dropped-epoch");
                         ui.label(dropped.to_string());
+                        ui.end_row();
+
+                        // Flat while the sheet is frozen during playback; steps up
+                        // once per settle. Climbing per frame ⇒ #144 has regressed.
+                        ui.label("sheet bakes");
+                        ui.label(thumb_bakes.to_string());
                         ui.end_row();
                     });
             });
@@ -5216,6 +5247,47 @@ mod tests {
             app.playback.pending,
             Some(3),
             "release re-requests the landing frame in full"
+        );
+    }
+
+    /// #144: the contact sheet freezes (skips per-frame thumbnail invalidation)
+    /// whenever the transport is busy — playing, a seek in flight, or a held
+    /// timeline drag — and refreshes only once it settles. Gate mirrors the
+    /// histogram suppression (#141) plus the explicit scrub flag.
+    #[test]
+    fn thumbs_suppressed_tracks_transport_and_scrub() {
+        use crate::playback::PlayState;
+        let dir = tempfile::tempdir().unwrap();
+        touch_sequence(dir.path(), 5);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&dir.path().join("s.0001.exr"));
+        assert!(app.playback.is_active(), "sequence loaded");
+
+        // Settled: not playing, nothing pending, no drag → the sheet refreshes.
+        app.playback.state = PlayState::Paused;
+        app.playback.pending = None;
+        app.scrub_active = false;
+        assert!(!app.thumbs_suppressed(), "settled ⇒ not suppressed");
+
+        // Playing ⇒ frozen.
+        app.playback.start_playing(std::time::Instant::now());
+        assert!(app.thumbs_suppressed(), "playing ⇒ suppressed");
+
+        // Paused but a seek is still in flight ⇒ frozen until it lands.
+        app.playback.state = PlayState::Paused;
+        app.playback.pending = Some(3);
+        assert!(app.thumbs_suppressed(), "pending decode ⇒ suppressed");
+
+        // A held timeline drag ⇒ frozen even with nothing pending.
+        app.playback.pending = None;
+        app.scrub_active = true;
+        assert!(app.thumbs_suppressed(), "active scrub ⇒ suppressed");
+
+        // Drag released and settled ⇒ refreshes again.
+        app.scrub_active = false;
+        assert!(
+            !app.thumbs_suppressed(),
+            "released + settled ⇒ not suppressed"
         );
     }
 
