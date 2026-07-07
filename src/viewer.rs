@@ -473,6 +473,43 @@ impl DrawCtx<'_> {
     }
 }
 
+/// Persisted viewer display preferences, single-owned by [`ExrViewer`] (#151).
+///
+/// These used to be mirrored on `ExrApp` and cloned into the viewer before
+/// `viewer.ui()` and read back after, every frame. Now the viewer owns them
+/// outright; `ExrApp` keeps a nested `persisted_prefs` bridge that its eframe
+/// `save()`/load path syncs to/from this struct at persist time only. Every
+/// member type is already serde-ready.
+#[derive(Clone, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ViewerPrefs {
+    /// Diff visualization controls (#15): active colormap, magnitude metric,
+    /// noise floor. Mutated by the mode-param UI.
+    pub diff_colormap: Colormap,
+    pub diff_metric: DiffMetric,
+    pub diff_floor: f32,
+    /// User-saved named gradients — the preset library shared with the gradient
+    /// editor.
+    pub custom_gradients: Vec<(String, Gradient)>,
+    /// Customizable viewport background (#18); mutated by the background window.
+    pub background: crate::background::Background,
+    /// Named background presets (mode + colours + gradient).
+    pub background_presets: Vec<(String, crate::background::Background)>,
+}
+
+impl Default for ViewerPrefs {
+    fn default() -> Self {
+        Self {
+            diff_colormap: Colormap::BlackBody,
+            diff_metric: DiffMetric::MaxChannel,
+            diff_floor: 0.0,
+            custom_gradients: Vec::new(),
+            background: crate::background::Background::default(),
+            background_presets: Vec::new(),
+        }
+    }
+}
+
 /// All canvas state for one A/B pair: view transform, tone controls, the active
 /// [`CompareMode`], the texture caches described in the module docs, plus
 /// sampling/histogram/contact-sheet state. Driven each frame by [`Self::ui`].
@@ -533,15 +570,10 @@ pub struct ExrViewer {
     /// layer's interleaved half bit-patterns, so `build_layer_texture` doesn't
     /// page-fault a fresh ~66 MB allocation every build during playback.
     t2_staging: Vec<u16>,
-    /// Diff visualization controls (see issue #15). The active colormap, the
-    /// magnitude metric, and the noise floor. Hydrated from `ExrApp` each frame so
-    /// they persist across sessions; mutated here by the mode-param UI.
-    pub diff_colormap: Colormap,
-    pub diff_metric: DiffMetric,
-    pub diff_floor: f32,
-    /// User-saved named gradients (the preset library shared with the gradient
-    /// editor). Round-tripped through `ExrApp` for persistence.
-    pub custom_gradients: Vec<(String, Gradient)>,
+    /// Persisted display preferences, single-owned here (#151): diff controls,
+    /// custom gradients, background + presets. `ExrApp` mirrors these to disk only
+    /// at eframe `save()`/load time; the UI mutates them in place.
+    pub prefs: ViewerPrefs,
     /// Baked 256-entry colormap LUT (f32 texels) + the colormap they were baked
     /// from, so the GPU texture is re-uploaded only when the active gradient
     /// changes. Transient (rebuilt on demand).
@@ -554,12 +586,6 @@ pub struct ExrViewer {
     new_preset_name: String,
     gradient_editor_target: GradientTarget,
 
-    /// Customizable viewport background (issue #18). Hydrated from `ExrApp` each
-    /// frame (persisted there); mutated by the background settings window.
-    pub background: crate::background::Background,
-    /// Named background presets (mode + colours + gradient). Round-tripped through
-    /// `ExrApp` for persistence.
-    pub background_presets: Vec<(String, crate::background::Background)>,
     /// Whether the background settings window is open, and the in-progress preset
     /// name. Transient.
     pub show_background_window: bool,
@@ -699,18 +725,13 @@ impl Default for ExrViewer {
             gpu_textures_b: Vec::new(),
             t2: T2Ring::new(),
             t2_staging: Vec::new(),
-            diff_colormap: Colormap::BlackBody,
-            diff_metric: DiffMetric::MaxChannel,
-            diff_floor: 0.0,
-            custom_gradients: Vec::new(),
+            prefs: ViewerPrefs::default(),
             colormap_lut: Vec::new(),
             colormap_sig: None,
             gradient_editor_open: false,
             editing_gradient: Colormap::BlackBody.gradient(),
             new_preset_name: String::new(),
             gradient_editor_target: GradientTarget::DiffColormap,
-            background: crate::background::Background::default(),
-            background_presets: Vec::new(),
             show_background_window: false,
             new_bg_preset_name: String::new(),
             bg_gradient_lut: Vec::new(),
@@ -1161,20 +1182,20 @@ impl ExrViewer {
                 ui.label("Colormap");
                 let mut pick: Option<Colormap> = None;
                 egui::ComboBox::from_id_salt("diff_colormap_select")
-                    .selected_text(self.diff_colormap.label())
+                    .selected_text(self.prefs.diff_colormap.label())
                     .show_ui(ui, |ui| {
                         for cm in Colormap::PRESETS {
                             if ui
-                                .selectable_label(self.diff_colormap == cm, cm.label())
+                                .selectable_label(self.prefs.diff_colormap == cm, cm.label())
                                 .clicked()
                             {
                                 pick = Some(cm);
                             }
                         }
-                        if !self.custom_gradients.is_empty() {
+                        if !self.prefs.custom_gradients.is_empty() {
                             ui.separator();
-                            for (name, g) in &self.custom_gradients {
-                                let selected = matches!(&self.diff_colormap, Colormap::Custom(cur) if cur == g);
+                            for (name, g) in &self.prefs.custom_gradients {
+                                let selected = matches!(&self.prefs.diff_colormap, Colormap::Custom(cur) if cur == g);
                                 if ui.selectable_label(selected, name).clicked() {
                                     pick = Some(Colormap::Custom(g.clone()));
                                 }
@@ -1182,28 +1203,28 @@ impl ExrViewer {
                         }
                     });
                 if let Some(cm) = pick {
-                    self.diff_colormap = cm;
+                    self.prefs.diff_colormap = cm;
                 }
 
                 ui.label("Metric");
                 egui::ComboBox::from_id_salt("diff_metric_select")
-                    .selected_text(self.diff_metric.label())
+                    .selected_text(self.prefs.diff_metric.label())
                     .show_ui(ui, |ui| {
                         for m in DiffMetric::ALL {
-                            ui.selectable_value(&mut self.diff_metric, m, m.label());
+                            ui.selectable_value(&mut self.prefs.diff_metric, m, m.label());
                         }
                     });
 
                 ui.label("Floor");
-                ui.add(egui::Slider::new(&mut self.diff_floor, 0.0..=0.25));
+                ui.add(egui::Slider::new(&mut self.prefs.diff_floor, 0.0..=0.25));
 
                 // Legend / scale bar. Per-channel RGB has no colormap, so skip it.
-                if self.diff_metric != DiffMetric::PerChannelRGB {
+                if self.prefs.diff_metric != DiffMetric::PerChannelRGB {
                     self.diff_legend(ui);
                 }
 
                 if ui.button("Edit gradient…").clicked() {
-                    self.editing_gradient = self.diff_colormap.gradient();
+                    self.editing_gradient = self.prefs.diff_colormap.gradient();
                     self.gradient_editor_target = GradientTarget::DiffColormap;
                     self.gradient_editor_open = true;
                 }
@@ -1236,7 +1257,7 @@ impl ExrViewer {
     /// spans black→saturated. The legend is a visualization aid; it is not
     /// interactive.
     fn diff_legend(&self, ui: &mut egui::Ui) {
-        let grad = self.diff_colormap.gradient();
+        let grad = self.prefs.diff_colormap.gradient();
         let (rect, _) = ui.allocate_exact_size(egui::vec2(120.0, 14.0), egui::Sense::hover());
         if ui.is_rect_visible(rect) {
             let painter = ui.painter_at(rect);
@@ -1370,8 +1391,8 @@ impl ExrViewer {
 
         // Route "Apply" to whichever feature opened the editor.
         let apply_to_target = |s: &mut Self, grad: Gradient| match s.gradient_editor_target {
-            GradientTarget::DiffColormap => s.diff_colormap = Colormap::Custom(grad),
-            GradientTarget::Background => s.background.gradient = grad,
+            GradientTarget::DiffColormap => s.prefs.diff_colormap = Colormap::Custom(grad),
+            GradientTarget::Background => s.prefs.background.gradient = grad,
         };
         if apply {
             apply_to_target(self, self.editing_gradient.clone());
@@ -1380,10 +1401,15 @@ impl ExrViewer {
             let name = self.new_preset_name.trim().to_string();
             let grad = self.editing_gradient.clone();
             // The named-gradient library is shared by both editors.
-            if let Some(slot) = self.custom_gradients.iter_mut().find(|(n, _)| n == &name) {
+            if let Some(slot) = self
+                .prefs
+                .custom_gradients
+                .iter_mut()
+                .find(|(n, _)| n == &name)
+            {
                 slot.1 = grad.clone();
             } else {
-                self.custom_gradients.push((name, grad.clone()));
+                self.prefs.custom_gradients.push((name, grad.clone()));
             }
             apply_to_target(self, grad);
             self.new_preset_name.clear();
@@ -1393,7 +1419,7 @@ impl ExrViewer {
 
     /// The viewport-background settings window (issue #18): mode selector, the
     /// per-mode colour/size/gradient controls, and a named-preset library. Mutates
-    /// `self.background` live; rendered once per frame from [`Self::ui`] when
+    /// `self.prefs.background` live; rendered once per frame from [`Self::ui`] when
     /// `show_background_window`. Colours are linear (see `background` module docs).
     fn background_window(&mut self, ctx: &egui::Context) {
         if !self.show_background_window {
@@ -1408,49 +1434,55 @@ impl ExrViewer {
                 ui.horizontal(|ui| {
                     ui.label("Mode");
                     egui::ComboBox::from_id_salt("bg_mode_select")
-                        .selected_text(self.background.mode.label())
+                        .selected_text(self.prefs.background.mode.label())
                         .show_ui(ui, |ui| {
                             for m in BackgroundMode::ALL {
-                                ui.selectable_value(&mut self.background.mode, m, m.label());
+                                ui.selectable_value(&mut self.prefs.background.mode, m, m.label());
                             }
                         });
                 });
                 ui.separator();
 
-                match self.background.mode {
+                match self.prefs.background.mode {
                     BackgroundMode::Checkerboard => {
                         ui.horizontal(|ui| {
                             ui.label("Dark");
-                            ui.color_edit_button_rgb(&mut self.background.checker_dark);
+                            ui.color_edit_button_rgb(&mut self.prefs.background.checker_dark);
                             ui.label("Light");
-                            ui.color_edit_button_rgb(&mut self.background.checker_light);
+                            ui.color_edit_button_rgb(&mut self.prefs.background.checker_light);
                         });
                         ui.horizontal(|ui| {
                             ui.label("Cell size");
                             ui.add(
-                                egui::Slider::new(&mut self.background.checker_size, 2.0..=128.0)
-                                    .suffix(" px"),
+                                egui::Slider::new(
+                                    &mut self.prefs.background.checker_size,
+                                    2.0..=128.0,
+                                )
+                                .suffix(" px"),
                             );
                         });
                     }
                     BackgroundMode::Solid => {
                         ui.horizontal(|ui| {
                             ui.label("Colour");
-                            ui.color_edit_button_rgb(&mut self.background.solid);
+                            ui.color_edit_button_rgb(&mut self.prefs.background.solid);
                         });
                     }
                     BackgroundMode::Gradient => {
                         // Preview bar of the current gradient.
-                        Self::gradient_preview_bar(ui, &self.background.gradient.clone());
+                        Self::gradient_preview_bar(ui, &self.prefs.background.gradient.clone());
                         ui.horizontal(|ui| {
                             ui.label("Angle");
                             ui.add(
-                                egui::Slider::new(&mut self.background.gradient_angle, 0.0..=360.0)
-                                    .suffix("°"),
+                                egui::Slider::new(
+                                    &mut self.prefs.background.gradient_angle,
+                                    0.0..=360.0,
+                                )
+                                .suffix("°"),
                             );
                         });
                         if ui.button("Edit gradient…").clicked() {
-                            self.editing_gradient = self.background.gradient.clone();
+                            self.editing_gradient = self.prefs.background.gradient.clone();
                             self.gradient_editor_target = GradientTarget::Background;
                             self.gradient_editor_open = true;
                         }
@@ -1465,7 +1497,8 @@ impl ExrViewer {
                 egui::ScrollArea::vertical()
                     .max_height(110.0)
                     .show(ui, |ui| {
-                        for (i, (name, preset)) in self.background_presets.iter().enumerate() {
+                        for (i, (name, preset)) in self.prefs.background_presets.iter().enumerate()
+                        {
                             ui.horizontal(|ui| {
                                 if ui.button(name).clicked() {
                                     load = Some(preset.clone());
@@ -1477,10 +1510,10 @@ impl ExrViewer {
                         }
                     });
                 if let Some(bg) = load {
-                    self.background = bg;
+                    self.prefs.background = bg;
                 }
                 if let Some(i) = delete {
-                    self.background_presets.remove(i);
+                    self.prefs.background_presets.remove(i);
                 }
                 ui.horizontal(|ui| {
                     ui.text_edit_singleline(&mut self.new_bg_preset_name);
@@ -1490,19 +1523,22 @@ impl ExrViewer {
                         .clicked()
                     {
                         let name = self.new_bg_preset_name.trim().to_string();
-                        let bg = self.background.clone();
-                        if let Some(slot) =
-                            self.background_presets.iter_mut().find(|(n, _)| n == &name)
+                        let bg = self.prefs.background.clone();
+                        if let Some(slot) = self
+                            .prefs
+                            .background_presets
+                            .iter_mut()
+                            .find(|(n, _)| n == &name)
                         {
                             slot.1 = bg;
                         } else {
-                            self.background_presets.push((name, bg));
+                            self.prefs.background_presets.push((name, bg));
                         }
                         self.new_bg_preset_name.clear();
                     }
                 });
                 if ui.button("Reset to default checker").clicked() {
-                    self.background = crate::background::Background::default();
+                    self.prefs.background = crate::background::Background::default();
                 }
             });
         self.show_background_window = open;
@@ -1922,9 +1958,12 @@ impl ExrViewer {
         // window / gradient editor / preset-load paths alike. Queue happens before
         // the drain below so the stale ids are freed this frame. (OCIO thumbnails
         // skip the background composite, so they don't depend on it.)
-        if use_gpu && !self.ocio_active && self.gpu_thumb_bg.as_ref() != Some(&self.background) {
+        if use_gpu
+            && !self.ocio_active
+            && self.gpu_thumb_bg.as_ref() != Some(&self.prefs.background)
+        {
             self.invalidate_gpu_thumbnails(true, true);
-            self.gpu_thumb_bg = Some(self.background.clone());
+            self.gpu_thumb_bg = Some(self.prefs.background.clone());
         }
 
         // Drain any ids queued by the invalidations just above so they're freed
@@ -1946,7 +1985,7 @@ impl ExrViewer {
             channel_mode: self.channel_mode.as_u32(),
             lut_domain_min: self.lut_domain_min,
             lut_domain_max: self.lut_domain_max,
-            background: self.background.clone(),
+            background: self.prefs.background.clone(),
         };
 
         let draw_sheet = |viewer: &mut Self,
@@ -2673,21 +2712,24 @@ impl ExrViewer {
     /// Split out of `draw_canvas_gpu` (#152) to keep it focused on draw emission.
     fn sync_gradient_luts(&mut self, gpu_resources: &crate::gpu::GpuResources) {
         let render_state = gpu_resources.render_state();
-        let colormap_dirty = self.colormap_sig.as_ref() != Some(&self.diff_colormap);
-        let bg_gradient_dirty = self.bg_gradient_sig.as_ref() != Some(&self.background.gradient);
+        let colormap_dirty = self.colormap_sig.as_ref() != Some(&self.prefs.diff_colormap);
+        let bg_gradient_dirty =
+            self.bg_gradient_sig.as_ref() != Some(&self.prefs.background.gradient);
         if colormap_dirty {
             self.colormap_lut = self
+                .prefs
                 .diff_colormap
                 .gradient()
                 .bake(crate::gradient::COLORMAP_LUT_SIZE);
-            self.colormap_sig = Some(self.diff_colormap.clone());
+            self.colormap_sig = Some(self.prefs.diff_colormap.clone());
         }
         if bg_gradient_dirty {
             self.bg_gradient_lut = self
+                .prefs
                 .background
                 .gradient
                 .bake(crate::gradient::COLORMAP_LUT_SIZE);
-            self.bg_gradient_sig = Some(self.background.gradient.clone());
+            self.bg_gradient_sig = Some(self.prefs.background.gradient.clone());
         }
         if colormap_dirty || bg_gradient_dirty {
             let gpu_state = gpu_resources.gpu_state.as_ref();
@@ -2735,18 +2777,18 @@ impl ExrViewer {
             wipe_center: self.wipe_center,
             wipe_angle: self.wipe_angle.to_radians(),
             skip_checker: 0,
-            diff_metric: self.diff_metric.as_u32(),
-            diff_floor: self.diff_floor,
+            diff_metric: self.prefs.diff_metric.as_u32(),
+            diff_floor: self.prefs.diff_floor,
             // Per-draw value comes from the `overscan_factor` cell in `draw_gpu`.
             overscan_factor: 1.0,
             lut_domain_min: self.lut_domain_min,
             lut_domain_max: self.lut_domain_max,
-            bg_checker_dark: rgb3_to_vec4(self.background.checker_dark),
-            bg_checker_light: rgb3_to_vec4(self.background.checker_light),
-            bg_solid: rgb3_to_vec4(self.background.solid),
-            bg_mode: self.background.mode.as_u32(),
-            bg_grad_angle: self.background.gradient_angle,
-            bg_checker_size: self.background.checker_size,
+            bg_checker_dark: rgb3_to_vec4(self.prefs.background.checker_dark),
+            bg_checker_light: rgb3_to_vec4(self.prefs.background.checker_light),
+            bg_solid: rgb3_to_vec4(self.prefs.background.solid),
+            bg_mode: self.prefs.background.mode.as_u32(),
+            bg_grad_angle: self.prefs.background.gradient_angle,
+            bg_checker_size: self.prefs.background.checker_size,
             _pad3: 0,
         }
     }
@@ -3060,17 +3102,17 @@ impl ExrViewer {
                         } else {
                             1.0
                         },
-                        bg_mode: self.background.mode.as_u32() as f32,
-                        bg_checker_size: self.background.checker_size,
-                        bg_grad_angle: self.background.gradient_angle,
+                        bg_mode: self.prefs.background.mode.as_u32() as f32,
+                        bg_checker_size: self.prefs.background.checker_size,
+                        bg_grad_angle: self.prefs.background.gradient_angle,
                         // Re-apply the user gamma in display space (#93): under
                         // OCIO the main shader runs with gamma=1 (OCIO owns the
                         // display chain), so the control would otherwise be inert.
                         gamma: self.gamma,
                         _pad_b: 0.0,
-                        bg_checker_dark: rgb3_to_vec4(self.background.checker_dark),
-                        bg_checker_light: rgb3_to_vec4(self.background.checker_light),
-                        bg_solid: rgb3_to_vec4(self.background.solid),
+                        bg_checker_dark: rgb3_to_vec4(self.prefs.background.checker_dark),
+                        bg_checker_light: rgb3_to_vec4(self.prefs.background.checker_light),
+                        bg_solid: rgb3_to_vec4(self.prefs.background.solid),
                     };
                     // Finalize the render signature with the OCIO generation
                     // (bumped by the app on any config / display / view change), so
@@ -3402,7 +3444,7 @@ impl ExrViewer {
         let exp_mult = crate::render_math::exposure_to_multiplier(self.exposure);
         // Viewport background (issue #18): one config, sampled per pixel below so
         // every CPU composite path agrees with the GPU `background_color`.
-        let bg_cfg = &self.background;
+        let bg_cfg = &self.prefs.background;
         let gamma = self.gamma;
         let apply_gamma = self.gamma != 1.0;
         let apply_srgb = self.srgb;
@@ -3737,7 +3779,7 @@ impl ExrViewer {
         let mut pixels = vec![egui::Color32::BLACK; width * height];
 
         let exp_mult = crate::render_math::exposure_to_multiplier(self.exposure);
-        let bg_cfg = &self.background;
+        let bg_cfg = &self.prefs.background;
         let gamma = self.gamma;
         let apply_gamma = self.gamma != 1.0;
         let apply_srgb = self.srgb;
