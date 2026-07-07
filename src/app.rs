@@ -5285,7 +5285,10 @@ mod tests {
 
         // Drag released and settled ⇒ refreshes again.
         app.scrub_active = false;
-        assert!(!app.thumbs_suppressed(), "released + settled ⇒ not suppressed");
+        assert!(
+            !app.thumbs_suppressed(),
+            "released + settled ⇒ not suppressed"
+        );
     }
 
     // --- Decode-stall recovery (Windows freeze, unrecoverable-hang class) -----

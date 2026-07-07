@@ -1957,11 +1957,13 @@ impl ExrViewer {
             egui::ScrollArea::vertical()
                 .id_salt(if is_a { "sheet_a" } else { "sheet_b" })
                 .show(ui, |ui| {
-                    // Per layout pass, cap the thumbnails baked so a burst (settle
-                    // refresh, tone/OCIO/background wipe, first open) spreads over a
-                    // few frames instead of stalling one (#144). Visible cells are
-                    // served first; off-screen cells never consume the budget. Reset
-                    // per column.
+                    // Cap the thumbnails baked per side per frame so a burst
+                    // (settle refresh, tone/OCIO/background wipe, first open)
+                    // spreads over a few frames instead of stalling one (#144).
+                    // Fresh per `ScrollArea::show`: an A/B compare sheet runs this
+                    // closure once per side, so each side gets its own budget.
+                    // Visible cells are served first; off-screen cells never
+                    // consume it.
                     let mut bake_budget = THUMB_BAKES_PER_FRAME;
                     let mut needs_more = false;
                     ui.horizontal_wrapped(|ui| {
@@ -1986,9 +1988,9 @@ impl ExrViewer {
                             // thin axis to 1px, distorting aspect and diverging from
                             // the GPU path (which reports full-res). Known before any
                             // bake so the placeholder is framed correctly too. (#122)
-                            let aspect = data
-                                .logical_size(i)
-                                .map_or(1.0, |(w, h)| if h > 0 { w as f32 / h as f32 } else { 1.0 });
+                            let aspect = data.logical_size(i).map_or(1.0, |(w, h)| {
+                                if h > 0 { w as f32 / h as f32 } else { 1.0 }
+                            });
                             let (fit_w, fit_h) = if aspect >= 1.0 {
                                 (thumb_box, thumb_box / aspect)
                             } else {
@@ -2058,8 +2060,12 @@ impl ExrViewer {
                                 };
                                 if missing && visible {
                                     if bake_budget > 0 {
-                                        let baked = viewer
-                                            .generate_texture(ui.ctx(), data, i, Some(THUMB_BOX));
+                                        let baked = viewer.generate_texture(
+                                            ui.ctx(),
+                                            data,
+                                            i,
+                                            Some(THUMB_BOX),
+                                        );
                                         let ok = baked.is_some();
                                         if is_a {
                                             viewer.thumbnails[i] = baked;
