@@ -1470,7 +1470,7 @@ impl ExrViewer {
                     }
                     BackgroundMode::Gradient => {
                         // Preview bar of the current gradient.
-                        Self::gradient_preview_bar(ui, &self.prefs.background.gradient.clone());
+                        Self::gradient_preview_bar(ui, &self.prefs.background.gradient);
                         ui.horizontal(|ui| {
                             ui.label("Angle");
                             ui.add(
