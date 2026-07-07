@@ -216,27 +216,19 @@ pub struct ExrApp {
     recent_files: Vec<PathBuf>,
     theme: ThemeChoice,
 
-    /// Persisted Diff/Matte visualization controls (issue #15). The live state
-    /// lives on [`ExrViewer`] (where the UI mutates it); these mirror it for
-    /// persistence and are round-tripped each frame around `viewer.ui`. Defaults
-    /// reproduce the legacy behaviour (black-body / max-channel / no floor).
+    /// Persistence bridge for the viewer's display prefs (#151): diff controls,
+    /// custom gradients, background + presets. The runtime single owner is
+    /// `self.viewer.prefs` — this mirror is written from it in `save()` and read
+    /// back into it in `new()`, i.e. only at persist boundaries, never per frame.
+    ///
+    /// Nested (not `#[serde(flatten)]`): eframe persists via RON, and flatten
+    /// forces the whole app struct to serialize as a map, which fails to parse
+    /// against an existing struct-syntax `app.ron` and would wipe *all* settings.
+    /// The cost of nesting is a one-time reset of just these six display prefs on
+    /// upgrade (the old top-level keys are ignored; every other setting survives);
+    /// schema-versioned migration is tracked separately in #65.
     #[serde(default)]
-    diff_colormap: crate::gradient::Colormap,
-    #[serde(default)]
-    diff_metric: crate::gradient::DiffMetric,
-    #[serde(default)]
-    diff_floor: f32,
-    /// User-saved named gradients (the preset library shared with the editor).
-    #[serde(default)]
-    custom_gradients: Vec<(String, crate::gradient::Gradient)>,
-
-    /// Persisted viewport background (issue #18) + its named preset library.
-    /// Live state lives on [`ExrViewer`]; round-tripped each frame like the diff
-    /// controls. Default reproduces the legacy grey checker.
-    #[serde(default)]
-    background: crate::background::Background,
-    #[serde(default)]
-    background_presets: Vec<(String, crate::background::Background)>,
+    persisted_prefs: crate::viewer::ViewerPrefs,
 
     /// Snapshot to clipboard (issue #19): when true, each snapshot also writes a
     /// timestamped PNG to `~/.floki/snapshots/`. The clipboard copy always happens.
@@ -494,12 +486,7 @@ impl Default for ExrApp {
             dbg_last_trace: None,
             recent_files: Vec::new(),
             theme: ThemeChoice::default(),
-            diff_colormap: crate::gradient::Colormap::default(),
-            diff_metric: crate::gradient::DiffMetric::default(),
-            diff_floor: 0.0,
-            custom_gradients: Vec::new(),
-            background: crate::background::Background::default(),
-            background_presets: Vec::new(),
+            persisted_prefs: crate::viewer::ViewerPrefs::default(),
             save_snapshots: false,
             t2_enabled: true,
             beauty_preview: true,
@@ -572,6 +559,11 @@ impl ExrApp {
         } else {
             Self::default()
         };
+
+        // Move the persisted viewer prefs into their runtime owner, the viewer
+        // (#151). From here on `self.viewer.prefs` is the single source of truth;
+        // `persisted_prefs` stays dormant until `save()` re-mirrors it.
+        app.viewer.prefs = std::mem::take(&mut app.persisted_prefs);
 
         // Wire the repaint handle before anything can spawn the decode worker,
         // so the worker can wake the UI when a result lands (#137).
@@ -2224,8 +2216,15 @@ impl ExrApp {
     /// responsible for clearing the image slots (e.g. dropping B when A
     /// changes). Contrast [`Self::swap_image_data`], which replaces pixels while
     /// preserving session state for per-frame playback (#7).
+    ///
+    /// Persisted display prefs (diff controls, custom gradients, background +
+    /// presets) are single-owned by the viewer now (#151), so carry them across
+    /// the reset — opening a new image must not wipe the user's background or
+    /// gradient settings (previously the app re-pushed them each frame).
     fn reset_viewer_session(&mut self) {
+        let prefs = std::mem::take(&mut self.viewer.prefs);
         self.viewer = ExrViewer::default();
+        self.viewer.prefs = prefs;
     }
 
     /// Apply a worker-produced first-paint proxy (#33) to slot A. Dropped if the
@@ -2257,10 +2256,8 @@ impl ExrApp {
             // (apply_load_result) then preserves whatever view the user adjusts.
             self.reset_viewer_session();
         }
-        // Bake the persisted background into the proxy texture (the viewer was
-        // just reset above, so its background is the default until synced) to
-        // avoid a background jump when the full-res render takes over.
-        self.viewer.background = self.background.clone();
+        // The viewer keeps its background across the reset above (#151), so the
+        // proxy already renders with the persisted background — no re-sync needed.
         self.viewer.set_proxy(ctx, proxy);
         ctx.request_repaint();
     }
@@ -2496,6 +2493,10 @@ fn route_dropped_exrs(paths: &[PathBuf], dropped_right: bool) -> Vec<(PathBuf, b
 
 impl eframe::App for ExrApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        // Mirror the viewer-owned display prefs (#151) into the serde bridge so the
+        // whole-app serialize below persists them. Done here, at persist time only,
+        // instead of the old per-frame round-trip around `viewer.ui`.
+        self.persisted_prefs = self.viewer.prefs.clone();
         eframe::set_value(storage, eframe::APP_KEY, self);
     }
 
@@ -4251,16 +4252,10 @@ impl ExrApp {
                     // INV-SAMPLE (#7): suppress the pixel readout while a sequence
                     // is advancing or a seek's frame is still in flight.
                     self.viewer.suppress_sampling = self.playback.sampling_suppressed();
-                    // Diff controls: push the persisted state into the viewer, let
-                    // the mode-param UI mutate it during `ui`, then read it back so
-                    // `save` persists the latest. Kept identical both ways, so no
-                    // value is lost across frames.
-                    self.viewer.diff_colormap = self.diff_colormap.clone();
-                    self.viewer.diff_metric = self.diff_metric;
-                    self.viewer.diff_floor = self.diff_floor;
-                    self.viewer.custom_gradients = std::mem::take(&mut self.custom_gradients);
-                    self.viewer.background = self.background.clone();
-                    self.viewer.background_presets = std::mem::take(&mut self.background_presets);
+                    // Diff controls, custom gradients, and background + presets are
+                    // single-owned by the viewer now (#151): the UI mutates them in
+                    // place and `save()` persists them straight from the viewer — no
+                    // per-frame push/read-back or `mem::take` shuffle.
                     self.viewer.ui(
                         ui,
                         data,
@@ -4268,12 +4263,6 @@ impl ExrApp {
                         self.gpu_resources.as_ref(),
                         self.lut_bg.clone(),
                     );
-                    self.diff_colormap = self.viewer.diff_colormap.clone();
-                    self.diff_metric = self.viewer.diff_metric;
-                    self.diff_floor = self.viewer.diff_floor;
-                    self.custom_gradients = std::mem::take(&mut self.viewer.custom_gradients);
-                    self.background = self.viewer.background.clone();
-                    self.background_presets = std::mem::take(&mut self.viewer.background_presets);
                 } else if self.loading_a {
                     // A requested but its decode hasn't landed yet (no prior image
                     // to keep showing). If a low-res first-paint proxy (#58) is
@@ -4674,6 +4663,14 @@ mod tests {
             color: egui::Color32::RED,
             width: 1.0,
         });
+        // #151: display prefs are viewer-owned now — a new-session reset must NOT
+        // wipe them (opening a new file shouldn't lose your background / gradients).
+        app.viewer.prefs.diff_floor = 0.2;
+        app.viewer.prefs.background.checker_size = 77.0;
+        app.viewer.prefs.custom_gradients.push((
+            "keep".into(),
+            crate::gradient::Colormap::default().gradient(),
+        ));
 
         app.reset_viewer_session();
 
@@ -4682,6 +4679,64 @@ mod tests {
         assert_eq!(app.viewer.exposure, 0.0, "exposure reset");
         assert!(app.viewer.swatches.is_empty(), "swatches cleared");
         assert!(app.viewer.annotations.is_empty(), "annotations cleared");
+        // Prefs survive the reset.
+        assert_eq!(app.viewer.prefs.diff_floor, 0.2, "diff_floor preserved");
+        assert_eq!(
+            app.viewer.prefs.background.checker_size, 77.0,
+            "background preserved"
+        );
+        assert_eq!(
+            app.viewer.prefs.custom_gradients.len(),
+            1,
+            "custom gradients preserved"
+        );
+    }
+
+    #[test]
+    fn viewer_prefs_persist_and_restore_through_ron_storage() {
+        // Exercise the real save/load bridge (#151) through eframe's RON codec via
+        // an in-memory Storage, so this guards the actual persistence path — not
+        // just a serde round-trip.
+        #[derive(Default)]
+        struct MemStorage(std::collections::HashMap<String, String>);
+        impl eframe::Storage for MemStorage {
+            fn get_string(&self, key: &str) -> Option<String> {
+                self.0.get(key).cloned()
+            }
+            fn set_string(&mut self, key: &str, value: String) {
+                self.0.insert(key.to_owned(), value);
+            }
+            fn flush(&mut self) {}
+        }
+
+        let mut app = ExrApp::default();
+        // Mutate the viewer-owned prefs (the single runtime owner).
+        app.viewer.prefs.diff_floor = 0.125;
+        app.viewer.prefs.background.checker_size = 42.0;
+        app.viewer.prefs.background.gradient_angle = 90.0;
+        app.viewer.prefs.custom_gradients.push((
+            "mine".into(),
+            crate::gradient::Colormap::default().gradient(),
+        ));
+        app.viewer
+            .prefs
+            .background_presets
+            .push(("bg1".into(), crate::background::Background::default()));
+        let expected = app.viewer.prefs.clone();
+
+        // save(): mirror viewer.prefs into persisted_prefs, then RON-serialize.
+        let mut storage = MemStorage::default();
+        eframe::App::save(&mut app, &mut storage);
+
+        // new(): RON-deserialize, then move persisted_prefs back into the viewer.
+        let mut restored: ExrApp = eframe::get_value(&storage, eframe::APP_KEY)
+            .expect("app state round-trips through eframe's RON codec");
+        restored.viewer.prefs = std::mem::take(&mut restored.persisted_prefs);
+
+        assert_eq!(
+            restored.viewer.prefs, expected,
+            "viewer prefs survive the save/load persistence bridge"
+        );
     }
 
     #[test]
