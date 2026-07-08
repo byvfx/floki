@@ -3595,14 +3595,30 @@ impl ExrViewer {
         self.histogram_key = None;
     }
 
+    /// Drop the cached image-B **viewport** bind groups so the compare draws
+    /// rebuild from the newly swapped B data. In locked-step A/B playback (#98)
+    /// this runs on every B frame swap (how the next B frame paints); split from
+    /// the thumbnail clear so B playback doesn't re-bake the contact sheet every
+    /// frame (mirror the A #144 split).
+    pub fn invalidate_reference_viewport(&mut self) {
+        self.gpu_textures_b.fill(None);
+    }
+
+    /// Drop the cached image-B contact-sheet **thumbnails** (CPU + GPU). Skipped
+    /// while the transport is busy (`ExrApp::thumbs_suppressed`) during B playback,
+    /// refreshed on settle (#98/#144).
+    pub fn invalidate_reference_thumbnails(&mut self) {
+        self.thumbnails_b.fill(None);
+        self.invalidate_gpu_thumbnails(false, true);
+    }
+
     /// Drop every cached reference-image (B) texture so the viewport rebuilds from the
     /// newly loaded data. The caches otherwise only refresh when the layer *count*
     /// changes, so re-loading a different B with the same layer count would keep showing the
     /// stale image. Clears the GPU bind groups and the contact-sheet thumbnails (CPU + GPU).
     pub fn invalidate_reference_textures(&mut self) {
-        self.thumbnails_b.fill(None);
-        self.invalidate_gpu_thumbnails(false, true);
-        self.gpu_textures_b.fill(None);
+        self.invalidate_reference_thumbnails();
+        self.invalidate_reference_viewport();
     }
 
     /// Drop the cached image-A **viewport** bind groups so the central canvas
