@@ -5,9 +5,6 @@ codebase audits ([audit-2026-06](audit-2026-06.md), [audit-2026-07](audit-2026-0
 those cover general health, this one is specifically the **heavy-footage review
 playback** strategy and the ordered backlog behind it.
 
-Cross-reference: the memory note `floki-playback-proxy-caching` captures the same
-model in condensed form.
-
 ---
 
 ## The core insight: floki is footprint-bound, not throughput-bound
@@ -65,8 +62,8 @@ so `logical_size` frames full-res while the small texture upscales. This is the
 model all future footprint work must follow.
 
 Source pointers: OpenRV on
-[DeepWiki](https://deepwiki.com/AcademySoftwareFoundation/OpenRV), its caching
-architecture (Ch. 14 of the RV manual), issue
+[DeepWiki](https://deepwiki.com/AcademySoftwareFoundation/OpenRV), the RV
+manual's caching chapter, issue
 [#404](https://github.com/AcademySoftwareFoundation/OpenRV/issues/404) (decode
 thread contention), and its PBO-based texture-upload path (floki already does the
 equivalent with wgpu — see the #142 upload-path batch, so GPU upload is *not* a
