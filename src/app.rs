@@ -89,10 +89,11 @@ struct LoadJob {
     /// step 3). Set for playback prefetch while the clock advances; cleared for
     /// explicit opens and the full re-decode on settle. See [`ExrData::load_beauty`].
     beauty_only: bool,
-    /// Decode a **downsampled scrub proxy** at this `target_blocks` size (#94)
-    /// instead of a full/beauty frame — for cheap playback of heavy footage.
+    /// Decode a **downsampled scrub proxy** at this `max_dim` (long-side px) size
+    /// (#94) instead of a full/beauty frame — for cheap playback of heavy footage.
     /// `None` = no proxy. Takes precedence over `beauty_only`, which is kept as the
-    /// fallback when the fast proxy read isn't available. See [`ExrData::load_proxy`].
+    /// fallback if the decode errors. See [`ExrData::load_proxy`] (a normal decode
+    /// then a post-decode box-filter).
     proxy_target: Option<usize>,
 }
 
@@ -296,10 +297,9 @@ pub struct ExrApp {
     /// Persisted.
     #[serde(default = "ret_true")]
     proxy_enabled: bool,
-    /// Scrub-proxy target size — the `target_blocks` knob for the fast read
-    /// (roughly the proxy's height in scanline blocks; higher = sharper but
-    /// larger + slower, and self-gates to full on footage without enough blocks).
-    /// Persisted.
+    /// Scrub-proxy size — the downsampled **long-side pixel** cap passed to
+    /// [`crate::exr_loader::ExrData::load_proxy`] (`max_dim`): higher = sharper but
+    /// larger + fewer frames cached. Persisted.
     #[serde(default = "default_proxy_size")]
     proxy_size: usize,
 
@@ -1233,7 +1233,9 @@ impl ExrApp {
             // stays suppressed until the full frame lands. An active timeline
             // drag counts as moving (#143): upgrading every touched frame
             // mid-drag would spam full decodes; the release settles instead.
-            let needs_full = !self.playback.is_playing() && !self.scrub_active && data.beauty_only;
+            let needs_full = !self.playback.is_playing()
+                && !self.scrub_active
+                && (data.beauty_only || data.proxy);
             self.loading_a = false;
             self.viewer.set_t2_frame(Some(frame)); // bind this frame's T2 texture
             self.swap_image_arc(data, false);
@@ -1300,7 +1302,9 @@ impl ExrApp {
             return;
         }
         if let Some(data) = self.frame_cache.get(crate::cache::Slot::B, frame) {
-            let needs_full = !self.playback.is_playing() && !self.scrub_active && data.beauty_only;
+            let needs_full = !self.playback.is_playing()
+                && !self.scrub_active
+                && (data.beauty_only || data.proxy);
             self.swap_b_frame(data);
             self.pending_b = if needs_full { Some(frame) } else { None };
         } else {
@@ -1721,7 +1725,7 @@ impl ExrApp {
         let a_full = self
             .frame_cache
             .peek(crate::cache::Slot::A, a_frame)
-            .is_some_and(|d| !d.beauty_only);
+            .is_some_and(|d| !d.beauty_only && !d.proxy);
         // Locked-step B (#98): its settled frame must be full-resident too so
         // compare-mode sampling/AOV on B is correct. A hole holds the previous B
         // frame — nothing to fetch, so treat it as settled.
@@ -1733,7 +1737,7 @@ impl ExrApp {
                     || self
                         .frame_cache
                         .peek(crate::cache::Slot::B, bf)
-                        .is_some_and(|d| !d.beauty_only)
+                        .is_some_and(|d| !d.beauty_only && !d.proxy)
             }
         };
         if a_full {
@@ -2102,12 +2106,16 @@ impl ExrApp {
         self.dbg_last_sample = Some(sample); // stash for the status bar + debug overlay
 
         // T1: recomputed each tick; shrinks under other memory pressure.
-        // While scrub proxies are active (#94) the resident frames are tiny
-        // downsampled proxies, so size the cap off proxy bytes — hundreds fit
-        // instead of the ~16 that full 178 MB frames allow. Falls back to
-        // full-frame bytes when proxies aren't in use, or on footage the fast read
-        // can't proxy (proxy_bytes stays `None`).
-        let sizing_bytes = if self.proxy_enabled && self.playback.is_active() {
+        // While scrub proxies are actually being produced (#94) the resident
+        // frames are tiny downsampled proxies, so size the cap off proxy bytes —
+        // hundreds fit instead of the ~16 that full 178 MB frames allow. Gated on
+        // the SAME condition proxies decode under (`proxy_enabled` + beauty layer):
+        // on a non-beauty AOV the ring fills with *full* frames, so a proxy-sized
+        // cap would over-count and risk OOM. Falls back to full-frame bytes
+        // otherwise (or when proxy_bytes hasn't been measured yet).
+        let proxying =
+            self.proxy_enabled && self.playback.is_active() && self.viewer.active_layer == 0;
+        let sizing_bytes = if proxying {
             self.proxy_bytes.or(self.frame_bytes)
         } else {
             self.frame_bytes
@@ -2340,15 +2348,16 @@ impl ExrApp {
             match res.result {
                 Ok(data) => {
                     let arc = std::sync::Arc::new(data);
-                    // Measure one frame to size the cache budget (homogeneous seq).
-                    // Size from a *full* A frame only: beauty-only frames (#56,
-                    // step 3) are smaller, and B may be a different resolution than
-                    // A (#98) — either would mis-size the shared ring budget.
-                    if arc.proxy {
-                        // Size the proxy budget off the first tiny proxy (#94).
-                        self.proxy_bytes.get_or_insert_with(|| arc.approx_bytes());
-                    } else if !arc.beauty_only && slot == crate::cache::Slot::A {
-                        self.frame_bytes.get_or_insert_with(|| arc.approx_bytes());
+                    // Measure one **Slot::A** frame to size the shared cache budget
+                    // (homogeneous seq): B may be a different resolution (#98), so
+                    // sizing off a B frame would mis-size the ring. A full A frame
+                    // seeds `frame_bytes`; a proxy A frame seeds `proxy_bytes` (#94).
+                    if slot == crate::cache::Slot::A {
+                        if arc.proxy {
+                            self.proxy_bytes.get_or_insert_with(|| arc.approx_bytes());
+                        } else if !arc.beauty_only {
+                            self.frame_bytes.get_or_insert_with(|| arc.approx_bytes());
+                        }
                     }
                     self.frame_cache.insert(slot, res.frame, arc.clone());
                     // A full-res frame landing (the settle upgrade, #94/#56)
@@ -4132,8 +4141,12 @@ impl ExrApp {
                         .changed();
                 if proxy_changed || size_changed {
                     // The cached ring is now the wrong decode mode/size — drop it so
-                    // frames re-decode (mirrors the Beauty-preview toggle).
+                    // frames re-decode (mirrors the Beauty-preview toggle). Also
+                    // forget the measured proxy byte-size so a new size re-measures
+                    // it (otherwise a larger proxy is budgeted at the old, smaller
+                    // size until restart).
                     self.frame_cache.clear();
+                    self.proxy_bytes = None;
                     self.invalidate_inflight();
                     self.request_sequence_frame(self.playback.current_frame);
                 }

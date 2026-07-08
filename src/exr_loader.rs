@@ -28,10 +28,14 @@ pub struct ExrData {
     /// the readout + AOV switcher see every channel (INV-SAMPLE, #7).
     pub beauty_only: bool,
     /// True when this is a **downsampled scrub proxy** (#94), built by
-    /// [`ExrData::load_proxy`] — a normal decode box-filtered down ([`Self::downsampled`])
-    /// — for cheap playback of heavy footage. Implies `beauty_only` (so settle-to-full
-    /// already re-decodes it); the distinct flag lets the cache budget size off the
-    /// tiny proxy bytes so hundreds of frames fit, and marks it in the debug overlay.
+    /// [`ExrData::load_proxy`] — a normal decode box-filtered down
+    /// ([`Self::downsampled`]) — for cheap playback of heavy footage. Not a valid
+    /// full/sampling source, so callers treat a proxy as **not-full** (settle
+    /// re-decodes it) regardless of `beauty_only`; the distinct flag also lets the
+    /// cache budget size off the tiny proxy bytes so hundreds of frames fit, and
+    /// marks it in the debug overlay. (In practice a proxy is also `beauty_only`,
+    /// since `load_proxy` downsamples a `load_beauty` result — but `downsampled`
+    /// itself preserves the source flag, so don't rely on that coupling.)
     pub proxy: bool,
     /// For a **proxy** (#94), the *full-resolution* display dimensions — the pixel
     /// buffers are downsampled, but the viewport must frame the image at full size

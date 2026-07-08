@@ -26,11 +26,12 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
 
-/// Default target number of scanline blocks to decompress for a fast-read proxy.
+/// Target number of scanline blocks to decompress for the **first-paint** proxy.
 /// Bounding the work to a constant (independent of resolution) is what makes the
 /// first paint fast: [`ProxyImage::from_exr_fast_read`] decompresses only every
-/// Nth block, and bails when that wouldn't skip anything. Higher = sharper but
-/// more decode; the scrub-proxy path (#94) drives this from a user setting.
+/// Nth block, and bails when that wouldn't skip anything. This is the sole caller
+/// now — the #94 scrub-proxy playback path uses a post-decode downsample
+/// (`ExrData::load_proxy`) instead, not the fast read.
 pub const PROXY_TARGET_BLOCKS: usize = 48;
 
 /// A low-resolution first-paint image. See the module docs.
