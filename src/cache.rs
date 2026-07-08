@@ -9,8 +9,10 @@
 //! loop when `LoopMode::Loop` wraps, #140), while scrubbing drop by absolute
 //! distance — LRU breaks ties. See `docs/playback/memory-contract.md`.
 //!
-//! Keyed on `(Slot, frame)` so locked-step A/B (#7, Phase 5) is an extension, not
-//! a rewrite; Phase 3 only ever stores `Slot::A` frames.
+//! Keyed on `(Slot, frame)` so locked-step A/B (#98) rides the same ring and
+//! eviction: single-image and A-plays/B-holds only store `Slot::A`, while
+//! locked-step B playback stores `Slot::B` alongside it (both playheads are
+//! protected from eviction).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -104,6 +106,13 @@ impl FrameCache {
         self.entries.clear();
     }
 
+    /// Drop every frame of one slot, keeping the other. Used when locked-step B
+    /// (#98) is dropped or replaced so a new B sequence (which reuses frame
+    /// numbers) can't hit a stale `Slot::B` entry.
+    pub fn clear_slot(&mut self, slot: Slot) {
+        self.entries.retain(|(s, _), _| *s != slot);
+    }
+
     /// Drop a single frame, returning whether it was resident. Used by the
     /// render-watch (#101) when a frame is re-rendered or removed on disk, so the
     /// stale pixels don't survive in the ring.
@@ -112,17 +121,21 @@ impl FrameCache {
     }
 
     /// Evict frames until at most `capacity` remain (capacity is floored at 1),
-    /// protecting the active frame `(Slot::A, playhead)`. Victim selection is the
-    /// directional-ring + LRU policy in [`FrameCache::pick_victim`].
+    /// protecting the active frame `(Slot::A, playhead)` and, for locked-step A/B
+    /// (#98), `(Slot::B, playhead_b)` when a B playhead is given. Victim selection
+    /// is the directional-ring + LRU policy in [`FrameCache::pick_victim`].
     ///
     /// `loop_wrap` is the in/out range when playing with `LoopMode::Loop`, so
     /// eviction distance follows the play direction *around* the loop; pass
-    /// `None` for Once/PingPong and while paused.
+    /// `None` for Once/PingPong and while paused. `loop_wrap` is in A's frame
+    /// space; B entries rank by plain distance from `playhead_b` (their numbers
+    /// live in B's range, not A's trim).
     /// Returns the number of frames evicted (for instrumentation).
     pub fn evict_to(
         &mut self,
         capacity: usize,
         playhead: u32,
+        playhead_b: Option<u32>,
         direction: Direction,
         playing: bool,
         loop_wrap: Option<(u32, u32)>,
@@ -130,12 +143,12 @@ impl FrameCache {
         let cap = capacity.max(1);
         let mut evicted = 0;
         while self.entries.len() > cap {
-            match self.pick_victim(playhead, direction, playing, loop_wrap) {
+            match self.pick_victim(playhead, playhead_b, direction, playing, loop_wrap) {
                 Some(victim) => {
                     self.entries.remove(&victim);
                     evicted += 1;
                 }
-                // Only the protected active frame remains — stop.
+                // Only the protected active frame(s) remain — stop.
                 None => break,
             }
         }
@@ -162,6 +175,7 @@ impl FrameCache {
     fn pick_victim(
         &self,
         playhead: u32,
+        playhead_b: Option<u32>,
         direction: Direction,
         playing: bool,
         loop_wrap: Option<(u32, u32)>,
@@ -170,7 +184,13 @@ impl FrameCache {
         // offset, so any behind frame outranks every ahead frame.
         const BEHIND_BIAS: u64 = 1 << 40;
 
-        let evictability = |frame: u32| -> u64 {
+        let evictability = |slot: Slot, frame: u32| -> u64 {
+            // Slot B (#98) ranks by plain distance from B's own playhead: its
+            // frames live in B's range, so the A-frame-space loop-wrap / behind
+            // logic below doesn't apply. A keeps the tuned directional policy.
+            if slot == Slot::B {
+                return playhead_b.map_or(0, |pb| u64::from(frame.abs_diff(pb)));
+            }
             let dist = u64::from(frame.abs_diff(playhead));
             if !playing {
                 return dist; // scrub: pure distance, either side.
@@ -200,9 +220,15 @@ impl FrameCache {
 
         self.entries
             .iter()
-            // Never evict the frame currently on screen.
-            .filter(|((slot, frame), _)| !(*slot == Slot::A && *frame == playhead))
-            .map(|((slot, frame), entry)| (*slot, *frame, evictability(*frame), entry.last_used))
+            // Never evict a frame currently on screen — A's playhead, and B's too
+            // in locked-step (#98).
+            .filter(|((slot, frame), _)| {
+                !((*slot == Slot::A && *frame == playhead)
+                    || (*slot == Slot::B && playhead_b == Some(*frame)))
+            })
+            .map(|((slot, frame), entry)| {
+                (*slot, *frame, evictability(*slot, *frame), entry.last_used)
+            })
             // Max evictability; on a tie, the least-recently-used (smallest
             // last_used) frame is the victim.
             .max_by(|a, b| a.2.cmp(&b.2).then(b.3.cmp(&a.3)))
@@ -283,9 +309,22 @@ mod tests {
         let mut c = FrameCache::new();
         fill(&mut c, Slot::A, &[10, 11, 12]);
         // Capacity 1 with playhead on 11: everything else goes, 11 stays.
-        c.evict_to(1, 11, Direction::Forward, true, None);
+        c.evict_to(1, 11, None, Direction::Forward, true, None);
         assert_eq!(c.len(), 1);
         assert!(c.contains(Slot::A, 11), "active frame is never evicted");
+    }
+
+    #[test]
+    fn evict_protects_both_playheads_in_locked_step() {
+        // Locked-step A/B (#98): A and B live in different frame ranges and both
+        // have an on-screen frame that must survive a hard squeeze.
+        let mut c = FrameCache::new();
+        fill(&mut c, Slot::A, &[3, 4, 5, 6]);
+        fill(&mut c, Slot::B, &[103, 104, 105, 106]);
+        c.evict_to(2, 5, Some(105), Direction::Forward, true, None);
+        assert_eq!(c.len(), 2, "everything but the two playheads is evicted");
+        assert!(c.contains(Slot::A, 5), "A playhead protected");
+        assert!(c.contains(Slot::B, 105), "B playhead protected");
     }
 
     #[test]
@@ -296,7 +335,7 @@ mod tests {
         // Trim to 3: the two behind frames (furthest first: 3 then 4) are dropped.
         // The returned count (used by the #100 debug overlay) reflects that.
         assert_eq!(
-            c.evict_to(3, 5, Direction::Forward, true, None),
+            c.evict_to(3, 5, None, Direction::Forward, true, None),
             2,
             "evicted count"
         );
@@ -316,7 +355,7 @@ mod tests {
         let mut c = FrameCache::new();
         // All ahead of playhead 5.
         fill(&mut c, Slot::A, &[5, 6, 7, 8]);
-        c.evict_to(2, 5, Direction::Forward, true, None);
+        c.evict_to(2, 5, None, Direction::Forward, true, None);
         // Keep playhead + nearest ahead; drop the furthest-ahead (8 then 7).
         assert!(c.contains(Slot::A, 5) && c.contains(Slot::A, 6));
         assert!(!c.contains(Slot::A, 7) && !c.contains(Slot::A, 8));
@@ -327,7 +366,7 @@ mod tests {
         let mut c = FrameCache::new();
         // Playhead 5, playing in reverse: 6,7 are "behind", 3,4 ahead.
         fill(&mut c, Slot::A, &[3, 4, 5, 6, 7]);
-        c.evict_to(3, 5, Direction::Reverse, true, None);
+        c.evict_to(3, 5, None, Direction::Reverse, true, None);
         assert!(c.contains(Slot::A, 5));
         assert!(
             c.contains(Slot::A, 3) && c.contains(Slot::A, 4),
@@ -344,7 +383,7 @@ mod tests {
         let mut c = FrameCache::new();
         // Playhead 5; not playing -> bidirectional distance.
         fill(&mut c, Slot::A, &[1, 4, 5, 6, 9]);
-        c.evict_to(3, 5, Direction::Forward, false, None);
+        c.evict_to(3, 5, None, Direction::Forward, false, None);
         // Furthest from 5 are 1 (dist 4) and 9 (dist 4); both dropped.
         assert!(c.contains(Slot::A, 5));
         assert!(
@@ -365,7 +404,7 @@ mod tests {
         c.insert(Slot::A, 4, frame()); // inserted earlier
         c.insert(Slot::A, 6, frame()); // inserted later
         c.get(Slot::A, 6); // touch 6 so 4 is least-recently-used
-        c.evict_to(2, 5, Direction::Forward, false, None);
+        c.evict_to(2, 5, None, Direction::Forward, false, None);
         assert!(c.contains(Slot::A, 6), "recently used survives the tie");
         assert!(!c.contains(Slot::A, 4), "LRU loses the tie");
     }
@@ -382,7 +421,7 @@ mod tests {
         // Loop [1,10], playhead 9 forward. Wrapped prefetch 1,2 has landed;
         // 7,8 were just shown. Ring distances from 9: 10→1, 1→2, 2→3, 7→8, 8→9.
         fill(&mut c, Slot::A, &[7, 8, 9, 10, 1, 2]);
-        c.evict_to(4, 9, Direction::Forward, true, Some((1, 10)));
+        c.evict_to(4, 9, None, Direction::Forward, true, Some((1, 10)));
         assert!(c.contains(Slot::A, 9), "playhead protected");
         assert!(
             c.contains(Slot::A, 10) && c.contains(Slot::A, 1) && c.contains(Slot::A, 2),
@@ -401,7 +440,7 @@ mod tests {
         let mut c = FrameCache::new();
         // Loop [1,10], playhead 2 reverse. Prefetch 1,10,9 (wrapping); 3,4 just shown.
         fill(&mut c, Slot::A, &[4, 3, 2, 1, 10, 9]);
-        c.evict_to(4, 2, Direction::Reverse, true, Some((1, 10)));
+        c.evict_to(4, 2, None, Direction::Reverse, true, Some((1, 10)));
         assert!(c.contains(Slot::A, 2), "playhead protected");
         assert!(
             c.contains(Slot::A, 1) && c.contains(Slot::A, 10) && c.contains(Slot::A, 9),
@@ -420,7 +459,7 @@ mod tests {
         let mut c = FrameCache::new();
         // Loop trimmed to [1,10]; frame 12 is a leftover from the old range.
         fill(&mut c, Slot::A, &[12, 8, 9, 10, 1]);
-        c.evict_to(4, 9, Direction::Forward, true, Some((1, 10)));
+        c.evict_to(4, 9, None, Direction::Forward, true, Some((1, 10)));
         assert!(
             !c.contains(Slot::A, 12),
             "out-of-range leftover evicted before any in-range frame"

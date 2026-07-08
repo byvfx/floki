@@ -103,6 +103,20 @@ pub fn advance(
     }
 }
 
+/// The slot-B frame number for locked-step A/B playback (#98): B is a *slaved*
+/// function of A's playhead, not an independent clock. B lines up **by position**
+/// — B advances by the same delta as A from A's in-point, offset onto B's own
+/// range, so two sequences that start on different frame numbers (A@1001, B@1)
+/// still play in step. Clamped to B's range (a shorter B holds its last frame
+/// while A keeps going). `b_range` is the inclusive `(min, max)` of the B
+/// sequence. Pure over numbers — a hole in B is handled by the caller (hold the
+/// previous B frame when `path_for` is `None`).
+#[must_use]
+pub fn map_b_frame(a_frame: u32, a_in: u32, b_range: (u32, u32)) -> u32 {
+    let delta = a_frame.saturating_sub(a_in);
+    b_range.0.saturating_add(delta).min(b_range.1)
+}
+
 /// Playback state attached to the app. Prefs (fps / loop / direction / pacing)
 /// persist; the runtime playhead, loaded sequence, clock anchor, and in-flight
 /// request do not (`#[serde(skip)]`) and reset on each open.
@@ -326,6 +340,27 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::time::Instant;
+
+    #[test]
+    fn map_b_frame_aligns_by_position() {
+        // Same-numbered ranges: B tracks A one-for-one from the in-point.
+        assert_eq!(map_b_frame(5, 1, (1, 10)), 5);
+        assert_eq!(map_b_frame(1, 1, (1, 10)), 1);
+        // Differently-numbered sequences line up by position, not by number:
+        // A@1001 (in 1001) ↔ B@1; A@1005 ↔ B@5.
+        assert_eq!(map_b_frame(1001, 1001, (1, 100)), 1);
+        assert_eq!(map_b_frame(1005, 1001, (1, 100)), 5);
+        // B in-point offset: B starts at 500, A's delta lands at 500+delta.
+        assert_eq!(map_b_frame(1003, 1001, (500, 600)), 502);
+        // A trimmed to start at 3: at A's in-point B sits at its own min.
+        assert_eq!(map_b_frame(3, 3, (10, 20)), 10);
+        assert_eq!(map_b_frame(6, 3, (10, 20)), 13);
+        // Shorter B clamps to its last frame while A keeps advancing.
+        assert_eq!(map_b_frame(50, 1, (1, 5)), 5);
+        assert_eq!(map_b_frame(5, 1, (1, 5)), 5);
+        // Degenerate single-frame B holds regardless of A.
+        assert_eq!(map_b_frame(42, 1, (7, 7)), 7);
+    }
 
     #[test]
     fn stop_resets_the_fps_measurement() {
