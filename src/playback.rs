@@ -25,6 +25,18 @@ pub enum Direction {
     Reverse,
 }
 
+impl Direction {
+    /// The other direction — the read-behind walk (#169) steps *against* play
+    /// with the same `advance` rule the clock uses.
+    #[must_use]
+    pub fn opposite(self) -> Self {
+        match self {
+            Self::Forward => Self::Reverse,
+            Self::Reverse => Self::Forward,
+        }
+    }
+}
+
 /// What happens when the playhead reaches the in/out boundary.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub enum LoopMode {
