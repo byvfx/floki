@@ -7,22 +7,40 @@
 //! - **P1** — the playhead frame, if it isn't resident (we fell behind).
 //! - **P2** — frames ahead in the play direction, nearest first, up to
 //!   `decode_ahead`, skipping anything already resident.
+//! - **P3** — the **read-behind window** (#169): up to `read_behind` frames just
+//!   *behind* the playhead, nearest first — so play-then-step-back (the most
+//!   common review gesture) hits cache. Strictly after the forward window: a
+//!   step-back hit must never cost forward readiness.
 //!
 //! (P0 — an explicit user seek — is handled by the app directly bumping the epoch
 //! and requesting the frame; it isn't part of the prefetch want-list.)
 //!
 //! Back-pressure is the cache budget: the caller passes
-//! `decode_ahead = min(configured, max_t1 - 1)`, so a want-list never asks for
-//! more than the T1 ring can hold (this ties #57 to #56). The decode-ahead worker
-//! that consumes this lands in Phase 4; Phase 3 ships it pure and tested.
+//! `decode_ahead + read_behind = min(configured, max_t1 - 1)` (split via
+//! [`read_behind`], OpenRV's `-lookback` model), so a want-list never asks for
+//! more than the T1 ring can hold (this ties #57 to #56) — the eviction policy
+//! (`FrameCache::pick_victim`) protects the same behind window it fetches, so
+//! the two never fight over the last slots.
 
 use std::collections::HashSet;
 
 use crate::playback::{Direction, LoopMode, advance};
 
+/// How much of a prefetch depth to reserve for the read-behind window (#169):
+/// a quarter, OpenRV's `-lookback` default ("percentage of the lookahead cache
+/// reserved for frames behind the playhead, default 25"). Zero below 4, so tiny
+/// caps (heavy full-res footage) spend everything on the forward window.
+#[must_use]
+pub fn read_behind(depth: usize) -> usize {
+    depth / 4
+}
+
 /// Ordered frame numbers to decode next (highest priority first), excluding any
 /// already in `resident`. At most `decode_ahead` prefetch frames follow the
-/// (optional) playhead frame.
+/// (optional) playhead frame, then at most `read_behind` frames behind it (#169).
+// The playback cursor plus the two window sizes are independent inputs; see
+// `next_want` for the same trade-off.
+#[allow(clippy::too_many_arguments)]
 #[must_use]
 pub fn want_list(
     playhead: u32,
@@ -32,6 +50,7 @@ pub fn want_list(
     mode: LoopMode,
     resident: &HashSet<u32>,
     decode_ahead: usize,
+    read_behind: usize,
 ) -> Vec<u32> {
     let mut wants = Vec::new();
 
@@ -52,6 +71,24 @@ pub fn want_list(
     for _ in 0..decode_ahead {
         let Some((next, next_dir)) = advance(frame, in_pt, out_pt, dir, mode) else {
             break; // Once reached the boundary.
+        };
+        frame = next;
+        dir = next_dir;
+        if frame != playhead && !resident.contains(&frame) && !wants.contains(&frame) {
+            wants.push(frame);
+        }
+    }
+
+    // P3: the read-behind window (#169) — up to `read_behind` positions walked
+    // *against* the play direction with the same step rule, so Loop wraps to the
+    // far end (matching the eviction ring distance, #140) and PingPong retraces
+    // the bounce — exactly the frames most recently shown. Nearest first;
+    // duplicates from a bounce revisiting the forward window are skipped.
+    let mut frame = playhead;
+    let mut dir = direction.opposite();
+    for _ in 0..read_behind {
+        let Some((next, next_dir)) = advance(frame, in_pt, out_pt, dir, mode) else {
+            break;
         };
         frame = next;
         dir = next_dir;
@@ -85,6 +122,7 @@ pub fn next_want(
     direction: Direction,
     mode: LoopMode,
     decode_ahead: usize,
+    read_behind: usize,
     is_resident: impl Fn(u32) -> bool,
     is_decodable: impl Fn(u32) -> bool,
 ) -> Option<u32> {
@@ -107,6 +145,22 @@ pub fn next_want(
             return Some(frame);
         }
     }
+    // P3: the read-behind window (#169) — only reached with the forward window
+    // fully satisfied. Same flipped walk as `want_list`; during steady play
+    // these frames were just displayed (resident), so this is free — it fetches
+    // only after a jump landed play mid-range with cold frames behind it.
+    let mut frame = playhead;
+    let mut dir = direction.opposite();
+    for _ in 0..read_behind {
+        let Some((next, next_dir)) = advance(frame, in_pt, out_pt, dir, mode) else {
+            break;
+        };
+        frame = next;
+        dir = next_dir;
+        if frame != playhead && !is_resident(frame) && is_decodable(frame) {
+            return Some(frame);
+        }
+    }
     None
 }
 
@@ -121,21 +175,21 @@ mod tests {
     #[test]
     fn playhead_comes_first_when_not_resident() {
         let r = resident(&[]);
-        let got = want_list(5, 1, 10, Direction::Forward, LoopMode::Loop, &r, 2);
+        let got = want_list(5, 1, 10, Direction::Forward, LoopMode::Loop, &r, 2, 0);
         assert_eq!(got, vec![5, 6, 7], "playhead, then prefetch ahead");
     }
 
     #[test]
     fn playhead_omitted_when_already_resident() {
         let r = resident(&[5]);
-        let got = want_list(5, 1, 10, Direction::Forward, LoopMode::Loop, &r, 2);
+        let got = want_list(5, 1, 10, Direction::Forward, LoopMode::Loop, &r, 2, 0);
         assert_eq!(got, vec![6, 7], "only prefetch ahead");
     }
 
     #[test]
     fn prefetches_in_reverse_direction() {
         let r = resident(&[5]);
-        let got = want_list(5, 1, 10, Direction::Reverse, LoopMode::Loop, &r, 3);
+        let got = want_list(5, 1, 10, Direction::Reverse, LoopMode::Loop, &r, 3, 0);
         assert_eq!(got, vec![4, 3, 2]);
     }
 
@@ -144,7 +198,7 @@ mod tests {
         let r = resident(&[5, 6, 8]);
         // Window = the next 3 positions (6, 7, 8); 6 and 8 are cached, so only 7
         // is wanted. The window does not reach past position 3 to 9/10.
-        let got = want_list(5, 1, 10, Direction::Forward, LoopMode::Loop, &r, 3);
+        let got = want_list(5, 1, 10, Direction::Forward, LoopMode::Loop, &r, 3, 0);
         assert_eq!(got, vec![7]);
     }
 
@@ -152,7 +206,7 @@ mod tests {
     fn loops_around_the_out_point() {
         let r = resident(&[3]);
         // Forward from 3 with out=3: wrap to in=1, then 2.
-        let got = want_list(3, 1, 3, Direction::Forward, LoopMode::Loop, &r, 5);
+        let got = want_list(3, 1, 3, Direction::Forward, LoopMode::Loop, &r, 5, 0);
         assert_eq!(got, vec![1, 2], "stops after covering the whole range once");
     }
 
@@ -160,7 +214,7 @@ mod tests {
     fn once_stops_at_the_boundary() {
         let r = resident(&[]);
         // Forward, Once, playhead at out point: only the playhead is wanted.
-        let got = want_list(10, 1, 10, Direction::Forward, LoopMode::Once, &r, 4);
+        let got = want_list(10, 1, 10, Direction::Forward, LoopMode::Once, &r, 4, 0);
         assert_eq!(got, vec![10]);
     }
 
@@ -169,7 +223,7 @@ mod tests {
         let r = resident(&[]);
         // Window of 3 positions from playhead 9: 10, (bounce to 9 = playhead,
         // skipped), 8. Plus the playhead itself (not resident) first.
-        let got = want_list(9, 1, 10, Direction::Forward, LoopMode::PingPong, &r, 3);
+        let got = want_list(9, 1, 10, Direction::Forward, LoopMode::PingPong, &r, 3, 0);
         assert_eq!(got, vec![9, 10, 8]);
     }
 
@@ -177,12 +231,12 @@ mod tests {
     fn decode_ahead_zero_yields_only_the_playhead() {
         let r = resident(&[]);
         assert_eq!(
-            want_list(5, 1, 10, Direction::Forward, LoopMode::Loop, &r, 0),
+            want_list(5, 1, 10, Direction::Forward, LoopMode::Loop, &r, 0, 0),
             vec![5]
         );
         // ...and nothing at all when the playhead is already resident.
         let r2 = resident(&[5]);
-        assert!(want_list(5, 1, 10, Direction::Forward, LoopMode::Loop, &r2, 0).is_empty());
+        assert!(want_list(5, 1, 10, Direction::Forward, LoopMode::Loop, &r2, 0, 0).is_empty());
     }
 
     // --- `next_want` (the allocation-free single-frame pump path) -------------
@@ -205,6 +259,7 @@ mod tests {
             dir,
             LoopMode::Loop,
             depth,
+            0,
             |f| set.contains(&f),
             |_| true,
         )
@@ -239,6 +294,7 @@ mod tests {
             Direction::Forward,
             LoopMode::Loop,
             4,
+            0,
             |f| resident_5.contains(&f),
             |f| f != 6, // 6 is a hole
         );
@@ -252,9 +308,73 @@ mod tests {
             Direction::Forward,
             LoopMode::Loop,
             4,
+            0,
             |f| r.contains(&f),
             |f| f != 5, // playhead is a hole
         );
         assert_eq!(got, Some(6));
+    }
+
+    // --- Read-behind window (#169) --------------------------------------------
+
+    #[test]
+    fn read_behind_reserves_a_quarter_of_the_depth() {
+        // OpenRV's -lookback model: 25%, zero below 4 so tiny caps stay forward.
+        assert_eq!(read_behind(16), 4);
+        assert_eq!(read_behind(8), 2);
+        assert_eq!(read_behind(3), 0);
+        assert_eq!(read_behind(0), 0);
+    }
+
+    #[test]
+    fn want_list_appends_the_read_behind_window_last() {
+        let r = resident(&[]);
+        // P1 playhead, P2 ahead window, then P3 behind — nearest first.
+        let got = want_list(5, 1, 10, Direction::Forward, LoopMode::Loop, &r, 2, 2);
+        assert_eq!(got, vec![5, 6, 7, 4, 3]);
+        // Reverse play mirrors: "behind" is the higher frames.
+        let got = want_list(5, 1, 10, Direction::Reverse, LoopMode::Loop, &r, 2, 2);
+        assert_eq!(got, vec![5, 4, 3, 6, 7]);
+    }
+
+    #[test]
+    fn read_behind_wraps_around_the_loop() {
+        // Playhead at the in point: "behind" wraps to the out point, matching
+        // the eviction ring distance (#140/#169).
+        let r = resident(&[1]);
+        let got = want_list(1, 1, 10, Direction::Forward, LoopMode::Loop, &r, 0, 2);
+        assert_eq!(got, vec![10, 9]);
+    }
+
+    #[test]
+    fn next_want_fetches_behind_only_when_ahead_is_satisfied() {
+        // Forward window fully resident → the nearest cold behind frame is next.
+        let set = resident(&[5, 6, 7]);
+        let got = next_want(
+            5,
+            1,
+            10,
+            Direction::Forward,
+            LoopMode::Loop,
+            2,
+            2,
+            |f| set.contains(&f),
+            |_| true,
+        );
+        assert_eq!(got, Some(4));
+        // A missing ahead frame always outranks the behind window.
+        let set = resident(&[5, 6]);
+        let got = next_want(
+            5,
+            1,
+            10,
+            Direction::Forward,
+            LoopMode::Loop,
+            2,
+            2,
+            |f| set.contains(&f),
+            |_| true,
+        );
+        assert_eq!(got, Some(7));
     }
 }

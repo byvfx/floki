@@ -1313,12 +1313,32 @@ impl ExrApp {
         self.pump_decode();
     }
 
-    /// How many frames to decode ahead of the playhead — bounded by the T1 ring
-    /// (`decode_ahead = min(configured, max_t1 − 1)`, tying #57 back-pressure to
+    /// The total prefetch window around the playhead (ahead + the #169
+    /// read-behind reservation, split in [`Self::next_want_slot`]) — bounded by
+    /// the T1 ring (`min(configured, max_t1 − 1)`, tying #57 back-pressure to
     /// the #56 budget) and a hard cap so a huge sequence can't queue the world.
     fn prefetch_depth(&self) -> usize {
         const MAX_PREFETCH: usize = 16;
         self.frame_cache_cap.saturating_sub(1).min(MAX_PREFETCH)
+    }
+
+    /// The read-behind reservation (#169) T1 eviction must protect — mirrors the
+    /// decode pump's slot-A depth exactly (`pump_decode`'s playing depth,
+    /// including the locked-step halving), so the evictor reserves precisely the
+    /// window the scheduler maintains: a larger value would protect frames the
+    /// pump can't fit and the two would churn. Zero while not playing —
+    /// paused/scrub eviction is bidirectional-distance and needs no carve-out.
+    fn read_behind_depth(&self) -> usize {
+        if !self.playback.is_playing() {
+            return 0;
+        }
+        let full = self.prefetch_depth();
+        let depth = if self.sequence_b.is_some() {
+            full / 2
+        } else {
+            full
+        };
+        crate::scheduler::read_behind(depth)
     }
 
     /// The user-assigned T1 RAM budget in bytes, or `None` for "auto" (the live
@@ -1472,6 +1492,11 @@ impl ExrApp {
     /// scheduler in B's own frame space (its range as in/out, its playhead),
     /// with A's direction / loop.
     fn next_want_slot(&self, slot: crate::cache::Slot, depth: usize) -> Option<u32> {
+        // Split the window RV-style (#169): ~25% reserved behind the playhead,
+        // the rest ahead — so forward window + behind reservation together never
+        // over-ask the ring (the #57 back-pressure contract holds for the sum).
+        let behind = crate::scheduler::read_behind(depth);
+        let ahead = depth - behind;
         match slot {
             crate::cache::Slot::A => {
                 let pending = self.playback.pending;
@@ -1481,7 +1506,8 @@ impl ExrApp {
                     self.playback.out_point,
                     self.playback.direction,
                     self.playback.loop_mode,
-                    depth,
+                    ahead,
+                    behind,
                     |f| self.frame_cache.contains(crate::cache::Slot::A, f) && Some(f) != pending,
                     |f| self.playback.frame_path(f).is_some(),
                 )
@@ -1495,7 +1521,8 @@ impl ExrApp {
                     seq_b.range.1,
                     self.playback.direction,
                     self.playback.loop_mode,
-                    depth,
+                    ahead,
+                    behind,
                     |f| self.frame_cache.contains(crate::cache::Slot::B, f) && Some(f) != pending,
                     |f| seq_b.path_for(f).is_some(),
                 )
@@ -1578,7 +1605,9 @@ impl ExrApp {
         };
         let depth = self.viewer.t2_cap().saturating_sub(1);
         // Empty resident set -> want_list returns the playhead + the window ahead;
-        // we then keep only frames actually cached in T1.
+        // we then keep only frames actually cached in T1. No read-behind here
+        // (#169): the T2 VRAM ring is tiny (≤ 8) and strictly forward — behind
+        // textures would displace the upcoming frames it exists to have ready.
         let wants = crate::scheduler::want_list(
             self.playback.current_frame,
             self.playback.in_point,
@@ -1587,6 +1616,7 @@ impl ExrApp {
             self.playback.loop_mode,
             &std::collections::HashSet::new(),
             depth,
+            0,
         );
         self.last_t2_pump = Some(self.playback.current_frame);
         // Budget by time, not a fixed count (#142 U4): one 4K build is 20-60ms on
@@ -2143,6 +2173,7 @@ impl ExrApp {
                     self.playback.direction,
                     self.playback.is_playing(),
                     loop_wrap,
+                    self.read_behind_depth(),
                 ) as u64);
             }
         }
@@ -2384,6 +2415,7 @@ impl ExrApp {
                             self.playback.direction,
                             self.playback.is_playing(),
                             loop_wrap,
+                            self.read_behind_depth(),
                         ) as u64);
                     // Show it only if it's the frame that slot's playhead awaits;
                     // a prefetched frame ahead of the playhead is just cached.

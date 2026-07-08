@@ -71,6 +71,12 @@ VRAM; only the *active* frame needs CPU for sampling).
   *around* the loop (distance in the play direction modulo the in/out span, #140), so
   prefetch wrapped past the out point ranks just-ahead instead of furthest-behind; trim
   leftovers outside the in/out range evict first.
+- **Read-behind window (#169):** ~25% of the prefetch depth (`scheduler::read_behind`,
+  OpenRV's `-lookback` model) is reserved for the frames *just shown*: within the window
+  they rank by plain backward distance instead of the behind bias, so play-then-step-back
+  is a cache hit. The scheduler fetches the same window (P3, after the forward window) and
+  the pump's forward depth shrinks by the reservation, so fetch and eviction never fight
+  over the last slots.
 - **Scrub (random):** weight by absolute distance from the playhead (bidirectional).
 
 ## INV-SAMPLE — the single invariant everything protects
