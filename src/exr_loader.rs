@@ -347,7 +347,9 @@ impl ExrData {
 fn map_file(path: &Path) -> Option<memmap2::Mmap> {
     let file = std::fs::File::open(path).ok()?;
     let map = unsafe { memmap2::Mmap::map(&file) }.ok()?;
-    // Best-effort hint; ignored where unsupported.
+    // Best-effort readahead hint; `advise` (madvise) is Unix-only in memmap2 —
+    // Windows' own mapped-file readahead heuristics apply there.
+    #[cfg(unix)]
     let _ = map.advise(memmap2::Advice::Sequential);
     Some(map)
 }
