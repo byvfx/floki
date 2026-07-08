@@ -1235,6 +1235,14 @@ impl ExrApp {
     /// rewritten — B seq frames supersede by the shared epoch (like A), so the
     /// B-open path keeps its stable path-key.
     fn request_b_frame(&mut self, frame: u32) {
+        // B is slaved to A, so it can move to a new frame while a previous B
+        // decode is still awaited — the old `loading_b` is now stale, and its
+        // frame (if it lands) won't match `current_frame_b`, so nothing else would
+        // clear it. Reset it on every B move: `submit_seq` re-sets it if this frame
+        // is submitted, and `apply_load_result` clears it when B's current frame
+        // lands. Without this, mapping B onto a hole (or advancing past an in-flight
+        // B frame) latches `loading_b` and gates `pump_decode` forever (freeze).
+        self.loading_b = false;
         let is_hole = self
             .sequence_b
             .as_ref()
@@ -1247,7 +1255,6 @@ impl ExrApp {
         }
         if let Some(data) = self.frame_cache.get(crate::cache::Slot::B, frame) {
             let needs_full = !self.playback.is_playing() && !self.scrub_active && data.beauty_only;
-            self.loading_b = false;
             self.swap_b_frame(data);
             self.pending_b = if needs_full { Some(frame) } else { None };
         } else {
@@ -6692,6 +6699,43 @@ mod tests {
             !app.frame_cache.contains(crate::cache::Slot::A, 2),
             "not misfiled into Slot::A"
         );
+    }
+
+    #[test]
+    fn b_move_to_hole_clears_loading_b_so_pump_is_not_gated() {
+        // #98 regression (Copilot): B is slaved to A, so it can move to a new frame
+        // — or a hole — while a previous B decode is still awaited. If `loading_b`
+        // isn't reset on the move, its stale-frame decode never matches
+        // `current_frame_b`, `loading_b` latches true, and `pump_decode` is gated
+        // forever → playback freeze.
+        let (_adir, a) = write_sequence(4);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&a[0]);
+        app.frame_cache_cap = 8;
+
+        // A B sequence with a hole at frame 3 (files 1, 2, 4).
+        let bdir = tempfile::tempdir().unwrap();
+        for n in [1u32, 2, 4] {
+            write_rgba_exr(&bdir.path().join(format!("bref.{n:04}.exr")));
+        }
+        let b1 = bdir.path().join("bref.0001.exr");
+        app.exr_data_b = Some(std::sync::Arc::new(ExrData::load(&b1).unwrap()));
+        app.loaded_file_b = Some(b1.clone());
+        app.detect_sequence_b(&b1);
+        assert!(
+            app.sequence_b
+                .as_ref()
+                .is_some_and(|s| s.holes.contains(&3)),
+            "B has a hole at 3"
+        );
+
+        // Simulate B awaiting a frame (a decode in flight), then move B onto the
+        // hole — as a locked-step advance would.
+        app.loading_b = true;
+        app.pending_b = Some(2);
+        app.request_b_frame(3);
+        assert!(!app.loading_b, "hole clears loading_b (pump stays ungated)");
+        assert_eq!(app.pending_b, None, "no B frame awaited on a hole");
     }
 
     #[test]
