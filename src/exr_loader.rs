@@ -87,13 +87,16 @@ impl ExrData {
         // path; it can't catch a rayon-worker panic, but miniz_oxide removes the
         // one decompression panic that used to abort the app.
         let read_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            read()
+            let builder = read()
                 .no_deep_data()
                 .largest_resolution_level()
                 .all_channels()
                 .all_layers()
-                .all_attributes()
-                .from_file(path_ref)
+                .all_attributes();
+            match map_file(path_ref) {
+                Some(map) => builder.from_buffered(std::io::Cursor::new(&map[..])),
+                None => builder.from_file(path_ref),
+            }
         }))
         .map_err(|_| DECODE_PANIC_MSG.to_string())?;
 
@@ -124,13 +127,16 @@ impl ExrData {
         // one-element layer list the rest of the app expects, so beauty-only and
         // full frames are the same `ExrData` shape downstream.
         let read_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            read()
+            let builder = read()
                 .no_deep_data()
                 .largest_resolution_level()
                 .all_channels()
                 .first_valid_layer()
-                .all_attributes()
-                .from_file(path_ref)
+                .all_attributes();
+            match map_file(path_ref) {
+                Some(map) => builder.from_buffered(std::io::Cursor::new(&map[..])),
+                None => builder.from_file(path_ref),
+            }
         }))
         .map_err(|_| DECODE_PANIC_MSG.to_string())?;
 
@@ -317,6 +323,33 @@ impl ExrData {
             })
             .fold(0usize, usize::saturating_add)
     }
+}
+
+/// Memory-map `path` for zero-copy decode (#164). `from_file` streams through a
+/// `BufReader`, paying a copy per read syscall; mapping lets the parse pull
+/// straight from the page cache — which the prefetch warmer
+/// (`crate::prefetch`) has ideally already filled from a background thread, so
+/// the decode's "read" is a pointer walk over warm pages. Cold files still
+/// win: `Advice::Sequential` turns page faults into kernel readahead. This is
+/// what OpenRV ships as its EXR default ("Memory Map. Based on performance
+/// tuning") and how tlRender/mrv2 read EXR (mmap'd `Imf::IStream`s).
+///
+/// Returns `None` when the file can't be opened or mapped (empty file, exotic
+/// filesystem) — callers fall back to the streaming `from_file` path, which
+/// also produces the friendlier open-error messages.
+///
+/// Safety: the map is read-only and private. The documented risk is another
+/// process *truncating* the file mid-parse (SIGBUS). Renderers conventionally
+/// write-to-temp-then-rename — the mapped (old) inode stays valid — and the
+/// render-watch (#101) invalidates re-rendered frames; an in-place writer
+/// truncating during the parse remains a theoretical abort, the same trade
+/// OpenRV and tlRender accept for their mmap'd EXR reads.
+fn map_file(path: &Path) -> Option<memmap2::Mmap> {
+    let file = std::fs::File::open(path).ok()?;
+    let map = unsafe { memmap2::Mmap::map(&file) }.ok()?;
+    // Best-effort hint; ignored where unsupported.
+    let _ = map.advise(memmap2::Advice::Sequential);
+    Some(map)
 }
 
 /// Map an `exr` read error to a human-readable string, with a friendlier

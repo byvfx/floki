@@ -29,6 +29,9 @@ mod layer;
 mod playback;
 // Pure pixel access over decoded EXR channels + thumbnail decimation (#153).
 mod pixels;
+// Read-ahead file warmer (#164) — overlaps the next frame's file read with the
+// current decode via the OS page cache.
+mod prefetch;
 mod proxy;
 mod render_math;
 // Resolves the A/B viewer state into a render program via the layer model (#114).
