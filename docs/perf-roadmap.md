@@ -177,6 +177,8 @@ art is manual pre-rendering (RVIO remasters, Nuke proxy files, OIIO `maketx`
 | [#161](https://github.com/byvfx/floki/pull/161) | [#151](https://github.com/byvfx/floki/issues/151) | Single-owner viewer prefs (removed the duplicate-state stutter source) |
 | [#162](https://github.com/byvfx/floki/pull/162) | [#98](https://github.com/byvfx/floki/issues/98) Ph.1 | Locked-step A/B playback engine — B slaved to A, both play in wipe/compare |
 | [#163](https://github.com/byvfx/floki/pull/163) | [#94](https://github.com/byvfx/floki/issues/94) Ph.1 | In-RAM scrub proxies — geometry-preserving post-decode `downsampled()`, so the range fits RAM and replays smoothly |
+| [#174](https://github.com/byvfx/floki/pull/174) | [#170](https://github.com/byvfx/floki/issues/170) | f16 proxies — `downsampled()` keeps the source bit-depth, halving proxy RAM and restoring the `Rgba16Float` upload path |
+| [#175](https://github.com/byvfx/floki/pull/175) | [#169](https://github.com/byvfx/floki/issues/169) | Read-behind window — ~25% of the prefetch depth reserved behind the playhead (scheduler P3 + eviction carve-out, RV `-lookback` model), so play-then-step-back hits cache |
 
 The proxies (#94/#163) are the footprint lever #1 in action; the rest of this
 roadmap is the remaining levers.
@@ -199,19 +201,7 @@ platforms ("Based on performance tuning"), and tlRender/mrv2 read EXR through
 mmap'd `Imf::IStream`s. Fallback/alternative: a byte-prefetch ring filled by a
 dedicated prefetch thread + a decode-from-bytes path (`exr` `from_buffered`).
 
-### 2. Prefetch read-behind window — [#169](https://github.com/byvfx/floki/issues/169)
-*Lever: pipelining (the other direction).* The scheduler (`src/scheduler.rs`)
-only ever walks **ahead** in the play direction, and `pick_victim` evicts
-behind-frames *first* during play — so play-then-step-back, the most common
-review gesture there is, is a guaranteed cache miss on exactly the frame the
-user just watched. Every surveyed player keeps a behind window: OpenRV reserves
-**25% of the look-ahead cache** for frames behind the playhead (`-lookback`),
-tlRender keeps `readBehind = 0.5 s`, xStudio starts its prefetch 0.5 s behind
-the playhead ("in case the user stops playback and steps back a couple of
-frames"). Small scheduler + eviction-rank change, outsized review-feel payoff.
-Companion to #164.
-
-### 3. Persistent on-disk proxy cache — [#165](https://github.com/byvfx/floki/issues/165)
+### 2. Persistent on-disk proxy cache — [#165](https://github.com/byvfx/floki/issues/165)
 *Lever: amortize decode.* Persist the downsampled proxies to disk (keyed
 path+mtime+size+proxy-px) so the first-touch decode is paid **once, ever** — a
 repeat pass or a later session loads proxies from disk instead of re-decoding.
@@ -226,7 +216,7 @@ resolution the bandwidth is trivial (1024-wide RGBA f16 ≈ 4.4 MB/frame ≈
 Pranckevičius 2025). Avoid DWA for the cache itself — compact but the slowest
 decode of the options (~60 ms @ 8K with 16 threads, OpenEXR #1755).
 
-### 4. Faster first-pass decode — [#33](https://github.com/byvfx/floki/issues/33)
+### 3. Faster first-pass decode — [#33](https://github.com/byvfx/floki/issues/33)
 *Lever: throughput (the one place it helps).* Speed up `ExrData::load` itself:
 lazy per-layer/channel decode (only decode what's shown), confirm the parallel
 decompression is fully engaged, proxy first-paint. This is the only decode-speed
@@ -244,7 +234,7 @@ benchmark exists — bench the fork against `openexr-sys`/OpenEXRCore on our own
 corpus before any rewrite (OpenEXR 3.3's Core-backed rewrite initially
 *regressed* DWA decode 12–17%, OpenEXR #1915 — Core is not automatically faster).
 
-### 5. B-side T2 GPU ring — [#166](https://github.com/byvfx/floki/issues/166) (#98 Phase 2)
+### 4. B-side T2 GPU ring — [#166](https://github.com/byvfx/floki/issues/166) (#98 Phase 2)
 *Lever: footprint/pipelining on the GPU side.* B currently uploads a texture
 per-frame (`build_layer_texture`) while A renders from the pre-uploaded T2 VRAM
 ring, so locked-step B stutters on heavy footage. Add a second T2 ring for slot B
@@ -253,7 +243,7 @@ Precedents: DJV 2.x divides its cache budget evenly across open files; tlRender
 counts all A/B-compare timelines into its bytes-per-frame; xStudio jitters
 per-playhead prefetch refresh so compared sources don't re-request in lockstep.
 
-### 6. Color-depth cache packing — [#167](https://github.com/byvfx/floki/issues/167)
+### 5. Color-depth cache packing — [#167](https://github.com/byvfx/floki/issues/167)
 *Lever: footprint (second axis).* Pack T1 cache entries at reduced bit-depth
 (floki already caches at f16; explore f16 → 8-bit/packed-half behind a quality
 toggle) → ~2× more frames in the same RAM, multiplying with #94 resolution
@@ -271,13 +261,13 @@ quick fix below.
 
 Smaller than the ranked levers, filed as their own issues:
 
-- **f16 proxy packing — [#170](https://github.com/byvfx/floki/issues/170).** `ExrData::downsampled()` emits **F32**
-  buffers (`exr_loader.rs`), so proxies from f16 sources are 2× bigger than
-  needed *and* defeat the T2 fast path — `build_layer_texture` only picks
-  `Rgba16Float` when all channels are F16, so F32 proxies upload as
-  `Rgba32Float` at 2× VRAM + bandwidth. Accumulate the box filter in f32, store
-  f16: proxy RAM halves and the f16 upload path comes back. Effectively the
-  first slice of #167, nearly free.
+- **f16 proxy packing — [#170](https://github.com/byvfx/floki/issues/170),
+  shipped in [#174](https://github.com/byvfx/floki/pull/174).**
+  `ExrData::downsampled()` emitted **F32** buffers, so proxies from f16 sources
+  were 2× bigger than needed *and* defeated the T2 fast path
+  (`build_layer_texture` only picks `Rgba16Float` when all channels are F16).
+  Now the box filter accumulates in f32 and stores at the source depth — proxy
+  RAM halved, f16 upload path restored. Was the first slice of #167.
 - **Decode-buffer reuse pool — [#171](https://github.com/byvfx/floki/issues/171).** floki allocates a fresh buffer per
   decode (~178 MB full-res, or proxy-size); at playback rates the allocator
   churn + page-zeroing is real hot-loop cost. xStudio keeps a 0.5 GB
