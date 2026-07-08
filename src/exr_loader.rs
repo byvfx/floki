@@ -163,9 +163,12 @@ impl ExrData {
     /// layer's `attributes` (incl. `layer_position`) are kept, and the original
     /// (full) layer size is recorded as [`Self::display_size`] — so the viewport
     /// frames it exactly like the full frame (`viewer.rs:2323`); only the pixel
-    /// buffers (→ the GPU texture) shrink and upscale. Output channels are `F32`.
-    /// Flagged `proxy`. (Single-layer in practice — the caller downsamples a
-    /// `load_beauty` result.)
+    /// buffers (→ the GPU texture) shrink and upscale. Output channels keep the
+    /// source bit-depth for `F16` (#170) — half the proxy RAM, and an all-f16
+    /// layer stays on the `Rgba16Float` upload path (`build_layer_texture`) —
+    /// while `F32`/`U32` sources land as `F32` (the filter accumulates in f32
+    /// either way). Flagged `proxy`. (Single-layer in practice — the caller
+    /// downsamples a `load_beauty` result.)
     #[must_use]
     pub fn downsampled(&self, max_dim: usize) -> Self {
         let mut layers: smallvec::SmallVec<[Layer<AnyChannels<FlatSamples>>; 2]> =
@@ -206,7 +209,18 @@ impl ExrData {
                         out[py * dw + px] = acc / n.max(1) as f32;
                     }
                 }
-                chans.push(AnyChannel::new(ch.name.clone(), FlatSamples::F32(out)));
+                // Store at the source depth for f16 (#170): the accumulation
+                // above already filtered at f32 precision, and rounding the
+                // result back to half loses nothing the source ever had. U32
+                // stays F32 — a box-filtered ID channel is meaningless either
+                // way, and proxies are never a sampling source.
+                let samples = match &ch.sample_data {
+                    FlatSamples::F16(_) => {
+                        FlatSamples::F16(out.iter().map(|&v| f16::from_f32(v)).collect())
+                    }
+                    FlatSamples::F32(_) | FlatSamples::U32(_) => FlatSamples::F32(out),
+                };
+                chans.push(AnyChannel::new(ch.name.clone(), samples));
             }
             layers.push(Layer::new(
                 (dw, dh),
@@ -1059,6 +1073,63 @@ mod tests {
         // Framing reports the FULL size, while the pixel buffer is downsampled.
         assert_eq!(proxy.logical_size(0), Some((16, 200)));
         assert!(proxy.image.layer_data[0].size.1 < 200, "buffer shrank");
+    }
+
+    #[test]
+    fn downsampled_preserves_f16_bit_depth() {
+        // #170: an f16 source channel must stay f16 through the proxy downsample
+        // — half the proxy RAM, and an all-f16 layer keeps the `Rgba16Float`
+        // upload path — while an f32 channel stays f32. Previously every proxy
+        // channel came out F32, doubling both.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("mixed_depth.exr");
+        // 64×64, R/G/A half + B float; max_dim 16 → factor 4 → exactly 16×16.
+        write_typed_exr(
+            &p,
+            64,
+            64,
+            &[("R", true), ("G", true), ("B", false), ("A", true)],
+        );
+        let full = ExrData::load(&p).unwrap();
+        let proxy = full.downsampled(16);
+
+        let full_chans = &full.image.layer_data[0].channel_data.list;
+        let proxy_chans = &proxy.image.layer_data[0].channel_data.list;
+        assert_eq!(full_chans.len(), proxy_chans.len());
+        for (src, out) in full_chans.iter().zip(proxy_chans) {
+            assert_eq!(src.name, out.name, "channel order preserved by sort");
+            // Depth matches the source, and the constant 0.5 fixture survives
+            // the filter + (for halves) the f32→f16 round-trip exactly.
+            match (&src.sample_data, &out.sample_data) {
+                (FlatSamples::F16(_), FlatSamples::F16(s)) => {
+                    assert_eq!(s[0].to_f32(), 0.5, "f16 {} value intact", src.name);
+                }
+                (FlatSamples::F32(_), FlatSamples::F32(s)) => {
+                    assert_eq!(s[0], 0.5, "f32 {} value intact", src.name);
+                }
+                _ => panic!("proxy channel {} changed bit depth", src.name),
+            }
+        }
+
+        // The footprint win is exact: 3 half channels (16×16×2B) + 1 float
+        // channel (16×16×4B) = 2560, vs 4096 if everything widened to F32.
+        assert_eq!(proxy.approx_bytes(), 3 * 256 * 2 + 256 * 4);
+
+        // An all-f16 source must produce a proxy that still satisfies the
+        // `Rgba16Float` upload gate (`all_channels_f16`, #142/#170).
+        let p2 = dir.path().join("all_half.exr");
+        write_typed_exr(
+            &p2,
+            64,
+            64,
+            &[("R", true), ("G", true), ("B", true), ("A", true)],
+        );
+        let proxy2 = ExrData::load(&p2).unwrap().downsampled(16);
+        let (_, r, g, b, a) = proxy2.logical_channels(0).unwrap();
+        assert!(
+            crate::pixels::all_channels_f16([r, g, b, a]),
+            "all-f16 source proxy keeps the f16 upload path"
+        );
     }
 
     // --- Beauty-only decode (#56, hardening step 3) --------------------------
