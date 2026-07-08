@@ -27,6 +27,19 @@ pub struct ExrData {
     /// not a valid sampling source — `app.rs` re-decodes it in full on settle so
     /// the readout + AOV switcher see every channel (INV-SAMPLE, #7).
     pub beauty_only: bool,
+    /// True when this is a **downsampled scrub proxy** (#94), built by
+    /// [`ExrData::load_proxy`] — a normal decode box-filtered down ([`Self::downsampled`])
+    /// — for cheap playback of heavy footage. Implies `beauty_only` (so settle-to-full
+    /// already re-decodes it); the distinct flag lets the cache budget size off the
+    /// tiny proxy bytes so hundreds of frames fit, and marks it in the debug overlay.
+    pub proxy: bool,
+    /// For a **proxy** (#94), the *full-resolution* display dimensions — the pixel
+    /// buffers are downsampled, but the viewport must frame the image at full size
+    /// (and preserve zoom/pan across the proxy↔full swap), or a tiny proxy would
+    /// render tiny. [`Self::logical_size`] returns this when set; the texture is
+    /// still built from the small buffers (and upscaled). `None` for real frames,
+    /// where the buffer dims *are* the display dims.
+    pub display_size: Option<(usize, usize)>,
 }
 
 /// A displayable "layer" (render pass) derived from grouping a physical EXR
@@ -81,7 +94,7 @@ impl ExrData {
         .map_err(|_| DECODE_PANIC_MSG.to_string())?;
 
         let image = map_read_err(read_result, path_ref)?;
-        Ok(Self::from_image(image, false))
+        Ok(Self::from_image(image, false, false))
     }
 
     /// Decode only the **first valid layer** of an EXR — the beauty/main pass by
@@ -122,13 +135,95 @@ impl ExrData {
             attributes: single.attributes,
             layer_data: smallvec::smallvec![single.layer_data],
         };
-        Ok(Self::from_image(image, true))
+        Ok(Self::from_image(image, true, false))
+    }
+
+    /// Decode a **downsampled scrub proxy** (#94), OpenRV "region cache" style: a
+    /// normal beauty decode, then box-filtered down to `<= max_dim` on the long
+    /// side ([`Self::downsampled`]). The full decode keeps the EXR
+    /// display/data-window **geometry** correct — the reason this replaced the old
+    /// fast-read, which flattened it and mis-positioned tight-data-window renders.
+    /// Only the pixel buffers shrink, so heavy footage **fits** in RAM and
+    /// replays/loops/scrubs play smooth from cache, in every compare mode. Flagged
+    /// `proxy` (and `beauty_only`) so settle re-decodes full. It does *not* cut the
+    /// first decode — a heavy frame still decodes once, then downsamples in.
+    ///
+    /// # Errors
+    /// Same contract as [`Self::load_beauty`].
+    pub fn load_proxy(path: impl AsRef<Path>, max_dim: usize) -> std::result::Result<Self, String> {
+        Ok(Self::load_beauty(path)?.downsampled(max_dim))
+    }
+
+    /// Box-filter this frame down so its long side is `<= max_dim` (#94). Preserves
+    /// the EXR geometry — `image.attributes` (incl. `display_window`) and each
+    /// layer's `attributes` (incl. `layer_position`) are kept, and the original
+    /// (full) layer size is recorded as [`Self::display_size`] — so the viewport
+    /// frames it exactly like the full frame (`viewer.rs:2323`); only the pixel
+    /// buffers (→ the GPU texture) shrink and upscale. Output channels are `F32`.
+    /// Flagged `proxy`. (Single-layer in practice — the caller downsamples a
+    /// `load_beauty` result.)
+    #[must_use]
+    pub fn downsampled(&self, max_dim: usize) -> Self {
+        let mut layers: smallvec::SmallVec<[Layer<AnyChannels<FlatSamples>>; 2]> =
+            smallvec::SmallVec::new();
+        // The displayed (first/beauty) layer's full data-window size drives framing.
+        let mut display_size = None;
+        for layer in &self.image.layer_data {
+            let (fw, fh) = (layer.size.0, layer.size.1);
+            let long = fw.max(fh);
+            let factor = if long == 0 || long <= max_dim {
+                1
+            } else {
+                long.div_ceil(max_dim.max(1))
+            };
+            let dw = fw.div_ceil(factor).max(1);
+            let dh = fh.div_ceil(factor).max(1);
+            display_size.get_or_insert((fw, fh));
+
+            let mut chans: smallvec::SmallVec<[AnyChannel<FlatSamples>; 4]> =
+                smallvec::SmallVec::new();
+            for ch in &layer.channel_data.list {
+                // Box-filter: average each `factor × factor` block (clamped to the
+                // edge) into one output sample. Read via `sample_channel` so the
+                // source's F16/F32/U32 type is handled uniformly.
+                let mut out = vec![0.0f32; dw * dh];
+                for py in 0..dh {
+                    for px in 0..dw {
+                        let (x0, y0) = (px * factor, py * factor);
+                        let (x1, y1) = (((px + 1) * factor).min(fw), ((py + 1) * factor).min(fh));
+                        let mut acc = 0.0f32;
+                        let mut n = 0u32;
+                        for y in y0..y1 {
+                            for x in x0..x1 {
+                                acc += crate::pixels::sample_channel(Some(ch), x, y, fw);
+                                n += 1;
+                            }
+                        }
+                        out[py * dw + px] = acc / n.max(1) as f32;
+                    }
+                }
+                chans.push(AnyChannel::new(ch.name.clone(), FlatSamples::F32(out)));
+            }
+            layers.push(Layer::new(
+                (dw, dh),
+                layer.attributes.clone(), // preserves layer_position
+                layer.encoding,
+                AnyChannels::sort(chans),
+            ));
+        }
+        let image = FlatImage {
+            attributes: self.image.attributes.clone(), // preserves display_window
+            layer_data: layers,
+        };
+        let mut data = Self::from_image(image, self.beauty_only, true);
+        data.display_size = display_size;
+        data
     }
 
     /// Build an [`ExrData`] from a decoded image: regroup channels into logical
-    /// layers and precompute the status-bar string. Shared by [`Self::load`] and
-    /// [`Self::load_beauty`].
-    fn from_image(image: FlatImage, beauty_only: bool) -> Self {
+    /// layers and precompute the status-bar string. Shared by [`Self::load`],
+    /// [`Self::load_beauty`], and [`Self::load_proxy`].
+    fn from_image(image: FlatImage, beauty_only: bool, proxy: bool) -> Self {
         let logical_layers = build_logical_layers(&image);
         let channels_str = build_channels_str(&logical_layers);
         Self {
@@ -136,13 +231,23 @@ impl ExrData {
             logical_layers,
             channels_str,
             beauty_only,
+            proxy,
+            display_size: None,
         }
     }
 
-    /// `(width, height)` of the physical layer backing the given logical layer.
+    /// `(width, height)` of the given logical layer **for display/framing**. For a
+    /// proxy (#94) this is the full-res [`Self::display_size`] (so the viewport
+    /// frames it at full size and the small texture upscales); otherwise it's the
+    /// physical layer's pixel dims. Note: texture packing reads the real buffer
+    /// dims via [`Self::logical_channels`] (`layer.size`) directly, so it is
+    /// unaffected by this override.
     #[must_use]
     pub fn logical_size(&self, idx: usize) -> Option<(usize, usize)> {
         let ll = self.logical_layers.get(idx)?;
+        if let Some(ds) = self.display_size {
+            return Some(ds);
+        }
         let layer = self.image.layer_data.get(ll.physical_index)?;
         Some((layer.size.0, layer.size.1))
     }
@@ -843,6 +948,113 @@ mod tests {
             &[("R", true), ("G", true), ("B", false), ("A", false)],
         );
         assert_eq!(ExrData::load(&p).unwrap().approx_bytes(), 16 + 32);
+    }
+
+    // --- Scrub proxy (#94) ---------------------------------------------------
+
+    /// Write a tall **uncompressed** RGBA EXR (1 scanline per block) so the
+    /// fast-read proxy has enough blocks to subsample (`block_stride >= 2`).
+    fn write_tall_rgba(path: &Path, w: usize, h: usize) {
+        let mut list = smallvec::SmallVec::new();
+        for name in ["R", "G", "B", "A"] {
+            list.push(AnyChannel::new(
+                Text::from(name),
+                FlatSamples::F32(vec![0.5; w * h]),
+            ));
+        }
+        let layer = Layer::new(
+            (w, h),
+            LayerAttributes::default(),
+            Encoding::UNCOMPRESSED,
+            AnyChannels::sort(list),
+        );
+        Image::from_layer(layer)
+            .write()
+            .to_file(path)
+            .expect("write tall exr fixture");
+    }
+
+    #[test]
+    fn load_proxy_builds_a_tiny_beauty_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("tall.exr");
+        write_tall_rgba(&p, 16, 200); // uncompressed → 200 blocks
+
+        let full = ExrData::load(&p).unwrap();
+        let proxy = ExrData::load_proxy(&p, 48).expect("proxy for a tall image");
+
+        assert!(proxy.proxy, "flagged as a proxy");
+        assert!(
+            proxy.beauty_only,
+            "proxy implies beauty-only so settle re-decodes it full (#94/#7)"
+        );
+        assert_eq!(proxy.logical_layers.len(), 1, "a single beauty layer");
+        // Frames at FULL res so it upscales into the full image rect (#94)...
+        assert_eq!(
+            proxy.display_size,
+            Some((16, 200)),
+            "logical_size reports the full display dims"
+        );
+        assert_eq!(proxy.logical_size(0), Some((16, 200)));
+        // ...while the actual decoded buffer is downsampled far smaller.
+        let (layer, ..) = proxy.logical_channels(0).unwrap();
+        assert!(
+            layer.size.0 <= 16 && layer.size.1 < 200,
+            "buffer downsampled: {}x{}",
+            layer.size.0,
+            layer.size.1
+        );
+        assert!(
+            proxy.approx_bytes() < full.approx_bytes(),
+            "proxy is much smaller than the full frame"
+        );
+    }
+
+    #[test]
+    fn load_proxy_of_a_small_file_is_a_no_op_downsample() {
+        // An image already `<= max_dim` on its long side needs no downsampling:
+        // load_proxy still succeeds (post-decode model, unlike the old fast read
+        // which bailed) — flagged proxy, dims unchanged.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("small.exr");
+        write_typed_exr(
+            &p,
+            2,
+            2,
+            &[("R", false), ("G", false), ("B", false), ("A", false)],
+        );
+        let proxy = ExrData::load_proxy(&p, 1024).expect("small file still decodes");
+        assert!(proxy.proxy && proxy.beauty_only);
+        assert_eq!(
+            proxy.logical_size(0),
+            Some((2, 2)),
+            "no downsample under max_dim"
+        );
+    }
+
+    #[test]
+    fn downsampled_preserves_display_and_data_window() {
+        // The whole reason for the post-decode rework (#94): downsampling must keep
+        // the EXR geometry the viewport positions by, so a proxy frames like the
+        // full frame instead of the old fast-read's mis-positioned quadrant.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("g.exr");
+        write_tall_rgba(&p, 16, 200);
+        let full = ExrData::load(&p).unwrap();
+        let proxy = full.downsampled(48);
+
+        assert_eq!(
+            proxy.image.attributes.display_window, full.image.attributes.display_window,
+            "display window preserved"
+        );
+        assert_eq!(
+            proxy.image.layer_data[0].attributes.layer_position,
+            full.image.layer_data[0].attributes.layer_position,
+            "data-window (layer) position preserved"
+        );
+        // Framing reports the FULL size, while the pixel buffer is downsampled.
+        assert_eq!(proxy.logical_size(0), Some((16, 200)));
+        assert!(proxy.image.layer_data[0].size.1 < 200, "buffer shrank");
     }
 
     // --- Beauty-only decode (#56, hardening step 3) --------------------------

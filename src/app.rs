@@ -52,6 +52,12 @@ struct LoadResult {
     result: Result<ExrData, String>,
 }
 
+/// serde default for `proxy_size` (#94): the scrub-proxy long-side pixel target
+/// (~half of 1080p → ~4× more frames fit, per the OpenRV model).
+fn default_proxy_size() -> usize {
+    1024
+}
+
 /// serde default for `t2_enabled` (bool's own default is `false`).
 fn ret_true() -> bool {
     true
@@ -83,6 +89,11 @@ struct LoadJob {
     /// step 3). Set for playback prefetch while the clock advances; cleared for
     /// explicit opens and the full re-decode on settle. See [`ExrData::load_beauty`].
     beauty_only: bool,
+    /// Decode a **downsampled scrub proxy** at this `target_blocks` size (#94)
+    /// instead of a full/beauty frame — for cheap playback of heavy footage.
+    /// `None` = no proxy. Takes precedence over `beauty_only`, which is kept as the
+    /// fallback when the fast proxy read isn't available. See [`ExrData::load_proxy`].
+    proxy_target: Option<usize>,
 }
 
 /// Message from the decode worker to the UI thread, delivered over `load_rx`. A
@@ -175,6 +186,11 @@ pub struct ExrApp {
     /// sequence is homogeneous). Sizes the cache budget.
     #[serde(skip)]
     frame_bytes: Option<usize>,
+    /// One **proxy** frame's measured `approx_bytes()` (#94), captured on the first
+    /// proxy decode. Sizes the T1 cap while proxying so hundreds of the tiny
+    /// frames fit instead of ~16 full ones.
+    #[serde(skip)]
+    proxy_bytes: Option<usize>,
     /// Sequence frame numbers submitted to the worker but not yet returned (#57).
     /// Bounds decode-ahead concurrency and prevents re-requesting an in-flight
     /// frame; cleared on every seek so superseded decodes can't be miscounted.
@@ -271,6 +287,21 @@ pub struct ExrApp {
     /// always-full decode if a file's first layer isn't its beauty. Persisted.
     #[serde(default = "ret_true")]
     beauty_preview: bool,
+
+    /// Scrub proxies (#94): while the playhead moves (play / scrub / precache),
+    /// decode a tiny **downsampled** proxy instead of a full/beauty frame, so
+    /// heavy footage plays fast and hundreds of frames fit RAM (vs ~16 full); the
+    /// settled playhead is always re-decoded full-res. On by default (self-gates
+    /// to a full decode on small/tiled/deep files); a transport kill-switch.
+    /// Persisted.
+    #[serde(default = "ret_true")]
+    proxy_enabled: bool,
+    /// Scrub-proxy target size — the `target_blocks` knob for the fast read
+    /// (roughly the proxy's height in scanline blocks; higher = sharper but
+    /// larger + slower, and self-gates to full on footage without enough blocks).
+    /// Persisted.
+    #[serde(default = "default_proxy_size")]
+    proxy_size: usize,
 
     /// Eager precache (#56, hardening step 4): fill the whole in/out range into
     /// the T1 ring up front — not just the decode-ahead window — so the cached
@@ -497,6 +528,7 @@ impl Default for ExrApp {
             // `budget::max_t1` recomputes it from a slice of free RAM.
             frame_cache_cap: 8,
             frame_bytes: None,
+            proxy_bytes: None,
             inflight: std::collections::HashSet::new(),
             sequence_b: None,
             current_frame_b: 0,
@@ -516,6 +548,8 @@ impl Default for ExrApp {
             save_snapshots: false,
             t2_enabled: true,
             beauty_preview: true,
+            proxy_enabled: true,
+            proxy_size: default_proxy_size(),
             precache: false,
             ram_budget_gb: 0.0,
             precache_filled: false,
@@ -995,6 +1029,7 @@ impl ExrApp {
             // An explicit open always decodes in full (it seeds the session and
             // the T1 RAM budget; AOVs must be present).
             beauty_only: false,
+            proxy_target: None,
         });
     }
 
@@ -1059,7 +1094,10 @@ impl ExrApp {
                     // for small / tiled / deep files anyway.
                     if !job.is_b
                         && !job.seq_frame
-                        && let Some(proxy) = crate::proxy::ProxyImage::from_exr_fast_read(&job.path)
+                        && let Some(proxy) = crate::proxy::ProxyImage::from_exr_fast_read(
+                            &job.path,
+                            crate::proxy::PROXY_TARGET_BLOCKS,
+                        )
                     {
                         let _ = result_tx.send(LoadMsg::Proxy {
                             path: job.path.clone(),
@@ -1067,13 +1105,21 @@ impl ExrApp {
                         });
                         wake_ui();
                     }
-                    // Beauty-only for playback prefetch while moving (#56, step 3):
-                    // one layer, faster decode + smaller resident frame. Full
-                    // all-AOV decode for opens and the settle re-decode.
-                    let result = if job.beauty_only {
-                        ExrData::load_beauty(&job.path)
-                    } else {
-                        ExrData::load(&job.path)
+                    // Decode mode while the playhead moves, cheapest first (#94/#56):
+                    // - a **scrub proxy** (downsampled, tiny + fast) when requested,
+                    //   falling back to beauty/full if the fast read isn't available;
+                    // - **beauty-only** (one layer) otherwise while moving (#56 step 3);
+                    // - full all-AOV for opens and the settle re-decode.
+                    let result = match job.proxy_target {
+                        Some(tb) => ExrData::load_proxy(&job.path, tb).or_else(|_| {
+                            if job.beauty_only {
+                                ExrData::load_beauty(&job.path)
+                            } else {
+                                ExrData::load(&job.path)
+                            }
+                        }),
+                        None if job.beauty_only => ExrData::load_beauty(&job.path),
+                        None => ExrData::load(&job.path),
                     };
                     let _ = result_tx.send(LoadMsg::Loaded(Box::new(LoadResult {
                         path: job.path,
@@ -1311,14 +1357,42 @@ impl ExrApp {
         self.decode_beauty_only_at(frame, self.current_frame_b)
     }
 
-    fn decode_beauty_only_at(&self, frame: u32, playhead: u32) -> bool {
-        if !self.beauty_preview || self.viewer.active_layer != 0 {
+    /// The shared "decode something cheaper while the playhead moves" condition for
+    /// beauty (#56) and proxy (#94): the viewer is on the beauty layer (layer 0 —
+    /// the only layer both cheaper decodes carry) AND the frame is playing, being
+    /// dragged, or a precache prefetch (not the settled playhead). The respective
+    /// `beauty_preview` / `proxy_enabled` kill-switches decide *which* cheaper
+    /// decode is used.
+    fn wants_cheap_decode_at(&self, frame: u32, playhead: u32) -> bool {
+        if self.viewer.active_layer != 0 {
             return false;
         }
         if self.playback.is_playing() || self.scrub_active {
             return true;
         }
         self.precache && frame != playhead
+    }
+
+    fn decode_beauty_only_at(&self, frame: u32, playhead: u32) -> bool {
+        self.beauty_preview && self.wants_cheap_decode_at(frame, playhead)
+    }
+
+    /// The scrub-proxy `target_blocks` to decode `frame` at (#94), or `None` for a
+    /// full/beauty decode. Same cheap-while-moving gate as beauty, behind the
+    /// `proxy_enabled` kill-switch; the worker falls back to beauty/full if the
+    /// fast proxy read isn't available for the file.
+    fn decode_proxy_target_at(&self, frame: u32, playhead: u32) -> Option<usize> {
+        (self.proxy_enabled && self.wants_cheap_decode_at(frame, playhead))
+            .then_some(self.proxy_size)
+    }
+
+    fn decode_proxy_target(&self, frame: u32) -> Option<usize> {
+        self.decode_proxy_target_at(frame, self.playback.current_frame)
+    }
+
+    /// Locked-step B (#98) counterpart of [`Self::decode_proxy_target`].
+    fn decode_proxy_target_b(&self, frame: u32) -> Option<usize> {
+        self.decode_proxy_target_at(frame, self.current_frame_b)
     }
 
     /// Decode-ahead pump (#57): with at most one sequence decode outstanding,
@@ -1457,6 +1531,12 @@ impl ExrApp {
             crate::cache::Slot::A => self.decode_beauty_only(w),
             crate::cache::Slot::B => self.decode_beauty_only_b(w),
         };
+        // Scrub proxy takes precedence over beauty while moving (#94); `beauty_only`
+        // stays as the worker's fallback if the fast proxy read isn't available.
+        let proxy_target = match slot {
+            crate::cache::Slot::A => self.decode_proxy_target(w),
+            crate::cache::Slot::B => self.decode_proxy_target_b(w),
+        };
         self.submit_job(LoadJob {
             path,
             is_b: slot == crate::cache::Slot::B,
@@ -1466,6 +1546,7 @@ impl ExrApp {
             // Seq-frames supersede by epoch, not open generation.
             open_gen: 0,
             beauty_only,
+            proxy_target,
         });
         // Anchor the stall watchdog: one decode is now outstanding.
         self.decode_submit_at = Some(std::time::Instant::now());
@@ -2021,7 +2102,17 @@ impl ExrApp {
         self.dbg_last_sample = Some(sample); // stash for the status bar + debug overlay
 
         // T1: recomputed each tick; shrinks under other memory pressure.
-        if let Some(bytes) = self.frame_bytes {
+        // While scrub proxies are active (#94) the resident frames are tiny
+        // downsampled proxies, so size the cap off proxy bytes — hundreds fit
+        // instead of the ~16 that full 178 MB frames allow. Falls back to
+        // full-frame bytes when proxies aren't in use, or on footage the fast read
+        // can't proxy (proxy_bytes stays `None`).
+        let sizing_bytes = if self.proxy_enabled && self.playback.is_active() {
+            self.proxy_bytes.or(self.frame_bytes)
+        } else {
+            self.frame_bytes
+        };
+        if let Some(bytes) = sizing_bytes {
             let cache_bytes = self.frame_cache.len() as u64 * bytes as u64;
             let auto = crate::budget::t1_capacity(&sample, bytes, cache_bytes);
             // A user-assigned RAM budget (if any) caps the auto figure —
@@ -2253,10 +2344,22 @@ impl ExrApp {
                     // Size from a *full* A frame only: beauty-only frames (#56,
                     // step 3) are smaller, and B may be a different resolution than
                     // A (#98) — either would mis-size the shared ring budget.
-                    if !arc.beauty_only && slot == crate::cache::Slot::A {
+                    if arc.proxy {
+                        // Size the proxy budget off the first tiny proxy (#94).
+                        self.proxy_bytes.get_or_insert_with(|| arc.approx_bytes());
+                    } else if !arc.beauty_only && slot == crate::cache::Slot::A {
                         self.frame_bytes.get_or_insert_with(|| arc.approx_bytes());
                     }
                     self.frame_cache.insert(slot, res.frame, arc.clone());
+                    // A full-res frame landing (the settle upgrade, #94/#56)
+                    // replaces a proxy/beauty frame, so its pre-built T2 GPU
+                    // texture is now stale — evict it or the viewport keeps binding
+                    // the blurry proxy texture ("stuck in proxy"). Slot::A only (the
+                    // T2 ring is A); fires only for full frames (settle), not the
+                    // proxy/beauty frames decoded while moving.
+                    if slot == crate::cache::Slot::A && !arc.beauty_only {
+                        self.viewer.evict_t2_frame(res.frame);
+                    }
                     // In Loop mode eviction distance follows the play direction
                     // around the loop, so prefetch wrapped past the out point
                     // isn't classified "behind" and evicted on arrival (#140).
@@ -3695,6 +3798,7 @@ impl ExrApp {
         let t2_len = self.viewer.t2_len();
         let t2_cap = self.viewer.t2_cap();
         let frame_bytes = self.frame_bytes;
+        let proxy_state = (self.proxy_enabled, self.proxy_size, self.proxy_bytes);
         let mut inflight: Vec<u32> = self.inflight.iter().copied().collect();
         inflight.sort_unstable();
         let sample = self.dbg_last_sample;
@@ -3743,6 +3847,22 @@ impl ExrApp {
                             .map(|b| fmt_bytes(b as u64))
                             .unwrap_or_else(|| "—".into());
                         ui.label(format!("{t1_len} / {t1_cap} frames  ·  ~{t1_frame}/frame"));
+                        ui.end_row();
+
+                        // Scrub proxy (#94): whether it's on, the size knob, and the
+                        // measured per-proxy bytes once one has decoded (proves
+                        // proxies are actually being produced for this footage).
+                        ui.label("proxy");
+                        let (px_on, px_size, px_bytes) = proxy_state;
+                        let px = if px_on {
+                            match px_bytes {
+                                Some(b) => format!("on · {px_size} px · ~{}/frame", fmt_bytes(b as u64)),
+                                None => format!("on · {px_size} px · (full — none produced)"),
+                            }
+                        } else {
+                            "off".to_string()
+                        };
+                        ui.label(px);
                         ui.end_row();
 
                         ui.label("T2 (GPU)");
@@ -3975,6 +4095,44 @@ impl ExrApp {
                 {
                     // Switching modes makes the cached ring (now the wrong decode
                     // mode) stale; drop it so frames re-decode under the new mode.
+                    self.frame_cache.clear();
+                    self.invalidate_inflight();
+                    self.request_sequence_frame(self.playback.current_frame);
+                }
+
+                ui.separator();
+
+                // Scrub-proxy kill-switch + size (#94). On → while moving, decode a
+                // tiny downsampled proxy so heavy footage plays and far more frames
+                // fit RAM; the paused frame is always re-decoded full-res. Self-gates
+                // to a full decode on small/tiled/deep files.
+                let proxy_changed = ui
+                    .checkbox(&mut self.proxy_enabled, "Scrub proxy")
+                    .on_hover_text(
+                        "While playing/scrubbing, decode a small downsampled proxy so \
+                         heavy footage plays smoothly and far more frames fit in RAM; \
+                         the paused frame sharpens to full res. Great for slow or \
+                         networked media.",
+                    )
+                    .changed();
+                let size_changed = self.proxy_enabled
+                    && ui
+                        .add(
+                            egui::DragValue::new(&mut self.proxy_size)
+                                .range(256..=4096)
+                                .speed(16.0)
+                                .suffix(" px"),
+                        )
+                        .on_hover_text(
+                            "Proxy size — the downsampled long-side resolution: higher \
+                             = sharper but larger + fewer frames cached. The frame is \
+                             decoded full (correct geometry) then box-filtered to this \
+                             size on the way into the cache.",
+                        )
+                        .changed();
+                if proxy_changed || size_changed {
+                    // The cached ring is now the wrong decode mode/size — drop it so
+                    // frames re-decode (mirrors the Beauty-preview toggle).
                     self.frame_cache.clear();
                     self.invalidate_inflight();
                     self.request_sequence_frame(self.playback.current_frame);
@@ -5561,6 +5719,52 @@ mod tests {
         assert!(!app.decode_beauty_only(cur), "released ⇒ full decode again");
     }
 
+    #[test]
+    fn proxy_target_gated_on_moving_and_toggle() {
+        // #94: a scrub proxy is decoded on the same cheap-while-moving gate as
+        // beauty (playing / drag / precache prefetch, beauty layer only), behind
+        // the `proxy_enabled` kill-switch; the settled playhead is always full.
+        let dir = tempfile::tempdir().unwrap();
+        touch_sequence(dir.path(), 3);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&dir.path().join("s.0001.exr"));
+        app.viewer.active_layer = 0;
+        let cur = app.playback.current_frame;
+        let ahead = cur + 1;
+        let size = app.proxy_size;
+
+        assert_eq!(app.decode_proxy_target(cur), None, "settled ⇒ full");
+
+        app.playback_toggle(); // playing
+        assert_eq!(app.decode_proxy_target(cur), Some(size), "playing ⇒ proxy");
+
+        app.viewer.active_layer = 2;
+        assert_eq!(
+            app.decode_proxy_target(cur),
+            None,
+            "non-beauty layer ⇒ full (proxy carries only the beauty layer)"
+        );
+        app.viewer.active_layer = 0;
+
+        app.proxy_enabled = false;
+        assert_eq!(app.decode_proxy_target(cur), None, "toggle off ⇒ full");
+        app.proxy_enabled = true;
+
+        // Settled + precache: prefetch proxies, the playhead itself stays full.
+        app.playback.state = PlayState::Paused;
+        app.precache = true;
+        assert_eq!(
+            app.decode_proxy_target(cur),
+            None,
+            "precache: the settled playhead stays full"
+        );
+        assert_eq!(
+            app.decode_proxy_target(ahead),
+            Some(size),
+            "precache prefetch ⇒ proxy"
+        );
+    }
+
     /// #143: mid-drag, a resident beauty ring frame displays without being
     /// marked for a full upgrade (that would spam full decodes per touched
     /// frame); the drag release settles the landing frame to full instead.
@@ -5807,6 +6011,7 @@ mod tests {
             epoch: 0,
             open_gen: app.open_gen_a,
             beauty_only: false,
+            proxy_target: None,
         });
 
         // The dead channel was replaced and a fresh worker spawned; it processes

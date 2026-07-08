@@ -26,11 +26,12 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
 
-/// Target number of scanline blocks to decompress for a fast-read proxy. Bounding
-/// the work to a constant (independent of resolution) is what makes the first
-/// paint fast: [`ProxyImage::from_exr_fast_read`] decompresses only every Nth
-/// block, and bails when that wouldn't skip anything.
-const PROXY_TARGET_BLOCKS: usize = 48;
+/// Default target number of scanline blocks to decompress for a fast-read proxy.
+/// Bounding the work to a constant (independent of resolution) is what makes the
+/// first paint fast: [`ProxyImage::from_exr_fast_read`] decompresses only every
+/// Nth block, and bails when that wouldn't skip anything. Higher = sharper but
+/// more decode; the scrub-proxy path (#94) drives this from a user setting.
+pub const PROXY_TARGET_BLOCKS: usize = 48;
 
 /// A low-resolution first-paint image. See the module docs.
 ///
@@ -164,7 +165,7 @@ impl ProxyImage {
     /// channels (correct for the common single-layer beauty case); the full-res
     /// render, which honours the selected layer, replaces it moments later.
     #[must_use]
-    pub fn from_exr_fast_read(path: &Path) -> Option<Self> {
+    pub fn from_exr_fast_read(path: &Path, target_blocks: usize) -> Option<Self> {
         let file = BufReader::with_capacity(1 << 20, File::open(path).ok()?);
         let reader = block::read(file, false).ok()?;
         let meta = reader.meta_data().clone();
@@ -172,6 +173,18 @@ impl ProxyImage {
 
         // Only flat scanline images. Tiled / deep go straight to the full decode.
         if header.deep || !matches!(header.blocks, BlockDescription::ScanLines) {
+            return None;
+        }
+        // Scrub proxies (#94) flatten the frame to a plain `(0,0)`-origin image, so
+        // they're only correct when the **data window already fills the display
+        // window** (no offset). A render with a tight data window — a sub-rect of
+        // the frame, e.g. a matte with transparent regions — is positioned by the
+        // full loader using the display/data window (viewer.rs), which a flattened
+        // proxy can't reproduce, so bail and let it fall back to a full decode.
+        let display = header.shared_attributes.display_window;
+        if header.own_attributes.layer_position != display.position
+            || header.layer_size != display.size
+        {
             return None;
         }
         let full_width = header.layer_size.0;
@@ -203,7 +216,7 @@ impl ProxyImage {
         // blocks), the full decode is already fast — bail rather than read twice.
         let block_h = header.compression.scan_lines_per_block().max(1);
         let num_blocks = full_height.div_ceil(block_h);
-        let block_stride = num_blocks / PROXY_TARGET_BLOCKS;
+        let block_stride = num_blocks / target_blocks.max(1);
         if block_stride < 2 {
             return None;
         }
@@ -426,7 +439,8 @@ mod tests {
             let path = dir.path().join("tall.exr");
             write_gradient(&path, 16, 200, half);
 
-            let proxy = ProxyImage::from_exr_fast_read(&path).expect("proxy for tall image");
+            let proxy = ProxyImage::from_exr_fast_read(&path, PROXY_TARGET_BLOCKS)
+                .expect("proxy for tall image");
             assert_eq!(
                 (proxy.full_width, proxy.full_height),
                 (16, 200),
@@ -460,13 +474,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("short.exr");
         write_gradient(&path, 8, 40, false);
-        assert!(ProxyImage::from_exr_fast_read(&path).is_none());
+        assert!(ProxyImage::from_exr_fast_read(&path, PROXY_TARGET_BLOCKS).is_none());
     }
 
     #[test]
     fn fast_read_returns_none_for_missing_file() {
         assert!(
-            ProxyImage::from_exr_fast_read(std::path::Path::new("/no/such/file.exr")).is_none()
+            ProxyImage::from_exr_fast_read(
+                std::path::Path::new("/no/such/file.exr"),
+                PROXY_TARGET_BLOCKS
+            )
+            .is_none()
         );
     }
 }
