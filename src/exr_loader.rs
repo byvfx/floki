@@ -338,12 +338,15 @@ impl ExrData {
 /// filesystem) — callers fall back to the streaming `from_file` path, which
 /// also produces the friendlier open-error messages.
 ///
-/// Safety: the map is read-only and private. The documented risk is another
-/// process *truncating* the file mid-parse (SIGBUS). Renderers conventionally
-/// write-to-temp-then-rename — the mapped (old) inode stays valid — and the
-/// render-watch (#101) invalidates re-rendered frames; an in-place writer
-/// truncating during the parse remains a theoretical abort, the same trade
-/// OpenRV and tlRender accept for their mmap'd EXR reads.
+/// Safety: the mapping is read-only but **shared** (not copy-on-write), so
+/// concurrent in-place writes to the file are visible through it — a torn
+/// read mid-parse yields garbage pixels or a decode error, not UB. The abort
+/// risk is another process *truncating* the file mid-parse (SIGBUS).
+/// Renderers conventionally write-to-temp-then-rename — the mapped (old)
+/// inode stays valid — and the render-watch (#101) invalidates re-rendered
+/// frames; an in-place writer truncating during the parse remains a
+/// theoretical abort, the same trade OpenRV and tlRender accept for their
+/// mmap'd EXR reads.
 fn map_file(path: &Path) -> Option<memmap2::Mmap> {
     let file = std::fs::File::open(path).ok()?;
     let map = unsafe { memmap2::Mmap::map(&file) }.ok()?;
