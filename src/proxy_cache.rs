@@ -54,6 +54,13 @@ const TMP_EXT: &str = "tmp";
 /// backlog this deep means the writer is behind — further sends drop by design.
 const WRITER_QUEUE_DEPTH: usize = 8;
 
+/// Ceiling on a single cache entry read into memory. A real proxy is a few MB
+/// to (extreme, multichannel-at-max-px) a few hundred MB; anything above this is
+/// corrupt or tampered, so skip it (fall back to decode) rather than `fs::read`
+/// an arbitrarily large file into RAM. `from_proxy_blob` separately bounds every
+/// allocation it makes to the blob's own remaining bytes.
+const MAX_BLOB_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 /// Bytes in one gibibyte (1024³) — floki's memory readouts are 1024-based
 /// (`resource_monitor::fmt_bytes`, `ram_budget_gb`), so the disk budget matches.
 const BYTES_PER_GIB: f64 = 1024.0 * 1024.0 * 1024.0;
@@ -232,8 +239,14 @@ impl ProxyCache {
         }
         let key = ProxyKey::for_source(path, proxy_px)?;
         let filename = key.filename();
+        let file = self.root.join(&filename);
+        // Skip an implausibly large (corrupt / tampered) entry before reading it
+        // whole into RAM.
+        if std::fs::metadata(&file).ok()?.len() > MAX_BLOB_BYTES {
+            return None;
+        }
         // A raw f16/f32 dump: read is a single alloc + memcpy, no decompression.
-        let bytes = std::fs::read(self.root.join(&filename)).ok()?;
+        let bytes = std::fs::read(&file).ok()?;
         let data = ExrData::from_proxy_blob(&bytes, &key)?;
         // Best-effort LRU touch — never blocks the read.
         self.send(WriterMsg::Touch(filename), false);

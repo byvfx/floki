@@ -4366,9 +4366,10 @@ impl ExrApp {
                                 .suffix(" GB"),
                         )
                         .on_hover_text(
-                            "On-disk proxy-cache size budget (GiB). A ceiling, not a \
-                             reservation — the least-recently-used proxies are evicted \
-                             first once it fills.",
+                            "On-disk proxy-cache size budget in GB (gibibytes, 1024³ — \
+                             same unit as the RAM budget). A ceiling, not a reservation: \
+                             the least-recently-used proxies are evicted first once it \
+                             fills.",
                         )
                         .changed();
                 if disk_changed || budget_changed {

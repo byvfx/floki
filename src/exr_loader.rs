@@ -23,6 +23,13 @@ const PROXY_BLOB_VERSION: u8 = 1;
 /// (`downsampled` maps U32 → F32), so those are the only two tags.
 const SAMPLE_TAG_F16: u8 = 0;
 const SAMPLE_TAG_F32: u8 = 1;
+/// Sanity bounds for reconstructing a proxy from an on-disk blob (#165): a
+/// corrupt or truncated `.fpx` must fail as a cache miss, never a huge allocation
+/// or a runaway loop. Real proxies are a handful of layers / channels; the
+/// per-channel sample buffer is separately bounded to the blob's own remaining
+/// bytes before it is allocated.
+const MAX_PROXY_LAYERS: usize = 64;
+const MAX_PROXY_CHANNELS: usize = 1024;
 
 pub struct ExrData {
     pub image: FlatImage,
@@ -397,6 +404,9 @@ impl ExrData {
         };
 
         let layer_count = r.u16()? as usize;
+        if layer_count > MAX_PROXY_LAYERS {
+            return None;
+        }
         let mut layer_data: smallvec::SmallVec<[Layer<AnyChannels<FlatSamples>>; 2]> =
             smallvec::SmallVec::new();
         for _ in 0..layer_count {
@@ -408,12 +418,21 @@ impl ExrData {
                 _ => Some(Text::from(r.str()?.as_str())),
             };
             let chan_count = r.u16()? as usize;
+            if chan_count > MAX_PROXY_CHANNELS {
+                return None;
+            }
             let mut chans: smallvec::SmallVec<[AnyChannel<FlatSamples>; 4]> =
                 smallvec::SmallVec::new();
             for _ in 0..chan_count {
                 let name = r.str()?;
                 let samples = match r.u8()? {
                     SAMPLE_TAG_F16 => {
+                        // Reject before allocating if the claimed sample count
+                        // can't fit in the bytes left — a corrupt `n` can't force
+                        // an allocation larger than the blob itself.
+                        if n.checked_mul(2)? > r.remaining() {
+                            return None;
+                        }
                         let mut v = Vec::with_capacity(n);
                         for _ in 0..n {
                             v.push(f16::from_bits(r.u16()?));
@@ -421,6 +440,9 @@ impl ExrData {
                         FlatSamples::F16(v)
                     }
                     SAMPLE_TAG_F32 => {
+                        if n.checked_mul(4)? > r.remaining() {
+                            return None;
+                        }
                         let mut v = Vec::with_capacity(n);
                         for _ in 0..n {
                             v.push(r.f32()?);
@@ -629,7 +651,14 @@ impl<'a> BlobReader<'a> {
     }
     fn str(&mut self) -> Option<String> {
         let len = self.u32()? as usize;
+        // `take` bounds `len` to the bytes left, so a corrupt length can't
+        // allocate past the blob's own size.
         String::from_utf8(self.take(len)?.to_vec()).ok()
+    }
+    /// Bytes not yet consumed — used to reject a claimed sample count that
+    /// couldn't possibly fit before allocating a buffer for it.
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.pos)
     }
 }
 
@@ -1548,6 +1577,43 @@ mod tests {
             ..key.clone()
         };
         assert!(ExrData::from_proxy_blob(&good, &other).is_none());
+    }
+
+    #[test]
+    fn from_proxy_blob_rejects_absurd_counts_without_allocating() {
+        // A corrupt/tampered blob with a valid header + matching key but a layer
+        // claiming a 65535×65535 buffer must return None (a cache miss) — the
+        // per-channel allocation is bounded to the blob's own remaining bytes, so
+        // a bogus dimension can never force a multi-GB allocation. (If this ever
+        // regressed it would OOM the test process, not just fail an assert.)
+        let key = blob_key();
+        let mut b = Vec::new();
+        b.extend_from_slice(PROXY_BLOB_MAGIC);
+        b.push(PROXY_BLOB_VERSION);
+        b.push(0b10); // proxy flag
+        b.extend_from_slice(&key.mtime_ns.to_le_bytes());
+        b.extend_from_slice(&key.size.to_le_bytes());
+        b.extend_from_slice(&key.proxy_px.to_le_bytes());
+        write_blob_str(&mut b, &key.path);
+        b.extend_from_slice(&0i32.to_le_bytes()); // display_window pos x
+        b.extend_from_slice(&0i32.to_le_bytes()); // display_window pos y
+        b.extend_from_slice(&64u32.to_le_bytes()); // display_window size x
+        b.extend_from_slice(&64u32.to_le_bytes()); // display_window size y
+        b.extend_from_slice(&1.0f32.to_le_bytes()); // pixel_aspect
+        b.push(0); // display_size: None
+        b.extend_from_slice(&1u16.to_le_bytes()); // layer_count = 1
+        b.extend_from_slice(&0i32.to_le_bytes()); // layer_position x
+        b.extend_from_slice(&0i32.to_le_bytes()); // layer_position y
+        b.extend_from_slice(&65535u32.to_le_bytes()); // lw  → n = 65535²
+        b.extend_from_slice(&65535u32.to_le_bytes()); // lh
+        b.push(0); // layer_name: None
+        b.extend_from_slice(&1u16.to_le_bytes()); // chan_count = 1
+        write_blob_str(&mut b, "R");
+        b.push(SAMPLE_TAG_F16); // ~8.6 GB of samples would follow — but don't
+        assert!(
+            ExrData::from_proxy_blob(&b, &key).is_none(),
+            "absurd dims must miss, not allocate"
+        );
     }
 
     // --- Beauty-only decode (#56, hardening step 3) --------------------------
