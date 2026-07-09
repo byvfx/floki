@@ -1286,11 +1286,13 @@ mod tests {
             let (layer, r, g, b, a) = data.logical_channels(0).expect("beauty layer");
             let w = layer.size.0;
             let at = |c| crate::pixels::sample_channel(c, 32, 32, w);
-            // Loose ε: DWA is lossy DCT (alpha is RLE'd, so effectively exact).
+            // RGB go through DWA's lossy DCT → loose ε. Alpha isn't in a CSC set,
+            // so it's stored losslessly → assert it exactly (below).
             approx::assert_abs_diff_eq!(at(r), 0.25, epsilon = 0.02);
             approx::assert_abs_diff_eq!(at(g), 0.50, epsilon = 0.02);
             approx::assert_abs_diff_eq!(at(b), 0.75, epsilon = 0.02);
-            approx::assert_abs_diff_eq!(at(a), 1.00, epsilon = 0.02);
+            // Lossless: 1.0 is exact in f16, so no DWA error here.
+            approx::assert_abs_diff_eq!(at(a), 1.00, epsilon = 1e-6);
         }
     }
 }
