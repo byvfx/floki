@@ -1264,4 +1264,33 @@ mod tests {
             "error should explain the bad EXR, got: {err}"
         );
     }
+
+    // --- DWA decode (exrs v1.74.1 rebase) ------------------------------------
+
+    /// DWAA/DWAB are lossy DCT codecs the `miniz-inflate` fork couldn't decode
+    /// before the v1.74.1 rebase — opening one used to fail with
+    /// `unsupported("pixels cannot be compressed (dwaa)")`. A committed fixture is
+    /// the only way to regression-test this: exrs can *decode* DWA but not *write*
+    /// it, so it can't be generated synthetically. Both fixtures are a 64×64
+    /// RGBA-half flat fill `(0.25, 0.5, 0.75, 1.0)`, so a correct decode
+    /// reproduces that within DWA's lossy tolerance.
+    #[test]
+    fn loads_dwaa_and_dwab_compressed_exrs() {
+        for name in ["dwaa", "dwab"] {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures")
+                .join(format!("{name}.exr"));
+            let data = ExrData::load(&path)
+                .unwrap_or_else(|e| panic!("{name} fixture must decode after the rebase: {e}"));
+            assert_eq!(data.logical_size(0), Some((64, 64)), "{name} dims");
+            let (layer, r, g, b, a) = data.logical_channels(0).expect("beauty layer");
+            let w = layer.size.0;
+            let at = |c| crate::pixels::sample_channel(c, 32, 32, w);
+            // Loose ε: DWA is lossy DCT (alpha is RLE'd, so effectively exact).
+            approx::assert_abs_diff_eq!(at(r), 0.25, epsilon = 0.02);
+            approx::assert_abs_diff_eq!(at(g), 0.50, epsilon = 0.02);
+            approx::assert_abs_diff_eq!(at(b), 0.75, epsilon = 0.02);
+            approx::assert_abs_diff_eq!(at(a), 1.00, epsilon = 0.02);
+        }
+    }
 }
