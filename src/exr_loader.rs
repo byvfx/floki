@@ -11,6 +11,26 @@ const DECODE_PANIC_MSG: &str = "Failed to decode EXR: the decompressor panicked.
      unsupported compression variant, be corrupted, or trigger a bug in the \
      exr crate's miniz_oxide decompressor.";
 
+/// On-disk proxy-cache blob format (#165). Magic + version prefix a raw f16/f32
+/// dump of a downsampled proxy plus the geometry the viewport frames by, so a
+/// repeat pass reconstructs the proxy without re-decoding the source EXR. The
+/// magic doubles as the version tag (`FPX1` = format v1); bump it on any layout
+/// change so a stale blob is rejected as a miss rather than mis-parsed. See
+/// [`ExrData::write_proxy_blob`] / [`ExrData::from_proxy_blob`].
+const PROXY_BLOB_MAGIC: &[u8] = b"FPX1";
+const PROXY_BLOB_VERSION: u8 = 1;
+/// Per-channel sample-type tags in the blob. Proxies only ever carry F16 or F32
+/// (`downsampled` maps U32 → F32), so those are the only two tags.
+const SAMPLE_TAG_F16: u8 = 0;
+const SAMPLE_TAG_F32: u8 = 1;
+/// Sanity bounds for reconstructing a proxy from an on-disk blob (#165): a
+/// corrupt or truncated `.fpx` must fail as a cache miss, never a huge allocation
+/// or a runaway loop. Real proxies are a handful of layers / channels; the
+/// per-channel sample buffer is separately bounded to the blob's own remaining
+/// bytes before it is allocated.
+const MAX_PROXY_LAYERS: usize = 64;
+const MAX_PROXY_CHANNELS: usize = 1024;
+
 pub struct ExrData {
     pub image: FlatImage,
     /// Displayable passes derived by grouping channels by their dotted name
@@ -260,6 +280,203 @@ impl ExrData {
         }
     }
 
+    /// Serialize this **proxy** frame to the on-disk-cache blob format (#165) so a
+    /// later pass / session can skip the decode. The blob is a raw f16/f32 sample
+    /// dump (mmap-able, ~zero decode cost) plus exactly the geometry the viewport
+    /// frames by — `display_window`, `pixel_aspect`, per-layer `layer_position` +
+    /// `layer_name` + size, and [`Self::display_size`] — so [`Self::from_proxy_blob`]
+    /// reconstitutes what [`Self::downsampled`] produced (the #163 invariant). The
+    /// `key` (source path + mtime + size + proxy px) is echoed into the header so
+    /// the reader can reject a hash collision or a stale entry. Custom `other`
+    /// attributes and chromaticities are intentionally dropped — nothing in the
+    /// render/geometry path reads them, and the settle re-decode restores them.
+    ///
+    /// Intended for a proxy (`self.proxy`); serializing a full frame this way is
+    /// well-formed but pointless (the caller only caches proxies).
+    #[must_use]
+    pub fn write_proxy_blob(&self, key: &crate::proxy_cache::ProxyKey) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(PROXY_BLOB_MAGIC);
+        out.push(PROXY_BLOB_VERSION);
+        out.push((self.beauty_only as u8) | ((self.proxy as u8) << 1));
+
+        // Echoed key tuple — verified on read to defeat 64-bit filename
+        // collisions and catch a stale entry the key hash didn't already exclude.
+        out.extend_from_slice(&key.mtime_ns.to_le_bytes());
+        out.extend_from_slice(&key.size.to_le_bytes());
+        out.extend_from_slice(&key.proxy_px.to_le_bytes());
+        write_blob_str(&mut out, &key.path);
+
+        // Image geometry: display window + pixel aspect frame the viewport.
+        let dw = self.image.attributes.display_window;
+        out.extend_from_slice(&dw.position.x().to_le_bytes());
+        out.extend_from_slice(&dw.position.y().to_le_bytes());
+        out.extend_from_slice(&(dw.size.x() as u32).to_le_bytes());
+        out.extend_from_slice(&(dw.size.y() as u32).to_le_bytes());
+        out.extend_from_slice(&self.image.attributes.pixel_aspect.to_le_bytes());
+        match self.display_size {
+            Some((w, h)) => {
+                out.push(1);
+                out.extend_from_slice(&(w as u32).to_le_bytes());
+                out.extend_from_slice(&(h as u32).to_le_bytes());
+            }
+            None => out.push(0),
+        }
+
+        out.extend_from_slice(&(self.image.layer_data.len() as u16).to_le_bytes());
+        for layer in &self.image.layer_data {
+            out.extend_from_slice(&layer.attributes.layer_position.x().to_le_bytes());
+            out.extend_from_slice(&layer.attributes.layer_position.y().to_le_bytes());
+            out.extend_from_slice(&(layer.size.0 as u32).to_le_bytes());
+            out.extend_from_slice(&(layer.size.1 as u32).to_le_bytes());
+            match &layer.attributes.layer_name {
+                Some(name) => {
+                    out.push(1);
+                    write_blob_str(&mut out, &name.to_string());
+                }
+                None => out.push(0),
+            }
+            out.extend_from_slice(&(layer.channel_data.list.len() as u16).to_le_bytes());
+            for ch in &layer.channel_data.list {
+                write_blob_str(&mut out, &ch.name.to_string());
+                match &ch.sample_data {
+                    FlatSamples::F16(v) => {
+                        out.push(SAMPLE_TAG_F16);
+                        for s in v {
+                            out.extend_from_slice(&s.to_bits().to_le_bytes());
+                        }
+                    }
+                    FlatSamples::F32(v) => {
+                        out.push(SAMPLE_TAG_F32);
+                        for s in v {
+                            out.extend_from_slice(&s.to_le_bytes());
+                        }
+                    }
+                    // A proxy never carries U32 (downsampled maps it to F32);
+                    // handled defensively so this stays total — normalize like
+                    // `pixels::sample_channel` and store as F32.
+                    FlatSamples::U32(v) => {
+                        out.push(SAMPLE_TAG_F32);
+                        for s in v {
+                            out.extend_from_slice(&(*s as f32 / u32::MAX as f32).to_le_bytes());
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Reconstruct a proxy [`ExrData`] from an on-disk-cache blob (#165), the
+    /// inverse of [`Self::write_proxy_blob`]. Returns `None` on any mismatch —
+    /// bad magic, wrong version, a truncated / corrupt body, or an echoed `key`
+    /// that doesn't match the request (a hash collision or a re-rendered source)
+    /// — so the caller treats it as a cache miss and decodes normally. Never
+    /// panics and never yields wrong pixels for the wrong request.
+    #[must_use]
+    pub fn from_proxy_blob(bytes: &[u8], key: &crate::proxy_cache::ProxyKey) -> Option<Self> {
+        let mut r = BlobReader::new(bytes);
+        if r.take(PROXY_BLOB_MAGIC.len())? != PROXY_BLOB_MAGIC {
+            return None;
+        }
+        if r.u8()? != PROXY_BLOB_VERSION {
+            return None;
+        }
+        let flags = r.u8()?;
+        let beauty_only = flags & 1 != 0;
+        let proxy = flags & 2 != 0;
+
+        // Reject a collision / stale entry: the echoed tuple must match the key
+        // the caller hashed to find this file.
+        if r.u64()? != key.mtime_ns
+            || r.u64()? != key.size
+            || r.u32()? != key.proxy_px
+            || r.str()? != key.path
+        {
+            return None;
+        }
+
+        let dw = IntegerBounds::new((r.i32()?, r.i32()?), (r.u32()? as usize, r.u32()? as usize));
+        let pixel_aspect = r.f32()?;
+        let display_size = match r.u8()? {
+            0 => None,
+            _ => Some((r.u32()? as usize, r.u32()? as usize)),
+        };
+
+        let layer_count = r.u16()? as usize;
+        if layer_count > MAX_PROXY_LAYERS {
+            return None;
+        }
+        let mut layer_data: smallvec::SmallVec<[Layer<AnyChannels<FlatSamples>>; 2]> =
+            smallvec::SmallVec::new();
+        for _ in 0..layer_count {
+            let layer_position = Vec2(r.i32()?, r.i32()?);
+            let (lw, lh) = (r.u32()? as usize, r.u32()? as usize);
+            let n = lw.checked_mul(lh)?;
+            let layer_name = match r.u8()? {
+                0 => None,
+                _ => Some(Text::from(r.str()?.as_str())),
+            };
+            let chan_count = r.u16()? as usize;
+            if chan_count > MAX_PROXY_CHANNELS {
+                return None;
+            }
+            let mut chans: smallvec::SmallVec<[AnyChannel<FlatSamples>; 4]> =
+                smallvec::SmallVec::new();
+            for _ in 0..chan_count {
+                let name = r.str()?;
+                let samples = match r.u8()? {
+                    SAMPLE_TAG_F16 => {
+                        // Reject before allocating if the claimed sample count
+                        // can't fit in the bytes left — a corrupt `n` can't force
+                        // an allocation larger than the blob itself.
+                        if n.checked_mul(2)? > r.remaining() {
+                            return None;
+                        }
+                        let mut v = Vec::with_capacity(n);
+                        for _ in 0..n {
+                            v.push(f16::from_bits(r.u16()?));
+                        }
+                        FlatSamples::F16(v)
+                    }
+                    SAMPLE_TAG_F32 => {
+                        if n.checked_mul(4)? > r.remaining() {
+                            return None;
+                        }
+                        let mut v = Vec::with_capacity(n);
+                        for _ in 0..n {
+                            v.push(r.f32()?);
+                        }
+                        FlatSamples::F32(v)
+                    }
+                    _ => return None,
+                };
+                chans.push(AnyChannel::new(Text::from(name.as_str()), samples));
+            }
+            let attributes = LayerAttributes {
+                layer_position,
+                layer_name,
+                ..LayerAttributes::default()
+            };
+            layer_data.push(Layer::new(
+                (lw, lh),
+                attributes,
+                Encoding::UNCOMPRESSED,
+                AnyChannels::sort(chans),
+            ));
+        }
+
+        let mut attributes = ImageAttributes::new(dw);
+        attributes.pixel_aspect = pixel_aspect;
+        let image = FlatImage {
+            attributes,
+            layer_data,
+        };
+        let mut data = Self::from_image(image, beauty_only, proxy);
+        data.display_size = display_size;
+        Some(data)
+    }
+
     /// `(width, height)` of the given logical layer **for display/framing**. For a
     /// proxy (#94) this is the full-res [`Self::display_size`] (so the viewport
     /// frames it at full size and the small texture upscales); otherwise it's the
@@ -389,6 +606,60 @@ fn map_read_err<T>(
             err_str
         }
     })
+}
+
+/// Append a length-prefixed (`u32` LE) UTF-8 string to a proxy-cache blob.
+fn write_blob_str(out: &mut Vec<u8>, s: &str) {
+    out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+    out.extend_from_slice(s.as_bytes());
+}
+
+/// Bounds-checked little-endian cursor over a proxy-cache blob (#165). Every
+/// accessor returns `Option`, so a truncated or corrupt blob short-circuits to a
+/// cache miss ([`ExrData::from_proxy_blob`]) instead of panicking.
+struct BlobReader<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> BlobReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, pos: 0 }
+    }
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let slice = self.bytes.get(self.pos..self.pos.checked_add(n)?)?;
+        self.pos += n;
+        Some(slice)
+    }
+    fn u8(&mut self) -> Option<u8> {
+        Some(self.take(1)?[0])
+    }
+    fn u16(&mut self) -> Option<u16> {
+        Some(u16::from_le_bytes(self.take(2)?.try_into().ok()?))
+    }
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+    fn i32(&mut self) -> Option<i32> {
+        Some(i32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
+    fn f32(&mut self) -> Option<f32> {
+        Some(f32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+    fn str(&mut self) -> Option<String> {
+        let len = self.u32()? as usize;
+        // `take` bounds `len` to the bytes left, so a corrupt length can't
+        // allocate past the blob's own size.
+        String::from_utf8(self.take(len)?.to_vec()).ok()
+    }
+    /// Bytes not yet consumed — used to reject a claimed sample count that
+    /// couldn't possibly fit before allocating a buffer for it.
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.pos)
+    }
 }
 
 /// Build the truncated, comma-joined display string of logical-layer names.
@@ -1167,6 +1438,181 @@ mod tests {
         assert!(
             crate::pixels::all_channels_f16([r, g, b, a]),
             "all-f16 source proxy keeps the f16 upload path"
+        );
+    }
+
+    // --- On-disk proxy-cache blob (#165) -------------------------------------
+
+    /// A throwaway key for blob tests (the on-disk cache echoes + verifies it).
+    fn blob_key() -> crate::proxy_cache::ProxyKey {
+        crate::proxy_cache::ProxyKey {
+            path: "/shots/sh010/beauty.0001.exr".into(),
+            mtime_ns: 1_700_000_000_123_456_789,
+            size: 178_000_000,
+            proxy_px: 1024,
+        }
+    }
+
+    #[test]
+    fn proxy_blob_round_trips_geometry_depth_and_layer_name() {
+        // Build a proxy-shaped frame directly so the geometry the viewport frames
+        // by is non-trivial: a shifted display window, a **named** beauty layer at
+        // a non-zero data-window origin, all-f16 channels, a custom pixel aspect,
+        // and a full-res `display_size` distinct from the (small) buffer.
+        let mut chans: smallvec::SmallVec<[AnyChannel<FlatSamples>; 4]> = smallvec::SmallVec::new();
+        for (i, name) in ["R", "G", "B", "A"].iter().enumerate() {
+            let vals: Vec<f16> = (0..3 * 2)
+                .map(|p| f16::from_f32((i as f32 * 10.0 + p as f32) * 0.01))
+                .collect();
+            chans.push(AnyChannel::new(Text::from(*name), FlatSamples::F16(vals)));
+        }
+        let attributes = LayerAttributes {
+            layer_position: Vec2(7, -3),
+            layer_name: Some(Text::from("beauty")),
+            ..LayerAttributes::default()
+        };
+        let layer = Layer::new(
+            (3usize, 2usize),
+            attributes,
+            Encoding::UNCOMPRESSED,
+            AnyChannels::sort(chans),
+        );
+        let mut img_attrs = ImageAttributes::new(IntegerBounds::new((5, 9), (40usize, 30usize)));
+        img_attrs.pixel_aspect = 2.0;
+        let image = FlatImage {
+            attributes: img_attrs,
+            layer_data: smallvec::smallvec![layer],
+        };
+        let mut proxy = ExrData::from_image(image, true, true);
+        proxy.display_size = Some((40, 30));
+
+        let key = blob_key();
+        let blob = proxy.write_proxy_blob(&key);
+        let back = ExrData::from_proxy_blob(&blob, &key).expect("valid blob round-trips");
+
+        assert!(back.proxy && back.beauty_only, "flags preserved");
+        assert_eq!(back.display_size, Some((40, 30)), "full-res framing size");
+        assert_eq!(
+            back.image.attributes.display_window, proxy.image.attributes.display_window,
+            "display window (viewport framing) preserved"
+        );
+        assert_eq!(back.image.attributes.pixel_aspect, 2.0);
+        let bl = &back.image.layer_data[0];
+        assert_eq!(
+            bl.attributes.layer_position,
+            Vec2(7, -3),
+            "data-window origin"
+        );
+        assert_eq!(
+            bl.attributes.layer_name.as_ref().map(ToString::to_string),
+            Some("beauty".to_string()),
+            "named beauty layer survives (logical-layer name fidelity)"
+        );
+        // Every channel stays F16 (buffer bit-for-bit) → keeps the Rgba16Float path.
+        let (_, r, g, b, a) = back.logical_channels(0).unwrap();
+        assert!(
+            crate::pixels::all_channels_f16([r, g, b, a]),
+            "f16 preserved"
+        );
+        for (src, out) in proxy.image.layer_data[0]
+            .channel_data
+            .list
+            .iter()
+            .zip(&bl.channel_data.list)
+        {
+            match (&src.sample_data, &out.sample_data) {
+                (FlatSamples::F16(a), FlatSamples::F16(b)) => {
+                    assert_eq!(a, b, "{} samples", src.name)
+                }
+                _ => panic!("channel {} depth changed", src.name),
+            }
+        }
+    }
+
+    #[test]
+    fn proxy_blob_round_trips_a_decoded_multipart_beauty() {
+        // End-to-end: the multi-part beauty proxy the cache actually stores.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("mp.exr");
+        write_multipart_exr(&p);
+        let proxy = ExrData::load_proxy(&p, 1).expect("proxy");
+        let key = blob_key();
+        let back =
+            ExrData::from_proxy_blob(&proxy.write_proxy_blob(&key), &key).expect("round-trips");
+        assert_eq!(back.logical_layers.len(), proxy.logical_layers.len());
+        assert_eq!(back.channels_str, proxy.channels_str);
+        assert_eq!(back.approx_bytes(), proxy.approx_bytes());
+        assert_eq!(back.logical_size(0), proxy.logical_size(0));
+    }
+
+    #[test]
+    fn from_proxy_blob_rejects_bad_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.exr");
+        write_tall_rgba(&p, 16, 200);
+        let key = blob_key();
+        let good = ExrData::load_proxy(&p, 48).unwrap().write_proxy_blob(&key);
+
+        // Sanity: the untouched blob does round-trip.
+        assert!(ExrData::from_proxy_blob(&good, &key).is_some());
+
+        // Bad magic.
+        let mut bad_magic = good.clone();
+        bad_magic[0] = b'X';
+        assert!(ExrData::from_proxy_blob(&bad_magic, &key).is_none());
+
+        // Wrong version byte (right after the 4-byte magic).
+        let mut bad_ver = good.clone();
+        bad_ver[4] = 0xFF;
+        assert!(ExrData::from_proxy_blob(&bad_ver, &key).is_none());
+
+        // Truncated body.
+        assert!(ExrData::from_proxy_blob(&good[..good.len() / 2], &key).is_none());
+        assert!(ExrData::from_proxy_blob(&[], &key).is_none());
+
+        // Echoed key mismatch (a hash collision or a re-rendered source): the
+        // stored key no longer matches the request → treated as a miss.
+        let other = crate::proxy_cache::ProxyKey {
+            mtime_ns: key.mtime_ns + 1,
+            ..key.clone()
+        };
+        assert!(ExrData::from_proxy_blob(&good, &other).is_none());
+    }
+
+    #[test]
+    fn from_proxy_blob_rejects_absurd_counts_without_allocating() {
+        // A corrupt/tampered blob with a valid header + matching key but a layer
+        // claiming a 65535×65535 buffer must return None (a cache miss) — the
+        // per-channel allocation is bounded to the blob's own remaining bytes, so
+        // a bogus dimension can never force a multi-GB allocation. (If this ever
+        // regressed it would OOM the test process, not just fail an assert.)
+        let key = blob_key();
+        let mut b = Vec::new();
+        b.extend_from_slice(PROXY_BLOB_MAGIC);
+        b.push(PROXY_BLOB_VERSION);
+        b.push(0b10); // proxy flag
+        b.extend_from_slice(&key.mtime_ns.to_le_bytes());
+        b.extend_from_slice(&key.size.to_le_bytes());
+        b.extend_from_slice(&key.proxy_px.to_le_bytes());
+        write_blob_str(&mut b, &key.path);
+        b.extend_from_slice(&0i32.to_le_bytes()); // display_window pos x
+        b.extend_from_slice(&0i32.to_le_bytes()); // display_window pos y
+        b.extend_from_slice(&64u32.to_le_bytes()); // display_window size x
+        b.extend_from_slice(&64u32.to_le_bytes()); // display_window size y
+        b.extend_from_slice(&1.0f32.to_le_bytes()); // pixel_aspect
+        b.push(0); // display_size: None
+        b.extend_from_slice(&1u16.to_le_bytes()); // layer_count = 1
+        b.extend_from_slice(&0i32.to_le_bytes()); // layer_position x
+        b.extend_from_slice(&0i32.to_le_bytes()); // layer_position y
+        b.extend_from_slice(&65535u32.to_le_bytes()); // lw  → n = 65535²
+        b.extend_from_slice(&65535u32.to_le_bytes()); // lh
+        b.push(0); // layer_name: None
+        b.extend_from_slice(&1u16.to_le_bytes()); // chan_count = 1
+        write_blob_str(&mut b, "R");
+        b.push(SAMPLE_TAG_F16); // ~8.6 GB of samples would follow — but don't
+        assert!(
+            ExrData::from_proxy_blob(&b, &key).is_none(),
+            "absurd dims must miss, not allocate"
         );
     }
 
