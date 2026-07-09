@@ -32,7 +32,7 @@ egui = "0.34.3"
 serde = { version = "1.0", features = ["derive"] }
 egui_extras = { version = "0.34.3", features = ["image", "all_loaders"] }
 env_logger = "0.11.10"
-exr = "1.74.0"
+exr = "1.74.1"
 log = "0.4.30"
 rfd = "0.17.2"
 smallvec = "1.15.1"
@@ -79,8 +79,11 @@ objc2-metal = { version = "0.3", default-features = false, features = ["MTLDevic
 name = "exr_load"
 harness = false
 
-# Patched exr: decompresses ZIP/PXR24 via miniz_oxide instead of zune-inflate,
-# which panics (and aborts the app via a rayon worker) on some valid files.
-# See https://github.com/byvfx/exrs/tree/miniz-inflate
+# Patched exr: upstream v1.74.1 (which adds DWAA/DWAB decode) with the
+# miniz-inflate patch re-applied — decompresses ZIP/PXR24 *and DWA's own internal
+# inflate* via miniz_oxide instead of zune-inflate, which panics (and aborts the
+# app via a rayon worker) on some valid files. Gives floki DWA support without
+# reintroducing that panic (upstream 1.74.1 still ships zune-inflate).
+# See https://github.com/byvfx/exrs/tree/miniz-inflate-1.74.1
 [patch.crates-io]
-exr = { git = "https://github.com/byvfx/exrs", branch = "miniz-inflate" }
+exr = { git = "https://github.com/byvfx/exrs", branch = "miniz-inflate-1.74.1" }

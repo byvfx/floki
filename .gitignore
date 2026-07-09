@@ -5,6 +5,10 @@
 
 # EXR test assets / renders (large binaries)
 *.exr
+# ...except the tiny committed DWA decode fixtures (<1 KB each): exrs can decode
+# DWAA/DWAB but cannot *write* them, so these can't be generated synthetically at
+# test time — they're the only way to regression-test DWA open support.
+!tests/fixtures/*.exr
 
 # Local agent guidance / runtime (not versioned)
 CLAUDE.md
