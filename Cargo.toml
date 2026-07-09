@@ -47,6 +47,10 @@ home = "0.5"
 # Bottom-bar resource monitor (#51): system + per-process memory. Default features off so
 # we only pull the memory/process collectors, not disk/network/components/users.
 sysinfo = { version = "0.33", default-features = false, features = ["system"] }
+# Zero-copy sequence decode reads (#164): map the EXR and parse straight from the
+# page cache instead of re-reading through a BufReader. Already resolved in
+# Cargo.lock (transitive), pinned here for direct use.
+memmap2 = "0.9"
 
 [dev-dependencies]
 tempfile = "3"          # scoped temp dirs/files for test fixtures (auto-cleanup)

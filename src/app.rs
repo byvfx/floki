@@ -179,6 +179,11 @@ pub struct ExrApp {
     /// instant cache hit. Cleared on each new sequence.
     #[serde(skip)]
     frame_cache: crate::cache::FrameCache,
+    /// Read-ahead file warmer (#164): pulls the next wanted frames' files
+    /// through the page cache while the current one decodes, so the decode
+    /// worker's read never waits on storage.
+    #[serde(skip)]
+    prefetcher: crate::prefetch::Prefetcher,
     /// Resident-frame budget for `frame_cache`, recomputed from the RAM budget
     /// (`budget::max_t1`) each status tick once a frame's size is measured.
     #[serde(skip)]
@@ -524,6 +529,7 @@ impl Default for ExrApp {
             viewer: ExrViewer::default(),
             playback: crate::playback::Playback::default(),
             frame_cache: crate::cache::FrameCache::new(),
+            prefetcher: crate::prefetch::Prefetcher::default(),
             // Conservative starting budget until the first frame is measured and
             // `budget::max_t1` recomputes it from a slice of free RAM.
             frame_cache_cap: 8,
@@ -1479,7 +1485,72 @@ impl ExrApp {
             }
             if let Some(w) = self.next_want_slot(slot, d) {
                 self.submit_seq(slot, w);
+                // Overlap I/O with decode (#164): while the worker decodes `w`,
+                // a background thread pulls the *next* wanted frames' files
+                // through the page cache, so the worker's next read is a
+                // memory-speed pointer walk (the decode maps the file) instead
+                // of a storage stall. Only while a prefetch window is active —
+                // warming on a bare playhead seek would race the user's intent.
+                if depth > 0 {
+                    self.warm_ahead(slot, w, depth);
+                }
                 return;
+            }
+        }
+    }
+
+    /// Queue the next few non-resident frames after `submitted` for background
+    /// file warming (#164) — the same order `next_want_slot` will request them,
+    /// so the warmer stays exactly ahead of the decoder. Best-effort and
+    /// epoch-agnostic: a superseded warm wastes bandwidth, never correctness.
+    fn warm_ahead(&mut self, slot: crate::cache::Slot, submitted: u32, depth: usize) {
+        /// Files to keep warm ahead of the decoder. One hides the read of the
+        /// very next frame; a second gives slack for a fast decode (proxies)
+        /// outpacing a slow warm. More would only evict-race the page cache.
+        const WARM_AHEAD: usize = 2;
+        let behind = crate::scheduler::read_behind(depth);
+        let ahead = depth - behind;
+        let mut resident: std::collections::HashSet<u32> =
+            self.frame_cache.resident_frames(slot).collect();
+        resident.insert(submitted);
+        let wants = match slot {
+            crate::cache::Slot::A => crate::scheduler::want_list(
+                self.playback.current_frame,
+                self.playback.in_point,
+                self.playback.out_point,
+                self.playback.direction,
+                self.playback.loop_mode,
+                &resident,
+                ahead,
+                behind,
+            ),
+            crate::cache::Slot::B => {
+                let Some(seq_b) = self.sequence_b.as_ref() else {
+                    return;
+                };
+                crate::scheduler::want_list(
+                    self.current_frame_b,
+                    seq_b.range.0,
+                    seq_b.range.1,
+                    self.playback.direction,
+                    self.playback.loop_mode,
+                    &resident,
+                    ahead,
+                    behind,
+                )
+            }
+        };
+        for w in wants.into_iter().take(WARM_AHEAD) {
+            let path = match slot {
+                crate::cache::Slot::A => self.playback.frame_path(w).map(Path::to_path_buf),
+                crate::cache::Slot::B => self
+                    .sequence_b
+                    .as_ref()
+                    .and_then(|s| s.path_for(w))
+                    .map(Path::to_path_buf),
+            };
+            if let Some(path) = path {
+                self.prefetcher.warm(path);
             }
         }
     }

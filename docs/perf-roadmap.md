@@ -179,6 +179,7 @@ art is manual pre-rendering (RVIO remasters, Nuke proxy files, OIIO `maketx`
 | [#163](https://github.com/byvfx/floki/pull/163) | [#94](https://github.com/byvfx/floki/issues/94) Ph.1 | In-RAM scrub proxies — geometry-preserving post-decode `downsampled()`, so the range fits RAM and replays smoothly |
 | [#174](https://github.com/byvfx/floki/pull/174) | [#170](https://github.com/byvfx/floki/issues/170) | f16 proxies — `downsampled()` keeps the source bit-depth, halving proxy RAM and restoring the `Rgba16Float` upload path |
 | [#175](https://github.com/byvfx/floki/pull/175) | [#169](https://github.com/byvfx/floki/issues/169) | Read-behind window — ~25% of the prefetch depth reserved behind the playhead (scheduler P3 + eviction carve-out, RV `-lookback` model), so play-then-step-back hits cache |
+| [#176](https://github.com/byvfx/floki/pull/176) | [#164](https://github.com/byvfx/floki/issues/164) | I/O prefetch pipeline — mmap zero-copy decode (`map_file` + `from_buffered`) + a page-cache warm-ahead thread (`src/prefetch.rs`) overlapping the next frame's read with the current decode |
 
 The proxies (#94/#163) are the footprint lever #1 in action; the rest of this
 roadmap is the remaining levers.
@@ -190,18 +191,7 @@ roadmap is the remaining levers.
 Ordered highest-payoff first. Each is a tracked issue; this doc is the context
 those issues share.
 
-### 1. I/O prefetch pipeline — [#164](https://github.com/byvfx/floki/issues/164)
-*Lever: pipelining.* Overlap the file **read** with **decode**, fed by the
-existing pump want-list. Epoch-agnostic, so the #98 pump/supersession logic is
-untouched. Biggest **general** win and the single best lever for **networked /
-slow-storage** media. Modest on local heavy footage (~15–20% faster fill); large
-where reads are slow. Two candidate designs, and the field survey **promotes
-mmap to the primary candidate**: OpenRV defaults EXR I/O to memory-mapped on all
-platforms ("Based on performance tuning"), and tlRender/mrv2 read EXR through
-mmap'd `Imf::IStream`s. Fallback/alternative: a byte-prefetch ring filled by a
-dedicated prefetch thread + a decode-from-bytes path (`exr` `from_buffered`).
-
-### 2. Persistent on-disk proxy cache — [#165](https://github.com/byvfx/floki/issues/165)
+### 1. Persistent on-disk proxy cache — [#165](https://github.com/byvfx/floki/issues/165)
 *Lever: amortize decode.* Persist the downsampled proxies to disk (keyed
 path+mtime+size+proxy-px) so the first-touch decode is paid **once, ever** — a
 repeat pass or a later session loads proxies from disk instead of re-decoding.
@@ -216,7 +206,7 @@ resolution the bandwidth is trivial (1024-wide RGBA f16 ≈ 4.4 MB/frame ≈
 Pranckevičius 2025). Avoid DWA for the cache itself — compact but the slowest
 decode of the options (~60 ms @ 8K with 16 threads, OpenEXR #1755).
 
-### 3. Faster first-pass decode — [#33](https://github.com/byvfx/floki/issues/33)
+### 2. Faster first-pass decode — [#33](https://github.com/byvfx/floki/issues/33)
 *Lever: throughput (the one place it helps).* Speed up `ExrData::load` itself:
 lazy per-layer/channel decode (only decode what's shown), confirm the parallel
 decompression is fully engaged, proxy first-paint. This is the only decode-speed
@@ -234,7 +224,7 @@ benchmark exists — bench the fork against `openexr-sys`/OpenEXRCore on our own
 corpus before any rewrite (OpenEXR 3.3's Core-backed rewrite initially
 *regressed* DWA decode 12–17%, OpenEXR #1915 — Core is not automatically faster).
 
-### 4. B-side T2 GPU ring — [#166](https://github.com/byvfx/floki/issues/166) (#98 Phase 2)
+### 3. B-side T2 GPU ring — [#166](https://github.com/byvfx/floki/issues/166) (#98 Phase 2)
 *Lever: footprint/pipelining on the GPU side.* B currently uploads a texture
 per-frame (`build_layer_texture`) while A renders from the pre-uploaded T2 VRAM
 ring, so locked-step B stutters on heavy footage. Add a second T2 ring for slot B
@@ -243,7 +233,7 @@ Precedents: DJV 2.x divides its cache budget evenly across open files; tlRender
 counts all A/B-compare timelines into its bytes-per-frame; xStudio jitters
 per-playhead prefetch refresh so compared sources don't re-request in lockstep.
 
-### 5. Color-depth cache packing — [#167](https://github.com/byvfx/floki/issues/167)
+### 4. Color-depth cache packing — [#167](https://github.com/byvfx/floki/issues/167)
 *Lever: footprint (second axis).* Pack T1 cache entries at reduced bit-depth
 (floki already caches at f16; explore f16 → 8-bit/packed-half behind a quality
 toggle) → ~2× more frames in the same RAM, multiplying with #94 resolution
