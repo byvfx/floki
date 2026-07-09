@@ -5,6 +5,52 @@ All notable changes to Floki are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.10.0] - 2026-07-08
+
+The heavy-footage review-playback wave. Scrub proxies, an I/O prefetch pipeline,
+and a persistent on-disk cache make 4K multi-AOV sequences play — and re-review —
+smoothly, where they used to thrash. Plus DWA-compressed EXRs now open at all.
+
+### Added
+- **DWAA/DWAB (DWA-compressed) EXRs now open.** floki previously failed to open
+  them (`pixels cannot be compressed (dwaa)`). The patched `exr` decoder is
+  rebased onto upstream's DWA support (v1.74.1) while keeping the miniz-inflate
+  fix that stops a decompressor panic from aborting the app.
+- **Persistent on-disk proxy cache.** Downsampled scrub proxies are cached to
+  `~/.floki/proxy-cache`, so a repeat pass or a later session loads them from disk
+  instead of re-decoding the source — the first-touch decode is paid once, ever.
+  Huge for networked media and repeated review (dailies, shot iteration). On by
+  default, LRU-bounded (default 10 GB), with a transport toggle, a size budget,
+  and a Clear button. The read-ahead warmer skips frames the cache already holds.
+- **In-RAM scrub proxies for heavy footage.** While playing or scrubbing, floki
+  decodes a small downsampled proxy so heavy footage plays smoothly and far more
+  frames fit in RAM (hundreds vs ~16 full); the paused frame always sharpens to
+  full res. Geometry-preserving, so tight-data-window renders still frame
+  correctly. A transport toggle with an adjustable proxy size.
+- **Locked-step A/B sequence playback.** In wipe/compare modes the B sequence
+  plays slaved to A, so both advance together.
+
+### Performance
+- **I/O prefetch pipeline.** A background warmer pulls the next frame's file
+  through the OS page cache while the current frame decodes (with a zero-copy
+  memory-mapped decode), so the read never blocks the decode cores — biggest on
+  slow or networked storage.
+- **Read-behind window.** ~25% of the prefetch depth is reserved behind the
+  playhead, so play-then-stop-then-step-back hits cache instead of re-decoding.
+- **f16 proxies.** Proxies keep the source half-float bit depth instead of
+  widening to f32 — half the proxy RAM, and the fast `Rgba16Float` upload path
+  stays engaged.
+- **Contact-sheet thumbnails freeze during playback** and refresh on settle,
+  removing a re-bake hitch while scrubbing.
+
+### Changed
+- **Eager precache now defaults on.** With proxies and the disk cache making a
+  full-range fill cheap, floki warms the whole in/out range up front by default
+  (bounded by the RAM budget). Existing saved settings are respected — only fresh
+  installs get the new default.
+- The `exr` decoder pulls `pulp` (SIMD dispatch for DWA's inverse DCT) as a new
+  transitive dependency.
+
 ## [1.9.3] - 2026-07-05
 
 More of the July audit ([docs/audit-2026-07.md](docs/audit-2026-07.md)): the
