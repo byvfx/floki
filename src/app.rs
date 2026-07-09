@@ -58,6 +58,13 @@ fn default_proxy_size() -> usize {
     1024
 }
 
+/// serde default for `proxy_cache_gb` (#165): the on-disk proxy-cache size budget
+/// in GiB. ~10 GiB ≈ 2.5–5k f16 proxy frames — plenty for a shot, trivial on a
+/// modern disk. A ceiling, LRU-evicted; the actual footprint is only what's cached.
+fn default_proxy_cache_gb() -> f32 {
+    10.0
+}
+
 /// serde default for `t2_enabled` (bool's own default is `false`).
 fn ret_true() -> bool {
     true
@@ -308,14 +315,37 @@ pub struct ExrApp {
     #[serde(default = "default_proxy_size")]
     proxy_size: usize,
 
+    /// Persist the downsampled scrub proxies to disk (#165) so the first-touch
+    /// decode of a frame is paid **once, ever** — a repeat pass / later session
+    /// loads proxies from `~/.floki/proxy-cache` instead of re-decoding. Keyed by
+    /// source path+mtime+size+proxy-px (a re-render auto-invalidates); LRU-evicted
+    /// to [`Self::proxy_cache_gb`]. On by default (bounded + self-invalidating);
+    /// a kill-switch. Persisted. The runtime cache lives in [`Self::proxy_cache`].
+    #[serde(default = "ret_true")]
+    proxy_disk_cache: bool,
+    /// On-disk proxy-cache size budget in **gibibytes** (1024³, matching the RAM
+    /// budget's unit). LRU ceiling, not a reservation. Persisted.
+    #[serde(default = "default_proxy_cache_gb")]
+    proxy_cache_gb: f32,
+    /// Runtime handle to the persistent proxy cache (#165). Shared (`Arc`) with
+    /// the decode worker, which reads-through it (hit → skip decode) and
+    /// write-throughs misses. Not persisted — rebuilt each session from
+    /// `proxy_disk_cache` / `proxy_cache_gb` in [`Self::new`]; the inert default
+    /// does zero I/O until `configure`d, so headless tests pay nothing.
+    #[serde(skip)]
+    proxy_cache: std::sync::Arc<crate::proxy_cache::ProxyCache>,
+
     /// Eager precache (#56, hardening step 4): fill the whole in/out range into
     /// the T1 ring up front — not just the decode-ahead window — so the cached
     /// span plays *and loops* with the decoder idle (PDplayer / OpenRV-style).
     /// Bounded by the live RAM budget: it fills to `frame_cache_cap` and the
     /// cache-fill bar under the scrubber shows the resident span; it never
-    /// pretends to hold what won't fit. Off by default (it eagerly commits RAM);
-    /// an explicit transport toggle. Persisted.
-    #[serde(default)]
+    /// pretends to hold what won't fit. On by default (#165): scrub proxies keep
+    /// the per-frame footprint small and the disk cache makes a repeat fill cheap,
+    /// so eagerly warming the range is affordable now. An explicit transport
+    /// toggle. Persisted (existing saved state is respected; only fresh installs
+    /// get the new default).
+    #[serde(default = "ret_true")]
     precache: bool,
 
     /// User-assigned cap on the RAM the T1 ring may use. The unit is **gibibytes**
@@ -556,7 +586,12 @@ impl Default for ExrApp {
             beauty_preview: true,
             proxy_enabled: true,
             proxy_size: default_proxy_size(),
-            precache: false,
+            proxy_disk_cache: true,
+            proxy_cache_gb: default_proxy_cache_gb(),
+            // Inert until `new` calls `configure`: zero I/O, no writer thread —
+            // so the `Default` app (every headless test) pays nothing.
+            proxy_cache: std::sync::Arc::new(crate::proxy_cache::ProxyCache::disabled()),
+            precache: true,
             ram_budget_gb: 0.0,
             precache_filled: false,
             last_t2_pump: None,
@@ -658,6 +693,14 @@ impl ExrApp {
                 app.ocio_enabled = false;
             }
         }
+
+        // Activate the persistent proxy cache (#165) from the restored settings.
+        // Off the UI thread: the first enable spawns the writer, which does the
+        // one-time directory scan + eviction.
+        app.proxy_cache.configure(
+            app.proxy_disk_cache,
+            crate::proxy_cache::gib_to_bytes(app.proxy_cache_gb),
+        );
 
         app
     }
@@ -1069,6 +1112,10 @@ impl ExrApp {
             let (job_tx, job_rx) = std::sync::mpsc::channel::<LoadJob>();
             let (result_tx, result_rx) = std::sync::mpsc::channel::<LoadMsg>();
             let epoch_signal = std::sync::Arc::clone(&self.epoch_signal);
+            // Persistent proxy cache (#165), shared with the worker: read-through
+            // (hit → skip decode) + write-through on a proxy miss. Cloned before
+            // the spawn like `epoch_signal`; a respawn re-clones from `self`.
+            let proxy_cache = std::sync::Arc::clone(&self.proxy_cache);
             let repaint_ctx = self.repaint_ctx.clone();
             // Wake the UI as soon as a result is queued (#137). Without this the
             // result waits for the next scheduled repaint — up to the full 50 ms
@@ -1116,14 +1163,37 @@ impl ExrApp {
                     //   falling back to beauty/full if the fast read isn't available;
                     // - **beauty-only** (one layer) otherwise while moving (#56 step 3);
                     // - full all-AOV for opens and the settle re-decode.
+                    // #165: a proxy job checks the on-disk cache first — a hit is a
+                    // raw f16 read (~zero decode); a miss decodes then write-throughs.
+                    let mut store_blob: Option<(crate::proxy_cache::ProxyKey, Vec<u8>)> = None;
                     let result = match job.proxy_target {
-                        Some(tb) => ExrData::load_proxy(&job.path, tb).or_else(|_| {
-                            if job.beauty_only {
-                                ExrData::load_beauty(&job.path)
+                        Some(tb) => {
+                            if let Some(cached) = proxy_cache.read(&job.path, tb) {
+                                Ok(cached)
                             } else {
-                                ExrData::load(&job.path)
+                                let decoded = ExrData::load_proxy(&job.path, tb).or_else(|_| {
+                                    if job.beauty_only {
+                                        ExrData::load_beauty(&job.path)
+                                    } else {
+                                        ExrData::load(&job.path)
+                                    }
+                                });
+                                // Cache only a genuine proxy (never a fallback
+                                // beauty/full). Serialize here (miss-only, <1% of
+                                // the decode just paid) so the borrow ends before
+                                // `decoded` is moved into the message; the disk
+                                // write happens off-thread in the cache's writer.
+                                if let Ok(data) = &decoded
+                                    && data.proxy
+                                    && let Some(key) =
+                                        crate::proxy_cache::ProxyKey::for_source(&job.path, tb)
+                                {
+                                    let blob = data.write_proxy_blob(&key);
+                                    store_blob = Some((key, blob));
+                                }
+                                decoded
                             }
-                        }),
+                        }
                         None if job.beauty_only => ExrData::load_beauty(&job.path),
                         None => ExrData::load(&job.path),
                     };
@@ -1137,6 +1207,11 @@ impl ExrApp {
                         result,
                     })));
                     wake_ui();
+                    // Queue the proxy write-through *after* the UI has the frame, so
+                    // the awaited frame never waits on the write path (#165).
+                    if let Some((key, blob)) = store_blob {
+                        proxy_cache.store(&key, blob);
+                    }
                 }
             });
             self.load_tx = Some(job_tx);
@@ -1550,6 +1625,19 @@ impl ExrApp {
                     .map(Path::to_path_buf),
             };
             if let Some(path) = path {
+                // Skip the read-ahead warm when the on-disk proxy cache (#165)
+                // already holds this frame at the size it would decode: the worker
+                // will hit the cache and never open the source, so pulling it
+                // through the page cache is wasted bandwidth — exactly the
+                // networked-storage cost the cache exists to remove. `contains`
+                // self-gates to `false` when the disk cache is off.
+                let px = match slot {
+                    crate::cache::Slot::A => self.decode_proxy_target(w),
+                    crate::cache::Slot::B => self.decode_proxy_target_b(w),
+                };
+                if px.is_some_and(|px| self.proxy_cache.contains(&path, px)) {
+                    continue;
+                }
                 self.prefetcher.warm(path);
             }
         }
@@ -4256,15 +4344,62 @@ impl ExrApp {
 
                 ui.separator();
 
+                // On-disk proxy cache (#165). On → persist scrub proxies to
+                // ~/.floki/proxy-cache so a repeat pass / later session loads them
+                // instead of re-decoding; LRU-bounded by the GB budget beside it.
+                let disk_changed = ui
+                    .checkbox(&mut self.proxy_disk_cache, "Disk cache")
+                    .on_hover_text(
+                        "Persist scrub proxies to disk (~/.floki/proxy-cache) so a \
+                         repeat pass or a later session loads them instantly instead \
+                         of re-decoding — auto-invalidated when a frame is re-rendered. \
+                         Huge for networked media and repeated review (dailies, shot \
+                         iteration).",
+                    )
+                    .changed();
+                let budget_changed = self.proxy_disk_cache
+                    && ui
+                        .add(
+                            egui::DragValue::new(&mut self.proxy_cache_gb)
+                                .range(1.0..=200.0)
+                                .speed(1.0)
+                                .suffix(" GB"),
+                        )
+                        .on_hover_text(
+                            "On-disk proxy-cache size budget (GiB). A ceiling, not a \
+                             reservation — the least-recently-used proxies are evicted \
+                             first once it fills.",
+                        )
+                        .changed();
+                if disk_changed || budget_changed {
+                    self.proxy_cache.configure(
+                        self.proxy_disk_cache,
+                        crate::proxy_cache::gib_to_bytes(self.proxy_cache_gb),
+                    );
+                }
+                if self.proxy_disk_cache
+                    && ui
+                        .button("Clear")
+                        .on_hover_text("Delete all cached proxies from ~/.floki/proxy-cache.")
+                        .clicked()
+                {
+                    self.proxy_cache.clear();
+                }
+
+                ui.separator();
+
                 // Eager precache kill-switch (#56, step 4). On → fill the whole
                 // in/out range into the ring up front (bounded by RAM); the
-                // cache-fill bar under the scrubber shows how much is resident.
+                // cache-fill bar under the scrubber shows how much is resident. On
+                // by default (#165): scrub proxies keep the footprint small and the
+                // disk cache makes a repeat fill cheap, so warming the range is cheap.
                 if ui
                     .checkbox(&mut self.precache, "Precache")
                     .on_hover_text(
                         "Cache the whole in/out range up front so it plays and \
                          loops with no decoding. Fills to the RAM budget; the bar \
-                         under the scrubber shows the cached span.",
+                         under the scrubber shows the cached span. Cheap with scrub \
+                         proxies + the disk cache on, so it's on by default.",
                     )
                     .changed()
                     && self.precache
@@ -5778,6 +5913,10 @@ mod tests {
         touch_sequence(dir.path(), 3);
         let mut app = ExrApp::default();
         app.detect_sequence(&dir.path().join("s.0001.exr"));
+        // This case tests the no-precache path; precache now defaults on (#165),
+        // so pin it off explicitly (precache-on makes prefetched-while-settled
+        // frames beauty, covered separately).
+        app.precache = false;
 
         let cur = app.playback.current_frame; // playhead (frame 1)
         let ahead = cur + 1; // a prefetch frame

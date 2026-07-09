@@ -180,33 +180,20 @@ art is manual pre-rendering (RVIO remasters, Nuke proxy files, OIIO `maketx`
 | [#174](https://github.com/byvfx/floki/pull/174) | [#170](https://github.com/byvfx/floki/issues/170) | f16 proxies — `downsampled()` keeps the source bit-depth, halving proxy RAM and restoring the `Rgba16Float` upload path |
 | [#175](https://github.com/byvfx/floki/pull/175) | [#169](https://github.com/byvfx/floki/issues/169) | Read-behind window — ~25% of the prefetch depth reserved behind the playhead (scheduler P3 + eviction carve-out, RV `-lookback` model), so play-then-step-back hits cache |
 | [#176](https://github.com/byvfx/floki/pull/176) | [#164](https://github.com/byvfx/floki/issues/164) | I/O prefetch pipeline — mmap zero-copy decode (`map_file` + `from_buffered`) + a page-cache warm-ahead thread (`src/prefetch.rs`) overlapping the next frame's read with the current decode |
+| #177 | [#165](https://github.com/byvfx/floki/issues/165) | Persistent on-disk proxy cache (`src/proxy_cache.rs`) — raw f16/f32 blob per proxy keyed path+mtime+size+px, read-through on the decode worker (hit = skip decode) + off-thread write-through, LRU-evicted to a GB budget. Closes the "amortize decode" lever. Add-ons: prefetcher skips warming a frame the cache already holds; a Clear-cache button; idle precache flipped default-on (proxies + disk cache make the full-range fill cheap). Extracts the on-disk half of #94, which can now close. |
 
-The proxies (#94/#163) are the footprint lever #1 in action; the rest of this
-roadmap is the remaining levers.
+The proxies (#94/#163) are the footprint lever #1 in action; the on-disk cache
+(#165) is the amortize-decode lever; the rest of this roadmap is what remains.
 
 ---
 
 ## Backlog (ranked)
 
 Ordered highest-payoff first. Each is a tracked issue; this doc is the context
-those issues share.
+those issues share. ~~#165~~ (persistent on-disk proxy cache) shipped in this
+wave — see the table above; the ranked levers that remain:
 
-### 1. Persistent on-disk proxy cache — [#165](https://github.com/byvfx/floki/issues/165)
-*Lever: amortize decode.* Persist the downsampled proxies to disk (keyed
-path+mtime+size+proxy-px) so the first-touch decode is paid **once, ever** — a
-repeat pass or a later session loads proxies from disk instead of re-decoding.
-Extracts the on-disk-cache half of #94 now that Phase 1 (#163) shipped; #94 can
-close once this lands. Huge for networked media and repeated review (dailies, shot
-iteration). **No open-source player has this** (field survey above) — RV, DJV,
-mrv2, xStudio are all RAM-only; the prior art is manual pre-rendering (RVIO,
-Nuke proxy files, OIIO `.tx`). **Format: raw f16 dumps, mmap-able.** At proxy
-resolution the bandwidth is trivial (1024-wide RGBA f16 ≈ 4.4 MB/frame ≈
-106 MB/s @ 24 fps), and decode cost is zero. Optional zstd for network shares
-(filtered zstd: ~2.3× ratio at ~20× faster decode than EXR/ZIP, per Aras
-Pranckevičius 2025). Avoid DWA for the cache itself — compact but the slowest
-decode of the options (~60 ms @ 8K with 16 threads, OpenEXR #1755).
-
-### 2. Faster first-pass decode — [#33](https://github.com/byvfx/floki/issues/33)
+### 1. Faster first-pass decode — [#33](https://github.com/byvfx/floki/issues/33)
 *Lever: throughput (the one place it helps).* Speed up `ExrData::load` itself:
 lazy per-layer/channel decode (only decode what's shown), confirm the parallel
 decompression is fully engaged, proxy first-paint. This is the only decode-speed
@@ -224,7 +211,7 @@ benchmark exists — bench the fork against `openexr-sys`/OpenEXRCore on our own
 corpus before any rewrite (OpenEXR 3.3's Core-backed rewrite initially
 *regressed* DWA decode 12–17%, OpenEXR #1915 — Core is not automatically faster).
 
-### 3. B-side T2 GPU ring — [#166](https://github.com/byvfx/floki/issues/166) (#98 Phase 2)
+### 2. B-side T2 GPU ring — [#166](https://github.com/byvfx/floki/issues/166) (#98 Phase 2)
 *Lever: footprint/pipelining on the GPU side.* B currently uploads a texture
 per-frame (`build_layer_texture`) while A renders from the pre-uploaded T2 VRAM
 ring, so locked-step B stutters on heavy footage. Add a second T2 ring for slot B
@@ -233,7 +220,7 @@ Precedents: DJV 2.x divides its cache budget evenly across open files; tlRender
 counts all A/B-compare timelines into its bytes-per-frame; xStudio jitters
 per-playhead prefetch refresh so compared sources don't re-request in lockstep.
 
-### 4. Color-depth cache packing — [#167](https://github.com/byvfx/floki/issues/167)
+### 3. Color-depth cache packing — [#167](https://github.com/byvfx/floki/issues/167)
 *Lever: footprint (second axis).* Pack T1 cache entries at reduced bit-depth
 (floki already caches at f16; explore f16 → 8-bit/packed-half behind a quality
 toggle) → ~2× more frames in the same RAM, multiplying with #94 resolution
@@ -270,11 +257,12 @@ Smaller than the ranked levers, filed as their own issues:
   DJV 1.x showed *achieved* FPS, mrv2/DJV3 show dropped-frame HUDs). The
   documented heavy-EXR workflow everywhere is "wait for the bar, then play" —
   floki's cache machinery needs to be legible for users to trust it.
-- **Idle precache default-on when proxying.** `tick_precache` exists but
-  defaults off; DJV 1.x idle-preloaded by default and xStudio starts
-  whole-timeline background caching 500 ms after the playhead stops. Proxies
-  (#94) are exactly what makes this affordable. (Fold into the cache-visibility
-  issue or flip the default with #165.)
+- **~~Idle precache default-on when proxying~~ — shipped with #165.** The
+  persisted `precache` default flipped `false → true`: fresh installs now get
+  scrub proxies + disk cache + precache on together, so the whole in/out range
+  warms up front (DJV 1.x / xStudio idle-preload model). Proxies keep the
+  footprint small and the disk cache makes a repeat fill cheap, which is what
+  makes eager precache affordable. Existing saved state is respected.
 - **Adaptive-throttle pacing (future).** xStudio's middle ground between
   Stutter and DropFrames: frames > 2 periods late multiply velocity by 0.8 until
   decode catches up, restoring after. Revisit once the levers above land.
