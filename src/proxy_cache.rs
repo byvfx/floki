@@ -199,7 +199,10 @@ impl ProxyCache {
 
         if !enabled || self.root.as_os_str().is_empty() {
             self.enabled.store(false, Ordering::Relaxed);
-            *self.writer.lock().unwrap() = None; // disconnect → writer thread exits
+            // disconnect → writer thread exits
+            if self.writer.lock().unwrap().take().is_some() {
+                log::debug!(target: "floki::proxy_cache", "disabled");
+            }
             return;
         }
 
@@ -223,6 +226,12 @@ impl ProxyCache {
                     .is_ok()
                 {
                     *guard = Some(tx);
+                    log::info!(
+                        target: "floki::proxy_cache",
+                        "enabled: dir={}, budget={:.1} GiB",
+                        self.root.display(),
+                        budget_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+                    );
                 }
             }
         }
@@ -240,17 +249,27 @@ impl ProxyCache {
         let key = ProxyKey::for_source(path, proxy_px)?;
         let filename = key.filename();
         let file = self.root.join(&filename);
-        // Skip an implausibly large (corrupt / tampered) entry before reading it
-        // whole into RAM.
-        if std::fs::metadata(&file).ok()?.len() > MAX_BLOB_BYTES {
-            return None;
+        // Read + verify the entry. A raw f16/f32 dump, so a hit is a single alloc +
+        // memcpy with no decompression. An implausibly large (corrupt / tampered)
+        // entry is skipped before it's read whole into RAM, and counts as a miss.
+        let hit = match std::fs::metadata(&file) {
+            Ok(meta) if meta.len() <= MAX_BLOB_BYTES => std::fs::read(&file)
+                .ok()
+                .and_then(|bytes| ExrData::from_proxy_blob(&bytes, &key)),
+            _ => None,
+        };
+        match hit {
+            Some(data) => {
+                log::debug!(target: "floki::proxy_cache", "hit {filename} ({proxy_px}px)");
+                // Best-effort LRU touch — never blocks the read.
+                self.send(WriterMsg::Touch(filename), false);
+                Some(data)
+            }
+            None => {
+                log::debug!(target: "floki::proxy_cache", "miss {filename} ({proxy_px}px)");
+                None
+            }
         }
-        // A raw f16/f32 dump: read is a single alloc + memcpy, no decompression.
-        let bytes = std::fs::read(&file).ok()?;
-        let data = ExrData::from_proxy_blob(&bytes, &key)?;
-        // Best-effort LRU touch — never blocks the read.
-        self.send(WriterMsg::Touch(filename), false);
-        Some(data)
     }
 
     /// Queue a proxy blob for background write-through. Best-effort: dropped if
@@ -287,6 +306,7 @@ impl ProxyCache {
     /// through the writer (blocking, so it can't be dropped) when one is running,
     /// else a direct sweep of the directory.
     pub fn clear(&self) {
+        log::debug!(target: "floki::proxy_cache", "clear requested");
         if self.send(WriterMsg::Clear, true) {
             return;
         }
@@ -423,6 +443,12 @@ impl Writer {
             return;
         }
         self.insert(filename.to_string(), blob.len() as u64);
+        log::debug!(
+            target: "floki::proxy_cache",
+            "wrote {filename} ({} B, total={})",
+            blob.len(),
+            self.total
+        );
         self.evict_to_budget();
     }
 
@@ -447,12 +473,14 @@ impl Writer {
         if self.total <= budget {
             return;
         }
+        let before = self.total;
         let mut order: Vec<(String, u64)> = self
             .index
             .iter()
             .map(|(name, e)| (name.clone(), e.last_used))
             .collect();
         order.sort_by_key(|(_, last_used)| *last_used);
+        let mut evicted = 0usize;
         for (name, _) in order {
             if self.total <= budget {
                 break;
@@ -460,7 +488,15 @@ impl Writer {
             if let Some(entry) = self.index.remove(&name) {
                 let _ = std::fs::remove_file(self.root.join(&name)); // best-effort
                 self.total = self.total.saturating_sub(entry.size);
+                evicted += 1;
             }
+        }
+        if evicted > 0 {
+            log::debug!(
+                target: "floki::proxy_cache",
+                "evicted {evicted} entries ({before} -> {} B, budget={budget})",
+                self.total
+            );
         }
     }
 }
