@@ -2371,6 +2371,21 @@ impl ExrViewer {
                     );
                 }
 
+                // Always-on display-window resolution ("format") readout — shown
+                // for every image, unlike the overscan/bbox annotations below which
+                // stay gated to data≠display. `disp_window` is full-res even for a
+                // downsampled proxy (`downsampled()` preserves display_window), so
+                // this never flickers on scrub.
+                if !is_side_by_side {
+                    unclipped_painter.text(
+                        disp_rect.right_bottom() + egui::vec2(0.0, 5.0),
+                        egui::Align2::RIGHT_TOP,
+                        format!("{}x{}", disp_window.size.x(), disp_window.size.y()),
+                        egui::FontId::proportional(12.0),
+                        egui::Color32::from_gray(200),
+                    );
+                }
+
                 // Labels for display window
                 let is_overscanned = image_rect.min.x < disp_rect.min.x
                     || image_rect.min.y < disp_rect.min.y
