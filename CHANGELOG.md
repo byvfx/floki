@@ -5,6 +5,25 @@ All notable changes to Floki are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.10.1] - 2026-07-09
+
+A small follow-up to the 1.10.0 playback wave: the image resolution is now
+always visible on the canvas, and the on-disk proxy cache reports its activity.
+
+### Fixed
+- **Resolution now always shown on the canvas.** The on-canvas resolution
+  readout only appeared when the EXR had overscan (a data window that differs
+  from the display window); a normal image showed none. The display-window
+  resolution now renders for every image, at the bottom-right of the frame. The
+  orange overscan/bbox annotation stays scoped to when the data window differs
+  from the display window.
+
+### Changed
+- **The persistent on-disk proxy cache now logs its activity.** Hit / miss /
+  write / eviction and enable / disable / clear are emitted under the
+  `floki::proxy_cache` log target, so cache behaviour is observable at runtime
+  (`RUST_LOG=floki::proxy_cache=debug`).
+
 ## [1.10.0] - 2026-07-08
 
 The heavy-footage review-playback wave. Scrub proxies, an I/O prefetch pipeline,
