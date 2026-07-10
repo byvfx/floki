@@ -2950,7 +2950,7 @@ impl ExrApp {
             painter.rect_stroke(
                 active,
                 0.0,
-                egui::Stroke::new(3.0, egui::Color32::from_rgb(90, 160, 240)),
+                egui::Stroke::new(3.0_f32, egui::Color32::from_rgb(90, 160, 240)),
                 egui::StrokeKind::Inside,
             );
             painter.line_segment(
@@ -4557,7 +4557,7 @@ impl ExrApp {
                     let x = x_of(h);
                     painter.line_segment(
                         [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                        egui::Stroke::new(1.5, hole_color),
+                        egui::Stroke::new(1.5_f32, hole_color),
                     );
                 }
             }
@@ -4566,7 +4566,7 @@ impl ExrApp {
                 let x = x_of(f);
                 painter.line_segment(
                     [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                    egui::Stroke::new(2.0, visuals.widgets.active.fg_stroke.color),
+                    egui::Stroke::new(2.0_f32, visuals.widgets.active.fg_stroke.color),
                 );
             }
             // Playhead (drawn last, on top).
@@ -4576,12 +4576,12 @@ impl ExrApp {
                     egui::pos2(px, rect.top() - 2.0),
                     egui::pos2(px, rect.bottom() + 2.0),
                 ],
-                egui::Stroke::new(2.0, visuals.strong_text_color()),
+                egui::Stroke::new(2.0_f32, visuals.strong_text_color()),
             );
             painter.rect_stroke(
                 rect,
                 3.0,
-                egui::Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color),
+                egui::Stroke::new(1.0_f32, visuals.widgets.noninteractive.bg_stroke.color),
                 egui::StrokeKind::Inside,
             );
         }
