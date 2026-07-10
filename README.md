@@ -9,7 +9,7 @@
 
 Powered by `egui`, `wgpu`, and the pure-Rust `exr` crate, it allows you to instantly view dense pixel data, isolate color channels, explore unbounded floating-point histograms, and perform pixel-perfect A/B diffing — all rendered natively on your GPU — as well as **play image sequences in real time**.
 
-![Floki viewer](assets/floki_1-7-0_base.png)
+![Floki viewer](assets/floki_1-10-0_base.png)
 
 ---
 
@@ -29,13 +29,17 @@ Open one frame of a numbered sequence (e.g. `render.0101.exr`) and play the whol
 * **Eager precache:** Optionally cache the whole in/out range up front — a green fill bar under the scrubber shows what's resident — so the span plays and loops with the decoder idle.
 * **Live render-watch:** Watch the sequence folder and pick up frames as a render writes them (new frames extend the range; re-rendered frames refresh), optionally parking the playhead on the newest frame.
 
-<!-- TODO(1.9.0): add a playback/transport screenshot, e.g. assets/floki_1-9-0_playback.png -->
+![Sequence playback](assets/floki_1-10-0_playback.gif)
+*Real-time sequence playback — the scrubber highlights the trimmed in/out region, the green bar shows the cached range, and target/measured fps read out live.*
 
 ### Deep Inspection
 * **Precision Pixel Sampling:** Hover over any pixel to reveal exact floating-point values (R, G, B, A) regardless of bit-depth (F16, F32, U32).
 * **Persistent Swatches:** `Shift + Click` on the image to drop a permanent color swatch into your toolbelt for cross-referencing.
 * **Metadata Explorer:** Cleanly displays embedded EXR attributes (like V-Ray/Arnold custom tags), layers, and bounding box data in collapsible panels for both Image A and Image B simultaneously.
 * **Dual Contact Sheets:** Instantly view all AOVs (Arbitrary Output Variables) and layers as a scrollable grid of thumbnails. If a second image is loaded, view dual synchronized contact sheets side-by-side or seamlessly toggle between them.
+
+![Contact sheet](assets/floki_1-10-0_contactsheet.png)
+*Dual contact sheets — every AOV and layer as a thumbnail grid, kept in sync across Image A and Image B.*
 
 ### Advanced A/B Comparison
 Load a Reference Image (Image B) to unlock advanced visual diffing:
@@ -47,27 +51,43 @@ Load a Reference Image (Image B) to unlock advanced visual diffing:
 
 Comparison controls follow a two-tier toolbar: the everyday controls stay on a single row, while the active mode's parameters slide into a contextual second row only when needed.
 
-![Wipe compare mode](assets/floki_1-7-0_wipe.png)
+![Wipe compare mode](assets/floki_1-10-0_wipe.png)
 *Wipe compare mode — drag the divider at any angle to check Image A against Image B.*
 
-![Side-by-side compare mode](assets/floki_1-7-0_side_by_side.png)
+![Side-by-side compare mode](assets/floki_1-10-0_sidebyside.png)
 *Side-by-side — Image A and Image B share one camera for synchronized panning and zooming.*
+
+![Diff matte](assets/floki_1-10-0_diff.png)
+*Diff matte — the magnitude of `A − B` as a false-colour heat map, with the value legend on-screen.*
 
 ### Image Analysis
 * **Dynamic Luminance Histogram:** Real-time histogram mapped to Exposure Values (EV stops). Effortlessly spot floating-point highlights over `1.0` using the Logarithmic view.
 * **Dual Histogram Mode:** When comparing two images, the histogram overlays a translucent Red graph (Image B) on top of the White graph (Image A) so you can visually align black levels.
 * **Channel Isolation:** Quickly isolate `R`, `G`, `B`, `A`, or view `RGB` composite with single-key shortcuts.
 
+![Luminance histogram](assets/floki_1-10-0_hist.png)
+*Dual EV histogram — Image B (translucent red) overlaid on Image A (white) to align black levels and catch highlights over 1.0.*
+
 ### Color Management
 * **OpenColorIO (built in):** OCIO is compiled into every build — there is no non-OCIO build. Point Floki at a config and pick the display/view transform to see your footage in the right space; it auto-enables when a config loads and can be toggled on/off from **Color Management**. The transform runs on the GPU and can optionally be baked to a 3D LUT for smoother pan/zoom on weaker GPUs.
 * **3D LUT Support:** Load Adobe `.cube` 3D LUTs and apply them in real time on the GPU as a display transform, alongside the built-in Exposure/Gamma/sRGB controls.
 
+![OpenColorIO color management](assets/floki_1-10-0_ocio.png)
+*Color Management — point Floki at an OCIO config and pick the display/view transform; the transform runs on the GPU.*
+
 ### Customizable Viewport Background
 * **Background Modes:** Replace the default transparency checkerboard with a checkerboard (custom cell colours and size), a solid colour, or a multi-stop gradient at any angle — set from **View ▸ Viewport Background**. Save named presets that persist across sessions. The background composites consistently across the GPU and OCIO display paths.
+
+| Checkerboard | Solid | Gradient |
+|:---:|:---:|:---:|
+| ![Checkerboard background](assets/floki_1-10-0_bg_checker.png) | ![Solid background](assets/floki_1-10-0_bg_solid.png) | ![Gradient background](assets/floki_1-10-0_bg_grad.png) |
 
 ### Snapshot & Review
 * **Snapshot to Clipboard:** Copy exactly what's on screen to the system clipboard with `Cmd/Ctrl + Shift + S` (or **View ▸ Snapshot to Clipboard**) — background, compare mode, OCIO, and annotations all included. Optionally also save a timestamped PNG to `~/.floki/snapshots/`.
 * **Annotation Overlay:** Mark up the view with arrows, boxes, a freehand pen, and text labels (adjustable colour and stroke width) before snapshotting. Annotations anchor to image pixels so they track pan/zoom, support undo/redo and clear-all, and are flattened into the snapshot automatically.
+
+![Annotation overlay](assets/floki_1-10-0_annotate.png)
+*Annotation overlay — arrows, boxes, freehand pen, and text labels anchor to image pixels and flatten into the snapshot.*
 
 ### Batch Tooling
 * **EXR Header Converter:** Bulk-rename channels across an entire directory to standard RGBA — available both as an in-app Tools window and a headless `convert_dir` CLI, parallelized across CPU cores via `rayon` with live progress and cancellation.
