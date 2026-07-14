@@ -240,6 +240,11 @@ pub struct ExrApp {
     /// than guesswork. Transient, off by default.
     #[serde(skip)]
     show_playback_debug: bool,
+    /// User-facing playback HUD (#172): a compact viewport overlay with achieved
+    /// vs target fps, the dropped/held-frame count for the current play run, and
+    /// T1 cache occupancy — so the cache/pacing machinery is legible during
+    /// review. Persisted (a review preference), off by default.
+    show_playback_hud: bool,
     /// Last `ResourceMonitor` sample, stashed each status tick for the overlay
     /// (the budget inputs: sys + VRAM used/total).
     #[serde(skip)]
@@ -249,6 +254,13 @@ pub struct ExrApp {
     dbg_evictions: u64,
     #[serde(skip)]
     dbg_dropped_epoch: u64,
+    /// Frames the pacer skipped (DropFrames) or held-late (Stutter) during the
+    /// current play run (#172), for the HUD + debug overlay. Reset when play
+    /// (re)starts. `dbg_dropped_epoch` above is unrelated (stale-decode discards).
+    #[serde(skip)]
+    run_dropped: u32,
+    #[serde(skip)]
+    run_held: u32,
 
     /// Wall-clock instant the most recent **sequence** decode job was submitted
     /// to the worker. Anchors the decode stall watchdog ([`Self::tick_decode_watchdog`]):
@@ -572,9 +584,12 @@ impl Default for ExrApp {
             inflight_b: std::collections::HashSet::new(),
             epoch_signal: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             show_playback_debug: false,
+            show_playback_hud: false,
             dbg_last_sample: None,
             dbg_evictions: 0,
             dbg_dropped_epoch: 0,
+            run_dropped: 0,
+            run_held: 0,
             decode_submit_at: None,
             last_decode_dur: None,
             dbg_last_trace: None,
@@ -1127,6 +1142,12 @@ impl ExrApp {
                 }
             };
             std::thread::spawn(move || {
+                // Reused box-filter accumulator for proxy downsampling (#171),
+                // owned by the worker for its whole life. Proxies are uniform-size
+                // per sequence, so this allocates + zeroes once instead of per
+                // channel per frame during scrub/playback (the decode-side analogue
+                // of the T2 `t2_staging` reuse).
+                let mut proxy_scratch: Vec<f32> = Vec::new();
                 for job in job_rx {
                     // Drop a sequence job a newer seek/scrub already superseded,
                     // **before** paying the decode (#…). Rapid scrubbing queues
@@ -1171,13 +1192,15 @@ impl ExrApp {
                             if let Some(cached) = proxy_cache.read(&job.path, tb) {
                                 Ok(cached)
                             } else {
-                                let decoded = ExrData::load_proxy(&job.path, tb).or_else(|_| {
-                                    if job.beauty_only {
-                                        ExrData::load_beauty(&job.path)
-                                    } else {
-                                        ExrData::load(&job.path)
-                                    }
-                                });
+                                let decoded =
+                                    ExrData::load_proxy_into(&job.path, tb, &mut proxy_scratch)
+                                        .or_else(|_| {
+                                            if job.beauty_only {
+                                                ExrData::load_beauty(&job.path)
+                                            } else {
+                                                ExrData::load(&job.path)
+                                            }
+                                        });
                                 // Cache only a genuine proxy (never a fallback
                                 // beauty/full). Serialize here (miss-only, <1% of
                                 // the decode just paid) so the borrow ends before
@@ -1883,6 +1906,9 @@ impl ExrApp {
             self.playback.state = PlayState::Paused;
             self.settle_to_full();
         } else {
+            // Fresh play run → reset the HUD's dropped/held counters (#172).
+            self.run_dropped = 0;
+            self.run_held = 0;
             self.playback.start_playing(std::time::Instant::now());
         }
     }
@@ -2105,6 +2131,12 @@ impl ExrApp {
             // (anchor to now) so we don't burst-catch-up — stutter holds
             // wall-time-independent, never skipping.
             if now > due + period {
+                // The lag we're forgiving is the number of frame-periods the
+                // display spent behind schedule — count it as held frames (#172).
+                let lag = now.duration_since(due).as_nanos() / period.as_nanos().max(1);
+                self.run_held = self
+                    .run_held
+                    .saturating_add(u32::try_from(lag).unwrap_or(u32::MAX));
                 self.playback.anchor = Some(now);
                 self.playback.frames_since_anchor = 0;
             }
@@ -2142,6 +2174,9 @@ impl ExrApp {
             }
         }
         if steps > 0 {
+            // Only the landing frame is displayed; the `steps - 1` frames stepped
+            // over are skipped/dropped — count them for the HUD (#172).
+            self.run_dropped = self.run_dropped.saturating_add(steps.saturating_sub(1));
             // The playhead skipped past any frame we were awaiting, so that
             // in-flight decode is no longer the one to show. Clear the awaited
             // state *before* requesting the new frame: otherwise `loading_a`
@@ -3115,6 +3150,7 @@ impl eframe::App for ExrApp {
         self.draw_tools_window(ui.ctx());
         self.draw_color_management_window(ui.ctx());
         self.draw_playback_debug(ui.ctx());
+        self.draw_playback_hud(ui.ctx());
         self.draw_menu_bar(ui);
         self.draw_status_bar(ui);
         // Transport bar sits just above the status bar (added after it, so it
@@ -3722,6 +3758,11 @@ impl ExrApp {
                         ui.checkbox(&mut self.save_snapshots, "Also save to ~/.floki/snapshots")
                             .on_hover_text("Write a timestamped PNG alongside the clipboard copy");
                         ui.separator();
+                        ui.checkbox(&mut self.show_playback_hud, "Playback HUD")
+                            .on_hover_text(
+                                "Compact on-viewport readout while playing: achieved / \
+                                 target fps, dropped/held frames, and cache occupancy (#172)",
+                            );
                         ui.checkbox(&mut self.show_playback_debug, "Playback Debug")
                             .on_hover_text(
                                 "Live cache / budget / pacing readout for playback soak testing (#100)",
@@ -3970,6 +4011,46 @@ impl ExrApp {
                 }
             });
         });
+    }
+
+    /// Compact on-viewport playback HUD (#172): achieved vs target fps (green when
+    /// keeping up, amber when lagging), the dropped (DropFrames) or held (Stutter)
+    /// frame count for the current play run, and T1 cache occupancy. Toggled from
+    /// View ▸ Playback HUD; shown only while a sequence is loaded. A chromeless,
+    /// non-interactive window anchored top-right so it never eats canvas clicks.
+    fn draw_playback_hud(&mut self, ctx: &egui::Context) {
+        if !self.show_playback_hud || !self.playback.is_active() {
+            return;
+        }
+        use crate::playback::Pacing;
+        let playing = self.playback.is_playing();
+        let (measured, target) = (self.playback.measured_fps, self.playback.fps_target);
+        // Skipped frames only accrue in DropFrames; held frames only in Stutter —
+        // label by the active pacing so the number always means what it says.
+        let (drop_label, drop_n) = match self.playback.pacing {
+            Pacing::DropFrames => ("dropped", self.run_dropped),
+            Pacing::Stutter => ("held", self.run_held),
+        };
+        let (t1_len, t1_cap) = (self.frame_cache.len(), self.frame_cache_cap);
+        egui::Window::new("playback_hud")
+            .title_bar(false)
+            .resizable(false)
+            .movable(false)
+            .interactable(false)
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 12.0))
+            .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                let fps_color = if !playing {
+                    ui.visuals().weak_text_color()
+                } else if measured >= target * 0.95 {
+                    egui::Color32::from_rgb(120, 200, 140)
+                } else {
+                    egui::Color32::from_rgb(220, 170, 80)
+                };
+                ui.colored_label(fps_color, format!("{measured:.1} / {target:.0} fps"));
+                ui.label(format!("{drop_label} {drop_n}"));
+                ui.label(format!("cache {t1_len}/{t1_cap} frames"));
+            });
     }
 
     /// Live playback debug overlay (#100): cache / budget / pacing readout for
@@ -4527,29 +4608,45 @@ impl ExrApp {
             let slot_x = |f: u32| {
                 rect.left() + ((f64::from(f.saturating_sub(lo)) / nslots) as f32) * rect.width()
             };
-            let fill = egui::Color32::from_rgb(64, 168, 96);
+            // Two-tone (#172): proxy/beauty-resident frames in a dim green, full-res
+            // on top in a brighter green — so a range that's only proxy-cached (it
+            // sharpens to full on pause) reads differently from a fully-cached one.
+            let proxy_fill = egui::Color32::from_rgb(52, 104, 72);
+            let full_fill = egui::Color32::from_rgb(64, 168, 96);
+            // Coalesce a sorted frame set into contiguous runs and paint each as one
+            // rect (#146 — one shape per frame tessellated thousands per repaint).
+            let paint_runs = |frames: &mut Vec<u32>, color: egui::Color32| {
+                frames.sort_unstable();
+                let mut i = 0;
+                while i < frames.len() {
+                    let start = frames[i];
+                    let mut end = start;
+                    while i + 1 < frames.len() && frames[i + 1] == end + 1 {
+                        i += 1;
+                        end = frames[i];
+                    }
+                    i += 1;
+                    let seg = egui::Rect::from_min_max(
+                        egui::pos2(slot_x(start), strip_top),
+                        egui::pos2(slot_x(end + 1).min(rect.right()), rect.bottom()),
+                    );
+                    painter.rect_filled(seg, 0.0, color);
+                }
+            };
+            // only the trimmed range is the precache target
+            let in_range = |f: u32| f >= in_pt && f <= out_pt;
             let mut resident: Vec<u32> = self
                 .frame_cache
                 .resident_frames(crate::cache::Slot::A)
-                // only the trimmed range is the precache target
-                .filter(|&f| f >= in_pt && f <= out_pt)
+                .filter(|&f| in_range(f))
                 .collect();
-            resident.sort_unstable();
-            let mut i = 0;
-            while i < resident.len() {
-                let start = resident[i];
-                let mut end = start;
-                while i + 1 < resident.len() && resident[i + 1] == end + 1 {
-                    i += 1;
-                    end = resident[i];
-                }
-                i += 1;
-                let seg = egui::Rect::from_min_max(
-                    egui::pos2(slot_x(start), strip_top),
-                    egui::pos2(slot_x(end + 1).min(rect.right()), rect.bottom()),
-                );
-                painter.rect_filled(seg, 0.0, fill);
-            }
+            paint_runs(&mut resident, proxy_fill);
+            let mut full: Vec<u32> = self
+                .frame_cache
+                .resident_full_frames(crate::cache::Slot::A)
+                .filter(|&f| in_range(f))
+                .collect();
+            paint_runs(&mut full, full_fill);
             // Holes: distinct vertical marks across the full span.
             if let Some(seq) = self.playback.sequence.as_ref() {
                 let hole_color = egui::Color32::from_rgb(206, 92, 60);
