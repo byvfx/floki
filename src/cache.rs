@@ -104,6 +104,16 @@ impl FrameCache {
             .map(|(_, f)| *f)
     }
 
+    /// Resident frame numbers held at **full** fidelity (not a scrub proxy or a
+    /// beauty-only decode), non-allocating — for the two-tone timeline cache bar
+    /// (#172), which shades full-res frames brighter than proxy/beauty frames.
+    pub fn resident_full_frames(&self, slot: Slot) -> impl Iterator<Item = u32> + '_ {
+        self.entries
+            .iter()
+            .filter(move |((s, _), e)| *s == slot && !e.data.proxy && !e.data.beauty_only)
+            .map(|((_, f), _)| *f)
+    }
+
     pub fn clear(&mut self) {
         self.entries.clear();
     }
@@ -303,6 +313,27 @@ mod tests {
         for &f in frames {
             cache.insert(slot, f, frame());
         }
+    }
+
+    /// A proxy (downsampled) frame — its `proxy` flag is set, so the two-tone
+    /// cache bar (#172) counts it as *not* full-res.
+    fn proxy_frame() -> Arc<ExrData> {
+        Arc::new(frame().downsampled(1))
+    }
+
+    #[test]
+    fn resident_full_frames_excludes_proxy() {
+        let mut c = FrameCache::new();
+        c.insert(Slot::A, 1, frame()); // full
+        c.insert(Slot::A, 2, proxy_frame()); // proxy — excluded from "full"
+        c.insert(Slot::A, 3, frame()); // full
+        let mut full: Vec<u32> = c.resident_full_frames(Slot::A).collect();
+        full.sort_unstable();
+        assert_eq!(full, vec![1, 3], "proxy frame excluded from full residency");
+        // ...but it's still resident for the base cache-fill tone.
+        let mut all: Vec<u32> = c.resident_frames(Slot::A).collect();
+        all.sort_unstable();
+        assert_eq!(all, vec![1, 2, 3]);
     }
 
     #[test]

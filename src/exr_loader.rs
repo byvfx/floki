@@ -181,7 +181,21 @@ impl ExrData {
     /// # Errors
     /// Same contract as [`Self::load_beauty`].
     pub fn load_proxy(path: impl AsRef<Path>, max_dim: usize) -> std::result::Result<Self, String> {
-        Ok(Self::load_beauty(path)?.downsampled(max_dim))
+        Self::load_proxy_into(path, max_dim, &mut Vec::new())
+    }
+
+    /// [`Self::load_proxy`] reusing a caller-owned `f32` scratch buffer for the
+    /// box-filter accumulator (#171). The decode worker owns one `scratch` across
+    /// the whole session, so proxy playback pays the accumulator allocation +
+    /// page-zeroing **once** instead of per channel per frame — the decode-side
+    /// analogue of the T2 `t2_staging` reuse. Proxies are uniform-size per
+    /// sequence, so the buffer never reallocates after the first frame.
+    pub fn load_proxy_into(
+        path: impl AsRef<Path>,
+        max_dim: usize,
+        scratch: &mut Vec<f32>,
+    ) -> std::result::Result<Self, String> {
+        Ok(Self::load_beauty(path)?.downsampled_into(max_dim, scratch))
     }
 
     /// Box-filter this frame down so its long side is `<= max_dim` (#94). Preserves
@@ -197,6 +211,13 @@ impl ExrData {
     /// downsamples a `load_beauty` result.)
     #[must_use]
     pub fn downsampled(&self, max_dim: usize) -> Self {
+        self.downsampled_into(max_dim, &mut Vec::new())
+    }
+
+    /// [`Self::downsampled`] reusing a caller-owned `f32` accumulator (#171), so
+    /// the per-channel box-filter scratch is allocated + zeroed once for the whole
+    /// session rather than on every proxy decode. See [`Self::load_proxy_into`].
+    pub fn downsampled_into(&self, max_dim: usize, scratch: &mut Vec<f32>) -> Self {
         let mut layers: smallvec::SmallVec<[Layer<AnyChannels<FlatSamples>>; 2]> =
             smallvec::SmallVec::new();
         // The displayed (first/beauty) layer's full data-window size drives framing.
@@ -218,8 +239,12 @@ impl ExrData {
             for ch in &layer.channel_data.list {
                 // Box-filter: average each `factor × factor` block (clamped to the
                 // edge) into one output sample. Read via `sample_channel` so the
-                // source's F16/F32/U32 type is handled uniformly.
-                let mut out = vec![0.0f32; dw * dh];
+                // source's F16/F32/U32 type is handled uniformly. The accumulator
+                // is the reused `scratch` (#171): `resize` is a no-op after the
+                // first uniform-size channel/frame, and every element is fully
+                // overwritten below so the fill value is inert.
+                scratch.clear();
+                scratch.resize(dw * dh, 0.0);
                 for py in 0..dh {
                     for px in 0..dw {
                         let (x0, y0) = (px * factor, py * factor);
@@ -232,19 +257,20 @@ impl ExrData {
                                 n += 1;
                             }
                         }
-                        out[py * dw + px] = acc / n.max(1) as f32;
+                        scratch[py * dw + px] = acc / n.max(1) as f32;
                     }
                 }
                 // Store at the source depth for f16 (#170): the accumulation
                 // above already filtered at f32 precision, and rounding the
                 // result back to half loses nothing the source ever had. U32
                 // stays F32 — a box-filtered ID channel is meaningless either
-                // way, and proxies are never a sampling source.
+                // way, and proxies are never a sampling source. The f32 branch
+                // must copy out of the shared scratch (it can't be moved).
                 let samples = match &ch.sample_data {
                     FlatSamples::F16(_) => {
-                        FlatSamples::F16(out.iter().map(|&v| f16::from_f32(v)).collect())
+                        FlatSamples::F16(scratch.iter().map(|&v| f16::from_f32(v)).collect())
                     }
-                    FlatSamples::F32(_) | FlatSamples::U32(_) => FlatSamples::F32(out),
+                    FlatSamples::F32(_) | FlatSamples::U32(_) => FlatSamples::F32(scratch.clone()),
                 };
                 chans.push(AnyChannel::new(ch.name.clone(), samples));
             }
@@ -1439,6 +1465,49 @@ mod tests {
             crate::pixels::all_channels_f16([r, g, b, a]),
             "all-f16 source proxy keeps the f16 upload path"
         );
+    }
+
+    #[test]
+    fn downsampled_into_reuses_scratch_and_matches() {
+        // #171: `downsampled_into` with a reused accumulator must produce the exact
+        // same result as `downsampled`, regardless of the scratch's prior contents,
+        // and reuse the buffer (no realloc) across same-size frames.
+        let dir = tempfile::tempdir().unwrap();
+        let big = dir.path().join("big.exr");
+        let small = dir.path().join("small.exr");
+        write_typed_exr(&big, 64, 64, &[("R", true), ("G", true), ("B", false)]);
+        write_typed_exr(&small, 32, 32, &[("R", true), ("G", true), ("B", false)]);
+        let big_src = ExrData::load(&big).unwrap();
+        let small_src = ExrData::load(&small).unwrap();
+
+        let mut scratch = Vec::new();
+        // A differently-sized frame first exercises the resize path; then the same
+        // size twice must hit the no-realloc fast path with an identical result.
+        let _ = small_src.downsampled_into(16, &mut scratch);
+        let a = big_src.downsampled_into(16, &mut scratch);
+        let cap_after_first = scratch.capacity();
+        let b = big_src.downsampled_into(16, &mut scratch);
+        assert_eq!(
+            scratch.capacity(),
+            cap_after_first,
+            "same-size reuse must not reallocate the scratch"
+        );
+
+        // Equal to the throwaway-buffer path, byte for byte.
+        let want = big_src.downsampled(16);
+        for got in [&a, &b] {
+            let want_ch = &want.image.layer_data[0].channel_data.list;
+            let got_ch = &got.image.layer_data[0].channel_data.list;
+            assert_eq!(want_ch.len(), got_ch.len());
+            for (w, g) in want_ch.iter().zip(got_ch) {
+                assert_eq!(w.name, g.name);
+                match (&w.sample_data, &g.sample_data) {
+                    (FlatSamples::F16(ws), FlatSamples::F16(gs)) => assert_eq!(ws, gs),
+                    (FlatSamples::F32(ws), FlatSamples::F32(gs)) => assert_eq!(ws, gs),
+                    _ => panic!("bit depth mismatch for {}", w.name),
+                }
+            }
+        }
     }
 
     // --- On-disk proxy-cache blob (#165) -------------------------------------
