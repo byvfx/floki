@@ -5,6 +5,17 @@ All notable changes to Floki are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Anamorphic unsqueeze (#179).** The EXR `pixelAspectRatio` is now applied to
+  the viewport, so anamorphic footage (e.g. a 2× squeeze) displays at its correct
+  wide aspect instead of horizontally compressed. On by default; toggle it off for
+  raw square-pixel display, or set a custom squeeze factor for footage with a
+  missing/wrong header PAR — both in the viewer's "Display ▾" menu. Pixel readout,
+  annotations, "Frame (F)", and the display/data-window overlays all track the
+  unsqueeze; the anamorphic state is flagged in the Image Metadata panel.
+
 ## [1.10.2] - 2026-07-09
 
 A small follow-up to the 1.10.0 playback wave: the image resolution is now

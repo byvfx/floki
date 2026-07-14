@@ -172,6 +172,11 @@ struct CanvasLayout {
     tex_size: egui::Vec2,
     /// Pixel dimensions of image B's active layer, if B is loaded.
     tex_size_b: Option<egui::Vec2>,
+    /// Horizontal anamorphic unsqueeze factor for B (#179). A's factor is already
+    /// baked into `image_size`/`image_rect`, so single-image/composite/wipe/diff
+    /// draws need nothing further; only the Side-by-Side path lays B out separately
+    /// and must apply B's own factor here.
+    par_b: f32,
 }
 
 /// Which feature the shared gradient editor is currently editing — the result of
@@ -495,6 +500,12 @@ pub struct ViewerPrefs {
     pub background: crate::background::Background,
     /// Named background presets (mode + colours + gradient).
     pub background_presets: Vec<(String, crate::background::Background)>,
+    /// Anamorphic display (#179): when true, a non-1.0 EXR `pixelAspectRatio` is
+    /// applied as a horizontal display stretch (unsqueeze) so anamorphic footage
+    /// shows at its intended wide aspect. A no-op when PAR == 1.0. On by default,
+    /// matching RV / Nuke / Baselight; toggling it off returns to raw square-pixel
+    /// display.
+    pub anamorphic_unsqueeze: bool,
 }
 
 impl Default for ViewerPrefs {
@@ -506,6 +517,7 @@ impl Default for ViewerPrefs {
             custom_gradients: Vec::new(),
             background: crate::background::Background::default(),
             background_presets: Vec::new(),
+            anamorphic_unsqueeze: true,
         }
     }
 }
@@ -647,6 +659,11 @@ pub struct ExrViewer {
     pub scale: f32,
     pub translation: egui::Vec2,
     pub first_frame: bool,
+    /// Manual anamorphic squeeze override (#179): when `Some(f)`, the display
+    /// stretch uses `f` instead of the EXR header `pixelAspectRatio` (for footage
+    /// with a missing/wrong PAR). Session-only — not persisted, since it is
+    /// image-specific. Gated by [`ViewerPrefs::anamorphic_unsqueeze`].
+    pub pixel_aspect_override: Option<f32>,
     pub last_hover_pos_img: Option<(usize, usize)>,
     pub last_sampled_val_a: Option<[f32; 4]>,
     pub last_sampled_val_b: Option<[f32; 4]>,
@@ -769,6 +786,7 @@ impl Default for ExrViewer {
             scale: 1.0,
             translation: egui::Vec2::ZERO,
             first_frame: true,
+            pixel_aspect_override: None,
             last_hover_pos_img: None,
             last_sampled_val_a: None,
             last_sampled_val_b: None,
@@ -1105,6 +1123,38 @@ impl ExrViewer {
                 ui.label("Overscan Opacity:");
                 ui.add(egui::Slider::new(&mut self.overscan_opacity, 0.0..=1.0));
                 ui.checkbox(&mut self.show_tooltip, "Show Pixel Tooltip");
+
+                ui.separator();
+                // Anamorphic unsqueeze (#179): apply the EXR `pixelAspectRatio` as a
+                // horizontal display stretch. The master toggle persists via
+                // `ViewerPrefs`; the optional custom factor overrides the header PAR.
+                ui.checkbox(&mut self.prefs.anamorphic_unsqueeze, "Unsqueeze anamorphic")
+                    .on_hover_text(
+                        "Stretch non-square-pixel (anamorphic) footage to its display aspect",
+                    );
+                ui.add_enabled_ui(self.prefs.anamorphic_unsqueeze, |ui| {
+                    let header_par = exr_data.image.attributes.pixel_aspect;
+                    let mut custom = self.pixel_aspect_override.is_some();
+                    if ui
+                        .checkbox(&mut custom, "Custom factor")
+                        .on_hover_text("Override the header pixel aspect ratio")
+                        .changed()
+                    {
+                        // Seed the override from the header PAR, or a common 2× squeeze
+                        // when the header is square/absent.
+                        let seed = if header_par > 0.0 && header_par != 1.0 {
+                            header_par
+                        } else {
+                            2.0
+                        };
+                        self.pixel_aspect_override = custom.then_some(seed);
+                    }
+                    if let Some(factor) = self.pixel_aspect_override.as_mut() {
+                        ui.add(egui::DragValue::new(factor).speed(0.01).range(0.1..=4.0));
+                    } else {
+                        ui.label(format!("Header PAR: {header_par}"));
+                    }
+                });
             });
 
             if !self.show_contact_sheet {
@@ -1633,13 +1683,17 @@ impl ExrViewer {
         &mut self,
         response: &egui::Response,
         image_rect: egui::Rect,
-        scale: f32,
+        scale: egui::Vec2,
     ) {
-        let scale = scale.max(1e-6);
+        // Per-axis scale `(scale * par, scale)`: dividing by it maps a screen
+        // point back to *native* image pixels, so annotations are stored in
+        // native space and stay anchored across an anamorphic squeeze/unsqueeze
+        // toggle (#179).
+        let scale = egui::vec2(scale.x.max(1e-6), scale.y.max(1e-6));
         let to_img = |pos: egui::Pos2| {
             [
-                (pos.x - image_rect.min.x) / scale,
-                (pos.y - image_rect.min.y) / scale,
+                (pos.x - image_rect.min.x) / scale.x,
+                (pos.y - image_rect.min.y) / scale.y,
             ]
         };
 
@@ -1694,9 +1748,23 @@ impl ExrViewer {
         }
     }
 
+    /// Effective horizontal unsqueeze factor for an image whose header pixel
+    /// aspect ratio is `header_par` (#179). Returns `1.0` (no stretch) when the
+    /// anamorphic toggle is off; otherwise the manual override if set, else the
+    /// header PAR. Clamped away from zero so the reciprocal used in screen↔image
+    /// coordinate mapping stays finite.
+    fn unsqueeze_factor(&self, header_par: f32) -> f32 {
+        if !self.prefs.anamorphic_unsqueeze {
+            return 1.0;
+        }
+        self.pixel_aspect_override.unwrap_or(header_par).max(1e-3)
+    }
+
     /// Paint all committed annotations plus the in-progress shape. Text labels are
-    /// drawn here too; the editable text field is a separate popup.
-    fn draw_annotations(&self, painter: &egui::Painter, image_rect: egui::Rect, scale: f32) {
+    /// drawn here too; the editable text field is a separate popup. `scale` is the
+    /// per-axis screen scale `(scale * par, scale)`; the x component carries the
+    /// anamorphic unsqueeze so shapes track the stretched image (#179).
+    fn draw_annotations(&self, painter: &egui::Painter, image_rect: egui::Rect, scale: egui::Vec2) {
         for ann in &self.annotations {
             Self::draw_one_annotation(painter, ann, image_rect, scale);
         }
@@ -1709,9 +1777,9 @@ impl ExrViewer {
         painter: &egui::Painter,
         ann: &Annotation,
         image_rect: egui::Rect,
-        scale: f32,
+        scale: egui::Vec2,
     ) {
-        let to_screen = |p: [f32; 2]| image_rect.min + egui::vec2(p[0] * scale, p[1] * scale);
+        let to_screen = |p: [f32; 2]| image_rect.min + egui::vec2(p[0] * scale.x, p[1] * scale.y);
         let stroke = egui::Stroke::new(ann.width, ann.color);
         match &ann.kind {
             AnnotationKind::Arrow { a, b } => {
@@ -1752,11 +1820,16 @@ impl ExrViewer {
 
     /// The editable text field shown at the click point while placing a `Text`
     /// annotation. Enter commits, `Esc` cancels (handled in `handle_hotkeys`).
-    fn annotation_text_popup(&mut self, ui: &mut egui::Ui, image_rect: egui::Rect, scale: f32) {
+    fn annotation_text_popup(
+        &mut self,
+        ui: &mut egui::Ui,
+        image_rect: egui::Rect,
+        scale: egui::Vec2,
+    ) {
         let Some((pos, _)) = self.anno_text_edit.as_ref() else {
             return;
         };
-        let screen = image_rect.min + egui::vec2(pos[0] * scale, pos[1] * scale);
+        let screen = image_rect.min + egui::vec2(pos[0] * scale.x, pos[1] * scale.y);
         let mut commit = false;
         egui::Area::new(ui.id().with("anno_text_edit"))
             .order(egui::Order::Foreground)
@@ -2258,6 +2331,14 @@ impl ExrViewer {
                 }
             }
 
+            // Anamorphic unsqueeze factors (#179): A from its own header
+            // `pixelAspectRatio`, B from B's. Both are `1.0` (a no-op) when the
+            // toggle is off or the PAR is 1.0, so square-pixel footage is untouched.
+            let par = self.unsqueeze_factor(exr_data.image.attributes.pixel_aspect);
+            let par_b = exr_data_b
+                .map(|d| self.unsqueeze_factor(d.image.attributes.pixel_aspect))
+                .unwrap_or(1.0);
+
             if let Some(gpu) = gpu_resources {
                 // A layer switch invalidates the per-frame T2 ring (textures are
                 // per-layer). Do this before binding/building below.
@@ -2311,9 +2392,16 @@ impl ExrViewer {
                 // crop the framebuffer screenshot to just the image area.
                 self.last_canvas_rect = Some(rect);
 
-                self.handle_canvas_interaction(ui, rect, &response, tex_size, tex_size_b);
-                // Render Image
-                let image_size = tex_size * self.scale;
+                // Fit-to-view (#179): frame the *unsqueezed* extents so "Frame (F)"
+                // and the first-paint fit account for the wider anamorphic image.
+                let fit_size = egui::vec2(tex_size.x * par, tex_size.y);
+                let fit_size_b = tex_size_b.map(|b| egui::vec2(b.x * par_b, b.y));
+                self.handle_canvas_interaction(ui, rect, &response, fit_size, fit_size_b);
+                // Render Image — the x extent carries the anamorphic unsqueeze (#179).
+                let image_size = egui::vec2(tex_size.x * self.scale * par, tex_size.y * self.scale);
+                // Per-axis screen scale for all screen↔image coordinate mapping
+                // (annotations, pixel readout): x includes the unsqueeze, y does not.
+                let view_scale = egui::vec2(self.scale * par, self.scale);
 
                 // Side-by-Side draws each image at its own offset position, so the
                 // single centered overscan geometry below does not apply: skip the
@@ -2326,9 +2414,10 @@ impl ExrViewer {
                     .attributes
                     .layer_position;
 
-                let disp_size =
-                    egui::vec2(disp_window.size.x() as f32, disp_window.size.y() as f32)
-                        * self.scale;
+                let disp_size = egui::vec2(
+                    disp_window.size.x() as f32 * self.scale * par,
+                    disp_window.size.y() as f32 * self.scale,
+                );
                 let disp_rect = egui::Rect::from_min_size(
                     rect.center() + self.translation - disp_size / 2.0,
                     disp_size,
@@ -2343,9 +2432,9 @@ impl ExrViewer {
                 ));
 
                 let data_offset = egui::vec2(
-                    (data_window_min.0 - disp_window.position.x()) as f32,
-                    (data_window_min.1 - disp_window.position.y()) as f32,
-                ) * self.scale;
+                    (data_window_min.0 - disp_window.position.x()) as f32 * self.scale * par,
+                    (data_window_min.1 - disp_window.position.y()) as f32 * self.scale,
+                );
 
                 let image_rect = egui::Rect::from_min_size(disp_rect.min + data_offset, image_size);
 
@@ -2353,7 +2442,7 @@ impl ExrViewer {
                 // is active (pan is suppressed above). Coordinates map through
                 // `image_rect`/`scale` so shapes anchor to image pixels.
                 if self.anno_tool.is_active() {
-                    self.handle_annotation_input(&response, image_rect, self.scale);
+                    self.handle_annotation_input(&response, image_rect, view_scale);
                 }
 
                 // The display-window overlays below paint unclipped; the draw paths
@@ -2422,6 +2511,7 @@ impl ExrViewer {
                     image_size,
                     tex_size,
                     tex_size_b,
+                    par_b,
                 };
 
                 if let Some(gpu) = gpu_resources {
@@ -2431,8 +2521,8 @@ impl ExrViewer {
                 // Annotation overlay on top of the image (and its in-progress shape).
                 // Painted by egui, so it is included in the snapshot screenshot (#19).
                 let anno_painter = ui.painter().with_clip_rect(rect);
-                self.draw_annotations(&anno_painter, image_rect, self.scale);
-                self.annotation_text_popup(ui, image_rect, self.scale);
+                self.draw_annotations(&anno_painter, image_rect, view_scale);
+                self.annotation_text_popup(ui, image_rect, view_scale);
 
                 // Draw data window bounding box over the image
                 if (is_overscanned || is_cropped) && !is_side_by_side {
@@ -2458,7 +2548,7 @@ impl ExrViewer {
 
                 self.handle_pixel_sampling(
                     ui, &response, exr_data, exr_data_b, rect, image_rect, image_size, tex_size,
-                    tex_size_b,
+                    tex_size_b, par, par_b,
                 );
             }
         }
@@ -2481,6 +2571,8 @@ impl ExrViewer {
         image_size: egui::Vec2,
         tex_size: egui::Vec2,
         tex_size_b: Option<egui::Vec2>,
+        par: f32,
+        par_b: f32,
     ) {
         // INV-SAMPLE (#7): while a sequence is advancing (or a seek's frame is
         // still decoding), suppress the readout — the displayed frame can lag the
@@ -2514,10 +2606,13 @@ impl ExrViewer {
                 // `tex_size_b` is the actual prerequisite for the geometry math
                 // below (it's unwrapped multiple times here).
                 if let Some(tex_size_b) = tex_size_b {
-                    let mut image_size_b = tex_size_b * self.scale;
+                    // B's x extent carries B's own unsqueeze (`par_b`); A's
+                    // `image_size` already includes `par` from the caller (#179).
+                    let mut image_size_b =
+                        egui::vec2(tex_size_b.x * self.scale * par_b, tex_size_b.y * self.scale);
                     if self.normalize_side_by_side {
                         let scale_b = (tex_size.y * self.scale) / tex_size_b.y;
-                        image_size_b = tex_size_b * scale_b;
+                        image_size_b = egui::vec2(tex_size_b.x * scale_b * par_b, tex_size_b.y * scale_b);
                     }
                     let combined_width = image_size.x + image_size_b.x;
                     let combined_height = image_size.y.max(image_size_b.y);
@@ -2544,7 +2639,8 @@ impl ExrViewer {
 
                     if image_rect_a.contains(pos) {
                         let local = pos - image_rect_a.min;
-                        hover_x = Some((local.x / self.scale) as usize);
+                        // Map back to native pixels: x undoes the unsqueeze (#179).
+                        hover_x = Some((local.x / (self.scale * par)) as usize);
                         hover_y = Some((local.y / self.scale) as usize);
                     } else if image_rect_b.contains(pos) {
                         let local = pos - image_rect_b.min;
@@ -2553,7 +2649,7 @@ impl ExrViewer {
                         } else {
                             self.scale
                         };
-                        hover_x = Some((local.x / scale_b) as usize);
+                        hover_x = Some((local.x / (scale_b * par_b)) as usize);
                         hover_y = Some((local.y / scale_b) as usize);
                         hovered_b = true;
                     }
@@ -2561,7 +2657,8 @@ impl ExrViewer {
             } else {
                 let image_local_pos = pos - image_rect.min;
                 if image_local_pos.x >= 0.0 && image_local_pos.y >= 0.0 {
-                    hover_x = Some((image_local_pos.x / self.scale) as usize);
+                    // Map back to native pixels: x undoes the unsqueeze (#179).
+                    hover_x = Some((image_local_pos.x / (self.scale * par)) as usize);
                     hover_y = Some((image_local_pos.y / self.scale) as usize);
                 }
             }
@@ -2857,6 +2954,7 @@ impl ExrViewer {
             image_size,
             tex_size,
             tex_size_b,
+            par_b,
             ..
         } = *layout;
         // Slot-B GPU bind group for the active layer, clamped to B's count.
@@ -2934,10 +3032,13 @@ impl ExrViewer {
             render_program::Arrangement::SideBySide => {
                 let bg_b_opt = pick_b();
                 if let (Some(bg_b), Some(size_b)) = (bg_b_opt, tex_size_b) {
-                    let mut image_size_b = size_b * self.scale;
+                    // B's x extent carries B's own unsqueeze (`par_b`); A's
+                    // `image_size` already includes `par` from the caller (#179).
+                    let mut image_size_b =
+                        egui::vec2(size_b.x * self.scale * par_b, size_b.y * self.scale);
                     if self.normalize_side_by_side {
                         let scale_b = (tex_size.y * self.scale) / size_b.y;
-                        image_size_b = size_b * scale_b;
+                        image_size_b = egui::vec2(size_b.x * scale_b * par_b, size_b.y * scale_b);
                     }
                     let combined_width = image_size.x + image_size_b.x;
                     let combined_height = image_size.y.max(image_size_b.y);
@@ -4151,6 +4252,32 @@ mod gui_tests {
             (f.y - 1080.0).abs() < 0.01,
             "equal heights when normalized {f:?}"
         );
+    }
+
+    #[test]
+    fn unsqueeze_factor_gates_on_toggle_and_override() {
+        let mut v = ExrViewer::default();
+
+        // Toggle on (the default), no override: the header PAR is used verbatim,
+        // and PAR 1.0 is a no-op for square-pixel footage.
+        assert!(v.prefs.anamorphic_unsqueeze);
+        assert_eq!(v.unsqueeze_factor(2.0), 2.0);
+        assert_eq!(v.unsqueeze_factor(1.0), 1.0);
+
+        // Manual override wins over the header PAR while the toggle is on.
+        v.pixel_aspect_override = Some(1.33);
+        assert_eq!(v.unsqueeze_factor(2.0), 1.33);
+
+        // Toggle off returns raw (1.0) regardless of header PAR or override.
+        v.prefs.anamorphic_unsqueeze = false;
+        assert_eq!(v.unsqueeze_factor(2.0), 1.0);
+        assert_eq!(v.unsqueeze_factor(1.0), 1.0);
+
+        // A degenerate zero/negative factor is clamped away from zero so the
+        // reciprocal used in coordinate mapping stays finite.
+        v.prefs.anamorphic_unsqueeze = true;
+        v.pixel_aspect_override = Some(0.0);
+        assert!(v.unsqueeze_factor(2.0) > 0.0);
     }
 
     #[test]
