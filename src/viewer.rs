@@ -1751,13 +1751,19 @@ impl ExrViewer {
     /// Effective horizontal unsqueeze factor for an image whose header pixel
     /// aspect ratio is `header_par` (#179). Returns `1.0` (no stretch) when the
     /// anamorphic toggle is off; otherwise the manual override if set, else the
-    /// header PAR. Clamped away from zero so the reciprocal used in screen↔image
-    /// coordinate mapping stays finite.
+    /// header PAR. A malformed/absent factor (0, negative, or NaN) falls back to
+    /// `1.0` rather than collapsing the image to a near-zero width, and keeps the
+    /// reciprocal used in screen↔image coordinate mapping finite.
     fn unsqueeze_factor(&self, header_par: f32) -> f32 {
         if !self.prefs.anamorphic_unsqueeze {
             return 1.0;
         }
-        self.pixel_aspect_override.unwrap_or(header_par).max(1e-3)
+        let factor = self.pixel_aspect_override.unwrap_or(header_par);
+        if factor.is_finite() && factor > 0.0 {
+            factor
+        } else {
+            1.0
+        }
     }
 
     /// Paint all committed annotations plus the in-progress shape. Text labels are
@@ -2612,7 +2618,8 @@ impl ExrViewer {
                         egui::vec2(tex_size_b.x * self.scale * par_b, tex_size_b.y * self.scale);
                     if self.normalize_side_by_side {
                         let scale_b = (tex_size.y * self.scale) / tex_size_b.y;
-                        image_size_b = egui::vec2(tex_size_b.x * scale_b * par_b, tex_size_b.y * scale_b);
+                        image_size_b =
+                            egui::vec2(tex_size_b.x * scale_b * par_b, tex_size_b.y * scale_b);
                     }
                     let combined_width = image_size.x + image_size_b.x;
                     let combined_height = image_size.y.max(image_size_b.y);
@@ -4273,11 +4280,16 @@ mod gui_tests {
         assert_eq!(v.unsqueeze_factor(2.0), 1.0);
         assert_eq!(v.unsqueeze_factor(1.0), 1.0);
 
-        // A degenerate zero/negative factor is clamped away from zero so the
-        // reciprocal used in coordinate mapping stays finite.
+        // A degenerate factor (0, negative, or NaN — e.g. a malformed/absent
+        // header PAR) falls back to 1.0 (no stretch) instead of collapsing the
+        // image to a near-zero width.
         v.prefs.anamorphic_unsqueeze = true;
         v.pixel_aspect_override = Some(0.0);
-        assert!(v.unsqueeze_factor(2.0) > 0.0);
+        assert_eq!(v.unsqueeze_factor(2.0), 1.0);
+        v.pixel_aspect_override = None;
+        assert_eq!(v.unsqueeze_factor(0.0), 1.0);
+        assert_eq!(v.unsqueeze_factor(-2.0), 1.0);
+        assert_eq!(v.unsqueeze_factor(f32::NAN), 1.0);
     }
 
     #[test]
