@@ -1192,13 +1192,15 @@ impl ExrApp {
                             if let Some(cached) = proxy_cache.read(&job.path, tb) {
                                 Ok(cached)
                             } else {
-                                let decoded = ExrData::load_proxy_into(&job.path, tb, &mut proxy_scratch).or_else(|_| {
-                                    if job.beauty_only {
-                                        ExrData::load_beauty(&job.path)
-                                    } else {
-                                        ExrData::load(&job.path)
-                                    }
-                                });
+                                let decoded =
+                                    ExrData::load_proxy_into(&job.path, tb, &mut proxy_scratch)
+                                        .or_else(|_| {
+                                            if job.beauty_only {
+                                                ExrData::load_beauty(&job.path)
+                                            } else {
+                                                ExrData::load(&job.path)
+                                            }
+                                        });
                                 // Cache only a genuine proxy (never a fallback
                                 // beauty/full). Serialize here (miss-only, <1% of
                                 // the decode just paid) so the borrow ends before
