@@ -77,7 +77,6 @@ pub fn frames_for(available: u64, width: usize, height: usize) -> usize {
     usize::try_from(available / per_frame).unwrap_or(usize::MAX)
 }
 
-
 /// Max number of T1 CPU frames (full `ExrData`, all layers) that fit a
 /// [`RAM_FREE_PCT`] slice of *currently-free* system RAM, given one frame's
 /// measured size (`ExrData::approx_bytes()`). Sequences are homogeneous, so a

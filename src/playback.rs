@@ -136,8 +136,8 @@ pub fn map_b_frame(a_frame: u32, a_in: u32, b_range: (u32, u32)) -> u32 {
 #[must_use]
 pub fn map_b_frame_offset(a_frame: u32, a_in: u32, b_range: (u32, u32), offset: i32) -> u32 {
     let aligned = map_b_frame(a_frame, a_in, b_range);
-    (i64::from(aligned) + i64::from(offset))
-        .clamp(i64::from(b_range.0), i64::from(b_range.1)) as u32
+    (i64::from(aligned) + i64::from(offset)).clamp(i64::from(b_range.0), i64::from(b_range.1))
+        as u32
 }
 
 /// Playback state attached to the app. Prefs (fps / loop / direction / pacing)
@@ -388,7 +388,10 @@ mod tests {
     #[test]
     fn map_b_frame_offset_nudges_and_clamps() {
         // offset 0 is exactly map_b_frame.
-        assert_eq!(map_b_frame_offset(5, 1, (1, 10), 0), map_b_frame(5, 1, (1, 10)));
+        assert_eq!(
+            map_b_frame_offset(5, 1, (1, 10), 0),
+            map_b_frame(5, 1, (1, 10))
+        );
         // Positive/negative offset shifts B within its range.
         assert_eq!(map_b_frame_offset(5, 1, (1, 10), 2), 7); // aligned 5 → +2
         assert_eq!(map_b_frame_offset(5, 1, (1, 10), -3), 2); // aligned 5 → −3
