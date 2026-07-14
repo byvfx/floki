@@ -129,6 +129,17 @@ pub fn map_b_frame(a_frame: u32, a_in: u32, b_range: (u32, u32)) -> u32 {
     b_range.0.saturating_add(delta).min(b_range.1)
 }
 
+/// [`map_b_frame`] with a user A/B frame offset (#166, #98 Phase 2) applied on top
+/// and re-clamped to B's range, so a reviewer's nudge (B ahead `+` / behind `−`)
+/// can never point outside the compared sequence. `offset == 0` is exactly
+/// [`map_b_frame`].
+#[must_use]
+pub fn map_b_frame_offset(a_frame: u32, a_in: u32, b_range: (u32, u32), offset: i32) -> u32 {
+    let aligned = map_b_frame(a_frame, a_in, b_range);
+    (i64::from(aligned) + i64::from(offset)).clamp(i64::from(b_range.0), i64::from(b_range.1))
+        as u32
+}
+
 /// Playback state attached to the app. Prefs (fps / loop / direction / pacing)
 /// persist; the runtime playhead, loaded sequence, clock anchor, and in-flight
 /// request do not (`#[serde(skip)]`) and reset on each open.
@@ -372,6 +383,23 @@ mod tests {
         assert_eq!(map_b_frame(5, 1, (1, 5)), 5);
         // Degenerate single-frame B holds regardless of A.
         assert_eq!(map_b_frame(42, 1, (7, 7)), 7);
+    }
+
+    #[test]
+    fn map_b_frame_offset_nudges_and_clamps() {
+        // offset 0 is exactly map_b_frame.
+        assert_eq!(
+            map_b_frame_offset(5, 1, (1, 10), 0),
+            map_b_frame(5, 1, (1, 10))
+        );
+        // Positive/negative offset shifts B within its range.
+        assert_eq!(map_b_frame_offset(5, 1, (1, 10), 2), 7); // aligned 5 → +2
+        assert_eq!(map_b_frame_offset(5, 1, (1, 10), -3), 2); // aligned 5 → −3
+        // Clamps to B's range at both ends — a nudge never leaves the sequence.
+        assert_eq!(map_b_frame_offset(5, 1, (1, 10), -100), 1); // floor at range.0
+        assert_eq!(map_b_frame_offset(5, 1, (1, 10), 100), 10); // ceil at range.1
+        // Offset composes with position alignment on differently-numbered B.
+        assert_eq!(map_b_frame_offset(1005, 1001, (1, 100), 10), 15); // aligned 5 → +10
     }
 
     #[test]

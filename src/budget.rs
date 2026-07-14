@@ -54,21 +54,26 @@ fn with_headroom(total: u64, pct: u64) -> u64 {
     total.saturating_mul(pct) / 100
 }
 
-/// Max number of T2 GPU textures that fit the VRAM budget remaining after
-/// current allocation. One texture per frame, active layer only.
-///
-/// Uses `Sample::gpu_budget` when available, else [`FALLBACK_VRAM_BUDGET`].
-/// Returns `0` if not even one frame fits (caller disables pre-upload and
-/// decodes on demand — see the failure modes in the memory contract).
+/// VRAM bytes the T2 ring(s) may claim: the headroomed working-set budget minus
+/// what is already allocated. Uses `Sample::gpu_budget` when available, else
+/// [`FALLBACK_VRAM_BUDGET`]. This is the pool the caller splits across the A and
+/// B rings in locked-step compare (#166) — compute it once, then slice it.
 #[must_use]
-pub fn max_t2(sample: &Sample, width: usize, height: usize) -> usize {
+pub fn vram_available(sample: &Sample) -> u64 {
+    let total = sample.gpu_budget.unwrap_or(FALLBACK_VRAM_BUDGET);
+    let used = sample.gpu_used.unwrap_or(0);
+    with_headroom(total, VRAM_HEADROOM_PCT).saturating_sub(used)
+}
+
+/// How many T2 textures of the given dimensions fit `available` VRAM bytes. One
+/// texture per frame, active layer only. Returns `0` for a degenerate frame size
+/// or when not even one fits (caller disables pre-upload and decodes on demand).
+#[must_use]
+pub fn frames_for(available: u64, width: usize, height: usize) -> usize {
     let per_frame = t2_frame_bytes(width, height);
     if per_frame == 0 {
         return 0;
     }
-    let total = sample.gpu_budget.unwrap_or(FALLBACK_VRAM_BUDGET);
-    let used = sample.gpu_used.unwrap_or(0);
-    let available = with_headroom(total, VRAM_HEADROOM_PCT).saturating_sub(used);
     usize::try_from(available / per_frame).unwrap_or(usize::MAX)
 }
 
@@ -160,34 +165,63 @@ mod tests {
     }
 
     #[test]
-    fn max_t2_divides_headroomed_budget_by_frame() {
+    fn vram_available_divides_headroomed_budget_by_frame() {
         // 2 GB budget, nothing used, 80% headroom = 1.6 GB; 1000x1000 = 16 MB.
         let s = sample(0, 0, Some(2_000_000_000), Some(0));
-        assert_eq!(max_t2(&s, 1000, 1000), 100);
+        assert_eq!(frames_for(vram_available(&s), 1000, 1000), 100);
     }
 
     #[test]
-    fn max_t2_subtracts_current_allocation() {
+    fn vram_available_subtracts_current_allocation() {
         // 1.6 GB headroomed, 800 MB already allocated -> 800 MB free / 16 MB = 50.
         let s = sample(0, 0, Some(2_000_000_000), Some(800_000_000));
-        assert_eq!(max_t2(&s, 1000, 1000), 50);
+        assert_eq!(vram_available(&s), 800_000_000);
+        assert_eq!(frames_for(vram_available(&s), 1000, 1000), 50);
     }
 
     #[test]
-    fn max_t2_uses_fallback_budget_when_gpu_budget_unknown() {
+    fn vram_available_uses_fallback_budget_when_gpu_budget_unknown() {
         // Off-Metal: gpu_budget None -> 1 GiB * 80% = 858_993_459; /16 MB = 53.
         let s = sample(0, 0, None, None);
-        assert_eq!(max_t2(&s, 1000, 1000), 53);
+        assert_eq!(vram_available(&s), 858_993_459);
+        assert_eq!(frames_for(vram_available(&s), 1000, 1000), 53);
     }
 
     #[test]
-    fn max_t2_zero_when_nothing_fits() {
+    fn frames_for_zero_when_nothing_fits() {
         // Budget fully consumed.
         let s = sample(0, 0, Some(2_000_000_000), Some(2_000_000_000));
-        assert_eq!(max_t2(&s, 1000, 1000), 0);
+        assert_eq!(vram_available(&s), 0);
+        assert_eq!(frames_for(vram_available(&s), 1000, 1000), 0);
         // Degenerate frame size.
         let s2 = sample(0, 0, Some(2_000_000_000), Some(0));
-        assert_eq!(max_t2(&s2, 0, 1000), 0);
+        assert_eq!(frames_for(vram_available(&s2), 0, 1000), 0);
+    }
+
+    #[test]
+    fn frames_for_splits_evenly_across_equal_dims() {
+        // 1.6 GB available; 1000x1000 = 16 MB -> 100 frames whole, 50 each half.
+        let s = sample(0, 0, Some(2_000_000_000), Some(0));
+        let avail = vram_available(&s);
+        assert_eq!(frames_for(avail, 1000, 1000), 100);
+        assert_eq!(frames_for(avail / 2, 1000, 1000), 50);
+    }
+
+    #[test]
+    fn frames_for_gives_a_larger_slot_proportionally_fewer() {
+        // Same half-budget, B twice A's area -> B fits ~half as many as A.
+        let s = sample(0, 0, Some(2_000_000_000), Some(0));
+        let half = vram_available(&s) / 2;
+        let a = frames_for(half, 1000, 1000); // 16 MB/frame
+        let b = frames_for(half, 1000, 2000); // 32 MB/frame
+        assert_eq!(a, 50);
+        assert_eq!(b, 25);
+    }
+
+    #[test]
+    fn frames_for_zero_for_degenerate_or_empty_budget() {
+        assert_eq!(frames_for(1_000_000_000, 0, 1000), 0);
+        assert_eq!(frames_for(0, 1000, 1000), 0);
     }
 
     #[test]
