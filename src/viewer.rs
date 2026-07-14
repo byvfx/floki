@@ -1748,22 +1748,29 @@ impl ExrViewer {
         }
     }
 
-    /// Effective horizontal unsqueeze factor for an image whose header pixel
-    /// aspect ratio is `header_par` (#179). Returns `1.0` (no stretch) when the
-    /// anamorphic toggle is off; otherwise the manual override if set, else the
-    /// header PAR. A malformed/absent factor (0, negative, or NaN) falls back to
-    /// `1.0` rather than collapsing the image to a near-zero width, and keeps the
-    /// reciprocal used in screen↔image coordinate mapping finite.
-    fn unsqueeze_factor(&self, header_par: f32) -> f32 {
+    /// Sanitize a raw unsqueeze factor (#179): return `1.0` (no stretch) when the
+    /// anamorphic toggle is off, or when the factor is non-finite or ≤ 0 — a
+    /// malformed/absent header PAR must not collapse the image to a near-zero
+    /// width, and the reciprocal used in screen↔image coordinate mapping must stay
+    /// finite.
+    fn sanitize_unsqueeze(&self, factor: f32) -> f32 {
         if !self.prefs.anamorphic_unsqueeze {
             return 1.0;
         }
-        let factor = self.pixel_aspect_override.unwrap_or(header_par);
         if factor.is_finite() && factor > 0.0 {
             factor
         } else {
             1.0
         }
+    }
+
+    /// Effective horizontal unsqueeze factor for the **primary (A)** image, whose
+    /// header pixel aspect ratio is `header_par` (#179). The manual override wins
+    /// over the header PAR when set. The reference (B) image is unsqueezed from its
+    /// own header only (`sanitize_unsqueeze` on B's PAR in [`Self::ui`]), so a
+    /// custom factor set to fix A does not distort a differently-squeezed B.
+    fn unsqueeze_factor(&self, header_par: f32) -> f32 {
+        self.sanitize_unsqueeze(self.pixel_aspect_override.unwrap_or(header_par))
     }
 
     /// Paint all committed annotations plus the in-progress shape. Text labels are
@@ -2337,12 +2344,14 @@ impl ExrViewer {
                 }
             }
 
-            // Anamorphic unsqueeze factors (#179): A from its own header
-            // `pixelAspectRatio`, B from B's. Both are `1.0` (a no-op) when the
-            // toggle is off or the PAR is 1.0, so square-pixel footage is untouched.
+            // Anamorphic unsqueeze factors (#179): A from its header
+            // `pixelAspectRatio` plus the manual override; B from B's header only
+            // (the override is A-specific, so it must not distort a differently-
+            // squeezed reference). Both are `1.0` (a no-op) when the toggle is off
+            // or the PAR is 1.0, so square-pixel footage is untouched.
             let par = self.unsqueeze_factor(exr_data.image.attributes.pixel_aspect);
             let par_b = exr_data_b
-                .map(|d| self.unsqueeze_factor(d.image.attributes.pixel_aspect))
+                .map(|d| self.sanitize_unsqueeze(d.image.attributes.pixel_aspect))
                 .unwrap_or(1.0);
 
             if let Some(gpu) = gpu_resources {
@@ -4271,14 +4280,19 @@ mod gui_tests {
         assert_eq!(v.unsqueeze_factor(2.0), 2.0);
         assert_eq!(v.unsqueeze_factor(1.0), 1.0);
 
-        // Manual override wins over the header PAR while the toggle is on.
+        // Manual override wins over the header PAR while the toggle is on — but
+        // only for the primary (A) image. The reference (B) image is unsqueezed
+        // from its own header via `sanitize_unsqueeze`, which ignores the override,
+        // so a custom factor set to fix A does not distort a differently-squeezed B.
         v.pixel_aspect_override = Some(1.33);
         assert_eq!(v.unsqueeze_factor(2.0), 1.33);
+        assert_eq!(v.sanitize_unsqueeze(2.0), 2.0);
 
         // Toggle off returns raw (1.0) regardless of header PAR or override.
         v.prefs.anamorphic_unsqueeze = false;
         assert_eq!(v.unsqueeze_factor(2.0), 1.0);
         assert_eq!(v.unsqueeze_factor(1.0), 1.0);
+        assert_eq!(v.sanitize_unsqueeze(2.0), 1.0);
 
         // A degenerate factor (0, negative, or NaN — e.g. a malformed/absent
         // header PAR) falls back to 1.0 (no stretch) instead of collapsing the
