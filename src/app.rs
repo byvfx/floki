@@ -4657,8 +4657,16 @@ impl ExrApp {
                                                 attrs.display_window.position.x(),
                                                 attrs.display_window.position.y()
                                             ));
+                                            // Flag anamorphic footage (#179); the
+                                            // unsqueeze toggle lives in the viewer's
+                                            // "Display ▾" menu.
+                                            let par_note = if attrs.pixel_aspect != 1.0 {
+                                                " (anamorphic)"
+                                            } else {
+                                                ""
+                                            };
                                             ui.label(format!(
-                                                "Pixel Aspect: {}",
+                                                "Pixel Aspect: {}{par_note}",
                                                 attrs.pixel_aspect
                                             ));
 
