@@ -222,6 +222,13 @@ pub struct ExrApp {
     sequence_b: Option<crate::sequence::Sequence>,
     #[serde(skip)]
     current_frame_b: u32,
+    /// User-set A/B frame offset (#166, #98 Phase 2): B shows its position-aligned
+    /// frame plus this offset, clamped to B's range — so a reviewer can nudge B
+    /// ahead (+) or behind (−) to line up takes that begin on different frames.
+    /// Runtime, not persisted (it is footage-specific; resets to 0 each session
+    /// and on a new A open).
+    #[serde(skip)]
+    ab_offset: i32,
     #[serde(skip)]
     pending_b: Option<u32>,
     #[serde(skip)]
@@ -374,6 +381,11 @@ pub struct ExrApp {
     /// the pump skips its want-list allocation — the common paused / settled case.
     #[serde(skip)]
     last_t2_pump: Option<u32>,
+    /// The B playhead the B T2 ring was last pumped for (#166) — the `last_t2_pump`
+    /// counterpart for slot B, so a full B ring on an unmoved B frame skips its
+    /// want-list allocation.
+    #[serde(skip)]
+    last_t2_pump_b: Option<u32>,
 
     /// A timeline drag is in progress (#143). While held, seeks decode
     /// beauty-only like playback does — the readout is suppressed or showing
@@ -568,6 +580,7 @@ impl Default for ExrApp {
             inflight: std::collections::HashSet::new(),
             sequence_b: None,
             current_frame_b: 0,
+            ab_offset: 0,
             pending_b: None,
             inflight_b: std::collections::HashSet::new(),
             epoch_signal: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -595,6 +608,7 @@ impl Default for ExrApp {
             ram_budget_gb: 0.0,
             precache_filled: false,
             last_t2_pump: None,
+            last_t2_pump_b: None,
             scrub_active: false,
             watch_enabled: false,
             watch_follow: false,
@@ -1267,10 +1281,15 @@ impl ExrApp {
     fn clear_b_sequence(&mut self) {
         self.sequence_b = None;
         self.current_frame_b = 0;
+        self.ab_offset = 0;
         self.pending_b = None;
         self.loading_b = false;
         self.inflight_b.clear();
         self.frame_cache.clear_slot(crate::cache::Slot::B);
+        // Drop the B T2 GPU ring too (#166): its frame keys belong to the sequence
+        // being cleared; the next B show re-sets the on-screen frame.
+        self.viewer.clear_t2_b();
+        self.viewer.set_t2_frame_b(None);
     }
 
     /// Arm locked-step B (#98) if the just-opened B file is part of an image
@@ -1284,6 +1303,9 @@ impl ExrApp {
         };
         let bf = seq.number_of(path).unwrap_or(seq.range.0);
         self.current_frame_b = bf;
+        // The opened B frame is on screen; mark it for the B ring so its pump
+        // protects it from eviction (#166) even before the first locked-step swap.
+        self.viewer.set_t2_frame_b(Some(bf));
         // Seed the ring with the opened B frame (mirror the A open, #56) so it's an
         // instant hit and the first locked-step advance has a cached neighbour.
         if let Some(arc) = self.exr_data_b.clone() {
@@ -1349,10 +1371,13 @@ impl ExrApp {
         let Some(range) = self.sequence_b.as_ref().map(|s| s.range) else {
             return;
         };
-        let b_frame = crate::playback::map_b_frame(
+        // B follows A by position, plus the user's A/B offset (#166), clamped to
+        // B's range so the nudge can never point outside the compared sequence.
+        let b_frame = crate::playback::map_b_frame_offset(
             self.playback.current_frame,
             self.playback.in_point,
             range,
+            self.ab_offset,
         );
         self.current_frame_b = b_frame;
         self.request_b_frame(b_frame);
@@ -1793,6 +1818,59 @@ impl ExrApp {
             }
             if let Some(arc) = self.frame_cache.peek(crate::cache::Slot::A, w)
                 && self.viewer.prebuild_t2(gpu, &arc, w)
+            {
+                built += 1;
+            }
+        }
+    }
+
+    /// Pre-upload **slot-B** T2 GPU textures (#166, #98 Phase 2) ahead of B's
+    /// playhead in locked-step compare, so a compared sequence binds an
+    /// already-uploaded texture each frame instead of re-packing + re-uploading on
+    /// the UI thread — the per-frame B upload that made B stutter while A stayed
+    /// smooth. Mirrors [`Self::pump_t2`] in B's own frame space; no-op unless B is
+    /// a sequence with a non-zero B ring cap. Only touches frames already resident
+    /// in the `Slot::B` T1 cache (never decodes). UI-thread only.
+    fn pump_t2_b(&mut self) {
+        let Some(range) = self.sequence_b.as_ref().map(|s| s.range) else {
+            return;
+        };
+        if !self.playback.is_active() || self.viewer.t2_cap_b() == 0 {
+            return;
+        }
+        // Full B ring on an unmoved B playhead: every slot is built for this frame.
+        if self.viewer.t2_len_b() >= self.viewer.t2_cap_b()
+            && self.last_t2_pump_b == Some(self.current_frame_b)
+        {
+            return;
+        }
+        let Some(gpu) = self.gpu_resources.as_ref() else {
+            return;
+        };
+        let depth = self.viewer.t2_cap_b().saturating_sub(1);
+        // B's want-list in B's own frame space (its range as in/out, its playhead),
+        // sharing A's direction/loop — the same shape `next_want_slot`/`warm_ahead`
+        // use for B. Forward-only (no read-behind), like the A ring.
+        let wants = crate::scheduler::want_list(
+            self.current_frame_b,
+            range.0,
+            range.1,
+            self.playback.direction,
+            self.playback.loop_mode,
+            &std::collections::HashSet::new(),
+            depth,
+            0,
+        );
+        self.last_t2_pump_b = Some(self.current_frame_b);
+        const PUMP_BUDGET: std::time::Duration = std::time::Duration::from_millis(4);
+        let start = std::time::Instant::now();
+        let mut built = 0;
+        for w in std::iter::once(self.current_frame_b).chain(wants) {
+            if built > 0 && start.elapsed() >= PUMP_BUDGET {
+                break;
+            }
+            if let Some(arc) = self.frame_cache.peek(crate::cache::Slot::B, w)
+                && self.viewer.prebuild_t2_b(gpu, &arc, w)
             {
                 built += 1;
             }
@@ -2340,20 +2418,50 @@ impl ExrApp {
         // T2: conservative — capped low, and disabled (→ lazy path) unless at
         // least a couple of frames comfortably fit, since a wgpu OOM aborts
         // the process. Off entirely when the user disables it or no sequence
-        // is loaded.
+        // is loaded. In locked-step compare (#166) the VRAM budget is split
+        // across the A and B rings so neither can push VRAM over the ceiling.
         const T2_HARD_CAP: usize = 8;
-        let t2_cap = if self.t2_enabled && self.playback.is_active() {
-            self.exr_data
-                .as_ref()
-                .and_then(|d| d.logical_size(self.viewer.active_layer))
-                .map_or(0, |(w, h)| {
-                    let fits = crate::budget::max_t2(&sample, w, h);
-                    if fits < 2 { 0 } else { fits.min(T2_HARD_CAP) }
+        // One texture per frame maps `available` bytes → a capped, ≥2-or-off count.
+        let cap_from = |available: u64, dims: Option<(usize, usize)>| -> usize {
+            dims.map_or(0, |(w, h)| {
+                let fits = crate::budget::frames_for(available, w, h);
+                if fits < 2 { 0 } else { fits.min(T2_HARD_CAP) }
+            })
+        };
+        let t2_on = self.t2_enabled && self.playback.is_active();
+        let b_active = t2_on && self.sequence_b.is_some();
+        let avail = crate::budget::vram_available(&sample);
+        // Split the pool in *bytes* (not frame counts) so A and B each derive
+        // their own count from their own resolution when the two differ.
+        let a_avail = if b_active { avail / 2 } else { avail };
+        let a_dims = t2_on
+            .then(|| {
+                self.exr_data
+                    .as_ref()
+                    .and_then(|d| d.logical_size(self.viewer.active_layer))
+            })
+            .flatten();
+        self.viewer.set_t2_cap(cap_from(a_avail, a_dims));
+
+        // B ring: same half-budget, sized from B's own dims at the B layer (active
+        // layer clamped to B's layer count). Disabled unless B is a live sequence.
+        let b_dims = b_active
+            .then(|| {
+                self.exr_data_b.as_ref().and_then(|d| {
+                    let layer_b = self
+                        .viewer
+                        .active_layer
+                        .min(d.logical_layers.len().saturating_sub(1));
+                    d.logical_size(layer_b)
                 })
+            })
+            .flatten();
+        let t2_cap_b = if b_active {
+            cap_from(avail / 2, b_dims)
         } else {
             0
         };
-        self.viewer.set_t2_cap(t2_cap);
+        self.viewer.set_t2_cap_b(t2_cap_b);
     }
 
     /// The ctx-free, synchronous core of the render-watch: re-scan the group,
@@ -2785,6 +2893,9 @@ impl ExrApp {
             return;
         }
         self.exr_data_b = Some(data);
+        // The B ring binds this frame's pre-built texture (#166); tell it which B
+        // frame is on screen (mirrors A's `set_t2_frame`).
+        self.viewer.set_t2_frame_b(Some(self.current_frame_b));
         self.viewer.invalidate_reference_viewport();
         if !self.thumbs_suppressed() {
             self.viewer.invalidate_reference_thumbnails();
@@ -3125,6 +3236,9 @@ impl eframe::App for ExrApp {
         // Pre-upload T2 GPU textures ahead of the playhead (#56). After the canvas
         // so the on-screen frame's texture exists; self-gates when T2 is off.
         self.pump_t2();
+        // ...and the slot-B ring in locked-step compare (#166); self-gates unless
+        // B is a sequence with a non-zero B ring cap.
+        self.pump_t2_b();
     }
 }
 
@@ -3997,6 +4111,8 @@ impl ExrApp {
         let t1_cap = self.frame_cache_cap;
         let t2_len = self.viewer.t2_len();
         let t2_cap = self.viewer.t2_cap();
+        let t2_len_b = self.viewer.t2_len_b();
+        let t2_cap_b = self.viewer.t2_cap_b();
         let frame_bytes = self.frame_bytes;
         let proxy_state = (self.proxy_enabled, self.proxy_size, self.proxy_bytes);
         let mut inflight: Vec<u32> = self.inflight.iter().copied().collect();
@@ -4072,6 +4188,17 @@ impl ExrApp {
                             format!("{t2_len} / {t2_cap} frames")
                         };
                         ui.label(t2);
+                        ui.end_row();
+
+                        // Slot-B T2 ring (#166) — only meaningful in locked-step
+                        // compare; shows "off" otherwise.
+                        ui.label("T2-B (GPU)");
+                        let t2b = if t2_cap_b == 0 {
+                            "off".to_string()
+                        } else {
+                            format!("{t2_len_b} / {t2_cap_b} frames")
+                        };
+                        ui.label(t2b);
                         ui.end_row();
 
                         ui.label("worker");
@@ -4276,6 +4403,32 @@ impl ExrApp {
                     && !self.t2_enabled
                 {
                     self.viewer.clear_t2();
+                }
+
+                // A/B frame offset (#166): nudge the compared (B) sequence relative
+                // to A. Only shown when B is a locked-step sequence.
+                if self.sequence_b.is_some() {
+                    ui.separator();
+                    ui.label("A/B offset");
+                    let mut off = self.ab_offset;
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut off)
+                                .range(-9999..=9999)
+                                .speed(0.1)
+                                .suffix(" f"),
+                        )
+                        .on_hover_text(
+                            "Frame offset of the compared (B) sequence relative to A: \
+                             nudge B ahead (+) or behind (−) to line up takes that \
+                             start on different frames. Clamped to B's range.",
+                        )
+                        .changed()
+                    {
+                        self.ab_offset = off;
+                        // Re-align B to the new offset immediately.
+                        self.sync_b_to_a();
+                    }
                 }
 
                 ui.separator();
