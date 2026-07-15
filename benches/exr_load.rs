@@ -134,19 +134,42 @@ fn bench_local(c: &mut Criterion) {
     }
 
     let mut group = c.benchmark_group("exr_load/local");
+    // Real renders are large (hundreds of MB); 10 samples over a short window is
+    // plenty to compare the three decode paths without spending minutes per file.
+    group.sample_size(10);
+    group.warm_up_time(std::time::Duration::from_secs(1));
+    group.measurement_time(std::time::Duration::from_secs(3));
     for path in &files {
         let label = path
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("unnamed")
             .to_string();
-        // Sanity-load once so a bad fixture fails loudly rather than mid-measure.
-        if let Err(e) = ExrData::load(path) {
-            eprintln!("exr_load/local: skipping {label} — load failed: {e}");
-            continue;
+        // Sanity-load once so a bad fixture fails loudly rather than mid-measure,
+        // and print the shape (parts / logical layers / decoded size) so the
+        // timings below are interpretable.
+        match ExrData::load(path) {
+            Ok(d) => eprintln!(
+                "exr_load/local: {label} — {} part(s)/logical layer(s), {} MB decoded (full)",
+                d.logical_layers.len(),
+                d.approx_bytes() / (1024 * 1024),
+            ),
+            Err(e) => {
+                eprintln!("exr_load/local: skipping {label} — load failed: {e}");
+                continue;
+            }
         }
-        group.bench_function(label, |b| {
+        // #33: the three decode paths that matter. `load` = full all-AOV (explicit
+        // open + settle re-decode); `load_beauty` = first/beauty part only (the
+        // playback ring); `load_proxy` = beauty then box-filter downsample (scrub).
+        group.bench_function(format!("{label}/load"), |b| {
             b.iter(|| ExrData::load(std::hint::black_box(path)).unwrap())
+        });
+        group.bench_function(format!("{label}/load_beauty"), |b| {
+            b.iter(|| ExrData::load_beauty(std::hint::black_box(path)).unwrap())
+        });
+        group.bench_function(format!("{label}/load_proxy_1024"), |b| {
+            b.iter(|| ExrData::load_proxy(std::hint::black_box(path), 1024).unwrap())
         });
     }
     group.finish();

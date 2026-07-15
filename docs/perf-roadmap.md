@@ -211,6 +211,36 @@ benchmark exists — bench the fork against `openexr-sys`/OpenEXRCore on our own
 corpus before any rewrite (OpenEXR 3.3's Core-backed rewrite initially
 *regressed* DWA decode 12–17%, OpenEXR #1915 — Core is not automatically faster).
 
+**Measured (2026-07-14) — constraint (d) resolved: do NOT rewrite the decoder.**
+Benched `load`/`load_beauty`/`load_proxy` (`benches/exr_load.rs` local group) vs an
+eager OpenEXR-3.4 `MultiPartInputFile` reference (all threads, read loop only) on
+24 real renders (the `assets/perf/` redSea set + 18 varied files: Karma multi-part,
+plates, HDRIs, DWA/PIZ/RLE), warm cache, local disk.
+
+- **Playback is already fast** — `load_beauty` 4–41 ms and `load_proxy` 8–56 ms on
+  everything. Full `load` scales with part count (single-part `load ≈ load_beauty`;
+  30-part redSea = ~29× its own beauty), so the beauty isolation already shipped
+  does its job (**28.8×** on the 30-part redSea).
+- **On multi-part zips (dailies / the common case) the fork is competitive-to-faster
+  than OpenEXR** — floki wins ghoul-7p (85 vs 162 ms), nebula-8p (49 vs 82),
+  smash-13p (100 vs 116), explosions-17p (152 vs 160); ~parity at 20 parts; OpenEXR
+  ~1.2× ahead on a couple of 10–11-part files. (The OpenEXR reference reads parts
+  *sequentially*, so floki's cross-part rayon parallelism is a real edge here.)
+- **The one real gap is codec-specific and only visible on single-part files:
+  OpenEXR decodes DWA ~2.6–2.9× and PIZ ~2.5–2.7× faster** (DWA-4K plate 28 vs
+  10 ms; PIZ HDRI 15 vs 6 ms). Hidden on multi-part renders by parallelism.
+  Absolute times stay interactive (≤85 ms worst single-part).
+
+**Verdict:** a full OpenEXR rewrite isn't justified — it costs the miniz
+panic-safety fix + a C++ dep + 3-platform static build, to *lose* on the common
+multi-part case and win only on heavy single-part DWA/PIZ. The remaining lever, if
+heavy single-part DWA/PIZ delivery footage becomes a workload, is a **targeted
+codec optimization inside the `byvfx/exrs` fork** (first check: is the DWA `pulp`
+SIMD path actually engaged, or falling back to scalar?) — not a rewrite. Otherwise
+the memory's ideas 1/2 (lazy on-demand AOV decode; two-stage beauty-then-AOV
+settle) *avoid* decode work rather than speeding it, and only bite the rare heavy
+multi-part still open + settle-to-full-on-pause.
+
 ### 2. B-side T2 GPU ring — [#166](https://github.com/byvfx/floki/issues/166) (#98 Phase 2)
 *Lever: footprint/pipelining on the GPU side.* B currently uploads a texture
 per-frame (`build_layer_texture`) while A renders from the pre-uploaded T2 VRAM
