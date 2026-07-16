@@ -3604,8 +3604,10 @@ impl ExrApp {
                     ui.add_space(5.0);
 
                     {
+                        ui.label(egui::RichText::new("OCIO color config").strong());
                         ui.label(
-                            "OCIO Config (.ocio) — empty uses built-in ACES (ocio://default):",
+                            "Leave empty and click Load to use the built-in ACES config \
+                             bundled with Floki, or Browse to a .ocio for your own.",
                         );
                         ui.horizontal(|ui| {
                             ui.text_edit_singleline(&mut self.ocio_path);
@@ -3626,8 +3628,8 @@ impl ExrApp {
                         if self.ocio_path.trim().is_empty() {
                             let hint =
                                 match std::env::var("OCIO").ok().filter(|v| !v.trim().is_empty()) {
-                                    Some(v) => format!("Empty path → using $OCIO: {v}"),
-                                    None => "Empty path → using built-in ACES (ocio://default)"
+                                    Some(v) => format!("Using $OCIO: {v} — no file needed"),
+                                    None => "Using built-in ACES (ocio://default) — no file needed"
                                         .to_string(),
                                 };
                             ui.label(egui::RichText::new(hint).weak());
