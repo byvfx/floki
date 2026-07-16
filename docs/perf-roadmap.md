@@ -241,6 +241,27 @@ the memory's ideas 1/2 (lazy on-demand AOV decode; two-stage beauty-then-AOV
 settle) *avoid* decode work rather than speeding it, and only bite the rare heavy
 multi-part still open + settle-to-full-on-pause.
 
+**Resolved (2026-07-16) — the fork "is DWA SIMD scalar?" first-check is answered;
+thread closed.** Full three-machine study in
+**[`docs/perf/dwa-arm-decode-investigation.md`](perf/dwa-arm-decode-investigation.md)**
+(x86 validation #184, Apple-Silicon re-run #185):
+- The single-part gap is **Apple-Silicon-specific and broad**, not DWA-only. On x86
+  (i9-13980HX, AVX2) every codec closes to **1.05–1.59×** OpenEXR; re-measured on the
+  A18 Pro it's **1.4–2.3×** across two plates (0370 render + anamorphic bsow footage).
+  The fork's DWA inverse-DCT is x86-SIMD-only (`idct.rs`) → **scalar on all Apple
+  Silicon**, but ZIP/ZIPS/PIZ (no DCT) regress on ARM too — so the root cause is the
+  general scalar decode paths (inflate + f16/f32 unpack), not the IDCT.
+- Adopted the DWA **f16 SIMD-batch** fix (fork `a368469`, #184); measured **~4–9% on
+  DWA** on both arches (the "helps Apple Silicon more" hypothesis only weakly held).
+- A **NEON IDCT tier** would help only DWA and only partway (DWA is the worst residual
+  on *both* arches) — a partial win, left **unbuilt**.
+
+**Action: none.** No rewrite (loses the miniz panic-fix + adds a C++ dep + 3-platform
+build), no NEON tier, no inflate swap — unless heavy single-part DWA/PIZ *delivery*
+footage becomes a real workload. The only decode item with user-visible payoff is the
+**two-stage settle** (decode-avoidance, idea 2), and it bites only heavy multi-part
+open/settle.
+
 ### 2. B-side T2 GPU ring — [#166](https://github.com/byvfx/floki/issues/166) (#98 Phase 2)
 *Lever: footprint/pipelining on the GPU side.* B currently uploads a texture
 per-frame (`build_layer_texture`) while A renders from the pre-uploaded T2 VRAM
