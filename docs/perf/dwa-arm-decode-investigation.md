@@ -130,6 +130,98 @@ the NEON tier alone is not the fix it was hypothesized to be.
 
 ---
 
+## RESULTS — Apple Silicon (A18 Pro "Neo", this Mac, 2026-07-16)
+
+The missing third leg. Re-run of the **same 0370 plate as the x86 table above**
+(bit-identical pixels — the identical `oiiotool` codec variants), on this Apple
+Silicon machine, with the **post-fix fork (`a368469`** — the DWA f16 SIMD-batch adopted
+in #184). This is the same machine class as the original *Apple Silicon baseline*
+(§ above), now on the x86 plate + the fix, so its ratios compare **directly** to the
+x86 table (the baseline used a different plate and the pre-fix fork).
+
+**Machine:** Apple A18 Pro, 6 cores (2P+4E), 8 GB, macOS 26.5.2 (passively cooled —
+absolute ms drift with thermal state; trust the ratio). **Plate:** subimage 0 of
+`TPLS2_206_206-0370_render_v006.redSea_bty.1078.exr`, 3225×2215 half RGBA (4ch),
+single-part, re-encoded to 5 identical-pixel codec variants. **floki:** criterion
+`/load` median (warm, sample_size 10, pin `a368469`). **OpenEXR:** `exrbench`
+all-parts, best of 2 passes (each internally best-of-3), `setGlobalThreadCount(6)`.
+
+| Codec | floki `/load` (median) | OpenEXR (best) | **ARM ratio** | x86 ratio | old-Neo ratio |
+|-------|-----------------------:|---------------:|:-------------:|:---------:|:-------------:|
+| ZIP   | 27.3 ms | 14.8 ms | **1.85×** | 1.36× | 2.3× |
+| ZIPS  | 34.5 ms | 24.4 ms | **1.41×** | 1.05× | 1.8× |
+| DWAA  | 37.2 ms | 16.3 ms | **2.28×** | 1.46× | 2.5× |
+| DWAB  | 44.3 ms | 21.2 ms | **2.09×** | 1.59× | 2.4× |
+| PIZ   | 53.8 ms | 30.8 ms | **1.75×** | 1.24× | 2.9× |
+
+(floki `/load` ≈ `/load_beauty` again — single-part. DWA decode re-confirmed: the
+bench ran `ExrData::load` on `p_dwaa`/`p_dwab` and decoded the full 54 MB with no
+error; the fork's DWA reference tests are green.)
+
+**Confirms the x86 verdict, now on identical pixels.** Every codec is slower on ARM
+than x86 (avg ~1.9× vs ~1.3×) — the gap is Apple-Silicon-specific and **broad**, not
+DWA-only. DWA is the worst residual on *both* arches (ARM 2.1–2.3×, x86 1.5–1.6×) —
+a real cross-arch DWA inefficiency *plus* an extra ARM scalar penalty on top. The
+old-Neo column ran higher (1.8–2.9×) but on a different plate + the pre-fix fork; the
+lower ratios here reflect the 0370 plate and the `a368469` fix, **not** a narrowing of
+the arch gap itself.
+
+### DWA fix (`a368469`) measured on Apple Silicon — the #184 open item
+
+#184 adopted the DWA f16 SIMD-batch fix but left it **unmeasured on Apple Silicon**
+("expected to help Apple Silicon more … needs a Mac run"). Before/after on this Mac,
+same 0370 variants:
+
+| Codec | before `3398c3e` | after `a368469` | ARM Δ | x86 Δ (#184) |
+|-------|-----------------:|----------------:|:-----:|:------------:|
+| DWAA  | 40.8 ms | 37.2 ms | **−8.8%** | −3% |
+| DWAB  | 46.4 ms | 44.3 ms | **−4.5%** | −8% |
+
+Both wins are real (the after-CIs — DWAA 36.2–38.0, DWAB 44.0–44.5 ms — clear the
+before-medians). The fix helps Apple Silicon in the **same ~4–9% band as x86**, not
+dramatically more (DWAA gains more here, DWAB less), so the "helps Apple Silicon more"
+hypothesis is only **weakly** borne out. The NEON fp16 batch path is a small,
+worthwhile win but does not close the ARM DWA gap (still 2.1–2.3× after).
+
+### Second plate — anamorphic footage (bsow, 4608×3164 RGB)
+
+Cross-check on a *different* plate: the anamorphic footage plate
+`bsow_101_002_020_plt_01_v001.1001.exr` (4608×3164 half **RGB**, PixelAspectRatio 2,
+single-part) — 2× the pixels of 0370 and a live-action image rather than a render.
+This is the **same plate as the doc's original Apple Silicon baseline** table (§ above),
+so floki's post-fix `/load` lands right on those pre-fix numbers (ZIP 61 vs 65, ZIPS 77
+vs 81, DWAA 100 vs 100, DWAB 104 vs 109, PIZ 138 vs 148 ms — marginally faster). Fresh
+same-session floki-vs-OpenEXR, post-fix `a368469`:
+
+| Codec | floki `/load` (median) | OpenEXR (best) | **ARM ratio** | Neo-baseline ratio |
+|-------|-----------------------:|---------------:|:-------------:|:------------------:|
+| ZIP   |  61.1 ms | 32.5 ms | **1.88×** | 2.3× |
+| ZIPS  |  76.9 ms | 44.7 ms | **1.72×** | 1.8× |
+| DWAA  |  99.6 ms | 45.0 ms | **2.21×** | 2.5× |
+| DWAB  | 104.3 ms | 49.6 ms | **2.10×** | 2.4× |
+| PIZ   | 138.2 ms | 59.5 ms | **2.32×** | 2.9× |
+
+Same story on a second plate: broad ARM regression (1.7–2.3×), DWA in the worst tier
+(2.1–2.2×, matching 0370). **PIZ is the single worst codec here (2.32×)** — worse than
+on 0370 (1.75×), consistent with PIZ's wavelet/Huffman cost scaling with image entropy
+(busy footage vs a cleaner render). Anamorphic PAR (2×) is a display-time unsqueeze and
+does not affect decode — the ratios are pure codec/arch. (OpenEXR 3.4.12 here reads a
+touch slower than the original baseline's column, so trust the *ratio*, not a
+cross-session absolute-ms delta.)
+
+**Net — all three machines now measured.** Single-part decode is a *broad ARM scalar
+regression* (every codec ~1.4–2.3× across both plates on this A18 Pro), DWA worst on
+every arch. The
+`a368469` fp16-batch fix shaves a few %; a NEON **IDCT** tier (still unbuilt) would
+chip only at DWA and, per the x86 evidence, can reach neither parity nor the
+ZIP/ZIPS/PIZ regressions. Priority for any future ARM work is unchanged from the x86
+verdict: the general scalar paths (inflate + f16/f32 unpack) dominate, DWA-specific
+SIMD is second-order. Playback (`load_beauty`/`load_proxy`) stays fast throughout, so
+none of this blocks review use — it's an explicit-open / settle-to-full latency
+question only.
+
+---
+
 ## Profiling — where the DWA decode time actually goes (x86, 2026-07-16)
 
 Follow-up to answer "what *is* the ~1.5× DWA gap, if not the IDCT?". Two methods on
@@ -350,6 +442,13 @@ check a variant opens in the app).
 > not close to ~1.0× on x86 (it's the *worst* residual at ~1.5×), and PIZ/ZIP did
 > *not* stay ~2× (they closed too). So a NEON tier is at best a partial ARM win, not
 > the fix. Kept below for when/if it's revisited (measure on the Mac first).
+>
+> **Update (2026-07-16, Apple Silicon run — § RESULTS — Apple Silicon above):** the
+> Mac numbers are now in. DWA stays the worst residual on ARM too (2.1–2.3×), and the
+> broad regression is confirmed on identical pixels — so the NEON **IDCT** tier below
+> is still only a partial DWA win and remains **unbuilt**. Separately, the already-
+> adopted `a368469` fp16-batch fix was measured on Apple Silicon at −4–9% on DWA
+> (same band as x86), not the larger Mac gain hypothesized in #184.
 
 Add an **aarch64 NEON tier** to `byvfx/exrs` `src/compression/dwa/idct.rs`,
 mirroring the x86 `V1`/`V3` tiers, using pulp's aarch64 NEON token; gate the new
