@@ -1426,7 +1426,7 @@ dependencies = [
 [[package]]
 name = "exr"
 version = "1.74.1"
-source = "git+https://github.com/byvfx/exrs?branch=miniz-inflate-1.74.1#3398c3e8711050cb56622b2787ccc085996bbc8b"
+source = "git+https://github.com/byvfx/exrs?branch=miniz-inflate-1.74.1#a3684698806fb95bf8d3475a28872cde7d610e7b"
 dependencies = [
  "bit_field",
  "half",

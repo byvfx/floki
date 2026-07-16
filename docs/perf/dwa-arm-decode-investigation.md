@@ -80,6 +80,165 @@ stay ~fast and are not the concern here.)
 
 ---
 
+## RESULTS — x86 workstation (Windows 11, 2026-07-15)
+
+**Machine:** Intel Core i9-13980HX (24C/32T, AVX2), Windows 11, all cores.
+**Plate:** beauty part (subimage 0) of the `redSea` multi-part plate, **3225×2215
+half RGBA (4ch), single-part**, re-encoded to 5 identical-pixel codec variants with
+`oiiotool`. (Neo used a 4608×3164×3ch plate; different pixel count — the *ratio*
+still cancels the machine, but don't compare absolute ms across the two tables.)
+**floki:** criterion `/load` median (warm, sample_size 10). **OpenEXR:** `exrbench`
+all-parts, best of 3 runs (each internally best-of-3), `setGlobalThreadCount(32)`.
+
+| Codec | floki `/load` (median) | OpenEXR (best) | **x86 ratio** | Neo ratio |
+|-------|-----------------------:|---------------:|:-------------:|:---------:|
+| ZIP   | 33.0 ms | 24.2 ms | **1.36×** | 2.3× |
+| ZIPS  | 38.4 ms | 36.4 ms | **1.05×** | 1.8× |
+| DWAA  | 43.5 ms | 29.9 ms | **1.46×** | 2.5× |
+| DWAB  | 62.6 ms | 39.5 ms | **1.59×** | 2.4× |
+| PIZ   | 38.5 ms | 31.0 ms | **1.24×** | 2.9× |
+
+(floki `/load` ≈ `/load_beauty` here, as expected for a single-part file. DWA
+correctness re-confirmed: `exr_loader::tests::loads_dwaa_and_dwab_compressed_exrs`
+passes, and `p_dwaa.exr` opens correctly.)
+
+### Verdict: **outcome 2 — the gap is overwhelmingly Apple-Silicon-specific.**
+
+*Everything* closed on x86. The Neo's 1.8–2.9× spread collapses to 1.05–1.59×;
+ZIPS essentially ties OpenEXR (1.05×). This is **not** outcome 1 (DWA→1.0× while
+PIZ/ZIP stay ~2×) — PIZ, the *worst* codec on the Neo (2.9×), closes to 1.24×, so
+its penalty was almost entirely the ARM **scalar** inflate/wavelet/unpack paths, not
+anything DCT-related.
+
+Two things the x86 numbers *do* isolate:
+- **The ARM regression is broad, not DWA-only.** All five codecs regress ~1.8–2.9×
+  on Apple Silicon. A NEON DCT tier touches only DWA; it cannot fix the ZIP/ZIPS/PIZ
+  ARM slowdowns (those have no DCT).
+- **DWA carries a real, arch-independent ~1.5× gap.** DWAA/DWAB are the *worst*
+  residual on x86 (1.46× / 1.59×) even with AVX2 — so the fork's DWA decode trails
+  OpenEXR's by ~1.5× on *both* arches, independent of NEON.
+
+**Implication for the NEON-tier decision:** a NEON IDCT would help ARM DWA, but at
+best pulls ARM DWA down toward this x86 ~1.5× floor — not to parity — and does
+nothing for the (larger, broader) ARM regression in the non-DWA codecs. So the
+doc's original "just add NEON DWA" framing is only a *partial* ARM win. The bigger
+ARM lever is the general scalar decode paths (inflate + f16/f32 channel unpack);
+the ~1.5× cross-arch DWA inefficiency is a separate, smaller optimization worth a
+look on both arches. Net: single-part decode on x86 is already competitive
+(1.0–1.6×) — no urgent action; #33's ARM story is "broad scalar regression," and
+the NEON tier alone is not the fix it was hypothesized to be.
+
+---
+
+## Profiling — where the DWA decode time actually goes (x86, 2026-07-16)
+
+Follow-up to answer "what *is* the ~1.5× DWA gap, if not the IDCT?". Two methods on
+`load(p_dwaa.exr)`: (a) coarse **stage timers** temporarily inserted into the fork's
+`dwa::decompress` (one representative 3225×32 chunk; decode is per-chunk parallel so
+the proportions hold), and (b) a **samply/ETW sample**. (Function-name symbolication
+was blocked headless — the `debug=1` line-tables PDB lacks the public-symbol stream
+`dbghelp` needs — so the samply read is module-level; the saved
+`dwaa_prof.json.gz` opens fine in profiler.firefox.com for per-function detail.)
+
+**Measured per-stage split of `dwa::decompress`:**
+
+| Stage | share | what it is |
+|-------|:-----:|------------|
+| **Lossy-DCT decode** | **61%** | un-RLE AC, half→f32 zigzag, **AVX2 IDCT**, CSC709 inverse, per-pixel nonlinear→linear LUT |
+| **Sections inflate** | **28%** | `miniz_oxide` zlib for AC/DC/RLE/UNKNOWN + PIZ Huffman |
+| write_scanlines | 10% | per-sample little-endian byte assembly |
+| endian convert | ~0% | no-op on x86 (LE) |
+
+**samply (active compute, after excluding ~62% idle parked rayon workers):** compute
+concentrates in a handful of tight inner loops, with a notable **~4% of all samples
+in `vcruntime140` memcpy/memset** — the DWA path allocates/copies many throwaway
+buffers (`split_planar_channels` `.to_vec()` per channel, `interleave_byte_planes`,
+the per-group `dct_blocks` Vec, `write_scanlines` growth).
+
+**Conclusion: the IDCT is *not* the bottleneck.** It's a well-vectorized AVX2 kernel
+(`idct.rs`, pulp `f32x8`) and is a small slice of the 61% lossy stage. The lossy
+stage is dominated by **scalar per-sample work** — the nonlinear→linear LUT
+(`f16::from_f32` per pixel), un-RLE/zigzag/CSC — plus buffer churn. This is exactly
+why a NEON IDCT tier would barely move the number (and why DWA stayed ~1.5× on x86
+instead of collapsing to 1.0×).
+
+**Two levers this exposes (ranked):**
+1. **Inflate library — cross-cutting, highest ROI.** The 28% "sections" cost is
+   `miniz_oxide`, and that same inflate *is* the entire ZIP gap (ZIP `/load` ≈ 1.36×
+   is pure inflate). `miniz_oxide` was a deliberate **panic-safety** choice (the
+   reason `byvfx/exrs` exists — see repo `CLAUDE.md`). A faster *panic-safe* inflate
+   (e.g. `zlib-rs`) would speed up **ZIP, ZIPS, and ~28% of DWA** at once, on both
+   arches.
+2. **DWA scalar output path — DWA-specific.** Fuse CSC + nonlinear→linear LUT + the
+   scanline write into fewer passes and cut the intermediate `Vec` allocations/copies
+   (the memcpy signal). Pure-scalar wins, no arch-specific SIMD, measurable on x86.
+
+**Measurement-variance note:** absolute `/load` ms on this i9-13980HX (laptop HX
+part) drift with thermal state — a re-run right after heavy compilation came in
+20–35% slower with much wider criterion CIs while the C++ reference simultaneously
+got faster (classic heat-soak signature). Trust ratios from a **cool, idle** run
+with tight CIs; treat single noisy runs as directional only.
+
+---
+
+## Windows (x86) procedure — how these numbers were produced
+
+The doc's macOS/Linux steps adapted for this Windows box. Tooling was already on the
+network share one level above the repo (`G:\__projects\_programming`): `oiiotool` +
+`exrinfo` from a USD build, and OpenEXR 3.4 + Imath + OpenColorIO 2.4 from a vcpkg
+tree. No installs were needed.
+
+**Tool locations**
+- `oiiotool.exe`, `exrinfo.exe`: `G:\__projects\_programming\usd_25_11\bin` — invoke
+  with **both** `usd_25_11\bin` *and* `usd_25_11\lib` on `PATH` (its boost/OIIO DLLs
+  live in `lib`; without it you get `0xC0000135` DLL-not-found).
+- OpenEXR 3.4 / Imath / OpenColorIO dev libs: `G:\__projects\_programming\vcpkg\installed\x64-windows`
+  (`include`, `lib`, `bin`).
+- MSVC 2022: init via `…\VC\Auxiliary\Build\vcvars64.bat`.
+
+**0. Toolchain gotcha.** The pulled tree needs **rustc ≥ 1.92** (egui 0.34.3); this
+box had 1.90 — `rustup update stable` (→ 1.97). Building floki's bench also compiles
+`floki-ocio`, which pulls **shaderc** (built from source → needs `cmake` + `ninja` +
+`python` + `git` on PATH; VS bundles cmake/ninja, Anaconda supplies python) and
+requires an **OpenColorIO** backend. Point `system-ocio` at vcpkg instead of a
+Homebrew/`OPENCOLORIO_ROOT` install:
+```
+set OPENCOLORIO_ROOT=G:\__projects\_programming\vcpkg\installed\x64-windows
+set IMATH_ROOT=%OPENCOLORIO_ROOT%
+```
+and keep `%VCPKG%\bin` on PATH at *run* time so the bench exe finds `OpenColorIO_2_4.dll`.
+(All of the above is scripted in a single `.bat` that calls `vcvars64` then prepends
+cmake/ninja/python/git/vcpkg-bin to PATH before `cargo bench`.)
+
+**1–2. Single-part plate + identical-pixel variants** (PowerShell; `$USD\bin;$USD\lib` on PATH):
+```powershell
+$OIIO = "G:\__projects\_programming\usd_25_11\bin\oiiotool.exe"
+$SRC  = "assets\perf\TPLS2_206_206-0370_render_v006.redSea_bty.1078.exr"  # multi-part
+$DW   = "$env:TEMP\dwatest"; New-Item -ItemType Directory -Force $DW | Out-Null
+& $OIIO $SRC --subimage 0 --compression zips -o "$DW\_base.exr"           # -> single-part beauty
+foreach ($c in 'zip','zips','dwaa','dwab','piz') { & $OIIO "$DW\_base.exr" --compression $c -o "$DW\p_$c.exr" }
+Remove-Item "$DW\_base.exr"                                               # bench only the 5 variants
+& "G:\__projects\_programming\usd_25_11\bin\exrinfo.exe" "$DW\p_dwaa.exr" # sanity: 1 part, dwaa
+```
+
+**3. floki decode** (inside the MSVC/OCIO-env .bat):
+```
+set FLOKI_PERF_FIXTURES=%TEMP%\dwatest
+cargo bench --bench exr_load -- exr_load/local
+```
+
+**4. OpenEXR C++ reference** — same `exrbench.cpp` as below, built with **MSVC** and
+vcpkg OpenEXR 3.4 (swap the clang/Homebrew line for):
+```
+cl /std:c++17 /O2 /EHsc exrbench.cpp ^
+   /I "%VCPKG%\include" /I "%VCPKG%\include\OpenEXR" /I "%VCPKG%\include\Imath" ^
+   /Fe:exrbench.exe /link /LIBPATH:"%VCPKG%\lib" OpenEXR-3_4.lib Imath-3_2.lib Iex-3_4.lib IlmThread-3_4.lib
+set "PATH=%VCPKG%\bin;%PATH%"            & rem runtime DLLs
+for %%c in (zip zips dwaa dwab piz) do .\exrbench.exe "%TEMP%\dwatest\p_%%c.exr"
+```
+
+---
+
 ## Do this on the workstation
 
 ### 0. Prereqs
@@ -186,6 +345,11 @@ DWAA/DWAB and the pixels must match (the fork's decode is already tested, but sa
 check a variant opens in the app).
 
 ## The fix (only if x86 shows DWA closing to ~1.0×)
+
+> **Status (2026-07-15, x86 run above):** precondition **not** cleanly met — DWA did
+> not close to ~1.0× on x86 (it's the *worst* residual at ~1.5×), and PIZ/ZIP did
+> *not* stay ~2× (they closed too). So a NEON tier is at best a partial ARM win, not
+> the fix. Kept below for when/if it's revisited (measure on the Mac first).
 
 Add an **aarch64 NEON tier** to `byvfx/exrs` `src/compression/dwa/idct.rs`,
 mirroring the x86 `V1`/`V3` tiers, using pulp's aarch64 NEON token; gate the new
