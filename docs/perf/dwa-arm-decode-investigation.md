@@ -183,8 +183,35 @@ dramatically more (DWAA gains more here, DWAB less), so the "helps Apple Silicon
 hypothesis is only **weakly** borne out. The NEON fp16 batch path is a small,
 worthwhile win but does not close the ARM DWA gap (still 2.1–2.3× after).
 
+### Second plate — anamorphic footage (bsow, 4608×3164 RGB)
+
+Cross-check on a *different* plate: the anamorphic footage plate
+`bsow_101_002_020_plt_01_v001.1001.exr` (4608×3164 half **RGB**, PixelAspectRatio 2,
+single-part) — 2× the pixels of 0370 and a live-action image rather than a render.
+This is the **same plate as the doc's original Apple Silicon baseline** table (§ above),
+so floki's post-fix `/load` lands right on those pre-fix numbers (ZIP 61 vs 65, ZIPS 77
+vs 81, DWAA 100 vs 100, DWAB 104 vs 109, PIZ 138 vs 148 ms — marginally faster). Fresh
+same-session floki-vs-OpenEXR, post-fix `a368469`:
+
+| Codec | floki `/load` (median) | OpenEXR (best) | **ARM ratio** | Neo-baseline ratio |
+|-------|-----------------------:|---------------:|:-------------:|:------------------:|
+| ZIP   |  61.1 ms | 32.5 ms | **1.88×** | 2.3× |
+| ZIPS  |  76.9 ms | 44.7 ms | **1.72×** | 1.8× |
+| DWAA  |  99.6 ms | 45.0 ms | **2.21×** | 2.5× |
+| DWAB  | 104.3 ms | 49.6 ms | **2.10×** | 2.4× |
+| PIZ   | 138.2 ms | 59.5 ms | **2.32×** | 2.9× |
+
+Same story on a second plate: broad ARM regression (1.7–2.3×), DWA in the worst tier
+(2.1–2.2×, matching 0370). **PIZ is the single worst codec here (2.32×)** — worse than
+on 0370 (1.75×), consistent with PIZ's wavelet/Huffman cost scaling with image entropy
+(busy footage vs a cleaner render). Anamorphic PAR (2×) is a display-time unsqueeze and
+does not affect decode — the ratios are pure codec/arch. (OpenEXR 3.4.12 here reads a
+touch slower than the original baseline's column, so trust the *ratio*, not a
+cross-session absolute-ms delta.)
+
 **Net — all three machines now measured.** Single-part decode is a *broad ARM scalar
-regression* (every codec ~1.4–2.3× on this A18 Pro), DWA worst on every arch. The
+regression* (every codec ~1.4–2.3× across both plates on this A18 Pro), DWA worst on
+every arch. The
 `a368469` fp16-batch fix shaves a few %; a NEON **IDCT** tier (still unbuilt) would
 chip only at DWA and, per the x86 evidence, can reach neither parity nor the
 ZIP/ZIPS/PIZ regressions. Priority for any future ARM work is unchanged from the x86
