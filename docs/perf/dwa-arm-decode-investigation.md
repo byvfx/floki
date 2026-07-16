@@ -130,6 +130,57 @@ the NEON tier alone is not the fix it was hypothesized to be.
 
 ---
 
+## Profiling — where the DWA decode time actually goes (x86, 2026-07-16)
+
+Follow-up to answer "what *is* the ~1.5× DWA gap, if not the IDCT?". Two methods on
+`load(p_dwaa.exr)`: (a) coarse **stage timers** temporarily inserted into the fork's
+`dwa::decompress` (one representative 3225×32 chunk; decode is per-chunk parallel so
+the proportions hold), and (b) a **samply/ETW sample**. (Function-name symbolication
+was blocked headless — the `debug=1` line-tables PDB lacks the public-symbol stream
+`dbghelp` needs — so the samply read is module-level; the saved
+`dwaa_prof.json.gz` opens fine in profiler.firefox.com for per-function detail.)
+
+**Measured per-stage split of `dwa::decompress`:**
+
+| Stage | share | what it is |
+|-------|:-----:|------------|
+| **Lossy-DCT decode** | **61%** | un-RLE AC, half→f32 zigzag, **AVX2 IDCT**, CSC709 inverse, per-pixel nonlinear→linear LUT |
+| **Sections inflate** | **28%** | `miniz_oxide` zlib for AC/DC/RLE/UNKNOWN + PIZ Huffman |
+| write_scanlines | 10% | per-sample little-endian byte assembly |
+| endian convert | ~0% | no-op on x86 (LE) |
+
+**samply (active compute, after excluding ~62% idle parked rayon workers):** compute
+concentrates in a handful of tight inner loops, with a notable **~4% of all samples
+in `vcruntime140` memcpy/memset** — the DWA path allocates/copies many throwaway
+buffers (`split_planar_channels` `.to_vec()` per channel, `interleave_byte_planes`,
+the per-group `dct_blocks` Vec, `write_scanlines` growth).
+
+**Conclusion: the IDCT is *not* the bottleneck.** It's a well-vectorized AVX2 kernel
+(`idct.rs`, pulp `f32x8`) and is a small slice of the 61% lossy stage. The lossy
+stage is dominated by **scalar per-sample work** — the nonlinear→linear LUT
+(`f16::from_f32` per pixel), un-RLE/zigzag/CSC — plus buffer churn. This is exactly
+why a NEON IDCT tier would barely move the number (and why DWA stayed ~1.5× on x86
+instead of collapsing to 1.0×).
+
+**Two levers this exposes (ranked):**
+1. **Inflate library — cross-cutting, highest ROI.** The 28% "sections" cost is
+   `miniz_oxide`, and that same inflate *is* the entire ZIP gap (ZIP `/load` ≈ 1.36×
+   is pure inflate). `miniz_oxide` was a deliberate **panic-safety** choice (the
+   reason `byvfx/exrs` exists — see repo `CLAUDE.md`). A faster *panic-safe* inflate
+   (e.g. `zlib-rs`) would speed up **ZIP, ZIPS, and ~28% of DWA** at once, on both
+   arches.
+2. **DWA scalar output path — DWA-specific.** Fuse CSC + nonlinear→linear LUT + the
+   scanline write into fewer passes and cut the intermediate `Vec` allocations/copies
+   (the memcpy signal). Pure-scalar wins, no arch-specific SIMD, measurable on x86.
+
+**Measurement-variance note:** absolute `/load` ms on this i9-13980HX (laptop HX
+part) drift with thermal state — a re-run right after heavy compilation came in
+20–35% slower with much wider criterion CIs while the C++ reference simultaneously
+got faster (classic heat-soak signature). Trust ratios from a **cool, idle** run
+with tight CIs; treat single noisy runs as directional only.
+
+---
+
 ## Windows (x86) procedure — how these numbers were produced
 
 The doc's macOS/Linux steps adapted for this Windows box. Tooling was already on the
