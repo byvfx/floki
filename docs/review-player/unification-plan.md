@@ -174,3 +174,65 @@ Route `emit_mode_draws` through the panel's proven loop.
 `SourceId`s). It fixes nothing user-visible on its own, but it is the foundation that makes
 Phase 2 (playable layers — the smoke-test gap) a small follow-up, and it converts the
 whole decode/cache/playback backend to the model the render half already speaks.
+
+---
+
+## Progress log
+
+Branch `feat/layer-stack-panel` (stacked on PR-A #188). Each slice is CI-green
+(`cargo test --lib` + `cargo clippy --lib` default & `--features system-ocio` + `cargo build`).
+
+- **PR-B.1–B.4** — additive Layers panel (scaffold, decode-on-demand, ping-pong render,
+  per-row vis/solo/blend/opacity/reorder/AOV). The N-layer render half.
+- **P1.1** `31c2809` — `cache.rs` → `SourceId` key + N-playhead eviction (`playheads:
+  &[(SourceId,u32)]` + `primary`); `Slot: Into<SourceId>` bridge; `ExrApp::cache_playheads()`.
+- **P1.2** `e03b0a8` — `LoadJob`/`LoadResult` `is_b:bool` → `source:SourceId`; worker routes
+  by source; `apply_load_result` derives `is_b` from `res.source` for the still-forked routing.
+
+## Execution checklist — remaining Phase 1 (resume here)
+
+Symbols are stable; line numbers drift (grep the name). Keep A/B pinned to
+`SourceId(0)`/`SourceId(1)` throughout so behavior is observable/unchanged.
+
+### P1.3 — per-source T2 GPU rings (mostly `viewer.rs`, some `app.rs`)
+
+- `ExrViewer.t2` / `t2_b` fields → one `HashMap<SourceId, T2Ring<T2Texture>>` (the
+  `T2Ring<T>` *policy* is already generic — reuse unchanged).
+- Fold the `_b` twin methods into source-keyed ones: `set_t2_cap`/`set_t2_cap_b`,
+  `set_t2_frame`/`set_t2_frame_b`, `t2_cap`/`t2_cap_b`, `t2_len`/`t2_len_b`,
+  `prebuild_t2`/`prebuild_t2_b`, `clear_t2`/`clear_t2_b`, `evict_t2_frame` (A-only today).
+- `ExrApp::pump_t2` / `pump_t2_b` → one per-source pump loop.
+- `tick_budgets` T2 VRAM **byte-split** (`a_avail = avail/2` when B active) → split `/n`
+  across active sources.
+- The two paint blocks binding `gpu_textures[active_layer]` from `t2` (A) and
+  `gpu_textures_b[layer_b]` from `t2_b` (B) touch both the ring (P1.3) and the render
+  arrays (Phase 3) — keep `gpu_textures`/`gpu_textures_b` as-is here; only the ring source
+  changes.
+
+### P1.4 — fold the `_b` app state; delete `Slot` (`app.rs`, `playback.rs`)
+
+- Fold these `ExrApp` fields into `HashMap<SourceId, SourceState>` + a `primary: SourceId`:
+  `exr_data`/`exr_data_b`, `sequence_b`, `current_frame_b`, `pending`/`pending_b`,
+  `inflight`/`inflight_b`, `loading_a`/`loading_b`, `loaded_file_b`, `open_gen_a`,
+  `ab_offset`, `last_t2_pump`/`last_t2_pump_b`. `SourceState { sequence, current_frame,
+  pending, inflight, loading, exr_data, loaded_file, open_gen }`.
+- Source-key the A/B forks: `submit_seq`, `next_want_slot`, `warm_ahead`,
+  `apply_load_result` (its derived `is_b`/`slot`), and fold the app-level `is_b:bool` params
+  (`open_file`, `swap_image_data`, `swap_image_arc`, `unload`, `route_dropped_exrs`).
+- `pump_decode`'s literal `[(A,0),(B,0),(A,d),(B,d)]` priority list → an N-source loop
+  (primary playheads P0, then prefetch P1); the `/2` depth splits (`pump_decode`,
+  `read_behind_depth`) → `/n_active`.
+- Replace `sync_b_to_a` + `request_b_frame` + `map_b_frame`/`map_b_frame_offset`
+  (`playback.rs`) with `Trim::source_frame` per source. **DECIDED semantics: BLANK outside a
+  layer's range** (not the old clamp/hold), and **the master clock does NOT stall** on a
+  lagging follower (keep `tick_stutter` gating on the primary only).
+- Delete `cache::Slot` + the `Slot::A.into()`/`Slot::B.into()` bridge sites once nothing
+  needs the two-value enum.
+- `budget.rs` needs no change (already slot-agnostic); `scheduler.rs`, `prefetch.rs`,
+  `playback::advance` unchanged.
+
+### After Phase 1
+
+Phase 2 (make Layers-panel `add_comp_source` detect a sequence + register a `SourceState`
+so comp layers play) becomes a small follow-up. Then Phase 3 (render unify) and Phase 4
+(collapse + persistence). See the per-Phase sections above.
