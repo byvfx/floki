@@ -5324,6 +5324,40 @@ impl ExrApp {
         );
     }
 
+    /// Ensure a comp source's GPU texture holds the requested AOV (#99 PR-B.4.3),
+    /// rebuilding it if the layer's AOV changed. A source stores one texture, so
+    /// this is exact while each source backs a single layer (every UI-reachable
+    /// state today — the Add flow makes one source per file). Sharing a source
+    /// across layers at different AOVs (back-to-beauty) would need per-`(SourceId,
+    /// aov)` textures — a follow-up. No-op if already current, headless, or the
+    /// rebuild fails (the stale texture is kept).
+    fn ensure_comp_aov(&mut self, source: crate::layer::SourceId, aov: usize) {
+        let Some(cs) = self.comp_sources.get(&source) else {
+            return;
+        };
+        if cs.aov == aov {
+            return;
+        }
+        // Clone the Arc so the immutable `comp_sources` borrow ends before the
+        // `gpu_resources` read + the `get_mut` write below (disjoint fields).
+        let exr_data = cs.exr_data.clone();
+        let Some(gpu) = self.gpu_resources.as_ref() else {
+            return;
+        };
+        let Some((texture, bind_group)) =
+            crate::viewer::ExrViewer::build_source_texture(gpu, &exr_data, aov)
+        else {
+            return;
+        };
+        let size = exr_data.logical_size(aov).unwrap_or((0, 0));
+        if let Some(cs) = self.comp_sources.get_mut(&source) {
+            cs.texture = Some(texture);
+            cs.bind_group = Some(bind_group);
+            cs.aov = aov;
+            cs.size = size;
+        }
+    }
+
     /// Remove a Layers-panel layer and free its source's pixels/VRAM once no other
     /// layer references it (#99 PR-B.2). A source can be shared by several layers
     /// (e.g. back-to-beauty AOVs of one file), so its [`CompSource`] is dropped
@@ -5404,17 +5438,46 @@ impl ExrApp {
                     solo: bool,
                     blend: crate::viewer::BlendMode,
                     opacity: f32,
+                    /// Current AOV index + the source's AOV names, for the per-row AOV
+                    /// picker (#99 PR-B.4.3). Empty / single-entry ⇒ no picker shown.
+                    aov: usize,
+                    aov_names: Vec<String>,
                 }
                 let rows: Vec<Row> = self
                     .comp_stack
                     .iter()
-                    .map(|l| Row {
-                        id: l.id,
-                        name: l.name.clone(),
-                        enabled: l.enabled,
-                        solo: l.solo,
-                        blend: l.blend,
-                        opacity: l.opacity,
+                    .map(|l| {
+                        let (source, aov) = match &l.source {
+                            crate::layer::LayerSource::Image { source, aov } => (Some(*source), *aov),
+                            crate::layer::LayerSource::Adjustment => (None, 0),
+                        };
+                        let aov_names = source
+                            .and_then(|s| self.comp_sources.get(&s))
+                            .map(|cs| {
+                                cs.exr_data
+                                    .logical_layers
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, ll)| {
+                                        if ll.name.is_empty() {
+                                            format!("layer {i}")
+                                        } else {
+                                            ll.name.clone()
+                                        }
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        Row {
+                            id: l.id,
+                            name: l.name.clone(),
+                            enabled: l.enabled,
+                            solo: l.solo,
+                            blend: l.blend,
+                            opacity: l.opacity,
+                            aov,
+                            aov_names,
+                        }
                     })
                     .collect();
                 let count = rows.len();
@@ -5506,6 +5569,28 @@ impl ExrApp {
                                     l.blend = blend;
                                 }
                             });
+                            // AOV picker: which logical layer (pass) of the source to
+                            // show. Only for multi-layer EXRs — a single-beauty source
+                            // has nothing to choose. Changing it rebuilds the source
+                            // texture next frame (`ensure_comp_aov`).
+                            if row.aov_names.len() > 1 {
+                                let mut aov = row.aov.min(row.aov_names.len() - 1);
+                                egui::ComboBox::from_id_salt((row.id, "aov"))
+                                    .selected_text(row.aov_names[aov].clone())
+                                    .width(90.0)
+                                    .show_ui(ui, |ui| {
+                                        for (idx, nm) in row.aov_names.iter().enumerate() {
+                                            ui.selectable_value(&mut aov, idx, nm);
+                                        }
+                                    });
+                                if aov != row.aov
+                                    && let Some(l) = self.comp_stack.get_mut(row.id)
+                                    && let crate::layer::LayerSource::Image { aov: a, .. } =
+                                        &mut l.source
+                                {
+                                    *a = aov;
+                                }
+                            }
                         });
                     });
                 }
@@ -5538,6 +5623,14 @@ impl ExrApp {
         // Resolve the model → concrete draws at the shared global playhead (stills
         // sit at frame 0 via `Trim::full`; per-source sequence frames arrive w/ PR-C).
         let steps = self.comp_stack.composite_at(self.playback.current_frame);
+
+        // Rebuild any source texture whose layer switched AOV since it was last built
+        // (#99 PR-B.4.3), so the draw below binds the requested pass.
+        for step in &steps {
+            if let crate::layer::Step::Draw(d) = step {
+                self.ensure_comp_aov(d.source, d.aov);
+            }
+        }
 
         // Bottom→top draw list from the decoded sources. A step whose source has no
         // texture (headless, or a not-yet-built AOV) is skipped; the bottom drawable
@@ -5768,6 +5861,27 @@ mod tests {
         );
         // Ids are never reused, so a re-add can't alias the freed source.
         assert_eq!(app.comp_next_source, 1, "allocator not rewound");
+    }
+
+    #[test]
+    fn comp_source_carries_all_aovs_for_the_picker() {
+        // A multi-pass source stores every logical layer, so the per-row AOV picker
+        // (#99 PR-B.4.3) has entries; the layer starts on AOV 0.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("passes.exr");
+        write_multi_pass_exr(&f, 3);
+
+        let mut app = ExrApp::default();
+        app.add_comp_source(f);
+        let source = crate::layer::SourceId(0);
+        let cs = app.comp_sources.get(&source).expect("source stored");
+        assert_eq!(cs.exr_data.logical_layers.len(), 3, "3 passes → 3 AOVs");
+        assert_eq!(cs.aov, 0, "starts on AOV 0");
+
+        // ensure_comp_aov is a no-op when the stored AOV already matches (headless has
+        // no GPU, but the early `aov == aov` return fires before that matters).
+        app.ensure_comp_aov(source, 0);
+        assert_eq!(app.comp_sources.get(&source).unwrap().aov, 0);
     }
 
     #[test]
