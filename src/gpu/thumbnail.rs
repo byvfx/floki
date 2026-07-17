@@ -302,7 +302,7 @@ fn uniforms_for(tone: &ThumbnailTone, out_w: usize, out_h: usize) -> crate::gpu:
         bg_mode: bg.mode.as_u32(),
         bg_grad_angle: bg.gradient_angle,
         bg_checker_size: bg.checker_size,
-        _pad3: 0,
+        composite_accum: 0,
     }
 }
 

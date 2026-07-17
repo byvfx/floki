@@ -383,6 +383,12 @@ impl DrawCtx<'_> {
         u.is_composite = if is_composite { 1 } else { 0 };
         u.opacity = opacity;
         u.overscan_factor = self.overscan_factor.get();
+        // Under OCIO the only `is_composite` draw is the layer-stack accumulate top
+        // layer (composite folds through the scene ping-pong there — see `emit_mode_draws`
+        // + `OcioCallback::accumulate`), whose `tex_b` is the screen-sized scene
+        // accumulation. Flag it so the shader samples `tex_b` at screen coords, not the
+        // image-local uv. The non-OCIO single-pass composite keeps `tex_b` as an image (0).
+        u.composite_accum = if is_composite && self.ocio_active { 1 } else { 0 };
 
         // OCIO path: pass 1 must emit scene-linear, so bypass the built-in
         // display chain (sRGB/gamma/.cube LUT). Exposure stays (linear).
@@ -2944,7 +2950,8 @@ impl ExrViewer {
             bg_mode: self.prefs.background.mode.as_u32(),
             bg_grad_angle: self.prefs.background.gradient_angle,
             bg_checker_size: self.prefs.background.checker_size,
-            _pad3: 0,
+            // Set per-draw in `DrawCtx::draw` for the layer-stack accumulate top layer.
+            composite_accum: 0,
         }
     }
 
@@ -3010,20 +3017,53 @@ impl ExrViewer {
             })
         };
         match program.arrangement {
-            // Single (one draw) and Composite (B over A in the blend shader).
+            // Single (one draw) and Composite (A over B — see the stacking-order note
+            // below).
             render_program::Arrangement::Stacked => {
                 if program.is_composite {
                     if let Some(bg_b) = pick_b() {
-                        ctx.draw(
-                            p,
-                            bg_a.clone(),
-                            Some(bg_b),
-                            rect,
-                            image_rect,
-                            false,
-                            true,
-                            opac,
-                        );
+                        if ctx.ocio_active {
+                            // OCIO path: fold the composite through the scene ping-pong
+                            // (OcioCallback::accumulate). Order preserves today's look —
+                            // A renders over B (#99 decision): bottom = B (a plain copy,
+                            // is_composite=0), top = A over the accumulation
+                            // (is_composite=1, the blend rides A). `tex_b` on the top draw
+                            // is ignored by the ping-pong (it binds the prior accumulation),
+                            // so pass B to keep the render signature reacting to B changing.
+                            ctx.draw(
+                                p,
+                                bg_b.clone(),
+                                None,
+                                rect,
+                                image_rect,
+                                false,
+                                false,
+                                opac,
+                            );
+                            ctx.draw(
+                                p,
+                                bg_a.clone(),
+                                Some(bg_b),
+                                rect,
+                                image_rect,
+                                false,
+                                true,
+                                opac,
+                            );
+                        } else {
+                            // Non-OCIO: a single 2-input pass (no offscreen to ping-pong
+                            // through) — A over B in the blend shader, unchanged.
+                            ctx.draw(
+                                p,
+                                bg_a.clone(),
+                                Some(bg_b),
+                                rect,
+                                image_rect,
+                                false,
+                                true,
+                                opac,
+                            );
+                        }
                     }
                 } else if let Some(draw) = program.draws.first() {
                     match draw.input {
@@ -3293,6 +3333,9 @@ impl ExrViewer {
                     };
                     let callback = crate::gpu::ocio_pass::OcioCallback {
                         draws,
+                        // Composite folds its draws through the scene ping-pong; every
+                        // other arrangement renders its draws in the single pass-1 loop.
+                        accumulate: program.is_composite,
                         display_format,
                         blit_uniforms,
                         scissor_pts,

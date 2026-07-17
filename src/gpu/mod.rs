@@ -69,7 +69,13 @@ pub struct Uniforms {
     pub bg_mode: u32,
     pub bg_grad_angle: f32,
     pub bg_checker_size: f32,
-    pub _pad3: u32,
+    /// When 1, the shader treats `tex_b` as the **screen-sized** scene
+    /// accumulation of the layer-stack ping-pong (#99) and samples it at the
+    /// fragment's screen position rather than the image-local `in.uv`. 0 for
+    /// single-pass composite / wipe / diff (where `tex_b` is an image texture).
+    /// Formerly `_pad3` alignment filler — same slot, so the layout is unchanged.
+    /// Keep in lockstep with `Uniforms.composite_accum` in `shader.wgsl`.
+    pub composite_accum: u32,
 }
 
 /// Uniforms for the OCIO blit pass: composites the transparency checkerboard in
@@ -1071,7 +1077,7 @@ mod tests {
             bg_mode: 2,
             bg_grad_angle: 90.0,
             bg_checker_size: 16.0,
-            _pad3: 0,
+            composite_accum: 0,
         };
         let bytes = bytemuck::bytes_of(&u);
         assert_eq!(bytes.len(), std::mem::size_of::<Uniforms>());
