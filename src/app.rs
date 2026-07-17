@@ -5319,6 +5319,17 @@ impl ExrApp {
                 return;
             }
         };
+        // A file can decode yet expose no renderable image layer (no channels /
+        // groups, or a deep/unsupported part). Reject it like a load error — before
+        // consuming a `SourceId` — so we never push a permanently non-renderable
+        // layer (size (0,0), no texture) with a misleading hint (#189 review).
+        if exr_data.logical_channels(0).is_none() {
+            self.error_msg = Some(format!(
+                "Layer '{}' has no renderable image layers.",
+                path.display()
+            ));
+            return;
+        }
         let name = path
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
