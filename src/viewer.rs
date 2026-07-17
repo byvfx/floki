@@ -655,14 +655,14 @@ pub struct ExrViewer {
     /// map policy (cap-shrink eviction, layer invalidation, on-screen protection)
     /// lives in the unit-tested [`T2Ring`]; the app drives it every frame via
     /// `set_t2_cap`/`set_t2_frame`/`prebuild_t2` (#153).
-    t2: T2Ring<T2Texture>,
-    /// T2 ring for slot **B** in locked-step A/B compare (#166, #98 Phase 2).
-    /// Mirrors `t2`, but keyed on B's frame number and built for B's layer
-    /// (`active_layer` clamped to B's layer count), so the compared sequence
-    /// pre-uploads ahead of the playhead instead of re-packing + re-uploading a
-    /// fresh texture every locked-step frame. Empty / cap-0 unless B is a
-    /// sequence in an active compare.
-    t2_b: T2Ring<T2Texture>,
+    ///
+    /// **Per-`SourceId` (#99):** one ring per source, created lazily. Today the
+    /// only keys are the A/B slots (`Slot::{A,B}.into()` = [`Self::T2_SOURCE_A`] /
+    /// [`Self::T2_SOURCE_B`]) — B mirrors A but keyed on B's frame number and built
+    /// for B's layer (`active_layer` clamped to B's layer count), pre-uploading the
+    /// compared sequence ahead of the playhead. An absent ring reads as disabled
+    /// (cap/len 0). Phase 2 rings the comp stack's N sources under their own ids.
+    t2_rings: std::collections::BTreeMap<crate::layer::SourceId, T2Ring<T2Texture>>,
     /// Reused staging buffer for the Rgba16Float pack (#142 U3): holds one
     /// layer's interleaved half bit-patterns, so `build_layer_texture` doesn't
     /// page-fault a fresh ~66 MB allocation every build during playback.
@@ -825,8 +825,7 @@ impl Default for ExrViewer {
             gpu_thumb_bg: None,
             gpu_textures: Vec::new(),
             gpu_textures_b: Vec::new(),
-            t2: T2Ring::new(),
-            t2_b: T2Ring::new(),
+            t2_rings: std::collections::BTreeMap::new(),
             t2_staging: Vec::new(),
             prefs: ViewerPrefs::default(),
             colormap_lut: Vec::new(),
@@ -2436,13 +2435,18 @@ impl ExrViewer {
 
             if let Some(gpu) = gpu_resources {
                 // A layer switch invalidates the per-frame T2 ring (textures are
-                // per-layer). Do this before binding/building below.
-                self.t2.ensure_layer(self.active_layer);
+                // per-layer). Do this before binding/building below. The ring is
+                // per-`SourceId` (#99); the primary (A) is `T2_SOURCE_A`.
+                let ring_a = self
+                    .t2_rings
+                    .entry(Self::T2_SOURCE_A)
+                    .or_insert_with(T2Ring::new);
+                ring_a.ensure_layer(self.active_layer);
                 // T2 (#56): bind the on-screen frame's pre-built texture if it is
                 // resident, so the swap is an instant bind, not a re-upload.
-                if self.t2.cap() > 0
-                    && let Some(frame) = self.t2.frame
-                    && let Some(t2) = self.t2.get(frame)
+                if ring_a.cap() > 0
+                    && let Some(frame) = ring_a.frame
+                    && let Some(t2) = ring_a.get(frame)
                 {
                     self.gpu_textures[self.active_layer] = Some(t2.bind_group.clone());
                 }
@@ -2457,25 +2461,28 @@ impl ExrViewer {
                     self.gpu_textures[self.active_layer] = Some(t2.bind_group.clone());
                     // Cache the freshly-built texture into the T2 ring for the
                     // on-screen frame (a lazy first paint feeds the ring).
-                    if self.t2.cap() > 0
-                        && let Some(frame) = self.t2.frame
+                    if ring_a.cap() > 0
+                        && let Some(frame) = ring_a.frame
                     {
-                        self.t2.insert(frame, t2);
-                        self.t2.evict_to_cap();
+                        ring_a.insert(frame, t2);
+                        ring_a.evict_to_cap();
                     }
                 }
                 if let Some(data_b) = exr_data_b {
-                    let layer_b = self
-                        .active_layer
-                        .min(data_b.logical_layers.len().saturating_sub(1));
-                    // A layer switch invalidates the per-frame B ring (per-layer).
-                    self.t2_b.ensure_layer(layer_b);
+                    let layer_b = self.t2_layer_for(data_b);
+                    // The compared source (B) rings under `T2_SOURCE_B`. A layer
+                    // switch invalidates its per-frame ring (per-layer).
+                    let ring_b = self
+                        .t2_rings
+                        .entry(Self::T2_SOURCE_B)
+                        .or_insert_with(T2Ring::new);
+                    ring_b.ensure_layer(layer_b);
                     // B T2 (#166): bind the on-screen B frame's pre-built texture
                     // if resident, so a locked-step B swap is an instant bind, not
                     // a re-upload (mirrors A above).
-                    if self.t2_b.cap() > 0
-                        && let Some(frame) = self.t2_b.frame
-                        && let Some(t2) = self.t2_b.get(frame)
+                    if ring_b.cap() > 0
+                        && let Some(frame) = ring_b.frame
+                        && let Some(t2) = ring_b.get(frame)
                     {
                         self.gpu_textures_b[layer_b] = Some(t2.bind_group.clone());
                     }
@@ -2485,11 +2492,11 @@ impl ExrViewer {
                     {
                         self.gpu_textures_b[layer_b] = Some(t2.bind_group.clone());
                         // Lazy first paint feeds the B ring for the on-screen frame.
-                        if self.t2_b.cap() > 0
-                            && let Some(frame) = self.t2_b.frame
+                        if ring_b.cap() > 0
+                            && let Some(frame) = ring_b.frame
                         {
-                            self.t2_b.insert(frame, t2);
-                            self.t2_b.evict_to_cap();
+                            ring_b.insert(frame, t2);
+                            ring_b.evict_to_cap();
                         }
                     }
                 }
@@ -3771,55 +3778,82 @@ impl ExrViewer {
 
     // --- T2 GPU-texture ring (#56) -------------------------------------------
 
-    /// Set the VRAM-budgeted T2 capacity (frames). `0` disables pre-upload and
-    /// drops the ring → the lazy per-swap path. Shrinking evicts immediately.
-    /// Called every frame from `tick_budgets` — an unchanged cap is a no-op.
-    pub(crate) fn set_t2_cap(&mut self, cap: usize) {
-        self.t2.set_cap(cap);
+    /// T2-ring source ids while the app is A/B-pinned (#99): the primary (A) and
+    /// the compared follower (B), mirroring the app's `Slot::{A,B}.into()`. Phase 2
+    /// rings the comp stack's N sources under their own ids.
+    const T2_SOURCE_A: crate::layer::SourceId = crate::layer::SourceId(0);
+    const T2_SOURCE_B: crate::layer::SourceId = crate::layer::SourceId(1);
+
+    /// `source`'s T2 ring, created empty on first use. Mutating entry points
+    /// (`set_t2_cap`, `set_t2_frame`) go through here; reads (`t2_cap`, `t2_len`)
+    /// tolerate an absent ring as "disabled".
+    fn t2_ring_mut(&mut self, source: crate::layer::SourceId) -> &mut T2Ring<T2Texture> {
+        self.t2_rings.entry(source).or_insert_with(T2Ring::new)
     }
 
-    /// Tell the viewer which sequence frame is on screen, so `ui()` binds its T2
-    /// texture. `None` for a single image (lazy path).
-    pub(crate) fn set_t2_frame(&mut self, frame: Option<u32>) {
-        self.t2.set_frame(frame);
+    /// The layer a source's T2 ring builds for: the active layer clamped to the
+    /// source's own layer count. A no-op for the primary (its active layer is
+    /// always in range); the clamp only bites a differently-shaped compared source
+    /// (#98 Phase 1 / #99). Kept as one helper so the ring's `ensure_layer` key,
+    /// the GPU build, and the bind all agree.
+    fn t2_layer_for(&self, exr_data: &ExrData) -> usize {
+        self.active_layer
+            .min(exr_data.logical_layers.len().saturating_sub(1))
     }
 
-    /// Current T2 capacity in frames (`0` = disabled).
-    pub(crate) fn t2_cap(&self) -> usize {
-        self.t2.cap()
+    /// Set the VRAM-budgeted T2 capacity (frames) for `source`. `0` disables
+    /// pre-upload and drops that ring → the lazy per-swap path. Shrinking evicts
+    /// immediately. Called every frame from `tick_budgets` — an unchanged cap is a
+    /// no-op. The app splits the VRAM budget across active sources (#166/#99), so
+    /// each source derives its own count from its own resolution.
+    pub(crate) fn set_t2_cap(&mut self, source: crate::layer::SourceId, cap: usize) {
+        self.t2_ring_mut(source).set_cap(cap);
     }
 
-    /// Number of GPU textures currently resident in the T2 ring (instrumentation).
-    pub(crate) fn t2_len(&self) -> usize {
-        self.t2.len()
+    /// Tell the viewer which sequence frame of `source` is on screen, so `ui()`
+    /// binds its T2 texture. `None` for a single image / non-sequence (lazy path).
+    pub(crate) fn set_t2_frame(&mut self, source: crate::layer::SourceId, frame: Option<u32>) {
+        self.t2_ring_mut(source).set_frame(frame);
     }
 
-    /// Pre-build the T2 texture for `(frame, active layer)` and ring it, evicting
-    /// to the cap. Returns `true` if it actually built (so the caller can amortize
-    /// uploads across frames). No-op — returns `false` — when disabled, already
-    /// resident, or the build fails. UI-thread only. Pass frames already resident
-    /// in the T1 cache; T2 never triggers a decode. The ring bookkeeping is
-    /// [`T2Ring`]'s; only the GPU build stays here.
+    /// `source`'s current T2 capacity in frames (`0` = disabled / no ring).
+    pub(crate) fn t2_cap(&self, source: crate::layer::SourceId) -> usize {
+        self.t2_rings.get(&source).map_or(0, |r| r.cap())
+    }
+
+    /// Number of GPU textures currently resident in `source`'s T2 ring
+    /// (instrumentation).
+    pub(crate) fn t2_len(&self, source: crate::layer::SourceId) -> usize {
+        self.t2_rings.get(&source).map_or(0, |r| r.len())
+    }
+
+    /// Pre-build the T2 texture for `(frame, source's layer)` and ring it under
+    /// `source`, evicting to the cap. Returns `true` if it actually built (so the
+    /// caller can amortize uploads across frames). No-op — returns `false` — when
+    /// disabled, already resident, or the build fails. UI-thread only. Pass frames
+    /// already resident in that source's T1 cache; T2 never triggers a decode. The
+    /// ring bookkeeping is [`T2Ring`]'s; only the GPU build stays here.
     pub(crate) fn prebuild_t2(
         &mut self,
+        source: crate::layer::SourceId,
         gpu: &crate::gpu::GpuResources,
         exr_data: &ExrData,
         frame: u32,
     ) -> bool {
-        if self.t2.cap() == 0 {
+        let layer = self.t2_layer_for(exr_data);
+        let ring = self.t2_rings.entry(source).or_insert_with(T2Ring::new);
+        if ring.cap() == 0 {
             return false;
         }
-        self.t2.ensure_layer(self.active_layer);
-        if self.t2.contains(frame) {
+        ring.ensure_layer(layer);
+        if ring.contains(frame) {
             return false;
         }
-        let Some(t2) =
-            Self::build_layer_texture(gpu, exr_data, self.active_layer, &mut self.t2_staging)
-        else {
+        let Some(t2) = Self::build_layer_texture(gpu, exr_data, layer, &mut self.t2_staging) else {
             return false;
         };
-        self.t2.insert(frame, t2);
-        self.t2.evict_to_cap();
+        ring.insert(frame, t2);
+        ring.evict_to_cap();
         true
     }
 
@@ -3828,83 +3862,23 @@ impl ExrViewer {
     /// from the fresh decode. Drop-only (no `destroy()`): if this frame is the one
     /// on screen, the bound bind group keeps the old texture alive until the next
     /// paint rebinds the fresh one — no in-flight draw is ever invalidated.
-    pub(crate) fn evict_t2_frame(&mut self, frame: u32) {
-        self.t2.evict_frame(frame);
-    }
-
-    /// Drop every T2 texture (new sequence / disabled / layer switch). Drop-only:
-    /// the on-screen frame's texture stays alive through its still-bound bind
-    /// group (cloned into `gpu_textures[active_layer]`) and is freed by wgpu once
-    /// that binding is replaced — critically, this clear can run *before* the
-    /// central panel rebinds for the just-advanced frame, so the bound frame may
-    /// differ from the ring's on-screen frame; dropping is safe for either, a
-    /// `destroy()` is not.
-    pub(crate) fn clear_t2(&mut self) {
-        self.t2.clear();
-    }
-
-    /// The B-slot layer for a compared image: the active layer clamped to B's
-    /// layer count (mirrors the bind path at `ui()` and #98 Phase 1). Kept as one
-    /// helper so the ring's `ensure_layer` key, the build, and the bind agree.
-    fn layer_b_for(&self, data_b: &ExrData) -> usize {
-        self.active_layer
-            .min(data_b.logical_layers.len().saturating_sub(1))
-    }
-
-    /// Set the VRAM-budgeted capacity of the **B** T2 ring (#166). `0` disables
-    /// B pre-upload → the lazy per-swap path. The app splits the VRAM budget
-    /// across A and B in `tick_budgets`, so this is A's `set_t2_cap` counterpart.
-    pub(crate) fn set_t2_cap_b(&mut self, cap: usize) {
-        self.t2_b.set_cap(cap);
-    }
-
-    /// Tell the viewer which B frame is on screen, so `ui()` binds its B T2
-    /// texture. `None` when B isn't a sequence (lazy path).
-    pub(crate) fn set_t2_frame_b(&mut self, frame: Option<u32>) {
-        self.t2_b.set_frame(frame);
-    }
-
-    /// Current B T2 capacity in frames (`0` = disabled).
-    pub(crate) fn t2_cap_b(&self) -> usize {
-        self.t2_b.cap()
-    }
-
-    /// Number of GPU textures resident in the B T2 ring (instrumentation).
-    pub(crate) fn t2_len_b(&self) -> usize {
-        self.t2_b.len()
-    }
-
-    /// Pre-build the B T2 texture for `(frame, B layer)` and ring it, evicting to
-    /// the cap. B counterpart of [`Self::prebuild_t2`]; the B layer is derived
-    /// from `exr_data` (active layer clamped to B's layer count). Returns `true`
-    /// if it built. Pass frames already resident in the `Slot::B` T1 cache.
-    pub(crate) fn prebuild_t2_b(
-        &mut self,
-        gpu: &crate::gpu::GpuResources,
-        exr_data: &ExrData,
-        frame: u32,
-    ) -> bool {
-        if self.t2_b.cap() == 0 {
-            return false;
+    pub(crate) fn evict_t2_frame(&mut self, source: crate::layer::SourceId, frame: u32) {
+        if let Some(ring) = self.t2_rings.get_mut(&source) {
+            ring.evict_frame(frame);
         }
-        let layer_b = self.layer_b_for(exr_data);
-        self.t2_b.ensure_layer(layer_b);
-        if self.t2_b.contains(frame) {
-            return false;
-        }
-        let Some(t2) = Self::build_layer_texture(gpu, exr_data, layer_b, &mut self.t2_staging)
-        else {
-            return false;
-        };
-        self.t2_b.insert(frame, t2);
-        self.t2_b.evict_to_cap();
-        true
     }
 
-    /// Drop every B T2 texture (new B sequence / B dropped / disabled). Drop-only,
-    /// like [`Self::clear_t2`].
-    pub(crate) fn clear_t2_b(&mut self) {
-        self.t2_b.clear();
+    /// Drop every T2 texture in `source`'s ring (new sequence / disabled / layer
+    /// switch / source dropped). Drop-only: the on-screen frame's texture stays
+    /// alive through its still-bound bind group (cloned into `gpu_textures*`) and is
+    /// freed by wgpu once that binding is replaced — critically, this clear can run
+    /// *before* the central panel rebinds for the just-advanced frame, so the bound
+    /// frame may differ from the ring's on-screen frame; dropping is safe for
+    /// either, a `destroy()` is not.
+    pub(crate) fn clear_t2(&mut self, source: crate::layer::SourceId) {
+        if let Some(ring) = self.t2_rings.get_mut(&source) {
+            ring.clear();
+        }
     }
 
     /// CPU contact-sheet thumbnail bake: decimate `layer_index` to the thumbnail

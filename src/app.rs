@@ -1353,8 +1353,8 @@ impl ExrApp {
         self.dbg_dropped_epoch = 0;
         // A different sequence reuses frame numbers, so drop the T2 GPU ring too
         // (and reset the on-screen frame; the first show re-sets it).
-        self.viewer.clear_t2();
-        self.viewer.set_t2_frame(None);
+        self.viewer.clear_t2(Self::A_SOURCE);
+        self.viewer.set_t2_frame(Self::A_SOURCE, None);
         // Drop any prior sequence's in-flight frames (a different sequence reuses
         // frame numbers); `enter`/`clear` bump the epoch so their results are
         // dropped. `loading_a` is left to `open_file`, which owns this open.
@@ -1391,8 +1391,8 @@ impl ExrApp {
         self.frame_cache.clear_slot(crate::cache::Slot::B);
         // Drop the B T2 GPU ring too (#166): its frame keys belong to the sequence
         // being cleared; the next B show re-sets the on-screen frame.
-        self.viewer.clear_t2_b();
-        self.viewer.set_t2_frame_b(None);
+        self.viewer.clear_t2(Self::B_SOURCE);
+        self.viewer.set_t2_frame(Self::B_SOURCE, None);
     }
 
     /// Arm locked-step B (#98) if the just-opened B file is part of an image
@@ -1408,7 +1408,7 @@ impl ExrApp {
         self.b_mut().current_frame = bf;
         // The opened B frame is on screen; mark it for the B ring so its pump
         // protects it from eviction (#166) even before the first locked-step swap.
-        self.viewer.set_t2_frame_b(Some(bf));
+        self.viewer.set_t2_frame(Self::B_SOURCE, Some(bf));
         // Seed the ring with the opened B frame (mirror the A open, #56) so it's an
         // instant hit and the first locked-step advance has a cached neighbour.
         if let Some(arc) = self.exr_data_b.clone() {
@@ -1443,7 +1443,7 @@ impl ExrApp {
                 && !self.scrub_active
                 && (data.beauty_only || data.proxy);
             self.loading_a = false;
-            self.viewer.set_t2_frame(Some(frame)); // bind this frame's T2 texture
+            self.viewer.set_t2_frame(Self::A_SOURCE, Some(frame)); // bind this frame's T2 texture
             self.swap_image_arc(data, false);
             if needs_full {
                 self.playback.pending = Some(frame);
@@ -1532,6 +1532,9 @@ impl ExrApp {
         self.frame_cache_cap.saturating_sub(1).min(MAX_PREFETCH)
     }
 
+    /// The source id of the **primary** (Slot A) — `Slot::A.into()`. The master
+    /// clock's source; keys A's T2 ring (#99).
+    const A_SOURCE: crate::layer::SourceId = crate::layer::SourceId(0);
     /// The source id of the locked-step **B** follower — `Slot::B.into()`. Held as
     /// a const so the sole `followers` entry (and its `Slot::B` cache / T2 slot)
     /// has one name while the app is still A/B-pinned; Phase 2 inserts comp sources
@@ -1924,14 +1927,14 @@ impl ExrApp {
     /// most a couple per call to amortize the upload across UI frames; only
     /// touches frames already resident in T1 (never decodes). UI-thread only.
     fn pump_t2(&mut self) {
-        if !self.playback.is_active() || self.viewer.t2_cap() == 0 {
+        if !self.playback.is_active() || self.viewer.t2_cap(Self::A_SOURCE) == 0 {
             return;
         }
         // Nothing to do when the ring is full and the playhead hasn't moved since
         // the last pump: every slot is already built for this frame. Skips the
         // want-list allocation in the paused / settled case (#142 U4). A playhead
         // move, or a shrunk/evicted ring, drops one of these conditions and pumps.
-        if self.viewer.t2_len() >= self.viewer.t2_cap()
+        if self.viewer.t2_len(Self::A_SOURCE) >= self.viewer.t2_cap(Self::A_SOURCE)
             && self.last_t2_pump == Some(self.playback.current_frame)
         {
             return;
@@ -1939,7 +1942,7 @@ impl ExrApp {
         let Some(gpu) = self.gpu_resources.as_ref() else {
             return;
         };
-        let depth = self.viewer.t2_cap().saturating_sub(1);
+        let depth = self.viewer.t2_cap(Self::A_SOURCE).saturating_sub(1);
         // Empty resident set -> want_list returns the playhead + the window ahead;
         // we then keep only frames actually cached in T1. No read-behind here
         // (#169): the T2 VRAM ring is tiny (≤ 8) and strictly forward — behind
@@ -1969,7 +1972,7 @@ impl ExrApp {
                 break;
             }
             if let Some(arc) = self.frame_cache.peek(crate::cache::Slot::A, w)
-                && self.viewer.prebuild_t2(gpu, &arc, w)
+                && self.viewer.prebuild_t2(Self::A_SOURCE, gpu, &arc, w)
             {
                 built += 1;
             }
@@ -1987,11 +1990,11 @@ impl ExrApp {
         let Some(range) = self.b().sequence.as_ref().map(|s| s.range) else {
             return;
         };
-        if !self.playback.is_active() || self.viewer.t2_cap_b() == 0 {
+        if !self.playback.is_active() || self.viewer.t2_cap(Self::B_SOURCE) == 0 {
             return;
         }
         // Full B ring on an unmoved B playhead: every slot is built for this frame.
-        if self.viewer.t2_len_b() >= self.viewer.t2_cap_b()
+        if self.viewer.t2_len(Self::B_SOURCE) >= self.viewer.t2_cap(Self::B_SOURCE)
             && self.last_t2_pump_b == Some(self.b().current_frame)
         {
             return;
@@ -1999,7 +2002,7 @@ impl ExrApp {
         let Some(gpu) = self.gpu_resources.as_ref() else {
             return;
         };
-        let depth = self.viewer.t2_cap_b().saturating_sub(1);
+        let depth = self.viewer.t2_cap(Self::B_SOURCE).saturating_sub(1);
         // B's want-list in B's own frame space (its range as in/out, its playhead),
         // sharing A's direction/loop — the same shape `next_want_slot`/`warm_ahead`
         // use for B. Forward-only (no read-behind), like the A ring.
@@ -2022,7 +2025,7 @@ impl ExrApp {
                 break;
             }
             if let Some(arc) = self.frame_cache.peek(crate::cache::Slot::B, w)
-                && self.viewer.prebuild_t2_b(gpu, &arc, w)
+                && self.viewer.prebuild_t2(Self::B_SOURCE, gpu, &arc, w)
             {
                 built += 1;
             }
@@ -2597,9 +2600,11 @@ impl ExrApp {
         let t2_on = self.t2_enabled && self.playback.is_active();
         let b_active = t2_on && self.b().sequence.is_some();
         let avail = crate::budget::vram_available(&sample);
-        // Split the pool in *bytes* (not frame counts) so A and B each derive
-        // their own count from their own resolution when the two differ.
-        let a_avail = if b_active { avail / 2 } else { avail };
+        // Split the pool in *bytes* (not frame counts) across the active sources
+        // (#99) so each derives its own count from its own resolution when they
+        // differ. One active follower (B) → the same A/B halving as before.
+        let per_source = avail / self.n_active_sources() as u64;
+        let a_avail = per_source;
         let a_dims = t2_on
             .then(|| {
                 self.exr_data
@@ -2607,10 +2612,11 @@ impl ExrApp {
                     .and_then(|d| d.logical_size(self.viewer.active_layer))
             })
             .flatten();
-        self.viewer.set_t2_cap(cap_from(a_avail, a_dims));
+        self.viewer.set_t2_cap(Self::A_SOURCE, cap_from(a_avail, a_dims));
 
-        // B ring: same half-budget, sized from B's own dims at the B layer (active
-        // layer clamped to B's layer count). Disabled unless B is a live sequence.
+        // B ring: same per-source share, sized from B's own dims at the B layer
+        // (active layer clamped to B's layer count). Disabled unless B is a live
+        // sequence.
         let b_dims = b_active
             .then(|| {
                 self.exr_data_b.as_ref().and_then(|d| {
@@ -2623,11 +2629,11 @@ impl ExrApp {
             })
             .flatten();
         let t2_cap_b = if b_active {
-            cap_from(avail / 2, b_dims)
+            cap_from(per_source, b_dims)
         } else {
             0
         };
-        self.viewer.set_t2_cap_b(t2_cap_b);
+        self.viewer.set_t2_cap(Self::B_SOURCE, t2_cap_b);
     }
 
     /// The ctx-free, synchronous core of the render-watch: re-scan the group,
@@ -2691,7 +2697,7 @@ impl ExrApp {
         // 1. A re-rendered or removed frame's cached pixels are stale — drop T1+T2.
         for &f in diff.changed.iter().chain(&diff.removed) {
             self.frame_cache.remove(Slot::A, f);
-            self.viewer.evict_t2_frame(f);
+            self.viewer.evict_t2_frame(Self::A_SOURCE, f);
             self.inflight.remove(&f);
         }
 
@@ -2835,7 +2841,7 @@ impl ExrApp {
                     // T2 ring is A); fires only for full frames (settle), not the
                     // proxy/beauty frames decoded while moving.
                     if slot == crate::cache::Slot::A && !arc.beauty_only {
-                        self.viewer.evict_t2_frame(res.frame);
+                        self.viewer.evict_t2_frame(Self::A_SOURCE, res.frame);
                     }
                     // In Loop mode eviction distance follows the play direction
                     // around the loop, so prefetch wrapped past the out point
@@ -2860,7 +2866,7 @@ impl ExrApp {
                         crate::cache::Slot::A if res.frame == self.playback.current_frame => {
                             self.loading_a = false;
                             self.playback.pending = None;
-                            self.viewer.set_t2_frame(Some(res.frame));
+                            self.viewer.set_t2_frame(Self::A_SOURCE, Some(res.frame));
                             self.swap_image_arc(arc, false);
                             self.playback.note_shown(std::time::Instant::now());
                         }
@@ -3066,7 +3072,7 @@ impl ExrApp {
         // The B ring binds this frame's pre-built texture (#166); tell it which B
         // frame is on screen (mirrors A's `set_t2_frame`).
         let bf = self.b().current_frame;
-        self.viewer.set_t2_frame_b(Some(bf));
+        self.viewer.set_t2_frame(Self::B_SOURCE, Some(bf));
         self.viewer.invalidate_reference_viewport();
         if !self.thumbs_suppressed() {
             self.viewer.invalidate_reference_thumbnails();
@@ -4340,10 +4346,10 @@ impl ExrApp {
 
         let t1_len = self.frame_cache.len();
         let t1_cap = self.frame_cache_cap;
-        let t2_len = self.viewer.t2_len();
-        let t2_cap = self.viewer.t2_cap();
-        let t2_len_b = self.viewer.t2_len_b();
-        let t2_cap_b = self.viewer.t2_cap_b();
+        let t2_len = self.viewer.t2_len(Self::A_SOURCE);
+        let t2_cap = self.viewer.t2_cap(Self::A_SOURCE);
+        let t2_len_b = self.viewer.t2_len(Self::B_SOURCE);
+        let t2_cap_b = self.viewer.t2_cap(Self::B_SOURCE);
         let frame_bytes = self.frame_bytes;
         let proxy_state = (self.proxy_enabled, self.proxy_size, self.proxy_bytes);
         let mut inflight: Vec<u32> = self.inflight.iter().copied().collect();
@@ -4633,7 +4639,7 @@ impl ExrApp {
                     .changed()
                     && !self.t2_enabled
                 {
-                    self.viewer.clear_t2();
+                    self.viewer.clear_t2(Self::A_SOURCE);
                 }
 
                 // A/B frame offset (#166): nudge the compared (B) sequence relative
