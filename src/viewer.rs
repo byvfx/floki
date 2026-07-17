@@ -395,7 +395,11 @@ impl DrawCtx<'_> {
         // + `OcioCallback::accumulate`), whose `tex_b` is the screen-sized scene
         // accumulation. Flag it so the shader samples `tex_b` at screen coords, not the
         // image-local uv. The non-OCIO single-pass composite keeps `tex_b` as an image (0).
-        u.composite_accum = if is_composite && self.ocio_active { 1 } else { 0 };
+        u.composite_accum = if is_composite && self.ocio_active {
+            1
+        } else {
+            0
+        };
 
         // OCIO path: pass 1 must emit scene-linear, so bypass the built-in
         // display chain (sRGB/gamma/.cube LUT). Exposure stays (linear).
@@ -3052,16 +3056,7 @@ impl ExrViewer {
                             // them on the bottom (B) layer so they apply once, on the top
                             // (A) layer, to the finished composite instead of compounding.
                             ctx.neutral_view_ops.set(true);
-                            ctx.draw(
-                                p,
-                                bg_b.clone(),
-                                None,
-                                rect,
-                                image_rect,
-                                false,
-                                false,
-                                opac,
-                            );
+                            ctx.draw(p, bg_b.clone(), None, rect, image_rect, false, false, opac);
                             ctx.neutral_view_ops.set(false);
                             ctx.draw(
                                 p,

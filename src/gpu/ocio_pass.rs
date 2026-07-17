@@ -1551,7 +1551,11 @@ mod metal_tests {
         for (i, (_, blend)) in layers.iter().enumerate() {
             let is_comp = if i == 0 { 0 } else { 1 };
             let u = accum_uniforms(full.0, full.1, full.2, is_comp, *blend, 0, 0.0);
-            queue.write_buffer(&gpu.uniform_buffer, i as u64 * stride as u64, bytemuck::bytes_of(&u));
+            queue.write_buffer(
+                &gpu.uniform_buffer,
+                i as u64 * stride as u64,
+                bytemuck::bytes_of(&u),
+            );
         }
         let exp_slot = layers.len() as u32;
         let ev = 1.0f32;
@@ -1895,9 +1899,9 @@ mod metal_tests {
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         // (tex_a, tex_b, uniform slot, target) for each of the three draws.
         let passes: [(&wgpu::BindGroup, &wgpu::BindGroup, u32, &wgpu::TextureView); 3] = [
-            (&a_bg, &b_bg, 0, &v_ref),          // single-pass reference
-            (&b_bg, &b_bg, 1, &v_b),            // ping-pong bottom (tex_b unused)
-            (&a_bg, &scene_b_texbg, 2, &v_a),   // ping-pong top (tex_b = accumulation)
+            (&a_bg, &b_bg, 0, &v_ref),        // single-pass reference
+            (&b_bg, &b_bg, 1, &v_b),          // ping-pong bottom (tex_b unused)
+            (&a_bg, &scene_b_texbg, 2, &v_a), // ping-pong top (tex_b = accumulation)
         ];
         for (tex_a, tex_b, slot, target) in passes {
             let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -2000,7 +2004,10 @@ mod metal_tests {
                     }
                 } else {
                     // Outside the image: both keep the α=−1 no-image sentinel.
-                    assert!(r[3] < 0.0 && p[3] < 0.0, "pixel ({x},{y}) should be sentinel");
+                    assert!(
+                        r[3] < 0.0 && p[3] < 0.0,
+                        "pixel ({x},{y}) should be sentinel"
+                    );
                 }
             }
         }
