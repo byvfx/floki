@@ -353,6 +353,13 @@ struct DrawCtx<'a> {
     uniform_offset: std::cell::Cell<u32>,
     /// Overscan dim factor for the next draw (`1.0` = none); set per branch.
     overscan_factor: std::cell::Cell<f32>,
+    /// When set, the next draw runs with the global view ops (exposure, channel
+    /// isolation) neutralized. Used for the lower layers of the layer-stack
+    /// accumulate ping-pong: those ops are applied once, on the TOP layer, so the
+    /// finished composite is exposed / channel-isolated exactly once rather than
+    /// compounding per layer (`fs_main` applies both after the blend). `false` for
+    /// every independent draw (single / wipe / side-by-side / the top composite draw).
+    neutral_view_ops: std::cell::Cell<bool>,
     /// Running FNV-1a hash of everything affecting the OCIO render, so the
     /// display transform is skipped on repaints that change nothing.
     ocio_sig: std::cell::Cell<u64>,
@@ -399,6 +406,16 @@ impl DrawCtx<'_> {
             // Don't bake the checker into scene-linear; it's composited
             // in display space (blit pass) after the OCIO transform.
             u.skip_checker = 1;
+        }
+
+        // Layer-stack accumulate: neutralize the global view ops on the lower
+        // layers so exposure / channel isolation apply once (on the top layer) to
+        // the finished composite instead of compounding per layer (see the field
+        // doc). `fs_main` applies both after the blend, so the topmost draw over an
+        // un-exposed accumulation yields exactly `composite × 2^EV`.
+        if self.neutral_view_ops.get() {
+            u.exposure = 0.0;
+            u.channel_mode = 0; // ChannelMode::RGB
         }
 
         let queue = &self.render_state.queue;
@@ -3030,6 +3047,11 @@ impl ExrViewer {
                             // (is_composite=1, the blend rides A). `tex_b` on the top draw
                             // is ignored by the ping-pong (it binds the prior accumulation),
                             // so pass B to keep the render signature reacting to B changing.
+                            //
+                            // Exposure / channel isolation are global view ops: neutralize
+                            // them on the bottom (B) layer so they apply once, on the top
+                            // (A) layer, to the finished composite instead of compounding.
+                            ctx.neutral_view_ops.set(true);
                             ctx.draw(
                                 p,
                                 bg_b.clone(),
@@ -3040,6 +3062,7 @@ impl ExrViewer {
                                 false,
                                 opac,
                             );
+                            ctx.neutral_view_ops.set(false);
                             ctx.draw(
                                 p,
                                 bg_a.clone(),
@@ -3227,6 +3250,7 @@ impl ExrViewer {
             ocio_active: self.ocio_active,
             uniform_offset: std::cell::Cell::new(0u32),
             overscan_factor: std::cell::Cell::new(1.0f32),
+            neutral_view_ops: std::cell::Cell::new(false),
             ocio_sig: std::cell::Cell::new(0xcbf29ce484222325u64),
             ocio_draws: std::cell::RefCell::new(Vec::new()),
         };

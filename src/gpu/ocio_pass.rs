@@ -1714,8 +1714,10 @@ mod metal_tests {
     // pixel-identical. This can only hold if the top draw reads the accumulation at the
     // fragment's screen position: sampling it at the image-local uv would read a different
     // (or empty) region of scene_b once the image doesn't fill the viewport, so a wrong
-    // uv fails here. Also checks the composited region equals the CPU A-over-B reference
-    // (so the test can't pass by both paths being blank).
+    // uv fails here. Runs at a nonzero exposure with the bottom layer neutralized and the
+    // top carrying EV (PR-A.4), so it also guards that exposure lands ONCE on the finished
+    // composite (× 2^EV) rather than compounding per layer. Also checks the composited
+    // region equals the CPU A-over-B×2^EV reference (so it can't pass by both being blank).
     #[test]
     fn accumulate_matches_single_pass_composite_on_device() {
         let instance =
@@ -1858,14 +1860,19 @@ mod metal_tests {
         let rect_max = [sw as f32, sh as f32];
         let screen = [sw as f32, sh as f32];
         let over = crate::viewer::BlendMode::Over.as_u32();
-        // slot 0: single-pass composite (composite_accum=0, tex_b = B image)
-        // slot 1: ping-pong bottom (B copy, is_composite=0)
-        // slot 2: ping-pong top (A over accumulation, composite_accum=1)
+        // A nonzero exposure so the test also guards PR-A.4's exposure-once behavior:
+        // the single-pass path exposes the whole composite once (blend then ×2^EV);
+        // the ping-pong applies exposure ONLY on the top layer (bottom is neutral), so
+        // exposure lands once on the finished composite rather than compounding.
+        let ev = 1.0f32;
+        // slot 0: single-pass composite (composite_accum=0, tex_b = B image; exposure EV)
+        // slot 1: ping-pong bottom (B copy, is_composite=0; exposure neutralized)
+        // slot 2: ping-pong top (A over accumulation, composite_accum=1; exposure EV)
         let stride = gpu.uniform_stride;
         let us = [
-            accum_uniforms(rect_min, rect_max, screen, 1, over, 0, 0.0),
+            accum_uniforms(rect_min, rect_max, screen, 1, over, 0, ev),
             accum_uniforms(rect_min, rect_max, screen, 0, 0, 0, 0.0),
-            accum_uniforms(rect_min, rect_max, screen, 1, over, 1, 0.0),
+            accum_uniforms(rect_min, rect_max, screen, 1, over, 1, ev),
         ];
         for (i, u) in us.iter().enumerate() {
             queue.write_buffer(
@@ -1976,14 +1983,19 @@ mod metal_tests {
                     );
                 }
                 if x >= sw / 2 {
-                    // Composited region: must equal the CPU A-over-B reference (and so be
-                    // non-sentinel), proving neither path is silently blank.
+                    // Composited region: must equal the CPU A-over-B reference exposed once
+                    // (×2^EV on rgb, alpha unchanged) — and so be non-sentinel, proving
+                    // neither path is silently blank and exposure landed exactly once.
                     let (i, j) = ((x - sw / 2) as usize, y as usize);
-                    let want = cpu_blend(texel(&a_px, i, j), texel(&b_px, i, j), over);
+                    let mut want = cpu_blend(texel(&a_px, i, j), texel(&b_px, i, j), over);
+                    let scale = 2f32.powf(ev);
+                    want[0] *= scale;
+                    want[1] *= scale;
+                    want[2] *= scale;
                     for c in 0..4 {
                         assert!(
                             (p[c] - want[c]).abs() <= tol,
-                            "pixel ({x},{y}) chan {c}: composite {p:?} vs cpu A-over-B {want:?}"
+                            "pixel ({x},{y}) chan {c}: composite {p:?} vs cpu A-over-B×2^EV {want:?}"
                         );
                     }
                 } else {
