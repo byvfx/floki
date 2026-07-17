@@ -5403,6 +5403,7 @@ impl ExrApp {
                     enabled: bool,
                     solo: bool,
                     blend: crate::viewer::BlendMode,
+                    opacity: f32,
                 }
                 let rows: Vec<Row> = self
                     .comp_stack
@@ -5413,6 +5414,7 @@ impl ExrApp {
                         enabled: l.enabled,
                         solo: l.solo,
                         blend: l.blend,
+                        opacity: l.opacity,
                     })
                     .collect();
                 let count = rows.len();
@@ -5470,6 +5472,22 @@ impl ExrApp {
                                     reorder = Some((row.id, i - 1));
                                 }
                             });
+                            // Opacity 0–100% (applies to every layer, including the
+                            // bottom — the shader premultiplies its color by this).
+                            let mut opacity = row.opacity;
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut opacity)
+                                        .range(0.0..=1.0)
+                                        .speed(0.01)
+                                        .fixed_decimals(2),
+                                )
+                                .on_hover_text("Opacity")
+                                .changed()
+                                && let Some(l) = self.comp_stack.get_mut(row.id)
+                            {
+                                l.opacity = opacity;
+                            }
                             // Blend (unused for the bottom layer, which is a plain
                             // copy — the base of the composite has nothing beneath it).
                             ui.add_enabled_ui(i > 0, |ui| {
