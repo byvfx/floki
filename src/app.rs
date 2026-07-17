@@ -5391,22 +5391,109 @@ impl ExrApp {
                     return;
                 }
 
-                // Rows top-of-stack first. Collect ids up front (bottom→top) so the
-                // row buttons can mutate the stack without aliasing the iteration
-                // borrow; display reversed so the top layer is the top row.
-                let rows: Vec<(crate::layer::LayerId, String)> = self
+                // Per-row controls (#99 PR-B.4): visibility / solo / blend / reorder /
+                // remove. Snapshot each row's id + display state up front (bottom→top)
+                // so the widgets can mutate `comp_stack` without aliasing an `iter()`
+                // borrow; the index `i` in this Vec is the layer's stack index (0 =
+                // bottom). Deferred edits (reorder / remove restructure the stack) are
+                // recorded and applied once after the loop.
+                struct Row {
+                    id: crate::layer::LayerId,
+                    name: String,
+                    enabled: bool,
+                    solo: bool,
+                    blend: crate::viewer::BlendMode,
+                }
+                let rows: Vec<Row> = self
                     .comp_stack
                     .iter()
-                    .map(|l| (l.id, l.name.clone()))
+                    .map(|l| Row {
+                        id: l.id,
+                        name: l.name.clone(),
+                        enabled: l.enabled,
+                        solo: l.solo,
+                        blend: l.blend,
+                    })
                     .collect();
+                let count = rows.len();
+                let solo_active = self.comp_stack.solo_active();
                 let mut remove: Option<crate::layer::LayerId> = None;
-                for (id, name) in rows.iter().rev() {
+                let mut reorder: Option<(crate::layer::LayerId, usize)> = None;
+
+                // Display top-of-stack first: iterate high stack index → low.
+                for (i, row) in rows.iter().enumerate().rev() {
                     ui.horizontal(|ui| {
-                        if ui.small_button("✕").on_hover_text("Remove layer").clicked() {
-                            remove = Some(*id);
+                        // Visibility. Dimmed (but not disabled) while a solo is active,
+                        // since solo overrides `enabled` in the composite.
+                        let mut enabled = row.enabled;
+                        if ui
+                            .checkbox(&mut enabled, "")
+                            .on_hover_text("Visible")
+                            .changed()
+                            && let Some(l) = self.comp_stack.get_mut(row.id)
+                        {
+                            l.enabled = enabled;
                         }
-                        ui.label(name);
+                        // Solo: isolate this layer (any solo hides non-soloed layers).
+                        if ui
+                            .selectable_label(row.solo, "S")
+                            .on_hover_text("Solo")
+                            .clicked()
+                            && let Some(l) = self.comp_stack.get_mut(row.id)
+                        {
+                            l.solo = !row.solo;
+                        }
+
+                        // Name, greyed when it won't render (disabled, or hidden by a
+                        // solo elsewhere).
+                        let renders = if solo_active { row.solo } else { row.enabled };
+                        ui.add(egui::Label::new(if renders {
+                            egui::RichText::new(&row.name)
+                        } else {
+                            egui::RichText::new(&row.name).weak()
+                        }));
+
+                        // Right-aligned per-row controls: remove, reorder, blend.
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("✕").on_hover_text("Remove layer").clicked() {
+                                remove = Some(row.id);
+                            }
+                            // ⬆ moves toward the top of the composite (higher index);
+                            // ⬇ toward the bottom. Disabled at the ends.
+                            ui.add_enabled_ui(i + 1 < count, |ui| {
+                                if ui.small_button("⬆").on_hover_text("Move up").clicked() {
+                                    reorder = Some((row.id, i + 1));
+                                }
+                            });
+                            ui.add_enabled_ui(i > 0, |ui| {
+                                if ui.small_button("⬇").on_hover_text("Move down").clicked() {
+                                    reorder = Some((row.id, i - 1));
+                                }
+                            });
+                            // Blend (unused for the bottom layer, which is a plain
+                            // copy — the base of the composite has nothing beneath it).
+                            ui.add_enabled_ui(i > 0, |ui| {
+                                let mut blend = row.blend;
+                                egui::ComboBox::from_id_salt((row.id, "blend"))
+                                    .selected_text(blend.label())
+                                    .width(90.0)
+                                    .show_ui(ui, |ui| {
+                                        for mode in crate::viewer::BlendMode::ALL {
+                                            ui.selectable_value(&mut blend, mode, mode.label());
+                                        }
+                                    });
+                                if blend != row.blend
+                                    && let Some(l) = self.comp_stack.get_mut(row.id)
+                                {
+                                    l.blend = blend;
+                                }
+                            });
+                        });
                     });
+                }
+                // Apply the structural edits after the loop (each restructures the Vec).
+                if let Some((id, to)) = reorder {
+                    self.comp_stack.move_to(id, to);
                 }
                 if let Some(id) = remove {
                     self.remove_comp_layer(id);

@@ -132,6 +132,16 @@ pub enum BlendMode {
 }
 
 impl BlendMode {
+    /// Every variant, in menu order — the single list the blend pickers iterate
+    /// (the A/B Composite combo and the Layers-panel per-row combo, #99 PR-B.4).
+    pub const ALL: [Self; 5] = [
+        Self::Over,
+        Self::Under,
+        Self::Add,
+        Self::Multiply,
+        Self::Screen,
+    ];
+
     /// Integer encoding shared with the GPU. This is the **single source of
     /// truth** for the `blend_mode` mapping; the `switch` in `gpu/shader.wgsl`
     /// must use these same values (Over=0, Under=1, Add=2, Multiply=3, Screen=4).
@@ -1363,13 +1373,7 @@ impl ExrViewer {
                 egui::ComboBox::from_id_salt("blend_mode_select")
                     .selected_text(self.blend_mode.label())
                     .show_ui(ui, |ui| {
-                        for mode in [
-                            BlendMode::Over,
-                            BlendMode::Under,
-                            BlendMode::Add,
-                            BlendMode::Multiply,
-                            BlendMode::Screen,
-                        ] {
+                        for mode in BlendMode::ALL {
                             ui.selectable_value(&mut self.blend_mode, mode, mode.label());
                         }
                     });
