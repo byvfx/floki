@@ -180,6 +180,33 @@ struct CanvasLayout {
     par_b: f32,
 }
 
+/// One resolved Layers-panel composite layer for [`ExrViewer::draw_comp_composite`]
+/// (#99 PR-B.3), in bottom→top order. The app builds these from
+/// `comp_stack.composite_at` + `comp_sources` (looking up each `Draw`'s source
+/// texture), so the viewer stays unaware of decode / source storage — it only
+/// folds the given bind groups through the accumulate ping-pong.
+pub struct CompDraw {
+    /// The layer's GPU texture bind group (its `CompSource`'s), bound as `tex_a`.
+    pub bind_group: std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>,
+    /// How this layer combines with the accumulation below it (ignored for the
+    /// bottom layer, which is a plain copy).
+    pub blend: BlendMode,
+    /// Layer opacity in `[0, 1]`.
+    pub opacity: f32,
+}
+
+/// Per-position flags for a comp layer at stack index `i` of `n` (#99 PR-B.3),
+/// returned as `(is_composite, is_top)`. The bottom layer (`i == 0`) is a plain
+/// copy into the cleared accumulation (`is_composite = false`, its blend unused);
+/// every layer above blends over the accumulation (`is_composite = true`). Only the
+/// top layer (`i == n-1`) applies the global view ops (exposure / channel
+/// isolation), so they hit the finished composite exactly once — the lower layers
+/// neutralize them (the exposure-once invariant from PR-A.4). Pure, so the ordering
+/// contract is unit-testable without a GPU.
+fn comp_layer_flags(i: usize, n: usize) -> (bool, bool) {
+    (i != 0, i + 1 == n)
+}
+
 /// Which feature the shared gradient editor is currently editing — the result of
 /// "Apply" / "Save as preset" is routed accordingly.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -361,6 +388,12 @@ struct DrawCtx<'a> {
     /// compounding per layer (`fs_main` applies both after the blend). `false` for
     /// every independent draw (single / wipe / side-by-side / the top composite draw).
     neutral_view_ops: std::cell::Cell<bool>,
+    /// Per-draw blend override for the N-layer Layers-panel composite (#99 PR-B.3):
+    /// each comp layer carries its own [`BlendMode`], unlike the single
+    /// `self.blend_mode` the A/B composite bakes into the base uniform. `Some(b)`
+    /// overrides `u.blend_mode` for the next draw; `None` (every A/B path) keeps the
+    /// base uniform's blend.
+    blend_override: std::cell::Cell<Option<BlendMode>>,
     /// Running FNV-1a hash of everything affecting the OCIO render, so the
     /// display transform is skipped on repaints that change nothing.
     ocio_sig: std::cell::Cell<u64>,
@@ -421,6 +454,13 @@ impl DrawCtx<'_> {
         if self.neutral_view_ops.get() {
             u.exposure = 0.0;
             u.channel_mode = 0; // ChannelMode::RGB
+        }
+
+        // Per-layer blend for the Layers-panel composite (#99 PR-B.3): the A/B
+        // composite bakes a single `self.blend_mode` into the base uniform, but each
+        // comp layer blends differently, so the emitter sets this per draw.
+        if let Some(blend) = self.blend_override.get() {
+            u.blend_mode = blend.as_u32();
         }
 
         let queue = &self.render_state.queue;
@@ -3201,6 +3241,148 @@ impl ExrViewer {
         }
     }
 
+    /// Render the Layers-panel composite (#99 PR-B.3): fold `draws` bottom→top
+    /// through the OCIO scene ping-pong (the PR-A accumulate path), reusing
+    /// [`DrawCtx`] + [`crate::gpu::ocio_pass::OcioCallback`] verbatim — only the
+    /// draw *source* differs (the panel's N sources instead of A/B). `base_size` is
+    /// the bottom layer's pixel size; every layer currently draws at that one canvas
+    /// rect (per-layer placement is the follow-up, #102/#104), so a differently-
+    /// sized layer is stretched to fit for now.
+    ///
+    /// Requires OCIO active (the ping-pong lives on the OCIO path) + a GPU; the
+    /// caller ([`crate::app::ExrApp::draw_comp_central`]) gates on both and shows a
+    /// fallback message otherwise. A no-op when `draws` is empty. Global tone
+    /// (exposure / gamma / channel isolation / background) comes from the shared
+    /// viewer fields, so it applies to the composite exactly as to a single image;
+    /// per-composite tone controls land with the row controls (PR-B.4).
+    pub(crate) fn draw_comp_composite(
+        &mut self,
+        ui: &mut egui::Ui,
+        base_size: (usize, usize),
+        draws: &[CompDraw],
+        gpu_resources: &crate::gpu::GpuResources,
+        lut_bg_opt: Option<std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>>,
+    ) {
+        if draws.is_empty() {
+            return;
+        }
+        let render_state = gpu_resources.render_state();
+        let (bw, bh) = base_size;
+        let tex_size = egui::vec2(bw.max(1) as f32, bh.max(1) as f32);
+
+        let (rect, response) =
+            ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
+        self.last_canvas_rect = Some(rect);
+        // Shared pan/zoom with the A/B view (the scale/translation fields are the
+        // same); framing on first paint fits the base layer (no B extent).
+        self.handle_canvas_interaction(ui, rect, &response, tex_size, None);
+
+        let image_size = egui::vec2(tex_size.x * self.scale, tex_size.y * self.scale);
+        let image_rect =
+            egui::Rect::from_center_size(rect.center() + self.translation, image_size);
+        // The comp stack has no separate display window yet: display == image.
+        let disp_rect = image_rect;
+        self.last_image_rect = Some(image_rect);
+
+        // Re-bake + upload the gradient LUTs on ramp change (stable handles otherwise).
+        self.sync_gradient_luts(gpu_resources);
+
+        let content = ui.ctx().content_rect();
+        let mut uniform_data =
+            self.build_frame_uniforms(image_rect, disp_rect, [content.width(), content.height()]);
+        // The composite is a stack, never a wipe — regardless of the A/B compare_mode
+        // the shared `build_frame_uniforms` reads.
+        uniform_data.is_wipe_mode = 0;
+
+        let gpu_state = gpu_resources.gpu_state.as_ref();
+        let ctx = DrawCtx {
+            render_state,
+            uniform_data,
+            uniform_buffer: gpu_state.uniform_buffer.clone(),
+            uniform_stride: gpu_state.uniform_stride,
+            active_lut_bg: lut_bg_opt.unwrap_or_else(|| gpu_state.default_lut_bind_group.clone()),
+            default_tex_bg: gpu_state.default_tex_bind_group.clone(),
+            ocio_active: self.ocio_active,
+            uniform_offset: std::cell::Cell::new(0u32),
+            overscan_factor: std::cell::Cell::new(1.0f32),
+            neutral_view_ops: std::cell::Cell::new(false),
+            blend_override: std::cell::Cell::new(None),
+            ocio_sig: std::cell::Cell::new(0xcbf29ce484222325u64),
+            ocio_draws: std::cell::RefCell::new(Vec::new()),
+        };
+
+        let painter = ui.painter().with_clip_rect(rect);
+        let n = draws.len();
+        for (i, d) in draws.iter().enumerate() {
+            let (is_composite, is_top) = comp_layer_flags(i, n);
+            // Neutralize the global view ops on every layer but the top, so exposure
+            // / channel isolation apply once to the finished composite (PR-A.4).
+            ctx.neutral_view_ops.set(!is_top);
+            // The bottom layer is a plain copy (blend unused); layers above carry
+            // their own blend.
+            ctx.blend_override
+                .set(if is_composite { Some(d.blend) } else { None });
+            // `tex_b` on an accumulate draw is the prior accumulation (bound by the
+            // ping-pong itself), so pass None here — the shader samples the scene
+            // target in screen space via `composite_accum`.
+            ctx.draw(
+                &painter,
+                d.bind_group.clone(),
+                None,
+                rect,
+                image_rect,
+                false, // is_diff
+                is_composite,
+                d.opacity,
+            );
+        }
+        ctx.neutral_view_ops.set(false);
+        ctx.blend_override.set(None);
+
+        let ocio_draws = std::mem::take(&mut *ctx.ocio_draws.borrow_mut());
+        if ocio_draws.is_empty() {
+            // Non-OCIO / no accumulate path: the N-layer composite needs an offscreen
+            // ping-pong the non-OCIO surface path doesn't have yet (the "OCIO-off
+            // display pass" follow-up). The caller only reaches here under OCIO, so
+            // this is just a guard.
+            return;
+        }
+        let blit_uniforms = crate::gpu::BlitUniforms {
+            display_min: [disp_rect.min.x, disp_rect.min.y],
+            display_max: [disp_rect.max.x, disp_rect.max.y],
+            screen_size: [content.width(), content.height()],
+            overscan_factor: 1.0,
+            bg_mode: self.prefs.background.mode.as_u32() as f32,
+            bg_checker_size: self.prefs.background.checker_size,
+            bg_grad_angle: self.prefs.background.gradient_angle,
+            gamma: self.gamma,
+            _pad_b: 0.0,
+            bg_checker_dark: rgb3_to_vec4(self.prefs.background.checker_dark),
+            bg_checker_light: rgb3_to_vec4(self.prefs.background.checker_light),
+            bg_solid: rgb3_to_vec4(self.prefs.background.solid),
+        };
+        let render_sig =
+            (ctx.ocio_sig.get() ^ self.ocio_render_gen).wrapping_mul(0x100000001b3);
+        let scissor_pts = Some([
+            image_rect.min.x,
+            image_rect.min.y,
+            image_rect.max.x,
+            image_rect.max.y,
+        ]);
+        let callback = crate::gpu::ocio_pass::OcioCallback {
+            draws: ocio_draws,
+            accumulate: true,
+            display_format: render_state.target_format,
+            blit_uniforms,
+            scissor_pts,
+            render_sig,
+        };
+        painter.add(eframe::egui_wgpu::Callback::new_paint_callback(
+            painter.clip_rect(),
+            callback,
+        ));
+    }
+
     fn draw_canvas_gpu(
         &mut self,
         ui: &egui::Ui,
@@ -3247,6 +3429,7 @@ impl ExrViewer {
             uniform_offset: std::cell::Cell::new(0u32),
             overscan_factor: std::cell::Cell::new(1.0f32),
             neutral_view_ops: std::cell::Cell::new(false),
+            blend_override: std::cell::Cell::new(None),
             ocio_sig: std::cell::Cell::new(0xcbf29ce484222325u64),
             ocio_draws: std::cell::RefCell::new(Vec::new()),
         };
@@ -4330,6 +4513,19 @@ mod gui_tests {
     use eframe::egui;
     use egui_kittest::Harness;
     use exr::prelude::*;
+
+    #[test]
+    fn comp_layer_flags_bottom_copies_top_applies_view_ops() {
+        use super::comp_layer_flags;
+        // Single layer: it is both the bottom (plain copy, is_composite=false) and the
+        // top (applies view ops once).
+        assert_eq!(comp_layer_flags(0, 1), (false, true));
+        // Four-layer stack bottom→top: only i==0 is a copy; only i==3 is the top.
+        assert_eq!(comp_layer_flags(0, 4), (false, false), "bottom: copy, not top");
+        assert_eq!(comp_layer_flags(1, 4), (true, false), "middle blends, not top");
+        assert_eq!(comp_layer_flags(2, 4), (true, false), "middle blends, not top");
+        assert_eq!(comp_layer_flags(3, 4), (true, true), "top blends + view ops");
+    }
 
     #[test]
     fn t2_victim_evicts_furthest_and_protects_on_screen() {

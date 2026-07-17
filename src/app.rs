@@ -5414,8 +5414,81 @@ impl ExrApp {
             });
     }
 
+    /// Render the Layers-panel composite in the central canvas (#99 PR-B.3):
+    /// resolve `comp_stack.composite_at` at the shared global frame, look up each
+    /// draw's decoded source texture in `comp_sources`, and fold them bottom→top
+    /// through the viewer's OCIO accumulate ping-pong. Requires OCIO active + a GPU
+    /// (the ping-pong lives on the OCIO path); otherwise shows a hint — the N-layer
+    /// non-OCIO composite is a follow-up. Assumes the panel is shown with a
+    /// non-empty stack (the caller gates on that).
+    fn draw_comp_central(&mut self, ui: &mut egui::Ui) {
+        // Mirror the per-frame viewer state the slot-A path sets before `viewer.ui`,
+        // so the composite honors the same tone / OCIO / LUT settings.
+        self.viewer.enable_lut = self.enable_lut && self.lut_bg.is_some();
+        self.viewer.lut_domain_min = self.lut_domain_min;
+        self.viewer.lut_domain_max = self.lut_domain_max;
+        self.viewer.ocio_active = self.ocio_enabled && self.ocio_ready;
+        self.viewer.ocio_render_gen = self.ocio_render_gen;
+
+        // Resolve the model → concrete draws at the shared global playhead (stills
+        // sit at frame 0 via `Trim::full`; per-source sequence frames arrive w/ PR-C).
+        let steps = self.comp_stack.composite_at(self.playback.current_frame);
+
+        // Bottom→top draw list from the decoded sources. A step whose source has no
+        // texture (headless, or a not-yet-built AOV) is skipped; the bottom drawable
+        // layer defines the shared canvas size.
+        let mut draws: Vec<crate::viewer::CompDraw> = Vec::new();
+        let mut base_size = (0usize, 0usize);
+        for step in &steps {
+            let crate::layer::Step::Draw(d) = step else {
+                continue; // Adjustment layers (#102) don't render yet.
+            };
+            let Some(cs) = self.comp_sources.get(&d.source) else {
+                continue;
+            };
+            let Some(bind_group) = cs.bind_group.clone() else {
+                continue;
+            };
+            if draws.is_empty() {
+                base_size = cs.size;
+            }
+            draws.push(crate::viewer::CompDraw {
+                bind_group,
+                blend: d.blend,
+                opacity: d.opacity,
+            });
+        }
+
+        if self.viewer.ocio_active
+            && !draws.is_empty()
+            && let Some(gpu) = self.gpu_resources.as_ref()
+        {
+            let lut = self.lut_bg.clone();
+            self.viewer
+                .draw_comp_composite(ui, base_size, &draws, gpu, lut);
+        } else {
+            let msg = if self.gpu_resources.is_none() {
+                "No GPU: the compositing viewport is unavailable."
+            } else if !self.viewer.ocio_active {
+                "Enable OCIO (Color Management) to view the layer composite."
+            } else {
+                "Add a source to the Layers panel to begin."
+            };
+            ui.centered_and_justified(|ui| {
+                ui.label(msg);
+            });
+        }
+    }
+
     fn draw_central_canvas(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default().show_inside(ui, |ui| {
+            // The Layers-panel composite takes over the viewport when the panel is
+            // active with sources (#99 PR-B.3), separate from the A/B path below
+            // (which is untouched — the compare modes are unaffected).
+            if self.show_layers_panel && !self.comp_stack.is_empty() {
+                self.draw_comp_central(ui);
+                return;
+            }
             if self.loaded_file.is_some() {
                 if let Some(data) = &self.exr_data {
                     self.viewer.enable_lut = self.enable_lut && self.lut_bg.is_some();
