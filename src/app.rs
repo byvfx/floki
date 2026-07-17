@@ -1518,6 +1518,21 @@ impl ExrApp {
         self.frame_cache_cap.saturating_sub(1).min(MAX_PREFETCH)
     }
 
+    /// The protected on-screen playheads for T1 eviction (#99 unification): the
+    /// primary (Slot A) always, plus the locked-step B playhead when a B sequence
+    /// is active. As the app's `_b` state folds into a per-`SourceId` map (Phase
+    /// 1.4) this grows to the full active-source set.
+    fn cache_playheads(&self) -> Vec<(crate::layer::SourceId, u32)> {
+        let mut playheads = vec![(
+            crate::cache::Slot::A.into(),
+            self.playback.current_frame,
+        )];
+        if self.sequence_b.is_some() {
+            playheads.push((crate::cache::Slot::B.into(), self.current_frame_b));
+        }
+        playheads
+    }
+
     /// The read-behind reservation (#169) T1 eviction must protect — mirrors the
     /// decode pump's slot-A depth exactly (`pump_decode`'s playing depth,
     /// including the locked-step halving), so the evictor reserves precisely the
@@ -2504,11 +2519,11 @@ impl ExrApp {
             if self.frame_cache.len() > self.frame_cache_cap {
                 let loop_wrap = (self.playback.loop_mode == crate::playback::LoopMode::Loop)
                     .then_some((self.playback.in_point, self.playback.out_point));
-                let playhead_b = self.sequence_b.is_some().then_some(self.current_frame_b);
+                let playheads = self.cache_playheads();
                 self.dbg_evictions = self.dbg_evictions.saturating_add(self.frame_cache.evict_to(
                     self.frame_cache_cap,
-                    self.playback.current_frame,
-                    playhead_b,
+                    &playheads,
+                    crate::cache::Slot::A.into(),
                     self.playback.direction,
                     self.playback.is_playing(),
                     loop_wrap,
@@ -2775,12 +2790,12 @@ impl ExrApp {
                     let loop_wrap = (self.playback.loop_mode == crate::playback::LoopMode::Loop)
                         .then_some((self.playback.in_point, self.playback.out_point));
                     // Protect B's on-screen frame too when it's locked-step (#98).
-                    let playhead_b = self.sequence_b.is_some().then_some(self.current_frame_b);
+                    let playheads = self.cache_playheads();
                     self.dbg_evictions =
                         self.dbg_evictions.saturating_add(self.frame_cache.evict_to(
                             self.frame_cache_cap,
-                            self.playback.current_frame,
-                            playhead_b,
+                            &playheads,
+                            crate::cache::Slot::A.into(),
                             self.playback.direction,
                             self.playback.is_playing(),
                             loop_wrap,
