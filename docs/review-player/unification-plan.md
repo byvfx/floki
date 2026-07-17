@@ -188,6 +188,21 @@ Branch `feat/layer-stack-panel` (stacked on PR-A #188). Each slice is CI-green
   &[(SourceId,u32)]` + `primary`); `Slot: Into<SourceId>` bridge; `ExrApp::cache_playheads()`.
 - **P1.2** `e03b0a8` — `LoadJob`/`LoadResult` `is_b:bool` → `source:SourceId`; worker routes
   by source; `apply_load_result` derives `is_b` from `res.source` for the still-forked routing.
+- **P1.4a** `a06c80b` — fold the eight scattered `*_b` follower fields
+  (`loaded_file_b`/`sequence_b`/`current_frame_b`/`ab_offset`/`pending_b`/`inflight_b`/`loading_b`)
+  into a single `SourceState` struct on `ExrApp` as `self.b`. Pure mechanical fold.
+- **P1.4b** `963e77a` — generalize that single `b` follower into
+  `followers: BTreeMap<SourceId, SourceState>` (+ `b()`/`b_mut()`/`active_followers()`/`n_active_sources()`);
+  B pinned as the sole entry at `Slot::B.into()`. The **source-agnostic** aggregates now iterate the
+  map: `cache_playheads`, the `pump_decode` busy-gate, the repaint poll, the watchdog/trace
+  "outstanding" checks, `invalidate_inflight`, and the `/2`→`/n_active_sources()` budget split.
+  Behavior-preserving (one follower). The `Slot::B`/`_b`-viewer-coupled decode/render/routing still
+  addresses the sole follower via `b()`/`b_mut()`.
+
+> **Ordering note:** P1.3 (viewer per-`SourceId` T2 rings) was reordered *after* P1.4a/b — the
+> `ExrViewer` still holds the `t2`/`t2_b` twins and `_b` methods, and the T1 cache + T2 rings stay
+> `Slot`-keyed. That coupling is why P1.4b keeps the literal A/B pump list and the `Slot::B`-forked
+> decode paths intact; generalizing them to an N-source loop and deleting `cache::Slot` waits on P1.3.
 
 ## Execution checklist — remaining Phase 1 (resume here)
 
@@ -211,25 +226,36 @@ Symbols are stable; line numbers drift (grep the name). Keep A/B pinned to
 
 ### P1.4 — fold the `_b` app state; delete `Slot` (`app.rs`, `playback.rs`)
 
-- Fold these `ExrApp` fields into `HashMap<SourceId, SourceState>` + a `primary: SourceId`:
-  `exr_data`/`exr_data_b`, `sequence_b`, `current_frame_b`, `pending`/`pending_b`,
-  `inflight`/`inflight_b`, `loading_a`/`loading_b`, `loaded_file_b`, `open_gen_a`,
-  `ab_offset`, `last_t2_pump`/`last_t2_pump_b`. `SourceState { sequence, current_frame,
-  pending, inflight, loading, exr_data, loaded_file, open_gen }`.
-- Source-key the A/B forks: `submit_seq`, `next_want_slot`, `warm_ahead`,
-  `apply_load_result` (its derived `is_b`/`slot`), and fold the app-level `is_b:bool` params
-  (`open_file`, `swap_image_data`, `swap_image_arc`, `unload`, `route_dropped_exrs`).
-- `pump_decode`'s literal `[(A,0),(B,0),(A,d),(B,d)]` priority list → an N-source loop
-  (primary playheads P0, then prefetch P1); the `/2` depth splits (`pump_decode`,
-  `read_behind_depth`) → `/n_active`.
-- Replace `sync_b_to_a` + `request_b_frame` + `map_b_frame`/`map_b_frame_offset`
-  (`playback.rs`) with `Trim::source_frame` per source. **DECIDED semantics: BLANK outside a
-  layer's range** (not the old clamp/hold), and **the master clock does NOT stall** on a
-  lagging follower (keep `tick_stutter` gating on the primary only).
-- Delete `cache::Slot` + the `Slot::A.into()`/`Slot::B.into()` bridge sites once nothing
-  needs the two-value enum.
+- **[DONE P1.4a]** Fold the scattered `*_b` follower fields into a `SourceState` struct
+  (`self.b`). **[DONE P1.4b]** Generalize it to `followers: BTreeMap<SourceId, SourceState>`;
+  B pinned as the sole entry. (`exr_data_b` stays the display slot; `open_gen_a` stays the
+  primary generation; A's decode state stays the top-level `inflight`/`loading_a` for now — a
+  full `primary: SourceId` fold with A *in* the map waits until A's transport-owned frame space
+  is generalized.)
+- **[DONE P1.4b]** The **source-agnostic aggregates** iterate `followers`: `cache_playheads`,
+  the `pump_decode` busy-gate, the repaint poll, the watchdog/trace outstanding checks,
+  `invalidate_inflight`, and the `/2`→`/n_active_sources()` budget splits.
+- **[TODO — needs P1.3]** Source-key the A/B *decode* forks (`submit_seq`, `next_want_slot`,
+  `warm_ahead`, `apply_load_result`'s derived `is_b`/`slot`) and the app-level `is_b:bool` params
+  (`open_file`, `swap_image_data`, `swap_image_arc`, `unload`, `route_dropped_exrs`). Today these
+  reach the sole follower through `b()`/`b_mut()`; a true N-source loop needs the T1 cache + T2
+  rings to be `SourceId`-native (P1.3) so the fork body isn't `Slot::B`/`_b`-hardcoded.
+- **[TODO — needs P1.3]** `pump_decode`'s literal `[(A,0),(B,0),(A,d),(B,d)]` priority list → an
+  N-source loop (primary playheads P0, then prefetch P1). Blocked on `Slot` being 2-valued.
+- **[TODO — behavior change]** Replace `sync_b_to_a` + `request_b_frame` +
+  `map_b_frame`/`map_b_frame_offset` (`playback.rs`) with `Trim::source_frame` per source.
+  **DECIDED semantics: BLANK outside a layer's range** (not the old clamp/hold), and **the master
+  clock does NOT stall** on a lagging follower (keep `tick_stutter` gating on the primary only).
+  Land as its own slice (it changes B's edge behavior + needs the display path to handle a blank
+  follower) — not bundled with the mechanical folds.
+- **[TODO — needs P1.3]** Delete `cache::Slot` + the `Slot::A.into()`/`Slot::B.into()` bridge
+  sites once the cache/viewer are `SourceId`-native and nothing needs the two-value enum.
 - `budget.rs` needs no change (already slot-agnostic); `scheduler.rs`, `prefetch.rs`,
   `playback::advance` unchanged.
+
+**Resume next at P1.3** (viewer per-`SourceId` T2 rings) — it unblocks the remaining P1.4 TODOs
+(the N-source pump loop + `Slot` deletion). The `map_b_frame`→`Trim` swap can land independently
+whenever, as its own behavior-change slice.
 
 ### After Phase 1
 
