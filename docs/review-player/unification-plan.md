@@ -240,32 +240,39 @@ Symbols are stable; line numbers drift (grep the name). Keep A/B pinned to
 - **[DONE P1.4b]** The **source-agnostic aggregates** iterate `followers`: `cache_playheads`,
   the `pump_decode` busy-gate, the repaint poll, the watchdog/trace outstanding checks,
   `invalidate_inflight`, and the `/2`→`/n_active_sources()` budget splits.
-- **[TODO — now unblocked, P1.3 done]** Source-key the A/B *decode* forks (`submit_seq`,
-  `next_want_slot`, `warm_ahead`, `apply_load_result`'s derived `is_b`/`slot`) and the app-level
-  `is_b:bool` params (`open_file`, `swap_image_data`, `swap_image_arc`, `unload`,
-  `route_dropped_exrs`). Today these reach the sole follower through `b()`/`b_mut()`; the T1 cache
-  (P1.1) + T2 rings (P1.3) are now `SourceId`-native, so the fork body no longer *has* to be
-  `Slot::B`/`_b`-hardcoded. Fold `pump_t2`/`pump_t2_b` into the one per-source loop here too.
-- **[TODO — now unblocked, P1.3 done]** `pump_decode`'s literal `[(A,0),(B,0),(A,d),(B,d)]`
-  priority list → an N-source loop (primary playheads P0, then prefetch P1).
-- **[TODO — behavior change]** Replace `sync_b_to_a` + `request_b_frame` +
+- **[DONE P1.4c]** `b3bd1d8` — source-key the *decode* forks: `next_want_slot(Slot)`→
+  `next_want(SourceId)`, `submit_seq`/`warm_ahead` take `SourceId`, each branching `source ==
+  A_SOURCE` (primary transport) vs a follower (`followers[&source]`). New per-source helpers
+  (`source_playhead`, `frame_path_for`, `has_source_frame`, `want_list_for`,
+  `decode_beauty_only_for`/`decode_proxy_target_for`) replace the `_b` twins. `apply_load_result`'s
+  seq routing keys on `res.source`. (The app-level `is_b:bool` open params + `swap_b_frame` display
+  stay — that's the A/B compare-UI open, folds in Phase 4.)
+- **[DONE P1.4c]** `b3bd1d8` — `pump_decode`'s literal `[(A,0),(B,0),(A,d),(B,d)]` list → an
+  ordered `[A] + active_followers` loop over two priority passes (P0 playheads, P1 prefetch).
+  `pump_t2`/`pump_t2_b` stay two source-keyed funcs (their one-loop fold deferred — separate
+  primary/follower `last_t2_pump` fields; low value).
+- **[DONE P1.4c-2]** `8195ed9` — delete `cache::Slot` + the `From<Slot>` bridge. All ~150 sites
+  (app.rs, cache.rs tests, the two `render_program` dead-code seams `slot_of`→`source_of`/
+  `layer_id_for`) now pass a `SourceId`. The backend (T1 cache, T2 rings, decode/pump) is fully
+  `SourceId`-native; A/B is the ≤2-source special case.
+- **[TODO — behavior change, independent]** Replace `sync_b_to_a` + `request_b_frame` +
   `map_b_frame`/`map_b_frame_offset` (`playback.rs`) with `Trim::source_frame` per source.
   **DECIDED semantics: BLANK outside a layer's range** (not the old clamp/hold), and **the master
   clock does NOT stall** on a lagging follower (keep `tick_stutter` gating on the primary only).
   Land as its own slice (it changes B's edge behavior + needs the display path to handle a blank
   follower) — not bundled with the mechanical folds.
-- **[TODO — now unblocked, P1.3 done]** Delete `cache::Slot` + the `Slot::A.into()`/`Slot::B.into()`
-  bridge sites once the decode forks above are source-keyed and nothing needs the two-value enum.
-  (The cache & viewer are already `SourceId`-native; `Slot` now survives only as the app-side A/B
-  label in the decode forks.)
 - `budget.rs` needs no change (already slot-agnostic); `scheduler.rs`, `prefetch.rs`,
   `playback::advance` unchanged.
 
-**Resume next at P1.4c** — source-key the decode forks (`submit_seq`/`next_want_slot`/`warm_ahead`/
-`apply_load_result`), turn the literal A/B pump list into an N-source loop, fold `pump_t2`/`pump_t2_b`
-together, and delete `cache::Slot`. Now unblocked (T1 cache + T2 rings are both `SourceId`-native).
-The `map_b_frame`→`Trim::source_frame` swap lands independently whenever, as its own behavior-change
-slice (BLANK outside range).
+**Phase 1 backend unification is essentially COMPLETE** (P1.1–P1.4c-2): the decode / T1 cache / T2
+ring / pump path are all `SourceId`-native and N-source-shaped, with A/B pinned as the ≤2-source
+special case. The only remaining Phase-1 item is the **`map_b_frame`→`Trim::source_frame`** swap — an
+independent behavior-change slice (blank-outside-range), landable whenever.
+
+**Resume next → Phase 2** (the visible payoff): make the Layers-panel `add_comp_source` detect a
+sequence + register a `SourceState` follower so **added comp layers play** on the shared transport.
+The backend now tracks any follower's playhead / in-flight / T2 ring / budget share, so this is the
+small follow-up the plan promised.
 
 ### After Phase 1
 
