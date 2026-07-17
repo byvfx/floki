@@ -32,10 +32,11 @@ impl From<ThemeChoice> for egui::ThemePreference {
 /// open** by `path` (its `loaded_file_b` is never rewritten by playback).
 struct LoadResult {
     path: PathBuf,
-    /// For an explicit open: B-open vs A-open (path/generation supersession). For
-    /// a **seq frame** (`seq_frame`), the cache slot: `true` = `Slot::B` in
-    /// locked-step A/B playback (#98), `false` = `Slot::A`.
-    is_b: bool,
+    /// Which source this decode is for (#99 unification): the A/B slots map to
+    /// fixed `SourceId`s via `cache::Slot` (A→0, B→1). For an explicit open it
+    /// selects B-open vs A-open (path/generation supersession); for a **seq frame**
+    /// (`seq_frame`) it is the cache slot (locked-step A/B, #98).
+    source: crate::layer::SourceId,
     /// True for an image-sequence frame (#7): apply via `swap_image_data` to
     /// preserve the viewer session, rather than starting a fresh session.
     seq_frame: bool,
@@ -117,9 +118,10 @@ const RAM_BUDGET_AUTO_BELOW_GB: f32 = 0.05;
 /// Job sent to the dedicated EXR worker thread via `load_tx`.
 struct LoadJob {
     path: PathBuf,
-    /// For an explicit open: B-open vs A-open. For a **seq frame** (`seq_frame`),
-    /// the cache slot: `true` = `Slot::B` (locked-step B, #98), `false` = `Slot::A`.
-    is_b: bool,
+    /// Which source this decode is for (#99 unification): A/B slots map to fixed
+    /// `SourceId`s via `cache::Slot` (A→0, B→1). Selects B-open vs A-open for an
+    /// explicit open; the cache slot for a **seq frame** (`seq_frame`, #98).
+    source: crate::layer::SourceId,
     /// True when this is a playback frame: skip the first-paint proxy and apply
     /// as a session-preserving swap on arrival (#7).
     seq_frame: bool,
@@ -606,7 +608,7 @@ pub struct ExrApp {
     loading_a: bool,
     #[serde(skip)]
     loading_b: bool,
-    /// Job queue sender: send `LoadJob { path, is_b }` to the single worker thread.
+    /// Job queue sender: send `LoadJob { path, source, .. }` to the single worker thread.
     #[serde(skip)]
     load_tx: Option<std::sync::mpsc::Sender<LoadJob>>,
     /// Result receiver: the worker sends completed `LoadResult`s back here.
@@ -1164,7 +1166,11 @@ impl ExrApp {
 
         self.submit_job(LoadJob {
             path,
-            is_b,
+            source: if is_b {
+                crate::cache::Slot::B.into()
+            } else {
+                crate::cache::Slot::A.into()
+            },
             seq_frame: false,
             frame: 0,
             epoch: self.playback.epoch,
@@ -1247,7 +1253,7 @@ impl ExrApp {
                     // slot B (a reference) and for playback frames (#7), which
                     // swap straight to full-res. `from_exr_fast_read` returns None
                     // for small / tiled / deep files anyway.
-                    if !job.is_b
+                    if job.source == crate::cache::Slot::A.into()
                         && !job.seq_frame
                         && let Some(proxy) = crate::proxy::ProxyImage::from_exr_fast_read(
                             &job.path,
@@ -1303,7 +1309,7 @@ impl ExrApp {
                     };
                     let _ = result_tx.send(LoadMsg::Loaded(Box::new(LoadResult {
                         path: job.path,
-                        is_b: job.is_b,
+                        source: job.source,
                         seq_frame: job.seq_frame,
                         frame: job.frame,
                         epoch: job.epoch,
@@ -1820,8 +1826,8 @@ impl ExrApp {
     }
 
     /// Submit one sequence decode for `slot` at frame `w` (#98). Tags the job with
-    /// its cache slot via `is_b`, marks it in-flight, and drives that slot's
-    /// "loading" state when it's the awaited playhead.
+    /// its cache slot via `source` (`slot.into()`), marks it in-flight, and drives
+    /// that slot's "loading" state when it's the awaited playhead.
     fn submit_seq(&mut self, slot: crate::cache::Slot, w: u32) {
         let path = match slot {
             crate::cache::Slot::A => self.playback.frame_path(w).map(Path::to_path_buf),
@@ -1859,7 +1865,7 @@ impl ExrApp {
         };
         self.submit_job(LoadJob {
             path,
-            is_b: slot == crate::cache::Slot::B,
+            source: slot.into(),
             seq_frame: true,
             frame: w,
             epoch: self.playback.epoch,
@@ -2735,6 +2741,10 @@ impl ExrApp {
     /// results (a newer open of a different file superseded this one) by checking
     /// the result path against the currently-requested path for its slot.
     fn apply_load_result(&mut self, res: LoadResult) {
+        // The A/B routing below still forks on slot; derive it from the result's
+        // source (B → the follower slot) until the `_b` state folds to a per-source
+        // map (#99 P1.4).
+        let is_b = res.source == crate::cache::Slot::B.into();
         // Playback frame (#7): supersession is by **epoch** (#57), not path —
         // sequences recur the same paths under loop/ping-pong/scrub-back, so a
         // stale frame could otherwise be mistaken for the current one. Apply as a
@@ -2746,7 +2756,7 @@ impl ExrApp {
                 return; // a seek/scrub/direction change superseded this decode.
             }
             // Route by cache slot (#98): `is_b` is the slot for a seq frame.
-            let slot = if res.is_b {
+            let slot = if is_b {
                 crate::cache::Slot::B
             } else {
                 crate::cache::Slot::A
@@ -2849,7 +2859,7 @@ impl ExrApp {
         // could drop a still-current open's result — and dropping it here returns
         // before clearing `loading_a`, permanently gating `pump_decode`. The
         // generation is bumped only by a later open or an unload.
-        let superseded = if res.is_b {
+        let superseded = if is_b {
             self.loaded_file_b.as_ref() != Some(&res.path)
         } else {
             res.open_gen != self.open_gen_a
@@ -2858,7 +2868,7 @@ impl ExrApp {
             return;
         }
 
-        if res.is_b {
+        if is_b {
             self.loading_b = false;
         } else {
             self.loading_a = false;
@@ -2866,7 +2876,7 @@ impl ExrApp {
 
         match res.result {
             Ok(data) => {
-                if res.is_b {
+                if is_b {
                     // B is a reference slot, not a new session: swap the pixel
                     // source while preserving the viewer's session state.
                     self.swap_image_data(data, true);
@@ -2908,7 +2918,7 @@ impl ExrApp {
                 self.error_msg = None;
             }
             Err(e) => {
-                if !res.is_b {
+                if !is_b {
                     self.exr_data = None;
                 }
                 self.error_msg = Some(e);
@@ -5927,7 +5937,7 @@ mod tests {
 
         app.apply_load_result(LoadResult {
             path: PathBuf::from("superseded.exr"),
-            is_b: false,
+            source: crate::cache::Slot::A.into(),
             seq_frame: false,
             frame: 0,
             epoch: 0,
@@ -5972,7 +5982,7 @@ mod tests {
 
         app.apply_load_result(LoadResult {
             path: newf,
-            is_b: false,
+            source: crate::cache::Slot::A.into(),
             seq_frame: false,
             frame: 0,
             epoch: 0,
@@ -6012,7 +6022,7 @@ mod tests {
         // The now-stale open result lands.
         app.apply_load_result(LoadResult {
             path: f,
-            is_b: false,
+            source: crate::cache::Slot::A.into(),
             seq_frame: false,
             frame: 0,
             epoch: 0,
@@ -6036,7 +6046,7 @@ mod tests {
 
         app.apply_load_result(LoadResult {
             path: PathBuf::from("current.exr"),
-            is_b: false,
+            source: crate::cache::Slot::A.into(),
             seq_frame: false,
             frame: 0,
             epoch: 0,
@@ -6068,7 +6078,7 @@ mod tests {
 
         app.apply_load_result(LoadResult {
             path,
-            is_b: false,
+            source: crate::cache::Slot::A.into(),
             seq_frame: false,
             frame: 0,
             epoch: 0,
@@ -6411,7 +6421,7 @@ mod tests {
         // Full decode lands through the real completion path.
         app.apply_load_result(LoadResult {
             path,
-            is_b: false,
+            source: crate::cache::Slot::A.into(),
             seq_frame: false,
             frame: 0,
             epoch: 0,
@@ -6710,7 +6720,7 @@ mod tests {
         // The decode fails: pending clears, nothing lands in T1.
         app.apply_load_result(LoadResult {
             path: dir.path().join("s.0003.exr"),
-            is_b: false,
+            source: crate::cache::Slot::A.into(),
             seq_frame: true,
             frame: 3,
             epoch: app.playback.epoch,
@@ -6751,7 +6761,7 @@ mod tests {
         let data2 = ExrData::load(&f2).unwrap();
         app.apply_load_result(LoadResult {
             path: f2,
-            is_b: false,
+            source: crate::cache::Slot::A.into(),
             seq_frame: true,
             frame: 2,
             epoch: app.playback.epoch,
@@ -7062,7 +7072,7 @@ mod tests {
         // A stale result for frame 2 (a pre-seek decode) arrives late.
         app.apply_load_result(LoadResult {
             path: dir.path().join("s.0002.exr"),
-            is_b: false,
+            source: crate::cache::Slot::A.into(),
             seq_frame: true,
             frame: 2,
             epoch: live_epoch.wrapping_sub(1),
@@ -7088,7 +7098,7 @@ mod tests {
         // there was no permanent leak.
         app.apply_load_result(LoadResult {
             path: dir.path().join("s.0002.exr"),
-            is_b: false,
+            source: crate::cache::Slot::A.into(),
             seq_frame: true,
             frame: 2,
             epoch: live_epoch,
@@ -7121,7 +7131,7 @@ mod tests {
 
         app.submit_job(LoadJob {
             path: f1,
-            is_b: false,
+            source: crate::cache::Slot::A.into(),
             seq_frame: false,
             frame: 0,
             epoch: 0,
@@ -7379,7 +7389,7 @@ mod tests {
         assert!(!full.beauty_only);
         app.apply_load_result(LoadResult {
             path: f1,
-            is_b: false,
+            source: crate::cache::Slot::A.into(),
             seq_frame: true,
             frame: 1,
             epoch: app.playback.epoch,
@@ -7544,7 +7554,7 @@ mod tests {
         let data = ExrData::load(path).unwrap();
         app.apply_load_result(LoadResult {
             path: path.to_path_buf(),
-            is_b: false,
+            source: crate::cache::Slot::A.into(),
             seq_frame: true,
             frame,
             epoch: app.playback.epoch,
@@ -7604,7 +7614,7 @@ mod tests {
         let data2 = ExrData::load(&f2).unwrap();
         app.apply_load_result(LoadResult {
             path: f2,
-            is_b: false,
+            source: crate::cache::Slot::A.into(),
             seq_frame: true,
             frame: 2,
             epoch: stale_epoch,
@@ -7934,13 +7944,13 @@ mod tests {
         );
     }
 
-    /// Deliver a decoded **slot-B** sequence frame (#98): `is_b = true` tags the
+    /// Deliver a decoded **slot-B** sequence frame (#98): the B `source` tags the
     /// cache slot on a seq frame.
     fn deliver_b_frame(app: &mut ExrApp, path: &std::path::Path, frame: u32) {
         let data = ExrData::load(path).unwrap();
         app.apply_load_result(LoadResult {
             path: path.to_path_buf(),
-            is_b: true,
+            source: crate::cache::Slot::B.into(),
             seq_frame: true,
             frame,
             epoch: app.playback.epoch,
@@ -8010,7 +8020,7 @@ mod tests {
         app.detect_sequence(&a[0]);
         app.frame_cache_cap = 8;
         let (_bdir, b) = arm_b_sequence(&mut app, 2);
-        // A B seq frame (`is_b = true`) is filed under Slot::B, never Slot::A.
+        // A B seq frame (B `source`) is filed under Slot::B, never Slot::A.
         deliver_b_frame(&mut app, &b[1], 2);
         assert!(
             app.frame_cache.contains(crate::cache::Slot::B, 2),
