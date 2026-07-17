@@ -119,8 +119,9 @@ pub enum CompareMode {
 }
 
 /// Compositing operator for [`CompareMode::Composite`] (premultiplied-alpha
-/// aware). Encoded for the shader via [`Self::as_u32`].
-#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+/// aware). Encoded for the shader via [`Self::as_u32`]. Serde-serializable so the
+/// Layers panel can persist each layer's blend (#99 PR-B; safe fieldless enum).
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug, serde::Serialize, serde::Deserialize)]
 pub enum BlendMode {
     #[default]
     Over,

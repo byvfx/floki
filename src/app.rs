@@ -58,6 +58,10 @@ fn default_proxy_size() -> usize {
     1024
 }
 
+/// Hard cap on Layers-panel composite sources (#99 PR-B). Playback footprint is
+/// bounded on 8 GB (see the roadmap); the panel disables Add at this many layers.
+const COMP_LAYER_CAP: usize = 6;
+
 /// serde default for `proxy_cache_gb` (#165): the on-disk proxy-cache size budget
 /// in GiB. ~10 GiB ≈ 2.5–5k f16 proxy frames — plenty for a shot, trivial on a
 /// modern disk. A ceiling, LRU-evicted; the actual footprint is only what's cached.
@@ -461,6 +465,20 @@ pub struct ExrApp {
     show_help: bool,
     #[serde(skip)]
     show_settings: bool,
+    /// Whether the additive **Layers** panel is shown (#99 PR-B). Menu-toggled.
+    #[serde(skip)]
+    show_layers_panel: bool,
+    /// The Layers panel's composite stack: a viewer-independent N-layer stack the
+    /// panel edits and (PR-B.3) composites via the PR-A accumulate ping-pong,
+    /// separate from the A/B compare stack so the compare modes stay untouched.
+    /// Runtime-only; its layers persist via a `LayerPersist` list (PR-B.5), not
+    /// this field (`LayerStack` isn't `Serialize`, and ids are re-allocated on load).
+    #[serde(skip)]
+    comp_stack: crate::layer::LayerStack,
+    /// Monotonic allocator for the panel's `SourceId`s (#99 PR-B). Never reused, so
+    /// a removed-then-added source can't alias a stale decode/texture (PR-B.2).
+    #[serde(skip)]
+    comp_next_source: u64,
 
     /// App-owned GPU core (#54): the single home for the persistent `GpuState`
     /// and the OCIO pass publisher. `None` in the CPU-only path (no wgpu
@@ -639,6 +657,9 @@ impl Default for ExrApp {
             resource_monitor: crate::resource_monitor::ResourceMonitor::default(),
             show_help: false,
             show_settings: false,
+            show_layers_panel: false,
+            comp_stack: crate::layer::LayerStack::new(),
+            comp_next_source: 0,
             gpu_resources: None,
             ocio_path: String::new(),
             lut_path: String::new(),
@@ -3268,6 +3289,7 @@ impl eframe::App for ExrApp {
         // stacks above); a no-op panel unless a sequence is loaded.
         self.draw_transport_bar(ui);
         self.draw_side_panel(ui);
+        self.draw_layers_panel(ui);
         self.draw_central_canvas(ui);
         // Pre-upload T2 GPU textures ahead of the playhead (#56). After the canvas
         // so the on-screen frame's texture exists; self-gates when T2 is off.
@@ -3856,6 +3878,11 @@ impl ExrApp {
 
                     ui.menu_button("View", |ui| {
                         ui.checkbox(&mut self.viewer.show_contact_sheet, "Contact Sheet");
+                        ui.checkbox(&mut self.show_layers_panel, "Layers")
+                            .on_hover_text(
+                                "Compositing layer stack: stack N sources as layers with \
+                                 per-layer blend / opacity / visibility (#99)",
+                            );
                         if ui.button("Viewport Background...").clicked() {
                             self.viewer.show_background_window = true;
                             ui.close();
@@ -5198,6 +5225,91 @@ impl ExrApp {
                     });
                 });
         }
+    }
+
+    /// Append a source to the Layers-panel stack (#99 PR-B). B.1 registers it as a
+    /// model entry (name + fresh `SourceId`); PR-B.2 decodes `path` into a texture
+    /// keyed by that `SourceId` so the layer actually renders.
+    fn add_comp_source(&mut self, path: std::path::PathBuf) {
+        if self.comp_stack.len() >= COMP_LAYER_CAP {
+            return;
+        }
+        let name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "layer".to_string());
+        let source = crate::layer::SourceId(self.comp_next_source);
+        self.comp_next_source += 1;
+        self.comp_stack
+            .push_image(name, source, 0, crate::layer::Trim::full(0, u32::MAX));
+    }
+
+    /// The additive **Layers** panel (#99 PR-B): a right dock listing the panel's
+    /// composite stack top-to-bottom, with Add / remove. Per-layer blend / opacity /
+    /// visibility / solo / AOV controls and reorder land in PR-B.4; rendering the
+    /// stack via the accumulate ping-pong lands in PR-B.3.
+    fn draw_layers_panel(&mut self, ui: &mut egui::Ui) {
+        if !self.show_layers_panel || self.viewer.fullscreen {
+            return;
+        }
+        egui::Panel::right("layers_panel")
+            .resizable(true)
+            .min_size(220.0)
+            .show_inside(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("Layers");
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{}/{}",
+                            self.comp_stack.len(),
+                            COMP_LAYER_CAP
+                        ))
+                        .weak(),
+                    );
+                });
+                ui.separator();
+
+                let at_cap = self.comp_stack.len() >= COMP_LAYER_CAP;
+                ui.add_enabled_ui(!at_cap, |ui| {
+                    if ui
+                        .button("➕  Add source…")
+                        .on_disabled_hover_text("Layer cap reached")
+                        .clicked()
+                        && let Some(path) = FileDialog::new()
+                            .add_filter("EXR Image", &["exr"])
+                            .pick_file()
+                    {
+                        self.add_comp_source(path);
+                    }
+                });
+                ui.separator();
+
+                if self.comp_stack.is_empty() {
+                    ui.weak("No layers yet. Add a source to begin.");
+                    return;
+                }
+
+                // Rows top-of-stack first. Collect ids up front (bottom→top) so the
+                // row buttons can mutate the stack without aliasing the iteration
+                // borrow; display reversed so the top layer is the top row.
+                let rows: Vec<(crate::layer::LayerId, String)> = self
+                    .comp_stack
+                    .iter()
+                    .map(|l| (l.id, l.name.clone()))
+                    .collect();
+                let mut remove: Option<crate::layer::LayerId> = None;
+                for (id, name) in rows.iter().rev() {
+                    ui.horizontal(|ui| {
+                        if ui.small_button("✕").on_hover_text("Remove layer").clicked() {
+                            remove = Some(*id);
+                        }
+                        ui.label(name);
+                    });
+                }
+                if let Some(id) = remove {
+                    self.comp_stack.remove(id);
+                }
+            });
     }
 
     fn draw_central_canvas(&mut self, ui: &mut egui::Ui) {
