@@ -14,9 +14,8 @@
 //! Keyed on `(SourceId, frame)` so every source rides the same ring and eviction
 //! (#99 unification): today's locked-step A/B (#98) is two sources — the primary
 //! (directional playhead) plus one follower — but the key + the N-playhead
-//! eviction below already generalize to the N-source comp stack. The A/B decode
-//! slots reach this via [`Slot`] → [`SourceId`] (a bridge that dissolves once the
-//! app's per-slot state folds into a per-source map).
+//! eviction below already generalize to the N-source comp stack. Callers pass a
+//! [`SourceId`] directly (`ExrApp::{A,B}_SOURCE` for the compare slots).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -24,25 +23,6 @@ use std::sync::Arc;
 use crate::exr_loader::ExrData;
 use crate::layer::SourceId;
 use crate::playback::Direction;
-
-/// Which image slot a cached frame belongs to — the A/B decode path's two-source
-/// identity (#98). A transitional bridge (#99 unification): it maps to a fixed
-/// [`SourceId`] so the cache is already source-native, and is removed once the
-/// app's `_b` state generalizes to a per-`SourceId` map.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum Slot {
-    A,
-    B,
-}
-
-impl From<Slot> for SourceId {
-    fn from(slot: Slot) -> Self {
-        SourceId(match slot {
-            Slot::A => 0,
-            Slot::B => 1,
-        })
-    }
-}
 
 struct Entry {
     data: Arc<ExrData>,
@@ -338,7 +318,7 @@ mod tests {
         Arc::new(ExrData::load(&path).unwrap())
     }
 
-    fn fill(cache: &mut FrameCache, slot: Slot, frames: &[u32]) {
+    fn fill(cache: &mut FrameCache, slot: SourceId, frames: &[u32]) {
         for &f in frames {
             cache.insert(slot, f, frame());
         }
@@ -353,14 +333,14 @@ mod tests {
     #[test]
     fn resident_full_frames_excludes_proxy() {
         let mut c = FrameCache::new();
-        c.insert(Slot::A, 1, frame()); // full
-        c.insert(Slot::A, 2, proxy_frame()); // proxy — excluded from "full"
-        c.insert(Slot::A, 3, frame()); // full
-        let mut full: Vec<u32> = c.resident_full_frames(Slot::A).collect();
+        c.insert(SourceId(0), 1, frame()); // full
+        c.insert(SourceId(0), 2, proxy_frame()); // proxy — excluded from "full"
+        c.insert(SourceId(0), 3, frame()); // full
+        let mut full: Vec<u32> = c.resident_full_frames(SourceId(0)).collect();
         full.sort_unstable();
         assert_eq!(full, vec![1, 3], "proxy frame excluded from full residency");
         // ...but it's still resident for the base cache-fill tone.
-        let mut all: Vec<u32> = c.resident_frames(Slot::A).collect();
+        let mut all: Vec<u32> = c.resident_frames(SourceId(0)).collect();
         all.sort_unstable();
         assert_eq!(all, vec![1, 2, 3]);
     }
@@ -368,46 +348,46 @@ mod tests {
     #[test]
     fn get_hits_resident_and_misses_absent() {
         let mut c = FrameCache::new();
-        c.insert(Slot::A, 5, frame());
-        assert!(c.get(Slot::A, 5).is_some());
-        assert!(c.get(Slot::A, 6).is_none());
+        c.insert(SourceId(0), 5, frame());
+        assert!(c.get(SourceId(0), 5).is_some());
+        assert!(c.get(SourceId(0), 6).is_none());
         // Source is part of the key.
-        assert!(c.get(Slot::B, 5).is_none());
+        assert!(c.get(SourceId(1), 5).is_none());
     }
 
     #[test]
     fn remove_drops_a_single_frame_and_reports_residency() {
         let mut c = FrameCache::new();
-        fill(&mut c, Slot::A, &[1, 2, 3]);
-        assert!(c.remove(Slot::A, 2), "resident frame removed");
-        assert!(!c.contains(Slot::A, 2));
+        fill(&mut c, SourceId(0), &[1, 2, 3]);
+        assert!(c.remove(SourceId(0), 2), "resident frame removed");
+        assert!(!c.contains(SourceId(0), 2));
         assert!(
-            c.contains(Slot::A, 1) && c.contains(Slot::A, 3),
+            c.contains(SourceId(0), 1) && c.contains(SourceId(0), 3),
             "others kept"
         );
-        assert!(!c.remove(Slot::A, 2), "second remove reports absent");
-        assert!(!c.remove(Slot::B, 1), "source is part of the key");
+        assert!(!c.remove(SourceId(0), 2), "second remove reports absent");
+        assert!(!c.remove(SourceId(1), 1), "source is part of the key");
     }
 
     #[test]
     fn resident_lists_only_the_requested_slot() {
         let mut c = FrameCache::new();
-        fill(&mut c, Slot::A, &[1, 2, 3]);
-        fill(&mut c, Slot::B, &[9]);
-        let mut a: Vec<u32> = c.resident_frames(Slot::A).collect();
+        fill(&mut c, SourceId(0), &[1, 2, 3]);
+        fill(&mut c, SourceId(1), &[9]);
+        let mut a: Vec<u32> = c.resident_frames(SourceId(0)).collect();
         a.sort_unstable();
         assert_eq!(a, vec![1, 2, 3]);
-        assert_eq!(c.resident_frames(Slot::B).collect::<Vec<_>>(), vec![9]);
+        assert_eq!(c.resident_frames(SourceId(1)).collect::<Vec<_>>(), vec![9]);
     }
 
     #[test]
     fn evict_protects_the_playhead_frame() {
         let mut c = FrameCache::new();
-        fill(&mut c, Slot::A, &[10, 11, 12]);
+        fill(&mut c, SourceId(0), &[10, 11, 12]);
         // Capacity 1 with playhead on 11: everything else goes, 11 stays.
         c.evict_to(1, &[(A, 11)], A, Direction::Forward, true, None, 0);
         assert_eq!(c.len(), 1);
-        assert!(c.contains(Slot::A, 11), "active frame is never evicted");
+        assert!(c.contains(SourceId(0), 11), "active frame is never evicted");
     }
 
     #[test]
@@ -415,19 +395,19 @@ mod tests {
         // Locked-step A/B (#98): A and B live in different frame ranges and both
         // have an on-screen frame that must survive a hard squeeze.
         let mut c = FrameCache::new();
-        fill(&mut c, Slot::A, &[3, 4, 5, 6]);
-        fill(&mut c, Slot::B, &[103, 104, 105, 106]);
+        fill(&mut c, SourceId(0), &[3, 4, 5, 6]);
+        fill(&mut c, SourceId(1), &[103, 104, 105, 106]);
         c.evict_to(2, &[(A, 5), (B, 105)], A, Direction::Forward, true, None, 0);
         assert_eq!(c.len(), 2, "everything but the two playheads is evicted");
-        assert!(c.contains(Slot::A, 5), "A playhead protected");
-        assert!(c.contains(Slot::B, 105), "B playhead protected");
+        assert!(c.contains(SourceId(0), 5), "A playhead protected");
+        assert!(c.contains(SourceId(1), 105), "B playhead protected");
     }
 
     #[test]
     fn playing_forward_evicts_behind_before_ahead() {
         let mut c = FrameCache::new();
         // Playhead 5; 3,4 are behind, 6,7 ahead.
-        fill(&mut c, Slot::A, &[3, 4, 5, 6, 7]);
+        fill(&mut c, SourceId(0), &[3, 4, 5, 6, 7]);
         // Trim to 3: the two behind frames (furthest first: 3 then 4) are dropped.
         // The returned count (used by the #100 debug overlay) reflects that.
         assert_eq!(
@@ -435,13 +415,13 @@ mod tests {
             2,
             "evicted count"
         );
-        assert!(c.contains(Slot::A, 5));
+        assert!(c.contains(SourceId(0), 5));
         assert!(
-            c.contains(Slot::A, 6) && c.contains(Slot::A, 7),
+            c.contains(SourceId(0), 6) && c.contains(SourceId(0), 7),
             "ahead kept"
         );
         assert!(
-            !c.contains(Slot::A, 3) && !c.contains(Slot::A, 4),
+            !c.contains(SourceId(0), 3) && !c.contains(SourceId(0), 4),
             "behind evicted"
         );
     }
@@ -450,26 +430,26 @@ mod tests {
     fn playing_drops_furthest_ahead_when_nothing_is_behind() {
         let mut c = FrameCache::new();
         // All ahead of playhead 5.
-        fill(&mut c, Slot::A, &[5, 6, 7, 8]);
+        fill(&mut c, SourceId(0), &[5, 6, 7, 8]);
         c.evict_to(2, &[(A, 5)], A, Direction::Forward, true, None, 0);
         // Keep playhead + nearest ahead; drop the furthest-ahead (8 then 7).
-        assert!(c.contains(Slot::A, 5) && c.contains(Slot::A, 6));
-        assert!(!c.contains(Slot::A, 7) && !c.contains(Slot::A, 8));
+        assert!(c.contains(SourceId(0), 5) && c.contains(SourceId(0), 6));
+        assert!(!c.contains(SourceId(0), 7) && !c.contains(SourceId(0), 8));
     }
 
     #[test]
     fn reverse_play_treats_higher_frames_as_behind() {
         let mut c = FrameCache::new();
         // Playhead 5, playing in reverse: 6,7 are "behind", 3,4 ahead.
-        fill(&mut c, Slot::A, &[3, 4, 5, 6, 7]);
+        fill(&mut c, SourceId(0), &[3, 4, 5, 6, 7]);
         c.evict_to(3, &[(A, 5)], A, Direction::Reverse, true, None, 0);
-        assert!(c.contains(Slot::A, 5));
+        assert!(c.contains(SourceId(0), 5));
         assert!(
-            c.contains(Slot::A, 3) && c.contains(Slot::A, 4),
+            c.contains(SourceId(0), 3) && c.contains(SourceId(0), 4),
             "ahead (lower) kept"
         );
         assert!(
-            !c.contains(Slot::A, 6) && !c.contains(Slot::A, 7),
+            !c.contains(SourceId(0), 6) && !c.contains(SourceId(0), 7),
             "behind (higher) evicted"
         );
     }
@@ -478,16 +458,16 @@ mod tests {
     fn scrubbing_evicts_by_absolute_distance_either_side() {
         let mut c = FrameCache::new();
         // Playhead 5; not playing -> bidirectional distance.
-        fill(&mut c, Slot::A, &[1, 4, 5, 6, 9]);
+        fill(&mut c, SourceId(0), &[1, 4, 5, 6, 9]);
         c.evict_to(3, &[(A, 5)], A, Direction::Forward, false, None, 0);
         // Furthest from 5 are 1 (dist 4) and 9 (dist 4); both dropped.
-        assert!(c.contains(Slot::A, 5));
+        assert!(c.contains(SourceId(0), 5));
         assert!(
-            c.contains(Slot::A, 4) && c.contains(Slot::A, 6),
+            c.contains(SourceId(0), 4) && c.contains(SourceId(0), 6),
             "nearest kept"
         );
         assert!(
-            !c.contains(Slot::A, 1) && !c.contains(Slot::A, 9),
+            !c.contains(SourceId(0), 1) && !c.contains(SourceId(0), 9),
             "furthest evicted"
         );
     }
@@ -496,13 +476,13 @@ mod tests {
     fn lru_breaks_ties_at_equal_distance() {
         let mut c = FrameCache::new();
         // Equidistant from playhead 5: frames 4 and 6 (dist 1).
-        c.insert(Slot::A, 5, frame());
-        c.insert(Slot::A, 4, frame()); // inserted earlier
-        c.insert(Slot::A, 6, frame()); // inserted later
-        c.get(Slot::A, 6); // touch 6 so 4 is least-recently-used
+        c.insert(SourceId(0), 5, frame());
+        c.insert(SourceId(0), 4, frame()); // inserted earlier
+        c.insert(SourceId(0), 6, frame()); // inserted later
+        c.get(SourceId(0), 6); // touch 6 so 4 is least-recently-used
         c.evict_to(2, &[(A, 5)], A, Direction::Forward, false, None, 0);
-        assert!(c.contains(Slot::A, 6), "recently used survives the tie");
-        assert!(!c.contains(Slot::A, 4), "LRU loses the tie");
+        assert!(c.contains(SourceId(0), 6), "recently used survives the tie");
+        assert!(!c.contains(SourceId(0), 4), "LRU loses the tie");
     }
 
     /// #140 regression: with the playhead near the out point in Loop mode, the
@@ -516,15 +496,15 @@ mod tests {
         let mut c = FrameCache::new();
         // Loop [1,10], playhead 9 forward. Wrapped prefetch 1,2 has landed;
         // 7,8 were just shown. Ring distances from 9: 10→1, 1→2, 2→3, 7→8, 8→9.
-        fill(&mut c, Slot::A, &[7, 8, 9, 10, 1, 2]);
+        fill(&mut c, SourceId(0), &[7, 8, 9, 10, 1, 2]);
         c.evict_to(4, &[(A, 9)], A, Direction::Forward, true, Some((1, 10)), 0);
-        assert!(c.contains(Slot::A, 9), "playhead protected");
+        assert!(c.contains(SourceId(0), 9), "playhead protected");
         assert!(
-            c.contains(Slot::A, 10) && c.contains(Slot::A, 1) && c.contains(Slot::A, 2),
+            c.contains(SourceId(0), 10) && c.contains(SourceId(0), 1) && c.contains(SourceId(0), 2),
             "wrapped prefetch is 'just ahead' around the loop — kept"
         );
         assert!(
-            !c.contains(Slot::A, 7) && !c.contains(Slot::A, 8),
+            !c.contains(SourceId(0), 7) && !c.contains(SourceId(0), 8),
             "just-behind frames are a full lap away — evicted first"
         );
     }
@@ -535,15 +515,15 @@ mod tests {
     fn reverse_loop_play_keeps_prefetch_wrapped_to_the_out_point() {
         let mut c = FrameCache::new();
         // Loop [1,10], playhead 2 reverse. Prefetch 1,10,9 (wrapping); 3,4 just shown.
-        fill(&mut c, Slot::A, &[4, 3, 2, 1, 10, 9]);
+        fill(&mut c, SourceId(0), &[4, 3, 2, 1, 10, 9]);
         c.evict_to(4, &[(A, 2)], A, Direction::Reverse, true, Some((1, 10)), 0);
-        assert!(c.contains(Slot::A, 2), "playhead protected");
+        assert!(c.contains(SourceId(0), 2), "playhead protected");
         assert!(
-            c.contains(Slot::A, 1) && c.contains(Slot::A, 10) && c.contains(Slot::A, 9),
+            c.contains(SourceId(0), 1) && c.contains(SourceId(0), 10) && c.contains(SourceId(0), 9),
             "prefetch wrapped past the in point kept"
         );
         assert!(
-            !c.contains(Slot::A, 3) && !c.contains(Slot::A, 4),
+            !c.contains(SourceId(0), 3) && !c.contains(SourceId(0), 4),
             "just-behind (higher) frames evicted first"
         );
     }
@@ -554,14 +534,14 @@ mod tests {
     fn loop_play_evicts_out_of_range_leftovers_first() {
         let mut c = FrameCache::new();
         // Loop trimmed to [1,10]; frame 12 is a leftover from the old range.
-        fill(&mut c, Slot::A, &[12, 8, 9, 10, 1]);
+        fill(&mut c, SourceId(0), &[12, 8, 9, 10, 1]);
         c.evict_to(4, &[(A, 9)], A, Direction::Forward, true, Some((1, 10)), 0);
         assert!(
-            !c.contains(Slot::A, 12),
+            !c.contains(SourceId(0), 12),
             "out-of-range leftover evicted before any in-range frame"
         );
         assert!(
-            c.contains(Slot::A, 8) && c.contains(Slot::A, 10) && c.contains(Slot::A, 1),
+            c.contains(SourceId(0), 8) && c.contains(SourceId(0), 10) && c.contains(SourceId(0), 1),
             "in-range frames kept"
         );
     }
@@ -573,22 +553,22 @@ mod tests {
     fn read_behind_window_survives_linear_play() {
         let mut c = FrameCache::new();
         // Playhead 10 forward, window 2: 9,8 reserved; 7 beyond the window.
-        fill(&mut c, Slot::A, &[7, 8, 9, 10, 11, 12, 13]);
+        fill(&mut c, SourceId(0), &[7, 8, 9, 10, 11, 12, 13]);
         c.evict_to(5, &[(A, 10)], A, Direction::Forward, true, None, 2);
         assert!(
-            !c.contains(Slot::A, 7),
+            !c.contains(SourceId(0), 7),
             "beyond the window: biased, evicted first"
         );
         assert!(
-            !c.contains(Slot::A, 13),
+            !c.contains(SourceId(0), 13),
             "furthest-ahead evicts before the reserved window"
         );
         assert!(
-            c.contains(Slot::A, 8) && c.contains(Slot::A, 9),
+            c.contains(SourceId(0), 8) && c.contains(SourceId(0), 9),
             "just-shown frames survive (#169)"
         );
         assert!(
-            c.contains(Slot::A, 11) && c.contains(Slot::A, 12),
+            c.contains(SourceId(0), 11) && c.contains(SourceId(0), 12),
             "near-ahead prefetch kept"
         );
     }
@@ -601,17 +581,17 @@ mod tests {
         let mut c = FrameCache::new();
         // Loop [1,10], playhead 9 forward, window 1: 8 reserved; 7 beyond it.
         // Ring ranks: 10→1, 1→2, 8→back 1 (carve-out), 7→fwd 8.
-        fill(&mut c, Slot::A, &[7, 8, 9, 10, 1]);
+        fill(&mut c, SourceId(0), &[7, 8, 9, 10, 1]);
         c.evict_to(3, &[(A, 9)], A, Direction::Forward, true, Some((1, 10)), 1);
-        assert!(c.contains(Slot::A, 9), "playhead protected");
-        assert!(c.contains(Slot::A, 8), "just-shown frame survives (#169)");
-        assert!(c.contains(Slot::A, 10), "nearest ahead kept");
+        assert!(c.contains(SourceId(0), 9), "playhead protected");
+        assert!(c.contains(SourceId(0), 8), "just-shown frame survives (#169)");
+        assert!(c.contains(SourceId(0), 10), "nearest ahead kept");
         assert!(
-            !c.contains(Slot::A, 7),
+            !c.contains(SourceId(0), 7),
             "beyond the window: nearly a full lap away, evicted first"
         );
         assert!(
-            !c.contains(Slot::A, 1),
+            !c.contains(SourceId(0), 1),
             "wrapped prefetch further out evicts before the reserved frame"
         );
     }
@@ -623,7 +603,7 @@ mod tests {
     fn evicts_a_third_source_by_its_own_playhead() {
         let mut c = FrameCache::new();
         let s2 = SourceId(2);
-        c.insert(Slot::A, 5, frame());
+        c.insert(SourceId(0), 5, frame());
         for f in [8, 9, 10, 11, 12] {
             c.insert(s2, f, frame());
         }
@@ -631,7 +611,7 @@ mod tests {
         // keep A/5 + s2/10 + the nearest s2 frame; drop s2's furthest (12 or 8).
         c.evict_to(3, &[(A, 5), (s2, 10)], A, Direction::Forward, true, None, 0);
         assert_eq!(c.len(), 3);
-        assert!(c.contains(Slot::A, 5), "primary playhead protected");
+        assert!(c.contains(SourceId(0), 5), "primary playhead protected");
         assert!(c.contains(s2, 10), "third source's playhead protected");
         // Its furthest-by-distance frame goes first (12 and 8 are dist 2; LRU tie →
         // 8 inserted earliest loses). Either way one of the far ones is gone.

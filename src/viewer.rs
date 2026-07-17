@@ -657,7 +657,7 @@ pub struct ExrViewer {
     /// `set_t2_cap`/`set_t2_frame`/`prebuild_t2` (#153).
     ///
     /// **Per-`SourceId` (#99):** one ring per source, created lazily. Today the
-    /// only keys are the A/B slots (`Slot::{A,B}.into()` = [`Self::T2_SOURCE_A`] /
+    /// only keys are the A/B compare slots ([`Self::T2_SOURCE_A`] /
     /// [`Self::T2_SOURCE_B`]) — B mirrors A but keyed on B's frame number and built
     /// for B's layer (`active_layer` clamped to B's layer count), pre-uploading the
     /// compared sequence ahead of the playhead. An absent ring reads as disabled
@@ -3779,8 +3779,8 @@ impl ExrViewer {
     // --- T2 GPU-texture ring (#56) -------------------------------------------
 
     /// T2-ring source ids while the app is A/B-pinned (#99): the primary (A) and
-    /// the compared follower (B), mirroring the app's `Slot::{A,B}.into()`. Phase 2
-    /// rings the comp stack's N sources under their own ids.
+    /// the compared follower (B), mirroring `ExrApp::{A,B}_SOURCE`. Phase 2 rings
+    /// the comp stack's N sources under their own ids.
     const T2_SOURCE_A: crate::layer::SourceId = crate::layer::SourceId(0);
     const T2_SOURCE_B: crate::layer::SourceId = crate::layer::SourceId(1);
 

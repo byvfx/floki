@@ -39,12 +39,11 @@
 //! # Cache-key correspondence (move toward `(LayerId, source_frame)`)
 //!
 //! The two layers carry **stable** [`LayerId`]s (allocated once when the viewer is
-//! built). [`slot_of`] / [`layer_id_for`] pin the `Slot ⇄ LayerId` correspondence
-//! so a future cache keyed on `(LayerId, source_frame)` is a drop-in extension of
-//! today's `(Slot, frame)` ring (`src/cache.rs`) rather than a rewrite. The ring
-//! itself is untouched this phase.
+//! built). [`source_of`] / [`layer_id_for`] pin the `SourceId ⇄ LayerId`
+//! correspondence so a future cache keyed on `(LayerId, source_frame)` is a drop-in
+//! extension of today's `(SourceId, frame)` ring (`src/cache.rs`) rather than a
+//! rewrite. The ring itself is untouched this phase.
 
-use crate::cache::Slot;
 use crate::layer::{LayerId, LayerSource, LayerStack, SourceId, Step, Trim};
 use crate::viewer::{BlendMode, CompareMode};
 
@@ -122,27 +121,24 @@ pub fn new_ab_stack() -> (LayerStack, (LayerId, LayerId)) {
     (stack, (a, b))
 }
 
-/// The stable `Slot` for a program input — A→`Slot::A`, B→`Slot::B`. Part of the
+/// The stable `SourceId` for a program input — A→`SRC_A`, B→`SRC_B`. Part of the
 /// cache-key seam consumed when the ring generalizes to `(LayerId, source_frame)`
 /// in #104; unused by the render path this phase.
 #[allow(dead_code)]
 #[must_use]
-pub fn slot_of(input: ProgramInput) -> Slot {
+pub fn source_of(input: ProgramInput) -> SourceId {
     match input {
-        ProgramInput::A => Slot::A,
-        ProgramInput::B => Slot::B,
+        ProgramInput::A => SRC_A,
+        ProgramInput::B => SRC_B,
     }
 }
 
-/// The stable `LayerId` of a cache slot in the A/B stack. Cache-key seam for #104
-/// (see [`slot_of`]); unused by the render path this phase.
+/// The stable `LayerId` of a source in the A/B stack. Cache-key seam for #104 (see
+/// [`source_of`]); unused by the render path this phase.
 #[allow(dead_code)]
 #[must_use]
-pub fn layer_id_for(slot: Slot, ids: (LayerId, LayerId)) -> LayerId {
-    match slot {
-        Slot::A => ids.0,
-        Slot::B => ids.1,
-    }
+pub fn layer_id_for(source: SourceId, ids: (LayerId, LayerId)) -> LayerId {
+    if source == SRC_B { ids.1 } else { ids.0 }
 }
 
 /// The spatial / inspection arrangement for a compare mode.
@@ -377,11 +373,11 @@ mod tests {
     #[test]
     fn layer_ids_are_stable_and_map_to_slots() {
         let (_stack, ids) = new_ab_stack();
-        // The Slot ⇄ LayerId correspondence round-trips and is order-stable.
-        assert_eq!(layer_id_for(Slot::A, ids), ids.0);
-        assert_eq!(layer_id_for(Slot::B, ids), ids.1);
-        assert_eq!(slot_of(ProgramInput::A), Slot::A);
-        assert_eq!(slot_of(ProgramInput::B), Slot::B);
+        // The ProgramInput ⇄ SourceId ⇄ LayerId correspondence round-trips.
+        assert_eq!(layer_id_for(SRC_A, ids), ids.0);
+        assert_eq!(layer_id_for(SRC_B, ids), ids.1);
+        assert_eq!(source_of(ProgramInput::A), SRC_A);
+        assert_eq!(source_of(ProgramInput::B), SRC_B);
         // A fresh stack reuses the same monotonic ids — they are deterministic, so
         // a cache keyed on them survives across rebuilds.
         let (_s2, ids2) = new_ab_stack();
