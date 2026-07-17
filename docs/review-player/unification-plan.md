@@ -199,30 +199,35 @@ Branch `feat/layer-stack-panel` (stacked on PR-A #188). Each slice is CI-green
   Behavior-preserving (one follower). The `Slot::B`/`_b`-viewer-coupled decode/render/routing still
   addresses the sole follower via `b()`/`b_mut()`.
 
-> **Ordering note:** P1.3 (viewer per-`SourceId` T2 rings) was reordered *after* P1.4a/b — the
-> `ExrViewer` still holds the `t2`/`t2_b` twins and `_b` methods, and the T1 cache + T2 rings stay
-> `Slot`-keyed. That coupling is why P1.4b keeps the literal A/B pump list and the `Slot::B`-forked
-> decode paths intact; generalizing them to an N-source loop and deleting `cache::Slot` waits on P1.3.
+- **P1.3** `5fd2e94` (landed *after* P1.4a/b) — viewer `t2`/`t2_b` twins → one
+  `t2_rings: BTreeMap<SourceId, T2Ring<T2Texture>>`; the seven `*_b` twin methods + `layer_b_for`
+  collapse into source-keyed `set_t2_cap`/`set_t2_frame`/`t2_cap`/`t2_len`/`prebuild_t2`/
+  `evict_t2_frame`/`clear_t2` (+ the general `t2_layer_for`); the two paint blocks bind `ring_a`/
+  `ring_b` by entry-or-insert (`gpu_textures`/`_b` stay — Phase 3). App call sites pass
+  `Self::{A,B}_SOURCE`; `tick_budgets` VRAM split `/2`→`/n_active_sources()`. `pump_t2`/`pump_t2_b`
+  stay two funcs (now source-keyed). Behavior-preserving. **The T1 cache (P1.1) and T2 rings (P1.3)
+  are now both `SourceId`-keyed** — the remaining P1.4 TODOs (N-source pump list, `cache::Slot`
+  deletion) are unblocked.
 
 ## Execution checklist — remaining Phase 1 (resume here)
 
 Symbols are stable; line numbers drift (grep the name). Keep A/B pinned to
 `SourceId(0)`/`SourceId(1)` throughout so behavior is observable/unchanged.
 
-### P1.3 — per-source T2 GPU rings (mostly `viewer.rs`, some `app.rs`)
+### P1.3 — per-source T2 GPU rings (mostly `viewer.rs`, some `app.rs`)  **[DONE `5fd2e94`]**
 
-- `ExrViewer.t2` / `t2_b` fields → one `HashMap<SourceId, T2Ring<T2Texture>>` (the
-  `T2Ring<T>` *policy* is already generic — reuse unchanged).
-- Fold the `_b` twin methods into source-keyed ones: `set_t2_cap`/`set_t2_cap_b`,
-  `set_t2_frame`/`set_t2_frame_b`, `t2_cap`/`t2_cap_b`, `t2_len`/`t2_len_b`,
-  `prebuild_t2`/`prebuild_t2_b`, `clear_t2`/`clear_t2_b`, `evict_t2_frame` (A-only today).
-- `ExrApp::pump_t2` / `pump_t2_b` → one per-source pump loop.
-- `tick_budgets` T2 VRAM **byte-split** (`a_avail = avail/2` when B active) → split `/n`
-  across active sources.
-- The two paint blocks binding `gpu_textures[active_layer]` from `t2` (A) and
-  `gpu_textures_b[layer_b]` from `t2_b` (B) touch both the ring (P1.3) and the render
-  arrays (Phase 3) — keep `gpu_textures`/`gpu_textures_b` as-is here; only the ring source
-  changes.
+- **[DONE]** `ExrViewer.t2` / `t2_b` → one `BTreeMap<SourceId, T2Ring<T2Texture>>` (chose
+  `BTreeMap` over `HashMap` for a deterministic per-source order; the `T2Ring<T>` policy reused
+  unchanged).
+- **[DONE]** Fold the `_b` twin methods into source-keyed ones (each takes `source: SourceId`):
+  `set_t2_cap`, `set_t2_frame`, `t2_cap`, `t2_len`, `prebuild_t2`, `clear_t2`, `evict_t2_frame`;
+  the seven `*_b` variants + `layer_b_for` are gone (`layer_b_for` → the general `t2_layer_for`).
+- **[DONE]** `tick_budgets` T2 VRAM byte-split `avail/2` → `avail / n_active_sources()`.
+- **[DONE]** The two paint blocks bind `ring_a`/`ring_b` (entry-or-insert); `gpu_textures`/
+  `gpu_textures_b` kept as-is (they unify in Phase 3), only the ring source changed.
+- **[DEFERRED]** `ExrApp::pump_t2` / `pump_t2_b` stay *two* source-keyed functions — the "one
+  per-source pump loop" rides with the `pump_decode` list unification below (same primary-vs-
+  follower frame-space asymmetry).
 
 ### P1.4 — fold the `_b` app state; delete `Slot` (`app.rs`, `playback.rs`)
 
@@ -235,27 +240,32 @@ Symbols are stable; line numbers drift (grep the name). Keep A/B pinned to
 - **[DONE P1.4b]** The **source-agnostic aggregates** iterate `followers`: `cache_playheads`,
   the `pump_decode` busy-gate, the repaint poll, the watchdog/trace outstanding checks,
   `invalidate_inflight`, and the `/2`→`/n_active_sources()` budget splits.
-- **[TODO — needs P1.3]** Source-key the A/B *decode* forks (`submit_seq`, `next_want_slot`,
-  `warm_ahead`, `apply_load_result`'s derived `is_b`/`slot`) and the app-level `is_b:bool` params
-  (`open_file`, `swap_image_data`, `swap_image_arc`, `unload`, `route_dropped_exrs`). Today these
-  reach the sole follower through `b()`/`b_mut()`; a true N-source loop needs the T1 cache + T2
-  rings to be `SourceId`-native (P1.3) so the fork body isn't `Slot::B`/`_b`-hardcoded.
-- **[TODO — needs P1.3]** `pump_decode`'s literal `[(A,0),(B,0),(A,d),(B,d)]` priority list → an
-  N-source loop (primary playheads P0, then prefetch P1). Blocked on `Slot` being 2-valued.
+- **[TODO — now unblocked, P1.3 done]** Source-key the A/B *decode* forks (`submit_seq`,
+  `next_want_slot`, `warm_ahead`, `apply_load_result`'s derived `is_b`/`slot`) and the app-level
+  `is_b:bool` params (`open_file`, `swap_image_data`, `swap_image_arc`, `unload`,
+  `route_dropped_exrs`). Today these reach the sole follower through `b()`/`b_mut()`; the T1 cache
+  (P1.1) + T2 rings (P1.3) are now `SourceId`-native, so the fork body no longer *has* to be
+  `Slot::B`/`_b`-hardcoded. Fold `pump_t2`/`pump_t2_b` into the one per-source loop here too.
+- **[TODO — now unblocked, P1.3 done]** `pump_decode`'s literal `[(A,0),(B,0),(A,d),(B,d)]`
+  priority list → an N-source loop (primary playheads P0, then prefetch P1).
 - **[TODO — behavior change]** Replace `sync_b_to_a` + `request_b_frame` +
   `map_b_frame`/`map_b_frame_offset` (`playback.rs`) with `Trim::source_frame` per source.
   **DECIDED semantics: BLANK outside a layer's range** (not the old clamp/hold), and **the master
   clock does NOT stall** on a lagging follower (keep `tick_stutter` gating on the primary only).
   Land as its own slice (it changes B's edge behavior + needs the display path to handle a blank
   follower) — not bundled with the mechanical folds.
-- **[TODO — needs P1.3]** Delete `cache::Slot` + the `Slot::A.into()`/`Slot::B.into()` bridge
-  sites once the cache/viewer are `SourceId`-native and nothing needs the two-value enum.
+- **[TODO — now unblocked, P1.3 done]** Delete `cache::Slot` + the `Slot::A.into()`/`Slot::B.into()`
+  bridge sites once the decode forks above are source-keyed and nothing needs the two-value enum.
+  (The cache & viewer are already `SourceId`-native; `Slot` now survives only as the app-side A/B
+  label in the decode forks.)
 - `budget.rs` needs no change (already slot-agnostic); `scheduler.rs`, `prefetch.rs`,
   `playback::advance` unchanged.
 
-**Resume next at P1.3** (viewer per-`SourceId` T2 rings) — it unblocks the remaining P1.4 TODOs
-(the N-source pump loop + `Slot` deletion). The `map_b_frame`→`Trim` swap can land independently
-whenever, as its own behavior-change slice.
+**Resume next at P1.4c** — source-key the decode forks (`submit_seq`/`next_want_slot`/`warm_ahead`/
+`apply_load_result`), turn the literal A/B pump list into an N-source loop, fold `pump_t2`/`pump_t2_b`
+together, and delete `cache::Slot`. Now unblocked (T1 cache + T2 rings are both `SourceId`-native).
+The `map_b_frame`→`Trim::source_frame` swap lands independently whenever, as its own behavior-change
+slice (BLANK outside range).
 
 ### After Phase 1
 
