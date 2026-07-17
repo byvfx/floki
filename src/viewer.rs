@@ -3561,6 +3561,27 @@ impl ExrViewer {
         })
     }
 
+    /// Build a standalone GPU texture + bind group for one AOV of an `ExrData`,
+    /// for the Layers-panel composite sources (#99 PR-B.2). Wraps
+    /// [`Self::build_layer_texture`] (all the F16/F32 packing logic) with a fresh
+    /// staging buffer and hands back just the two GPU handles the caller owns — the
+    /// `Texture` (kept to own the VRAM) and the `Arc<BindGroup>` (bound as a
+    /// composite layer). `None` if the AOV is out of range or the upload fails.
+    /// UI-thread only (`queue.write_texture`). `add` is rare, so the throwaway
+    /// staging `Vec` here — unlike the per-frame T2 path — is not worth pooling.
+    pub(crate) fn build_source_texture(
+        gpu_resources: &crate::gpu::GpuResources,
+        exr_data: &ExrData,
+        aov: usize,
+    ) -> Option<(
+        eframe::egui_wgpu::wgpu::Texture,
+        std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>,
+    )> {
+        let mut staging = Vec::new();
+        let t = Self::build_layer_texture(gpu_resources, exr_data, aov, &mut staging)?;
+        Some((t.texture, t.bind_group))
+    }
+
     // --- T2 GPU-texture ring (#56) -------------------------------------------
 
     /// Set the VRAM-budgeted T2 capacity (frames). `0` disables pre-upload and

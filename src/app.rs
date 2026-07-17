@@ -62,6 +62,40 @@ fn default_proxy_size() -> usize {
 /// bounded on 8 GB (see the roadmap); the panel disables Add at this many layers.
 const COMP_LAYER_CAP: usize = 6;
 
+/// A decoded Layers-panel source (#99 PR-B.2): its pixels plus the GPU texture the
+/// composite ping-pong (PR-B.3) binds as a layer. One per `SourceId`, held in
+/// [`ExrApp::comp_sources`]. The `texture` handle is kept purely to own the VRAM
+/// for the source's lifetime — dropping this `CompSource` (on layer removal)
+/// releases it (drop-only free; wgpu reclaims once no bind group is bound). GPU
+/// fields are `None` on the headless / CPU-only path (no `gpu_resources`), where
+/// the model layer is still valid but nothing renders.
+struct CompSource {
+    // Every field is written by `add_comp_source` (PR-B.2) but first *read* by the
+    // composite ping-pong / row controls in PR-B.3–B.4 — hence the item-level
+    // `#[allow(dead_code)]`s (the sanctioned "landed ahead of its consumer" pattern,
+    // #153), not a struct-wide allow that would also mask accidental dead fields.
+    /// Full decode, kept for pixel sampling, AOV metadata, and re-uploads (an AOV
+    /// switch in PR-B.4 rebuilds the texture from this without touching disk).
+    #[allow(dead_code)]
+    exr_data: std::sync::Arc<ExrData>,
+    /// Full-res pixel dimensions of `aov`, for per-layer placement in PR-B.3.
+    #[allow(dead_code)]
+    size: (usize, usize),
+    /// The logical layer (AOV) `bind_group` was built for. A layer whose `aov`
+    /// diverges from this needs a rebuild (PR-B.4); today every source is added at
+    /// AOV 0, so this is always 0.
+    #[allow(dead_code)]
+    aov: usize,
+    /// The layer's GPU bind group (binding0 = texture view, binding1 = sampler,
+    /// under `bind_group_layout_tex`) — directly bindable as `tex_a`/`tex_b` in the
+    /// composite shader. `None` headless. Set together with `texture`.
+    #[allow(dead_code)]
+    bind_group: Option<std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>>,
+    /// Owns the texture's VRAM; not read directly (the bind group holds the view).
+    #[allow(dead_code)]
+    texture: Option<eframe::egui_wgpu::wgpu::Texture>,
+}
+
 /// serde default for `proxy_cache_gb` (#165): the on-disk proxy-cache size budget
 /// in GiB. ~10 GiB ≈ 2.5–5k f16 proxy frames — plenty for a shot, trivial on a
 /// modern disk. A ceiling, LRU-evicted; the actual footprint is only what's cached.
@@ -479,6 +513,17 @@ pub struct ExrApp {
     /// a removed-then-added source can't alias a stale decode/texture (PR-B.2).
     #[serde(skip)]
     comp_next_source: u64,
+    /// Decoded pixels + GPU texture for each Layers-panel source, keyed by the
+    /// `SourceId` its layer references (#99 PR-B.2). Populated by
+    /// [`Self::add_comp_source`] (a synchronous decode-on-add — the panel is a
+    /// paused / cap-6 workflow, so it reuses [`ExrData::load`] rather than the
+    /// A/B decode worker) and consumed by the composite ping-pong (PR-B.3).
+    /// Runtime-only: GPU handles aren't serializable, so PR-B.5 re-decodes each
+    /// source from its persisted path on load. Sources are dropped (freeing VRAM)
+    /// when the last layer referencing them is removed — see
+    /// [`Self::remove_comp_layer`].
+    #[serde(skip)]
+    comp_sources: std::collections::HashMap<crate::layer::SourceId, CompSource>,
 
     /// App-owned GPU core (#54): the single home for the persistent `GpuState`
     /// and the OCIO pass publisher. `None` in the CPU-only path (no wgpu
@@ -660,6 +705,7 @@ impl Default for ExrApp {
             show_layers_panel: false,
             comp_stack: crate::layer::LayerStack::new(),
             comp_next_source: 0,
+            comp_sources: std::collections::HashMap::new(),
             gpu_resources: None,
             ocio_path: String::new(),
             lut_path: String::new(),
@@ -5227,13 +5273,27 @@ impl ExrApp {
         }
     }
 
-    /// Append a source to the Layers-panel stack (#99 PR-B). B.1 registers it as a
-    /// model entry (name + fresh `SourceId`); PR-B.2 decodes `path` into a texture
-    /// keyed by that `SourceId` so the layer actually renders.
+    /// Add a source to the Layers-panel stack (#99 PR-B.2): **decode-on-demand**.
+    /// Synchronously decodes `path` (the panel is a paused, cap-6 workflow, so it
+    /// reuses [`ExrData::load`] directly rather than the A/B decode worker), then —
+    /// when a GPU is present — uploads AOV 0 into a texture keyed by a fresh
+    /// `SourceId` in [`Self::comp_sources`], so the composite ping-pong (PR-B.3)
+    /// can bind it. On a decode error nothing is added; the error surfaces in the
+    /// status bar. Headless (no `gpu_resources`) still registers the model layer +
+    /// pixels, just without a texture.
     fn add_comp_source(&mut self, path: std::path::PathBuf) {
         if self.comp_stack.len() >= COMP_LAYER_CAP {
             return;
         }
+        // Decode first: a failed load must leave the stack untouched (no dangling
+        // layer pointing at a source with no pixels).
+        let exr_data = match ExrData::load(&path) {
+            Ok(d) => std::sync::Arc::new(d),
+            Err(e) => {
+                self.error_msg = Some(format!("Failed to load layer '{}': {e}", path.display()));
+                return;
+            }
+        };
         let name = path
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
@@ -5242,6 +5302,48 @@ impl ExrApp {
         self.comp_next_source += 1;
         self.comp_stack
             .push_image(name, source, 0, crate::layer::Trim::full(0, u32::MAX));
+
+        // Build the GPU texture for AOV 0 (matching `push_image`'s aov). Absent a
+        // GPU device (headless / CPU-only) the source is stored pixels-only.
+        let aov = 0;
+        let size = exr_data.logical_size(aov).unwrap_or((0, 0));
+        let (texture, bind_group) = match self.gpu_resources.as_ref() {
+            Some(gpu) => crate::viewer::ExrViewer::build_source_texture(gpu, &exr_data, aov)
+                .map_or((None, None), |(t, bg)| (Some(t), Some(bg))),
+            None => (None, None),
+        };
+        self.comp_sources.insert(
+            source,
+            CompSource {
+                exr_data,
+                size,
+                aov,
+                bind_group,
+                texture,
+            },
+        );
+    }
+
+    /// Remove a Layers-panel layer and free its source's pixels/VRAM once no other
+    /// layer references it (#99 PR-B.2). A source can be shared by several layers
+    /// (e.g. back-to-beauty AOVs of one file), so its [`CompSource`] is dropped
+    /// only when the last referencing layer goes — dropping it releases the GPU
+    /// texture (drop-only free; wgpu reclaims after the bind group unbinds).
+    fn remove_comp_layer(&mut self, id: crate::layer::LayerId) {
+        // Note the source this layer referenced before removing it.
+        let source = self.comp_stack.get(id).and_then(|l| match &l.source {
+            crate::layer::LayerSource::Image { source, .. } => Some(*source),
+            crate::layer::LayerSource::Adjustment => None,
+        });
+        self.comp_stack.remove(id);
+        // GC the source if the removed layer was its last reference.
+        if let Some(source) = source
+            && !self.comp_stack.iter().any(|l| {
+                matches!(&l.source, crate::layer::LayerSource::Image { source: s, .. } if *s == source)
+            })
+        {
+            self.comp_sources.remove(&source);
+        }
     }
 
     /// The additive **Layers** panel (#99 PR-B): a right dock listing the panel's
@@ -5307,7 +5409,7 @@ impl ExrApp {
                     });
                 }
                 if let Some(id) = remove {
-                    self.comp_stack.remove(id);
+                    self.remove_comp_layer(id);
                 }
             });
     }
@@ -5423,6 +5525,85 @@ mod tests {
             .write()
             .to_file(path)
             .expect("write multi-pass exr fixture");
+    }
+
+    // --- Layers panel: decode-on-add (#99 PR-B.2) ----------------------------
+    // Headless (no `gpu_resources`): the model layer + decoded pixels register,
+    // but no GPU texture is built. The composite-render half is on-device (PR-B.3).
+
+    #[test]
+    fn add_comp_source_decodes_and_registers_a_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("layer.exr");
+        write_rgba_exr(&f);
+
+        let mut app = ExrApp::default();
+        app.add_comp_source(f);
+
+        // One model layer, at AOV 0, referencing source id 0.
+        assert_eq!(app.comp_stack.len(), 1, "layer registered");
+        assert_eq!(app.comp_next_source, 1, "SourceId allocator advanced");
+        let layer = app.comp_stack.iter().next().unwrap();
+        let crate::layer::LayerSource::Image { source, aov } = layer.source else {
+            panic!("expected an image layer");
+        };
+        assert_eq!((source, aov), (crate::layer::SourceId(0), 0));
+
+        // The decoded pixels are stored keyed by that source; no GPU texture
+        // headless, but the model + size are populated.
+        let cs = app.comp_sources.get(&source).expect("source decoded + stored");
+        assert_eq!(cs.size, (2, 2), "2×2 fixture dims");
+        assert_eq!(cs.aov, 0);
+        assert_eq!(cs.exr_data.logical_layers.len(), 1, "beauty layer decoded");
+        assert!(cs.bind_group.is_none(), "no GPU texture headless");
+    }
+
+    #[test]
+    fn add_comp_source_rejects_a_bad_path_without_touching_the_stack() {
+        let mut app = ExrApp::default();
+        // A path that can't decode: nothing is added and the allocator is untouched,
+        // so no layer is left dangling at a source with no pixels.
+        app.add_comp_source(std::path::PathBuf::from("/nonexistent/does-not-exist.exr"));
+        assert!(app.comp_stack.is_empty(), "no layer on decode failure");
+        assert!(app.comp_sources.is_empty(), "no source stored");
+        assert_eq!(app.comp_next_source, 0, "SourceId not consumed");
+        assert!(app.error_msg.is_some(), "error surfaced to the status bar");
+    }
+
+    #[test]
+    fn remove_comp_layer_frees_its_orphaned_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("layer.exr");
+        write_rgba_exr(&f);
+
+        let mut app = ExrApp::default();
+        app.add_comp_source(f);
+        let id = app.comp_stack.iter().next().unwrap().id;
+        let source = crate::layer::SourceId(0);
+        assert!(app.comp_sources.contains_key(&source));
+
+        app.remove_comp_layer(id);
+        assert!(app.comp_stack.is_empty(), "layer removed");
+        assert!(
+            !app.comp_sources.contains_key(&source),
+            "orphaned source freed"
+        );
+        // Ids are never reused, so a re-add can't alias the freed source.
+        assert_eq!(app.comp_next_source, 1, "allocator not rewound");
+    }
+
+    #[test]
+    fn add_comp_source_stops_at_the_layer_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("layer.exr");
+        write_rgba_exr(&f);
+
+        let mut app = ExrApp::default();
+        for _ in 0..(COMP_LAYER_CAP + 2) {
+            app.add_comp_source(f.clone());
+        }
+        assert_eq!(app.comp_stack.len(), COMP_LAYER_CAP, "capped");
+        assert_eq!(app.comp_sources.len(), COMP_LAYER_CAP, "one source per layer");
     }
 
     #[test]
