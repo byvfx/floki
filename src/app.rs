@@ -1524,7 +1524,7 @@ impl ExrApp {
     }
 
     /// The total prefetch window around the playhead (ahead + the #169
-    /// read-behind reservation, split in [`Self::next_want_slot`]) — bounded by
+    /// read-behind reservation, split in [`Self::next_want`]) — bounded by
     /// the T1 ring (`min(configured, max_t1 − 1)`, tying #57 back-pressure to
     /// the #56 budget) and a hard cap so a huge sequence can't queue the world.
     fn prefetch_depth(&self) -> usize {
@@ -1629,12 +1629,29 @@ impl ExrApp {
         self.decode_beauty_only_at(frame, self.playback.current_frame)
     }
 
-    /// Locked-step B (#98) counterpart: same policy, but the settled-precache
-    /// "keep the playhead full" exception measures against B's own current frame
-    /// (B's numbers live in B's range, not A's), so a paused B frame is decoded
-    /// full for correct compare-mode sampling/AOV.
-    fn decode_beauty_only_b(&self, frame: u32) -> bool {
-        self.decode_beauty_only_at(frame, self.b().current_frame)
+    /// A source's current playhead (#99): the master transport for the primary
+    /// (Slot A), else the follower's slaved frame. Drives the per-source cheap-
+    /// decode gate below and the settle checks (each source's "settled playhead" is
+    /// its own frame). `0` for an unknown source (never happens for a live source).
+    fn source_playhead(&self, source: crate::layer::SourceId) -> u32 {
+        if source == Self::A_SOURCE {
+            self.playback.current_frame
+        } else {
+            self.followers.get(&source).map_or(0, |st| st.current_frame)
+        }
+    }
+
+    /// Per-source counterpart of [`Self::decode_beauty_only`] (#99): the
+    /// settled-precache "keep the playhead full" exception measures against the
+    /// source's own current frame (its numbers live in its own range, not A's), so
+    /// a paused compared frame is decoded full for correct compare-mode sampling.
+    /// The primary delegates to its canonical (tested) gate.
+    fn decode_beauty_only_for(&self, source: crate::layer::SourceId, frame: u32) -> bool {
+        if source == Self::A_SOURCE {
+            self.decode_beauty_only(frame)
+        } else {
+            self.decode_beauty_only_at(frame, self.source_playhead(source))
+        }
     }
 
     /// The shared "decode something cheaper while the playhead moves" condition for
@@ -1670,9 +1687,14 @@ impl ExrApp {
         self.decode_proxy_target_at(frame, self.playback.current_frame)
     }
 
-    /// Locked-step B (#98) counterpart of [`Self::decode_proxy_target`].
-    fn decode_proxy_target_b(&self, frame: u32) -> Option<usize> {
-        self.decode_proxy_target_at(frame, self.b().current_frame)
+    /// Per-source counterpart of [`Self::decode_proxy_target`] (#99). The primary
+    /// delegates to its canonical (tested) gate.
+    fn decode_proxy_target_for(&self, source: crate::layer::SourceId, frame: u32) -> Option<usize> {
+        if source == Self::A_SOURCE {
+            self.decode_proxy_target(frame)
+        } else {
+            self.decode_proxy_target_at(frame, self.source_playhead(source))
+        }
     }
 
     /// Decode-ahead pump (#57): with at most one sequence decode outstanding,
@@ -1721,42 +1743,42 @@ impl ExrApp {
         // With followers also playing, T1 holds one resident window per active
         // source, so split the decode-ahead per source (#98/#99) — otherwise A's
         // window alone would fill the budget and starve them. One follower → `/2`.
-        let b_active = self.b().sequence.is_some();
         let depth = full_depth / self.n_active_sources();
 
-        // Priority across the two slots, one job submitted per pump:
-        // P0 awaited playheads (A before B), then P1 prefetch (A before B).
-        // depth 0 asks `next_want` for the playhead only (its P1 slot).
-        for (slot, d) in [
-            (crate::cache::Slot::A, 0),
-            (crate::cache::Slot::B, 0),
-            (crate::cache::Slot::A, depth),
-            (crate::cache::Slot::B, depth),
-        ] {
-            if slot == crate::cache::Slot::B && !b_active {
-                continue;
-            }
-            if let Some(w) = self.next_want_slot(slot, d) {
-                self.submit_seq(slot, w);
-                // Overlap I/O with decode (#164): while the worker decodes `w`,
-                // a background thread pulls the *next* wanted frames' files
-                // through the page cache, so the worker's next read is a
-                // memory-speed pointer walk (the decode maps the file) instead
-                // of a storage stall. Only while a prefetch window is active —
-                // warming on a bare playhead seek would race the user's intent.
-                if depth > 0 {
-                    self.warm_ahead(slot, w, depth);
+        // Ordered sources, one job submitted per pump: the primary (A) first, then
+        // each active follower (deterministic by `SourceId` — `followers` is a
+        // BTreeMap). Two priority passes across all sources: P0 the awaited
+        // playheads (depth 0), then P1 the prefetch window (`depth`) — so a lagging
+        // follower's playhead still beats the primary's prefetch. `depth 0` asks
+        // `next_want` for the playhead only (its P1 slot).
+        let sources: Vec<crate::layer::SourceId> = std::iter::once(Self::A_SOURCE)
+            .chain(self.active_followers().map(|(id, _)| *id))
+            .collect();
+        for d in [0, depth] {
+            for &source in &sources {
+                if let Some(w) = self.next_want(source, d) {
+                    self.submit_seq(source, w);
+                    // Overlap I/O with decode (#164): while the worker decodes `w`,
+                    // a background thread pulls the *next* wanted frames' files
+                    // through the page cache, so the worker's next read is a
+                    // memory-speed pointer walk (the decode maps the file) instead
+                    // of a storage stall. Only while a prefetch window is active —
+                    // warming on a bare playhead seek would race the user's intent.
+                    if depth > 0 {
+                        self.warm_ahead(source, w, depth);
+                    }
+                    return;
                 }
-                return;
             }
         }
     }
 
     /// Queue the next few non-resident frames after `submitted` for background
-    /// file warming (#164) — the same order `next_want_slot` will request them,
-    /// so the warmer stays exactly ahead of the decoder. Best-effort and
-    /// epoch-agnostic: a superseded warm wastes bandwidth, never correctness.
-    fn warm_ahead(&mut self, slot: crate::cache::Slot, submitted: u32, depth: usize) {
+    /// file warming (#164) — the same order `next_want` will request them, so the
+    /// warmer stays exactly ahead of the decoder. Best-effort and epoch-agnostic: a
+    /// superseded warm wastes bandwidth, never correctness. Runs in `source`'s own
+    /// frame space (#99).
+    fn warm_ahead(&mut self, source: crate::layer::SourceId, submitted: u32, depth: usize) {
         /// Files to keep warm ahead of the decoder. One hides the read of the
         /// very next frame; a second gives slack for a fast decode (proxies)
         /// outpacing a slow warm. More would only evict-race the page cache.
@@ -1764,56 +1786,18 @@ impl ExrApp {
         let behind = crate::scheduler::read_behind(depth);
         let ahead = depth - behind;
         let mut resident: std::collections::HashSet<u32> =
-            self.frame_cache.resident_frames(slot).collect();
+            self.frame_cache.resident_frames(source).collect();
         resident.insert(submitted);
-        let wants = match slot {
-            crate::cache::Slot::A => crate::scheduler::want_list(
-                self.playback.current_frame,
-                self.playback.in_point,
-                self.playback.out_point,
-                self.playback.direction,
-                self.playback.loop_mode,
-                &resident,
-                ahead,
-                behind,
-            ),
-            crate::cache::Slot::B => {
-                let Some(seq_b) = self.b().sequence.as_ref() else {
-                    return;
-                };
-                crate::scheduler::want_list(
-                    self.b().current_frame,
-                    seq_b.range.0,
-                    seq_b.range.1,
-                    self.playback.direction,
-                    self.playback.loop_mode,
-                    &resident,
-                    ahead,
-                    behind,
-                )
-            }
-        };
+        let wants = self.want_list_for(source, &resident, ahead, behind);
         for w in wants.into_iter().take(WARM_AHEAD) {
-            let path = match slot {
-                crate::cache::Slot::A => self.playback.frame_path(w).map(Path::to_path_buf),
-                crate::cache::Slot::B => self
-                    .b()
-                    .sequence
-                    .as_ref()
-                    .and_then(|s| s.path_for(w))
-                    .map(Path::to_path_buf),
-            };
-            if let Some(path) = path {
+            if let Some(path) = self.frame_path_for(source, w) {
                 // Skip the read-ahead warm when the on-disk proxy cache (#165)
                 // already holds this frame at the size it would decode: the worker
                 // will hit the cache and never open the source, so pulling it
                 // through the page cache is wasted bandwidth — exactly the
                 // networked-storage cost the cache exists to remove. `contains`
                 // self-gates to `false` when the disk cache is off.
-                let px = match slot {
-                    crate::cache::Slot::A => self.decode_proxy_target(w),
-                    crate::cache::Slot::B => self.decode_proxy_target_b(w),
-                };
+                let px = self.decode_proxy_target_for(source, w);
                 if px.is_some_and(|px| self.proxy_cache.contains(&path, px)) {
                     continue;
                 }
@@ -1822,94 +1806,134 @@ impl ExrApp {
         }
     }
 
-    /// The next frame to fetch for one slot at the given decode-ahead `depth`, or
-    /// `None` if that slot's window is fully resident (#98). A frame we are
-    /// explicitly `pending` on counts as **not** resident even if a *beauty-only*
-    /// copy is cached, so the full all-AOV upgrade on settle still gets submitted
-    /// (INV-SAMPLE, #7; `contains` is fidelity-blind). B runs the same pure
-    /// scheduler in B's own frame space (its range as in/out, its playhead),
-    /// with A's direction / loop.
-    fn next_want_slot(&self, slot: crate::cache::Slot, depth: usize) -> Option<u32> {
+    /// One source's decode-ahead want-list in its own frame space (#99): the
+    /// primary's transport in/out range, else the follower's sequence range; both
+    /// share the master direction / loop. Empty for an inactive / unknown follower.
+    fn want_list_for(
+        &self,
+        source: crate::layer::SourceId,
+        resident: &std::collections::HashSet<u32>,
+        ahead: usize,
+        behind: usize,
+    ) -> Vec<u32> {
+        let (playhead, lo, hi) = if source == Self::A_SOURCE {
+            (
+                self.playback.current_frame,
+                self.playback.in_point,
+                self.playback.out_point,
+            )
+        } else if let Some(st) = self.followers.get(&source) {
+            match st.sequence.as_ref() {
+                Some(seq) => (st.current_frame, seq.range.0, seq.range.1),
+                None => return Vec::new(),
+            }
+        } else {
+            return Vec::new();
+        };
+        crate::scheduler::want_list(
+            playhead,
+            lo,
+            hi,
+            self.playback.direction,
+            self.playback.loop_mode,
+            resident,
+            ahead,
+            behind,
+        )
+    }
+
+    /// The on-disk path of `source`'s frame `w`, or `None` if absent (a hole or an
+    /// inactive follower). Primary → the transport's sequence; follower → its own.
+    fn frame_path_for(&self, source: crate::layer::SourceId, w: u32) -> Option<PathBuf> {
+        if source == Self::A_SOURCE {
+            self.playback.frame_path(w).map(Path::to_path_buf)
+        } else {
+            self.followers
+                .get(&source)
+                .and_then(|st| st.sequence.as_ref())
+                .and_then(|s| s.path_for(w))
+                .map(Path::to_path_buf)
+        }
+    }
+
+    /// Whether `source` has a decodable file for frame `f` — the `next_want`
+    /// path-existence predicate, without `frame_path_for`'s allocation in the hot
+    /// scheduler closure.
+    fn has_source_frame(&self, source: crate::layer::SourceId, f: u32) -> bool {
+        if source == Self::A_SOURCE {
+            self.playback.frame_path(f).is_some()
+        } else {
+            self.followers
+                .get(&source)
+                .and_then(|st| st.sequence.as_ref())
+                .is_some_and(|s| s.path_for(f).is_some())
+        }
+    }
+
+    /// The next frame to fetch for `source` at the given decode-ahead `depth`, or
+    /// `None` if its window is fully resident (#98/#99). A frame we are explicitly
+    /// `pending` on counts as **not** resident even if a *beauty-only* copy is
+    /// cached, so the full all-AOV upgrade on settle still gets submitted
+    /// (INV-SAMPLE, #7; `contains` is fidelity-blind). A follower runs the same pure
+    /// scheduler in its own frame space (its range as in/out, its playhead), with
+    /// the master direction / loop.
+    fn next_want(&self, source: crate::layer::SourceId, depth: usize) -> Option<u32> {
         // Split the window RV-style (#169): ~25% reserved behind the playhead,
         // the rest ahead — so forward window + behind reservation together never
         // over-ask the ring (the #57 back-pressure contract holds for the sum).
         let behind = crate::scheduler::read_behind(depth);
         let ahead = depth - behind;
-        match slot {
-            crate::cache::Slot::A => {
-                let pending = self.playback.pending;
-                crate::scheduler::next_want(
-                    self.playback.current_frame,
-                    self.playback.in_point,
-                    self.playback.out_point,
-                    self.playback.direction,
-                    self.playback.loop_mode,
-                    ahead,
-                    behind,
-                    |f| self.frame_cache.contains(crate::cache::Slot::A, f) && Some(f) != pending,
-                    |f| self.playback.frame_path(f).is_some(),
-                )
-            }
-            crate::cache::Slot::B => {
-                let seq_b = self.b().sequence.as_ref()?;
-                let pending = self.b().pending;
-                crate::scheduler::next_want(
-                    self.b().current_frame,
-                    seq_b.range.0,
-                    seq_b.range.1,
-                    self.playback.direction,
-                    self.playback.loop_mode,
-                    ahead,
-                    behind,
-                    |f| self.frame_cache.contains(crate::cache::Slot::B, f) && Some(f) != pending,
-                    |f| seq_b.path_for(f).is_some(),
-                )
-            }
-        }
+        let (playhead, lo, hi, pending) = if source == Self::A_SOURCE {
+            (
+                self.playback.current_frame,
+                self.playback.in_point,
+                self.playback.out_point,
+                self.playback.pending,
+            )
+        } else {
+            let st = self.followers.get(&source)?;
+            let seq = st.sequence.as_ref()?;
+            (st.current_frame, seq.range.0, seq.range.1, st.pending)
+        };
+        crate::scheduler::next_want(
+            playhead,
+            lo,
+            hi,
+            self.playback.direction,
+            self.playback.loop_mode,
+            ahead,
+            behind,
+            |f| self.frame_cache.contains(source, f) && Some(f) != pending,
+            |f| self.has_source_frame(source, f),
+        )
     }
 
-    /// Submit one sequence decode for `slot` at frame `w` (#98). Tags the job with
-    /// its cache slot via `source` (`slot.into()`), marks it in-flight, and drives
-    /// that slot's "loading" state when it's the awaited playhead.
-    fn submit_seq(&mut self, slot: crate::cache::Slot, w: u32) {
-        let path = match slot {
-            crate::cache::Slot::A => self.playback.frame_path(w).map(Path::to_path_buf),
-            crate::cache::Slot::B => self
-                .b()
-                .sequence
-                .as_ref()
-                .and_then(|s| s.path_for(w))
-                .map(Path::to_path_buf),
-        }
-        .expect("next_want only returns decodable frames");
+    /// Submit one sequence decode for `source` at frame `w` (#98/#99). Tags the job
+    /// with `source`, marks it in-flight, and drives that source's "loading" state
+    /// when it's the awaited playhead.
+    fn submit_seq(&mut self, source: crate::layer::SourceId, w: u32) {
+        let path = self
+            .frame_path_for(source, w)
+            .expect("next_want only returns decodable frames");
         // The awaited playhead drives the "loading" state; prefetch is silent.
-        match slot {
-            crate::cache::Slot::A => {
-                self.inflight.insert(w);
-                if Some(w) == self.playback.pending {
-                    self.loading_a = true;
-                }
+        if source == Self::A_SOURCE {
+            self.inflight.insert(w);
+            if Some(w) == self.playback.pending {
+                self.loading_a = true;
             }
-            crate::cache::Slot::B => {
-                self.b_mut().inflight.insert(w);
-                if Some(w) == self.b().pending {
-                    self.b_mut().loading = true;
-                }
+        } else if let Some(st) = self.followers.get_mut(&source) {
+            st.inflight.insert(w);
+            if Some(w) == st.pending {
+                st.loading = true;
             }
         }
-        let beauty_only = match slot {
-            crate::cache::Slot::A => self.decode_beauty_only(w),
-            crate::cache::Slot::B => self.decode_beauty_only_b(w),
-        };
+        let beauty_only = self.decode_beauty_only_for(source, w);
         // Scrub proxy takes precedence over beauty while moving (#94); `beauty_only`
         // stays as the worker's fallback if the fast proxy read isn't available.
-        let proxy_target = match slot {
-            crate::cache::Slot::A => self.decode_proxy_target(w),
-            crate::cache::Slot::B => self.decode_proxy_target_b(w),
-        };
+        let proxy_target = self.decode_proxy_target_for(source, w);
         self.submit_job(LoadJob {
             path,
-            source: slot.into(),
+            source,
             seq_frame: true,
             frame: w,
             epoch: self.playback.epoch,
@@ -2004,8 +2028,8 @@ impl ExrApp {
         };
         let depth = self.viewer.t2_cap(Self::B_SOURCE).saturating_sub(1);
         // B's want-list in B's own frame space (its range as in/out, its playhead),
-        // sharing A's direction/loop — the same shape `next_want_slot`/`warm_ahead`
-        // use for B. Forward-only (no read-behind), like the A ring.
+        // sharing A's direction/loop — the same shape `next_want`/`warm_ahead` use
+        // for B (cf. `want_list_for`). Forward-only (no read-behind), like the A ring.
         let wants = crate::scheduler::want_list(
             self.b().current_frame,
             range.0,
@@ -2790,10 +2814,10 @@ impl ExrApp {
     /// results (a newer open of a different file superseded this one) by checking
     /// the result path against the currently-requested path for its slot.
     fn apply_load_result(&mut self, res: LoadResult) {
-        // The A/B routing below still forks on slot; derive it from the result's
-        // source (B → the follower slot) until the `_b` state folds to a per-source
-        // map (#99 P1.4).
-        let is_b = res.source == crate::cache::Slot::B.into();
+        // The explicit-open routing below (the non-seq path) still forks A vs B;
+        // derive it from the result's source. Seq-frame routing keys on
+        // `res.source` directly (#99 P1.4c).
+        let is_b = res.source == Self::B_SOURCE;
         // Playback frame (#7): supersession is by **epoch** (#57), not path —
         // sequences recur the same paths under loop/ping-pong/scrub-back, so a
         // stale frame could otherwise be mistaken for the current one. Apply as a
@@ -2804,16 +2828,14 @@ impl ExrApp {
                 self.dbg_dropped_epoch = self.dbg_dropped_epoch.saturating_add(1);
                 return; // a seek/scrub/direction change superseded this decode.
             }
-            // Route by cache slot (#98): `is_b` is the slot for a seq frame.
-            let slot = if is_b {
-                crate::cache::Slot::B
-            } else {
-                crate::cache::Slot::A
-            };
-            match slot {
-                crate::cache::Slot::A => self.inflight.remove(&res.frame),
-                crate::cache::Slot::B => self.b_mut().inflight.remove(&res.frame),
-            };
+            // Route by source (#99): the primary (A) drives the master transport; a
+            // follower decodes under its own `SourceId` into the shared T1 cache.
+            let is_primary = res.source == Self::A_SOURCE;
+            if is_primary {
+                self.inflight.remove(&res.frame);
+            } else if let Some(st) = self.followers.get_mut(&res.source) {
+                st.inflight.remove(&res.frame);
+            }
             // The worker delivered a matching result — record turnaround so the
             // stall watchdog can scale its timeout off real decode cost.
             if let Some(t) = self.decode_submit_at {
@@ -2822,25 +2844,27 @@ impl ExrApp {
             match res.result {
                 Ok(data) => {
                     let arc = std::sync::Arc::new(data);
-                    // Measure one **Slot::A** frame to size the shared cache budget
-                    // (homogeneous seq): B may be a different resolution (#98), so
-                    // sizing off a B frame would mis-size the ring. A full A frame
-                    // seeds `frame_bytes`; a proxy A frame seeds `proxy_bytes` (#94).
-                    if slot == crate::cache::Slot::A {
+                    // Measure one **primary (A)** frame to size the shared cache
+                    // budget (homogeneous seq): a follower may be a different
+                    // resolution (#98), so sizing off its frame would mis-size the
+                    // ring. A full A frame seeds `frame_bytes`; a proxy A frame
+                    // seeds `proxy_bytes` (#94).
+                    if is_primary {
                         if arc.proxy {
                             self.proxy_bytes.get_or_insert_with(|| arc.approx_bytes());
                         } else if !arc.beauty_only {
                             self.frame_bytes.get_or_insert_with(|| arc.approx_bytes());
                         }
                     }
-                    self.frame_cache.insert(slot, res.frame, arc.clone());
+                    self.frame_cache.insert(res.source, res.frame, arc.clone());
                     // A full-res frame landing (the settle upgrade, #94/#56)
                     // replaces a proxy/beauty frame, so its pre-built T2 GPU
                     // texture is now stale — evict it or the viewport keeps binding
-                    // the blurry proxy texture ("stuck in proxy"). Slot::A only (the
-                    // T2 ring is A); fires only for full frames (settle), not the
-                    // proxy/beauty frames decoded while moving.
-                    if slot == crate::cache::Slot::A && !arc.beauty_only {
+                    // the blurry proxy texture ("stuck in proxy"). Primary only for
+                    // now (the compare follower's settle-evict is a follow-up);
+                    // fires only for full frames (settle), not the proxy/beauty
+                    // frames decoded while moving.
+                    if is_primary && !arc.beauty_only {
                         self.viewer.evict_t2_frame(Self::A_SOURCE, res.frame);
                     }
                     // In Loop mode eviction distance follows the play direction
@@ -2848,51 +2872,52 @@ impl ExrApp {
                     // isn't classified "behind" and evicted on arrival (#140).
                     let loop_wrap = (self.playback.loop_mode == crate::playback::LoopMode::Loop)
                         .then_some((self.playback.in_point, self.playback.out_point));
-                    // Protect B's on-screen frame too when it's locked-step (#98).
+                    // Protect every active source's on-screen frame (#98/#99).
                     let playheads = self.cache_playheads();
                     self.dbg_evictions =
                         self.dbg_evictions.saturating_add(self.frame_cache.evict_to(
                             self.frame_cache_cap,
                             &playheads,
-                            crate::cache::Slot::A.into(),
+                            Self::A_SOURCE,
                             self.playback.direction,
                             self.playback.is_playing(),
                             loop_wrap,
                             self.read_behind_depth(),
                         ) as u64);
-                    // Show it only if it's the frame that slot's playhead awaits;
+                    // Show it only if it's the frame that source's playhead awaits;
                     // a prefetched frame ahead of the playhead is just cached.
-                    match slot {
-                        crate::cache::Slot::A if res.frame == self.playback.current_frame => {
+                    if is_primary {
+                        if res.frame == self.playback.current_frame {
                             self.loading_a = false;
                             self.playback.pending = None;
                             self.viewer.set_t2_frame(Self::A_SOURCE, Some(res.frame));
                             self.swap_image_arc(arc, false);
                             self.playback.note_shown(std::time::Instant::now());
                         }
-                        crate::cache::Slot::B if res.frame == self.b().current_frame => {
-                            self.b_mut().loading = false;
-                            self.b_mut().pending = None;
-                            self.swap_b_frame(arc);
+                    } else if res.frame == self.source_playhead(res.source) {
+                        // Follower show — the locked-step B display slot for now.
+                        if let Some(st) = self.followers.get_mut(&res.source) {
+                            st.loading = false;
+                            st.pending = None;
                         }
-                        _ => {}
+                        self.swap_b_frame(arc);
                     }
                     self.error_msg = None;
                 }
                 Err(e) => {
-                    // Clear the awaited state for whichever slot's playhead errored.
-                    match slot {
-                        crate::cache::Slot::A if res.frame == self.playback.current_frame => {
+                    // Clear the awaited state for whichever source's playhead errored.
+                    if is_primary {
+                        if res.frame == self.playback.current_frame {
                             self.loading_a = false;
                             self.playback.pending = None;
                             self.error_msg = Some(e);
                         }
-                        crate::cache::Slot::B if res.frame == self.b().current_frame => {
-                            self.b_mut().loading = false;
-                            self.b_mut().pending = None;
-                            self.error_msg = Some(e);
+                    } else if res.frame == self.source_playhead(res.source) {
+                        if let Some(st) = self.followers.get_mut(&res.source) {
+                            st.loading = false;
+                            st.pending = None;
                         }
-                        _ => {}
+                        self.error_msg = Some(e);
                     }
                 }
             }
