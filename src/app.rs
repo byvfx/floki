@@ -2899,12 +2899,21 @@ impl ExrApp {
                             self.playback.note_shown(std::time::Instant::now());
                         }
                     } else if res.frame == self.source_playhead(res.source) {
-                        // Follower show — the locked-step B display slot for now.
+                        // The awaited follower frame landed (already in the T1 cache,
+                        // inserted above). Clear its wait state. The **B** compare
+                        // follower also drives the reference display slot
+                        // (`swap_b_frame`); a comp follower (#99 Phase 2) has no
+                        // display slot — `draw_comp_central` binds it from the cache —
+                        // so just nudge a repaint so the new frame paints.
                         if let Some(st) = self.followers.get_mut(&res.source) {
                             st.loading = false;
                             st.pending = None;
                         }
-                        self.swap_b_frame(arc);
+                        if res.source == Self::B_SOURCE {
+                            self.swap_b_frame(arc);
+                        } else if let Some(ctx) = &self.repaint_ctx {
+                            ctx.request_repaint();
+                        }
                     }
                     self.error_msg = None;
                 }
@@ -5422,10 +5431,20 @@ impl ExrApp {
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "layer".to_string());
+
+        // Detect whether the file is part of an image sequence (#99 Phase 2). A
+        // sequence source becomes a decoding **follower** on the shared playhead,
+        // and its layer's `Trim` spans the sequence range (blank outside it); a
+        // lone still keeps the all-frames trim and its single decoded texture.
+        let sequence = crate::sequence::detect_from_file(&path);
+        let trim = match &sequence {
+            Some(seq) => crate::layer::Trim::full(seq.range.0, seq.range.1),
+            None => crate::layer::Trim::full(0, u32::MAX),
+        };
+
         let source = crate::layer::SourceId(self.comp_next_source);
         self.comp_next_source += 1;
-        self.comp_stack
-            .push_image(name, source, 0, crate::layer::Trim::full(0, u32::MAX));
+        self.comp_stack.push_image(name, source, 0, trim);
 
         // Build the GPU texture for AOV 0 (matching `push_image`'s aov). Absent a
         // GPU device (headless / CPU-only) the source is stored pixels-only.
@@ -5436,6 +5455,24 @@ impl ExrApp {
                 .map_or((None, None), |(t, bg)| (Some(t), Some(bg))),
             None => (None, None),
         };
+
+        // A sequence source: register a follower so the shared decode pump / T1
+        // cache / eviction treat it like the A/B slots, and seed the cache with the
+        // opened frame (its full decode) for an instant first hit — mirrors
+        // `detect_sequence`. Stills register no follower (nothing to play).
+        if let Some(seq) = sequence {
+            let cf = seq.number_of(&path).unwrap_or(seq.range.0);
+            self.frame_cache.insert(source, cf, exr_data.clone());
+            self.followers.insert(
+                source,
+                SourceState {
+                    sequence: Some(seq),
+                    current_frame: cf,
+                    ..Default::default()
+                },
+            );
+        }
+
         self.comp_sources.insert(
             source,
             CompSource {
@@ -5501,6 +5538,12 @@ impl ExrApp {
             })
         {
             self.comp_sources.remove(&source);
+            // A sequence comp source is also a decode follower (#99 Phase 2): drop
+            // its follower state and every cached frame so a removed-then-re-added
+            // source can't hit a stale follower / cache entry. No-op for a still
+            // (no follower registered).
+            self.followers.remove(&source);
+            self.frame_cache.clear_slot(source);
         }
     }
 
@@ -6005,6 +6048,68 @@ mod tests {
             app.comp_next_source,
             COMP_SOURCE_BASE + 1,
             "allocator not rewound"
+        );
+    }
+
+    #[test]
+    fn add_comp_source_registers_a_sequence_follower() {
+        // A numbered file is detected as a sequence: the comp source becomes a
+        // decode follower on the shared playhead (#99 Phase 2), its layer's Trim
+        // spans the sequence range, and the opened frame is seeded into the T1
+        // cache under the comp source id — never the A/B slots.
+        let (_dir, paths) = write_sequence(5);
+        let mut app = ExrApp::default();
+        app.add_comp_source(paths[0].clone());
+
+        let source = crate::layer::SourceId(COMP_SOURCE_BASE);
+        let layer = app.comp_stack.iter().next().unwrap();
+        assert_eq!(
+            (layer.trim.in_point, layer.trim.out_point),
+            (1, 5),
+            "trim spans the detected sequence range, not the still's all-frames trim"
+        );
+
+        let f = app
+            .followers
+            .get(&source)
+            .expect("sequence source registered as a follower");
+        assert!(
+            f.sequence.is_some(),
+            "follower carries the detected sequence"
+        );
+        assert_eq!(
+            f.current_frame, 1,
+            "follower opens on the sequence's frame 1"
+        );
+
+        assert!(
+            app.frame_cache.contains(source, 1),
+            "opened frame seeded under the comp source id"
+        );
+        assert!(
+            !app.frame_cache.contains(ExrApp::A_SOURCE, 1)
+                && !app.frame_cache.contains(ExrApp::B_SOURCE, 1),
+            "comp frame must not land in the A/B slots"
+        );
+    }
+
+    #[test]
+    fn add_comp_source_still_registers_no_follower() {
+        // A lone (unnumbered) file stays a still: no follower, nothing to play.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("still.exr");
+        write_rgba_exr(&f);
+        let mut app = ExrApp::default();
+        app.add_comp_source(f);
+
+        let source = crate::layer::SourceId(COMP_SOURCE_BASE);
+        assert!(
+            !app.followers.contains_key(&source),
+            "a still registers no decode follower"
+        );
+        assert!(
+            app.comp_sources.contains_key(&source),
+            "the still source is still stored (its single texture)"
         );
     }
 
