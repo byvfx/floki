@@ -534,6 +534,11 @@ pub struct OcioCallback {
     /// the prior accumulation as `tex_b`) instead of the single-pass loop. Set for the
     /// `Composite` arrangement; false for single / wipe / side-by-side.
     pub accumulate: bool,
+    /// OCIO-off (#99 render-unify R2): run the config-independent display-encode
+    /// pass (scene-linear → sRGB, `GpuState::display_encode_pipeline`) in pass 2's
+    /// slot instead of the OCIO transform, so the layer-stack composite renders
+    /// with OCIO disabled. When false this is the normal OCIO display path.
+    pub use_display_encode: bool,
     pub display_format: wgpu::TextureFormat,
     pub blit_uniforms: crate::gpu::BlitUniforms,
     /// Visible image bounds in egui points (xmin, ymin, xmax, ymax). The OCIO transform is
@@ -604,21 +609,24 @@ impl eframe::egui_wgpu::CallbackTrait for OcioCallback {
             );
         }
 
-        // The OCIO pass may not exist yet (config not loaded); nothing to do then.
-        if callback_resources.get::<OcioGpuPass>().is_none() {
+        // OCIO pass 2 needs the OCIO display transform; if the config isn't loaded
+        // there's nothing to do — UNLESS we're rendering the OCIO-off composite
+        // (R2), whose display stage is the config-independent display-encode pass.
+        if !self.use_display_encode && callback_resources.get::<OcioGpuPass>().is_none() {
             return Vec::new();
         }
 
-        // If OcioTargets was just (re)created, initialize the cached scene
-        // bind group now that we know OcioGpuPass exists. This avoids
-        // recreating it every dirty frame in `render`.
+        // If OcioTargets was just (re)created, initialize the cached scene bind
+        // group for OCIO pass 2 now that we know OcioGpuPass exists. Skipped on the
+        // display-encode path, which builds its own scene input (a different layout).
         //
         // Clone the layout + sampler out of `OcioGpuPass` first (wgpu types are
         // cheaply `Arc`-backed) so we don't hold an immutable borrow of
         // `callback_resources` while taking a mutable one for `OcioTargets`.
-        let scene_bg_missing = callback_resources
-            .get::<OcioTargets>()
-            .is_some_and(|t| t.scene_bind_group.is_none());
+        let scene_bg_missing = !self.use_display_encode
+            && callback_resources
+                .get::<OcioTargets>()
+                .is_some_and(|t| t.scene_bind_group.is_none());
         if scene_bg_missing {
             let (layout, sampler) = {
                 let Some(ocio) = callback_resources.get::<OcioGpuPass>() else {
@@ -642,15 +650,17 @@ impl eframe::egui_wgpu::CallbackTrait for OcioCallback {
         }
 
         let cmd = {
-            let (Some(gpu), Some(ocio), Some(targets)) = (
+            let (Some(gpu), Some(targets)) = (
                 callback_resources
                     .get::<std::sync::Arc<GpuState>>()
                     .map(std::sync::Arc::as_ref),
-                callback_resources.get::<OcioGpuPass>(),
                 callback_resources.get::<OcioTargets>(),
             ) else {
                 return Vec::new();
             };
+            // Pass 2 is the OCIO transform when OCIO is active; on the display-encode
+            // path (R2) it's absent and `gpu.display_encode_pipeline` is used instead.
+            let ocio = callback_resources.get::<OcioGpuPass>();
 
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("OCIO"),
@@ -753,15 +763,60 @@ impl eframe::egui_wgpu::CallbackTrait for OcioCallback {
                     [cx, cy, cw, ch]
                 })
                 .filter(|[_, _, sw, sh]| *sw > 0 && *sh > 0);
-            ocio.render(
-                &mut encoder,
-                &targets.display_view,
-                targets
-                    .scene_bind_group
-                    .as_ref()
-                    .expect("scene_bind_group initialized in prepare()"),
-                scissor,
-            );
+            if self.use_display_encode {
+                // OCIO-off (R2): sRGB-encode the scene-linear accumulate into the
+                // display target with the config-independent display-encode pipeline,
+                // then the blit garnishes it exactly like the OCIO path.
+                let scene_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("display-encode scene input"),
+                    layout: &gpu.bind_group_layout_tex,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&targets.scene_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(&gpu.sampler),
+                        },
+                    ],
+                });
+                let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("display-encode (OCIO-off)"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &targets.display_view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                if let Some([x, y, sw, sh]) = scissor {
+                    rp.set_scissor_rect(x, y, sw, sh);
+                }
+                rp.set_pipeline(&gpu.display_encode_pipeline);
+                rp.set_bind_group(0, &scene_bg, &[]);
+                rp.draw(0..3, 0..1);
+            } else {
+                let Some(ocio) = ocio else {
+                    return Vec::new();
+                };
+                ocio.render(
+                    &mut encoder,
+                    &targets.display_view,
+                    targets
+                        .scene_bind_group
+                        .as_ref()
+                        .expect("scene_bind_group initialized in prepare()"),
+                    scissor,
+                );
+            }
 
             encoder.finish()
         };

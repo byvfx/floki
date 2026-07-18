@@ -387,6 +387,12 @@ struct DrawCtx<'a> {
     /// Whether OCIO is active — draws accumulate into `ocio_draws` instead of
     /// emitting a per-call callback.
     ocio_active: bool,
+    /// Force the accumulate path even when OCIO is off (#99 render-unify R2). The
+    /// layer-stack composite always folds through the scene ping-pong (all blend
+    /// modes need it); with OCIO off the callback's display stage is the sRGB
+    /// display-encode pass instead of the OCIO transform. `false` for the A/B path,
+    /// which uses the direct non-OCIO draw when OCIO is off.
+    force_accumulate: bool,
     /// Ring allocator, bumped by each draw (below the reserved offscreen slot).
     uniform_offset: std::cell::Cell<u32>,
     /// Overscan dim factor for the next draw (`1.0` = none); set per branch.
@@ -439,20 +445,19 @@ impl DrawCtx<'_> {
         // + `OcioCallback::accumulate`), whose `tex_b` is the screen-sized scene
         // accumulation. Flag it so the shader samples `tex_b` at screen coords, not the
         // image-local uv. The non-OCIO single-pass composite keeps `tex_b` as an image (0).
-        u.composite_accum = if is_composite && self.ocio_active {
-            1
-        } else {
-            0
-        };
+        // The accumulate path (OCIO on, or forced for the OCIO-off composite, R2).
+        let accumulate = self.ocio_active || self.force_accumulate;
+        u.composite_accum = if is_composite && accumulate { 1 } else { 0 };
 
-        // OCIO path: pass 1 must emit scene-linear, so bypass the built-in
-        // display chain (sRGB/gamma/.cube LUT). Exposure stays (linear).
-        if self.ocio_active {
+        // Accumulate pass 1 must emit scene-linear, so bypass the built-in display
+        // chain (sRGB/gamma/.cube LUT) — the display stage (OCIO transform, or the
+        // sRGB display-encode when OCIO is off) applies it after. Exposure stays.
+        if accumulate {
             u.srgb = 0;
             u.gamma = 1.0;
             u.enable_lut = 0;
-            // Don't bake the checker into scene-linear; it's composited
-            // in display space (blit pass) after the OCIO transform.
+            // Don't bake the checker into scene-linear; it's composited in display
+            // space (blit pass) after the display stage.
             u.skip_checker = 1;
         }
 
@@ -512,7 +517,7 @@ impl DrawCtx<'_> {
         // Diff is a false-color heat-map visualization (display-space,
         // not color-managed), so it always uses the normal pipeline —
         // even under OCIO it is NOT accumulated into the OCIO pass.
-        if self.ocio_active && !is_diff {
+        if accumulate && !is_diff {
             // Fold this draw's inputs (uniform bytes + texture pointers) into
             // the per-frame render signature; OcioCallback re-renders only
             // when this changes.
@@ -3313,6 +3318,7 @@ impl ExrViewer {
             active_lut_bg: lut_bg_opt.unwrap_or_else(|| gpu_state.default_lut_bind_group.clone()),
             default_tex_bg: gpu_state.default_tex_bind_group.clone(),
             ocio_active: self.ocio_active,
+            force_accumulate: true,
             uniform_offset: std::cell::Cell::new(0u32),
             overscan_factor: std::cell::Cell::new(1.0f32),
             neutral_view_ops: std::cell::Cell::new(false),
@@ -3351,10 +3357,8 @@ impl ExrViewer {
 
         let ocio_draws = std::mem::take(&mut *ctx.ocio_draws.borrow_mut());
         if ocio_draws.is_empty() {
-            // Non-OCIO / no accumulate path: the N-layer composite needs an offscreen
-            // ping-pong the non-OCIO surface path doesn't have yet (the "OCIO-off
-            // display pass" follow-up). The caller only reaches here under OCIO, so
-            // this is just a guard.
+            // `force_accumulate` means every drawable layer accumulated; empty here
+            // only if `draws` had no bindable layer — nothing to composite.
             return;
         }
         let blit_uniforms = crate::gpu::BlitUniforms {
@@ -3381,6 +3385,8 @@ impl ExrViewer {
         let callback = crate::gpu::ocio_pass::OcioCallback {
             draws: ocio_draws,
             accumulate: true,
+            // OCIO off → the display stage is the sRGB display-encode pass (R2).
+            use_display_encode: !self.ocio_active,
             display_format: render_state.target_format,
             blit_uniforms,
             scissor_pts,
@@ -3435,6 +3441,7 @@ impl ExrViewer {
             active_lut_bg: lut_bg_opt.unwrap_or_else(|| gpu_state.default_lut_bind_group.clone()),
             default_tex_bg: gpu_state.default_tex_bind_group.clone(),
             ocio_active: self.ocio_active,
+            force_accumulate: false,
             uniform_offset: std::cell::Cell::new(0u32),
             overscan_factor: std::cell::Cell::new(1.0f32),
             neutral_view_ops: std::cell::Cell::new(false),
@@ -3548,6 +3555,9 @@ impl ExrViewer {
                         // Composite folds its draws through the scene ping-pong; every
                         // other arrangement renders its draws in the single pass-1 loop.
                         accumulate: program.is_composite,
+                        // The A/B path emits this callback only under OCIO, so it always
+                        // takes the OCIO display transform, never the display-encode pass.
+                        use_display_encode: false,
                         display_format,
                         blit_uniforms,
                         scissor_pts,

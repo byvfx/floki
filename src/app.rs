@@ -5930,8 +5930,10 @@ impl ExrApp {
             });
         }
 
-        if self.viewer.ocio_active
-            && !draws.is_empty()
+        // The composite renders in any color mode (#99 R2): OCIO on → the OCIO
+        // display transform; OCIO off → the sRGB display-encode pass. Only a GPU
+        // and a drawable layer are required.
+        if !draws.is_empty()
             && let Some(gpu) = self.gpu_resources.as_ref()
         {
             let lut = self.lut_bg.clone();
@@ -5940,8 +5942,6 @@ impl ExrApp {
         } else {
             let msg = if self.gpu_resources.is_none() {
                 "No GPU: the compositing viewport is unavailable."
-            } else if !self.viewer.ocio_active {
-                "Enable OCIO (Color Management) to view the layer composite."
             } else {
                 "Add a source to the Layers panel to begin."
             };
