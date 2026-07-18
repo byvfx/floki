@@ -321,10 +321,21 @@ pub struct OcioTargets {
     /// `OcioGpuPass::init_scene_bind_group` and reused — eliminates a
     /// per-dirty-frame `create_bind_group`.
     scene_bind_group: Option<wgpu::BindGroup>,
+    /// Second scene-linear target for the layer-stack accumulate ping-pong (#99).
+    /// The composite folds bottom→top through the `[scene_view, scene_view_b]` pair;
+    /// the parity `start=(N-1)%2` is chosen so the final accumulation always lands
+    /// back in `scene_view`, leaving pass 2 + the blit (which read `scene_view`)
+    /// untouched. Unused by the single-pass path (single / wipe / side-by-side).
+    scene_view_b: wgpu::TextureView,
+    /// Pipeline-linear group-1 bind groups binding each scene target as `tex_b`, so
+    /// an accumulate draw can read the prior accumulation. `[0]`=`scene_view`,
+    /// `[1]`=`scene_view_b`.
+    accum_tex_bg: [wgpu::BindGroup; 2],
     /// `render_sig` of the content currently in `display_view`; lets `prepare` skip the
     /// two passes when nothing changed. `None` after (re)creation forces a first render.
     last_render_sig: Option<u64>,
     _scene: wgpu::Texture,
+    _scene_b: wgpu::Texture,
     _display: wgpu::Texture,
 }
 
@@ -346,6 +357,7 @@ impl Drop for OcioTargets {
         // drop-only like T2 eviction — a destroy of an in-flight texture aborts
         // the submit on Vulkan (see the note at viewer.rs `T2Texture`).
         self._scene.destroy();
+        self._scene_b.destroy();
         self._display.destroy();
     }
 }
@@ -382,11 +394,14 @@ impl OcioTargets {
         }));
     }
 
+    #[allow(clippy::too_many_arguments)] // offscreen targets need the full GPU context
     fn new(
         device: &wgpu::Device,
         blit_layout: &wgpu::BindGroupLayout,
         blit_sampler: &wgpu::Sampler,
         bg_gradient_view: &wgpu::TextureView,
+        tex_layout: &wgpu::BindGroupLayout,
+        tex_sampler: &wgpu::Sampler,
         width: u32,
         height: u32,
         display_format: wgpu::TextureFormat,
@@ -396,17 +411,23 @@ impl OcioTargets {
             height,
             depth_or_array_layers: 1,
         };
-        let scene = device.create_texture(&wgpu::TextureDescriptor {
+        // Rgba16Float scene targets: half the bandwidth of 32F, ample range for viewing.
+        // Must match `GpuState::pipeline_linear`'s color target format in gpu/mod.rs. The
+        // second (`scene_b`) is the layer-stack accumulate ping-pong partner (#99).
+        let scene_desc = wgpu::TextureDescriptor {
             label: Some("OCIO scene-linear target"),
             size: extent,
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            // Rgba16Float: half the bandwidth of 32F, ample range for viewing. Must match
-            // `GpuState::pipeline_linear`'s color target format in gpu/mod.rs.
             format: wgpu::TextureFormat::Rgba16Float,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
+        };
+        let scene = device.create_texture(&scene_desc);
+        let scene_b = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("OCIO scene-linear target B (accumulate)"),
+            ..scene_desc
         });
         let display = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("OCIO display target"),
@@ -419,7 +440,26 @@ impl OcioTargets {
             view_formats: &[],
         });
         let scene_view = scene.create_view(&wgpu::TextureViewDescriptor::default());
+        let scene_view_b = scene_b.create_view(&wgpu::TextureViewDescriptor::default());
         let display_view = display.create_view(&wgpu::TextureViewDescriptor::default());
+        // Bind each scene target as `tex_b` for the accumulate ping-pong; nearest,
+        // non-filtering sampler (the scene target is sampled 1:1 at screen resolution).
+        let accum_tex_bg = [&scene_view, &scene_view_b].map(|view| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("OCIO accumulate tex_b bind group"),
+                layout: tex_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(tex_sampler),
+                    },
+                ],
+            })
+        });
         let blit_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("OCIO blit uniform buffer"),
             size: std::mem::size_of::<crate::gpu::BlitUniforms>() as u64,
@@ -456,12 +496,15 @@ impl OcioTargets {
             width,
             height,
             scene_view,
+            scene_view_b,
+            accum_tex_bg,
             display_view,
             blit_bind_group,
             blit_uniform_buffer,
             scene_bind_group: None,
             last_render_sig: None,
             _scene: scene,
+            _scene_b: scene_b,
             _display: display,
         }
     }
@@ -486,6 +529,11 @@ pub struct OcioPass1Draw {
 /// display-space checker and overscan dim from `blit_uniforms`.
 pub struct OcioCallback {
     pub draws: Vec<OcioPass1Draw>,
+    /// When true, `draws` are a bottom→top layer-stack composite: pass 1 folds them
+    /// through the `scene`/`scene_b` ping-pong (each draw its own render pass, reading
+    /// the prior accumulation as `tex_b`) instead of the single-pass loop. Set for the
+    /// `Composite` arrangement; false for single / wipe / side-by-side.
+    pub accumulate: bool,
     pub display_format: wgpu::TextureFormat,
     pub blit_uniforms: crate::gpu::BlitUniforms,
     /// Visible image bounds in egui points (xmin, ymin, xmax, ymax). The OCIO transform is
@@ -515,7 +563,7 @@ impl eframe::egui_wgpu::CallbackTrait for OcioCallback {
             .get::<OcioTargets>()
             .is_none_or(|t| t.width != w || t.height != h);
         if need_new {
-            let (blit_layout, blit_sampler, bg_gradient_view) = {
+            let (blit_layout, blit_sampler, bg_gradient_view, tex_layout, tex_sampler) = {
                 let Some(gpu) = callback_resources.get::<std::sync::Arc<GpuState>>() else {
                     return Vec::new();
                 };
@@ -525,6 +573,8 @@ impl eframe::egui_wgpu::CallbackTrait for OcioCallback {
                     gpu.blit_sampler.clone(),
                     gpu.bg_gradient_texture
                         .create_view(&wgpu::TextureViewDescriptor::default()),
+                    gpu.bind_group_layout_tex.clone(),
+                    gpu.sampler.clone(),
                 )
             };
             let targets = OcioTargets::new(
@@ -532,6 +582,8 @@ impl eframe::egui_wgpu::CallbackTrait for OcioCallback {
                 &blit_layout,
                 &blit_sampler,
                 &bg_gradient_view,
+                &tex_layout,
+                &tex_sampler,
                 w,
                 h,
                 self.display_format,
@@ -604,27 +656,73 @@ impl eframe::egui_wgpu::CallbackTrait for OcioCallback {
                 label: Some("OCIO"),
             });
 
-            // Pass 1: composite + exposure into scene-linear (uniforms set srgb=0/gamma=1/lut=0/
-            // skip_checker=1). Each draw maps its own rect via the vertex shader, so two
-            // side-by-side draws land in their sub-rects within the one offscreen. Alpha is
-            // cleared to a negative sentinel: the blit treats scene_a < 0 as "no image" so the
-            // checker only shows under drawn pixels (matching the non-OCIO path).
-            {
+            // The α=−1 no-image sentinel clear: the blit treats scene_a < 0 as "no image"
+            // so the checker only shows under drawn pixels (matching the non-OCIO path).
+            let clear = wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: -1.0,
+                }),
+                store: wgpu::StoreOp::Store,
+            };
+
+            if self.accumulate && !self.draws.is_empty() {
+                // Pass 1 (layer-stack accumulate, #99): fold the draws bottom→top through
+                // the scene ping-pong. Each draw is its own render pass so the prior
+                // accumulation can be sampled as `tex_b` (a read-after-write across passes,
+                // barriered by wgpu). The bottom draw is `is_composite=0` (a copy over the
+                // clear); every draw above binds the prior accumulation as `tex_b` and its
+                // uniforms carry `is_composite=1` + `composite_accum=1` (screen-normalized
+                // tex_b sampling). Parity `start=(N-1)%2` lands the final accumulation in
+                // `scene_view`, so pass 2 + the blit are untouched.
+                //
+                // Correct while all layers share one image rect (today's A/B compare); a
+                // layer smaller than the frame would clear the accumulation outside its rect
+                // — differing per-layer rects land with the N-way panel (PR-B).
+                let n = self.draws.len();
+                let start = (n - 1) % 2;
+                let scene_views = [&targets.scene_view, &targets.scene_view_b];
+                for (i, d) in self.draws.iter().enumerate() {
+                    let dst = (i + start) % 2;
+                    let tex_b: &wgpu::BindGroup = if i == 0 {
+                        d.bg_b.as_ref() // unused: bottom draw is is_composite=0
+                    } else {
+                        &targets.accum_tex_bg[(i - 1 + start) % 2]
+                    };
+                    let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("OCIO pass 1 (accumulate)"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: scene_views[dst],
+                            resolve_target: None,
+                            depth_slice: None,
+                            ops: clear,
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    rp.set_viewport(0.0, 0.0, w as f32, h as f32, 0.0, 1.0);
+                    rp.set_pipeline(&gpu.pipeline_linear);
+                    rp.set_bind_group(0, d.bg_a.as_ref(), &[]);
+                    rp.set_bind_group(1, tex_b, &[]);
+                    rp.set_bind_group(2, &gpu.uniform_bind_group, &[d.uniform_offset]);
+                    rp.set_bind_group(3, d.lut_bg.as_ref(), &[]);
+                    rp.draw(0..6, 0..1);
+                }
+            } else {
+                // Pass 1 (single-pass): composite + exposure into scene-linear in one pass.
+                // Each draw maps its own rect via the vertex shader, so two side-by-side
+                // draws land in their sub-rects within the one offscreen.
                 let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("OCIO pass 1 (scene-linear)"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: &targets.scene_view,
                         resolve_target: None,
                         depth_slice: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color {
-                                r: 0.0,
-                                g: 0.0,
-                                b: 0.0,
-                                a: -1.0,
-                            }),
-                            store: wgpu::StoreOp::Store,
-                        },
+                        ops: clear,
                     })],
                     depth_stencil_attachment: None,
                     timestamp_writes: None,
@@ -1184,5 +1282,734 @@ mod metal_tests {
             "transparent covered texel should show the checker (got {:?})",
             &px[8..12]
         );
+    }
+
+    // Decode one IEEE-754 binary16 (half) into f32. `pipeline_linear` renders into
+    // an Rgba16Float target, so the accumulate readback is half-float; there's no
+    // `half` crate in the dep tree. Only the finite range the test exercises needs
+    // to be exact — subnormals / inf / nan are handled for completeness.
+    fn f16_to_f32(h: u16) -> f32 {
+        let sign = if (h >> 15) & 1 == 1 { -1.0 } else { 1.0 };
+        let exp = ((h >> 10) & 0x1f) as i32;
+        let mant = (h & 0x3ff) as f32;
+        let mag = if exp == 0 {
+            mant * 2f32.powi(-24) // subnormal: mant * 2^-24
+        } else if exp == 0x1f {
+            if mant == 0.0 { f32::INFINITY } else { f32::NAN }
+        } else {
+            (1.0 + mant / 1024.0) * 2f32.powi(exp - 15)
+        };
+        sign * mag
+    }
+
+    // The shader's premultiplied-alpha blend switch (shader.wgsl:214-249),
+    // transcribed as the *independent* CPU reference the on-device accumulate test
+    // asserts against — no such helper exists elsewhere in the tree (the
+    // shader.wgsl:213 comment names a `generate_composite_texture` that doesn't
+    // exist). `layer` is `color_a` (the incoming top layer), `accum` is `color_b`
+    // (the running accumulation below it). Keep in lockstep with `BlendMode::as_u32`
+    // (Over=0, Under=1, Add=2, Multiply=3, Screen=4).
+    fn cpu_blend(layer: [f32; 4], accum: [f32; 4], blend: u32) -> [f32; 4] {
+        let [ar, ag, ab, aa] = layer;
+        let [br, bg, bb, ba] = accum;
+        match blend {
+            1 => [
+                br + ar * (1.0 - ba),
+                bg + ag * (1.0 - ba),
+                bb + ab * (1.0 - ba),
+                ba + aa * (1.0 - ba),
+            ], // Under: B over A
+            2 => [ar + br, ag + bg, ab + bb, (aa + ba).min(1.0)], // Add
+            3 => [ar * br, ag * bg, ab * bb, aa],                 // Multiply (alpha = layer's)
+            4 => [
+                ar + br - ar * br,
+                ag + bg - ag * bg,
+                ab + bb - ab * bb,
+                aa + ba - aa * ba,
+            ], // Screen
+            _ => [
+                ar + br * (1.0 - aa),
+                ag + bg * (1.0 - aa),
+                ab + bb * (1.0 - aa),
+                aa + ba * (1.0 - aa),
+            ], // Over: A over B
+        }
+    }
+
+    // Neutral scene-linear "accumulate pass" uniforms: every display/exposure knob
+    // that would bake into the offscreen is zeroed (srgb=0, gamma=1, enable_lut=0,
+    // channel=RGB, skip_checker=1 so the real alpha — not the checker/opacity — is
+    // emitted). Exposure is a parameter only so the second assertion can prove the
+    // *global* exposure stage is a clean post-composite multiply; the accumulate
+    // itself always passes exposure=0.
+    #[allow(clippy::too_many_arguments)] // exercises the full accumulate uniform surface
+    fn accum_uniforms(
+        rect_min: [f32; 2],
+        rect_max: [f32; 2],
+        screen: [f32; 2],
+        is_composite: u32,
+        blend: u32,
+        composite_accum: u32,
+        exposure: f32,
+    ) -> crate::gpu::Uniforms {
+        crate::gpu::Uniforms {
+            rect_min,
+            rect_max,
+            screen_size: screen,
+            wipe_center: [0.0, 0.0],
+            display_min: rect_min,
+            display_max: rect_max,
+            exposure,
+            gamma: 1.0,
+            diff_multiplier: 1.0,
+            opacity: 1.0,
+            wipe_angle: 0.0,
+            channel_mode: 0,
+            is_diff_mode: 0,
+            srgb: 0,
+            enable_lut: 0,
+            is_composite,
+            blend_mode: blend,
+            is_wipe_mode: 0,
+            skip_checker: 1,
+            diff_metric: 0,
+            diff_floor: 0.0,
+            overscan_factor: 1.0,
+            lut_domain_min: [0.0, 0.0, 0.0, 0.0],
+            lut_domain_max: [1.0, 1.0, 1.0, 1.0],
+            bg_checker_dark: [0.1, 0.1, 0.1, 0.0],
+            bg_checker_light: [0.2, 0.2, 0.2, 0.0],
+            bg_solid: [0.18, 0.18, 0.18, 0.0],
+            bg_mode: 0,
+            bg_grad_angle: 0.0,
+            bg_checker_size: 16.0,
+            composite_accum,
+        }
+    }
+
+    // PR-A.2 (compositing layer stack, #99): the accumulate render seam validated
+    // end-to-end on the platform GPU — the plan's highest-risk item (ping-pong
+    // blend correctness in scene-linear premultiplied alpha). Builds a real
+    // bottom→top layer stack, composites it by ping-ponging through
+    // `pipeline_linear` exactly as the layer-stack render will (bottom layer
+    // `is_composite=0` over the sentinel clear; each layer above binds the prior
+    // accumulation as `tex_b`, itself as `tex_a`, `is_composite=1`,
+    // `blend_mode=layer.blend`), reads the Rgba16Float result back, and asserts it
+    // against the independent CPU reference above. Semi-transparent layers make the
+    // (1 - alpha) coverage terms and operand order (layer over accum) observable.
+    //
+    // Second assertion: a global exposure applied as a *post-composite* pass is a
+    // clean 2^EV multiply on rgb (alpha unchanged). Exposure must live in that
+    // global stage, not in the per-layer accumulate — it isn't a global operation
+    // once Multiply/Screen are in the stack.
+    #[test]
+    fn accumulate_composite_on_device() {
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let adapter = match pollster::block_on(
+            instance.request_adapter(&wgpu::RequestAdapterOptions::default()),
+        ) {
+            Ok(a) => a,
+            Err(_) => {
+                eprintln!("no GPU adapter available; skipping on-device accumulate test");
+                return;
+            }
+        };
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("accumulate-test-device"),
+            required_features: wgpu::Features::FLOAT32_FILTERABLE,
+            ..Default::default()
+        }))
+        .expect("request_device");
+
+        // Rgba8Unorm surface format is irrelevant here — we only drive `pipeline_linear`
+        // (Rgba16Float offscreen) and reuse GpuState's real bind-group layouts, ring
+        // uniform buffer, and default tex/LUT bind groups.
+        let gpu = GpuState::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
+
+        // Bottom→top premultiplied scene-linear stack (rgb <= alpha), all
+        // semi-transparent. The bottom layer's blend is unused (drawn is_composite=0);
+        // the layers above exercise the three blends the plan calls highest-risk.
+        use crate::viewer::BlendMode;
+        let layers: [([f32; 4], u32); 4] = [
+            ([0.20, 0.10, 0.05, 0.50], BlendMode::Over.as_u32()), // base (is_composite=0)
+            ([0.30, 0.00, 0.00, 0.60], BlendMode::Over.as_u32()),
+            ([0.10, 0.15, 0.10, 0.30], BlendMode::Add.as_u32()),
+            ([0.50, 0.40, 0.60, 0.80], BlendMode::Multiply.as_u32()),
+        ];
+
+        // Independent CPU reference: bottom is a straight copy, each layer above
+        // folds in via cpu_blend(layer, accum, blend).
+        let mut cpu = layers[0].0;
+        for (rgba, blend) in &layers[1..] {
+            cpu = cpu_blend(*rgba, cpu, *blend);
+        }
+
+        // 1x1 targets keep readback row-padding trivial: a full-screen quad covers
+        // the single pixel, which samples each 1x1 source at its center (nearest).
+        let (w, h) = (1u32, 1u32);
+        let extent = wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        };
+
+        // Upload each layer as an exact Rgba32Float source + a tex bind group over
+        // the real layout and nearest sampler. Keep every handle alive until submit.
+        let mut src_texs = Vec::new();
+        let mut src_views = Vec::new();
+        let mut src_bgs = Vec::new();
+        for (i, (rgba, _)) in layers.iter().enumerate() {
+            let tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("layer-src"),
+                size: extent,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba32Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                bytemuck::bytes_of(rgba),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(16),
+                    rows_per_image: Some(1),
+                },
+                extent,
+            );
+            src_views.push(tex.create_view(&wgpu::TextureViewDescriptor::default()));
+            src_bgs.push(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("layer-bg"),
+                layout: &gpu.bind_group_layout_tex,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&src_views[i]),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&gpu.sampler),
+                    },
+                ],
+            }));
+            src_texs.push(tex);
+        }
+
+        // Ping-pong pair: two Rgba16Float scene targets (pipeline_linear's format),
+        // each also sampleable as tex_b and copyable for readback.
+        let make_scene = |label| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: extent,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba16Float,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            })
+        };
+        let scene_texs = [make_scene("scene0"), make_scene("scene1")];
+        let scene_views = [
+            scene_texs[0].create_view(&wgpu::TextureViewDescriptor::default()),
+            scene_texs[1].create_view(&wgpu::TextureViewDescriptor::default()),
+        ];
+        let scene_bgs = [0usize, 1].map(|i| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("scene-bg"),
+                layout: &gpu.bind_group_layout_tex,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&scene_views[i]),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&gpu.sampler),
+                    },
+                ],
+            })
+        });
+
+        // Per-draw uniforms into the persistent ring buffer at aligned slot offsets:
+        // slots 0..N for the layers, slot N for the global-exposure pass.
+        let stride = gpu.uniform_stride;
+        // 1x1 target: image fills it, so screen-normalized == image-local uv and the
+        // accumulate draws use composite_accum=0 (the screen-normalized path is
+        // exercised separately by `accumulate_matches_single_pass_composite_on_device`).
+        let full = ([0.0, 0.0], [w as f32, h as f32], [w as f32, h as f32]);
+        for (i, (_, blend)) in layers.iter().enumerate() {
+            let is_comp = if i == 0 { 0 } else { 1 };
+            let u = accum_uniforms(full.0, full.1, full.2, is_comp, *blend, 0, 0.0);
+            queue.write_buffer(
+                &gpu.uniform_buffer,
+                i as u64 * stride as u64,
+                bytemuck::bytes_of(&u),
+            );
+        }
+        let exp_slot = layers.len() as u32;
+        let ev = 1.0f32;
+        let u_exp = accum_uniforms(full.0, full.1, full.2, 0, 0, 0, ev);
+        queue.write_buffer(
+            &gpu.uniform_buffer,
+            exp_slot as u64 * stride as u64,
+            bytemuck::bytes_of(&u_exp),
+        );
+
+        // Sentinel clear matching production pass 1; each draw is a full-quad REPLACE
+        // that covers the single pixel, so the clear value is overwritten under the image.
+        let clear = wgpu::Operations {
+            load: wgpu::LoadOp::Clear(wgpu::Color {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: -1.0,
+            }),
+            store: wgpu::StoreOp::Store,
+        };
+
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+
+        // Accumulate: draw i -> scene[i % 2], reading the prior accumulation from
+        // scene[(i + 1) % 2] as tex_b. Separate render passes; wgpu barriers the
+        // read-after-write between them.
+        for (i, _) in layers.iter().enumerate() {
+            let dst = i % 2;
+            let src = (i + 1) % 2;
+            let tex_b: &wgpu::BindGroup = if i == 0 {
+                gpu.default_tex_bind_group.as_ref() // unused when is_composite=0
+            } else {
+                &scene_bgs[src]
+            };
+            let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("accumulate"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &scene_views[dst],
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: clear,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            rp.set_viewport(0.0, 0.0, w as f32, h as f32, 0.0, 1.0);
+            rp.set_pipeline(&gpu.pipeline_linear);
+            rp.set_bind_group(0, &src_bgs[i], &[]);
+            rp.set_bind_group(1, tex_b, &[]);
+            rp.set_bind_group(2, &gpu.uniform_bind_group, &[i as u32 * stride]);
+            rp.set_bind_group(3, gpu.default_lut_bind_group.as_ref(), &[]);
+            rp.draw(0..6, 0..1);
+        }
+        let composite_idx = (layers.len() - 1) % 2;
+        let exposed_idx = 1 - composite_idx;
+
+        // Global exposure stage: one pass over the finished composite (is_composite=0,
+        // exposure=EV) -> scene[exposed_idx]. Models the post-composite display stage.
+        {
+            let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("global-exposure"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &scene_views[exposed_idx],
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: clear,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            rp.set_viewport(0.0, 0.0, w as f32, h as f32, 0.0, 1.0);
+            rp.set_pipeline(&gpu.pipeline_linear);
+            rp.set_bind_group(0, &scene_bgs[composite_idx], &[]); // tex_a = composite
+            rp.set_bind_group(1, gpu.default_tex_bind_group.as_ref(), &[]); // tex_b unused
+            rp.set_bind_group(2, &gpu.uniform_bind_group, &[exp_slot * stride]);
+            rp.set_bind_group(3, gpu.default_lut_bind_group.as_ref(), &[]);
+            rp.draw(0..6, 0..1);
+        }
+
+        // Read both targets back (bytes_per_row must be 256-aligned).
+        let make_readback = |label| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: 256,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })
+        };
+        let rb_comp = make_readback("rb-composite");
+        let rb_exp = make_readback("rb-exposed");
+        for (scene_idx, rb) in [(composite_idx, &rb_comp), (exposed_idx, &rb_exp)] {
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &scene_texs[scene_idx],
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: rb,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(256),
+                        rows_per_image: Some(1),
+                    },
+                },
+                extent,
+            );
+        }
+        queue.submit([encoder.finish()]);
+
+        rb_comp.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        rb_exp.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+
+        let decode = |buf: &wgpu::Buffer| -> [f32; 4] {
+            let data = buf.slice(..).get_mapped_range();
+            let hs: &[u16] = bytemuck::cast_slice(&data[..8]);
+            [
+                f16_to_f32(hs[0]),
+                f16_to_f32(hs[1]),
+                f16_to_f32(hs[2]),
+                f16_to_f32(hs[3]),
+            ]
+        };
+        let gpu_comp = decode(&rb_comp);
+        let gpu_exp = decode(&rb_exp);
+
+        // f16 carries ~3 decimal digits; a handful of chained ops keeps error well
+        // under this tolerance.
+        let tol = 0.01;
+        for c in 0..4 {
+            assert!(
+                (gpu_comp[c] - cpu[c]).abs() <= tol,
+                "composite channel {c}: gpu {gpu_comp:?} vs cpu {cpu:?}"
+            );
+        }
+        let scale = 2f32.powf(ev);
+        let expected_exp = [cpu[0] * scale, cpu[1] * scale, cpu[2] * scale, cpu[3]];
+        for c in 0..4 {
+            assert!(
+                (gpu_exp[c] - expected_exp[c]).abs() <= tol * scale,
+                "exposed channel {c}: gpu {gpu_exp:?} vs expected {expected_exp:?}"
+            );
+        }
+    }
+
+    // PR-A.3: behavior preservation + the screen-normalized `tex_b` sampling that the
+    // live accumulate ping-pong depends on. Two spatially-varying images are composited
+    // into an OFF-ORIGIN sub-rect of a screen-sized target two ways — (1) today's
+    // single-pass 2-input composite (`is_composite=1, composite_accum=0`, tex_b = the B
+    // image), and (2) the ping-pong (bottom B copy → scene_b, then A over scene_b with
+    // `composite_accum=1`, tex_b = the screen-sized accumulation) — and asserts they are
+    // pixel-identical. This can only hold if the top draw reads the accumulation at the
+    // fragment's screen position: sampling it at the image-local uv would read a different
+    // (or empty) region of scene_b once the image doesn't fill the viewport, so a wrong
+    // uv fails here. Runs at a nonzero exposure with the bottom layer neutralized and the
+    // top carrying EV (PR-A.4), so it also guards that exposure lands ONCE on the finished
+    // composite (× 2^EV) rather than compounding per layer. Also checks the composited
+    // region equals the CPU A-over-B×2^EV reference (so it can't pass by both being blank).
+    #[test]
+    fn accumulate_matches_single_pass_composite_on_device() {
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let adapter = match pollster::block_on(
+            instance.request_adapter(&wgpu::RequestAdapterOptions::default()),
+        ) {
+            Ok(a) => a,
+            Err(_) => {
+                eprintln!("no GPU adapter available; skipping on-device accumulate-parity test");
+                return;
+            }
+        };
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("accumulate-parity-device"),
+            required_features: wgpu::Features::FLOAT32_FILTERABLE,
+            ..Default::default()
+        }))
+        .expect("request_device");
+        let gpu = GpuState::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
+
+        // 4x2 screen; the image occupies the RIGHT half (off-origin, so screen-normalized
+        // and image-local uv diverge). Two 2x2 images with distinct per-texel premultiplied
+        // colors so a mis-sampled tex_b reads a wrong value.
+        let (sw, sh) = (4u32, 2u32);
+        let a_px: [f32; 16] = [
+            0.30, 0.10, 0.05, 0.60, 0.20, 0.20, 0.10, 0.50, // row 0: (0,0) (1,0)
+            0.10, 0.05, 0.30, 0.55, 0.25, 0.15, 0.15, 0.45, // row 1: (0,1) (1,1)
+        ];
+        let b_px: [f32; 16] = [
+            0.15, 0.20, 0.10, 0.50, 0.05, 0.10, 0.25, 0.40, // row 0
+            0.30, 0.05, 0.05, 0.60, 0.10, 0.25, 0.20, 0.55, // row 1
+        ];
+        let texel = |arr: &[f32; 16], i: usize, j: usize| -> [f32; 4] {
+            let o = (j * 2 + i) * 4;
+            [arr[o], arr[o + 1], arr[o + 2], arr[o + 3]]
+        };
+
+        // 2x2 Rgba32Float image + its tex bind group.
+        let mut keep_img = Vec::new(); // hold textures/views alive
+        let mut mk_image = |px: &[f32; 16]| -> wgpu::BindGroup {
+            let tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("img"),
+                size: wgpu::Extent3d {
+                    width: 2,
+                    height: 2,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba32Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                bytemuck::bytes_of(px),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(2 * 16),
+                    rows_per_image: Some(2),
+                },
+                wgpu::Extent3d {
+                    width: 2,
+                    height: 2,
+                    depth_or_array_layers: 1,
+                },
+            );
+            let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("img-bg"),
+                layout: &gpu.bind_group_layout_tex,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&gpu.sampler),
+                    },
+                ],
+            });
+            keep_img.push((tex, view));
+            bg
+        };
+        let a_bg = mk_image(&a_px);
+        let b_bg = mk_image(&b_px);
+
+        // Screen-sized Rgba16Float scene targets: ref (single-pass), plus the ping-pong
+        // pair (accum result in scene_a, prior accumulation in scene_b).
+        let scene_extent = wgpu::Extent3d {
+            width: sw,
+            height: sh,
+            depth_or_array_layers: 1,
+        };
+        let mk_scene = |label| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: scene_extent,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba16Float,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            })
+        };
+        let scene_ref = mk_scene("scene-ref");
+        let scene_a = mk_scene("scene-a");
+        let scene_b = mk_scene("scene-b");
+        let v_ref = scene_ref.create_view(&wgpu::TextureViewDescriptor::default());
+        let v_a = scene_a.create_view(&wgpu::TextureViewDescriptor::default());
+        let v_b = scene_b.create_view(&wgpu::TextureViewDescriptor::default());
+        let scene_b_texbg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("scene-b-texb"),
+            layout: &gpu.bind_group_layout_tex,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&v_b),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&gpu.sampler),
+                },
+            ],
+        });
+
+        // Image placed at the right half of the screen.
+        let rect_min = [(sw / 2) as f32, 0.0];
+        let rect_max = [sw as f32, sh as f32];
+        let screen = [sw as f32, sh as f32];
+        let over = crate::viewer::BlendMode::Over.as_u32();
+        // A nonzero exposure so the test also guards PR-A.4's exposure-once behavior:
+        // the single-pass path exposes the whole composite once (blend then ×2^EV);
+        // the ping-pong applies exposure ONLY on the top layer (bottom is neutral), so
+        // exposure lands once on the finished composite rather than compounding.
+        let ev = 1.0f32;
+        // slot 0: single-pass composite (composite_accum=0, tex_b = B image; exposure EV)
+        // slot 1: ping-pong bottom (B copy, is_composite=0; exposure neutralized)
+        // slot 2: ping-pong top (A over accumulation, composite_accum=1; exposure EV)
+        let stride = gpu.uniform_stride;
+        let us = [
+            accum_uniforms(rect_min, rect_max, screen, 1, over, 0, ev),
+            accum_uniforms(rect_min, rect_max, screen, 0, 0, 0, 0.0),
+            accum_uniforms(rect_min, rect_max, screen, 1, over, 1, ev),
+        ];
+        for (i, u) in us.iter().enumerate() {
+            queue.write_buffer(
+                &gpu.uniform_buffer,
+                i as u64 * stride as u64,
+                bytemuck::bytes_of(u),
+            );
+        }
+
+        let clear = wgpu::Operations {
+            load: wgpu::LoadOp::Clear(wgpu::Color {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: -1.0,
+            }),
+            store: wgpu::StoreOp::Store,
+        };
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        // (tex_a, tex_b, uniform slot, target) for each of the three draws.
+        let passes: [(&wgpu::BindGroup, &wgpu::BindGroup, u32, &wgpu::TextureView); 3] = [
+            (&a_bg, &b_bg, 0, &v_ref),        // single-pass reference
+            (&b_bg, &b_bg, 1, &v_b),          // ping-pong bottom (tex_b unused)
+            (&a_bg, &scene_b_texbg, 2, &v_a), // ping-pong top (tex_b = accumulation)
+        ];
+        for (tex_a, tex_b, slot, target) in passes {
+            let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("parity"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: clear,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            rp.set_viewport(0.0, 0.0, sw as f32, sh as f32, 0.0, 1.0);
+            rp.set_pipeline(&gpu.pipeline_linear);
+            rp.set_bind_group(0, tex_a, &[]);
+            rp.set_bind_group(1, tex_b, &[]);
+            rp.set_bind_group(2, &gpu.uniform_bind_group, &[slot * stride]);
+            rp.set_bind_group(3, gpu.default_lut_bind_group.as_ref(), &[]);
+            rp.draw(0..6, 0..1);
+        }
+
+        // Read scene_ref and scene_a back. Row stride padded to 256; sh=2 rows.
+        let rb_bytes = 256u64 * sh as u64;
+        let mk_rb = |label| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: rb_bytes,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })
+        };
+        let rb_ref = mk_rb("rb-ref");
+        let rb_pp = mk_rb("rb-pp");
+        for (tex, rb) in [(&scene_ref, &rb_ref), (&scene_a, &rb_pp)] {
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: rb,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(256),
+                        rows_per_image: Some(sh),
+                    },
+                },
+                scene_extent,
+            );
+        }
+        queue.submit([encoder.finish()]);
+        rb_ref.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        rb_pp.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+
+        // pixel (x, y) -> [f32; 4], decoding four halfs at row*256 + x*8.
+        let read_px = |buf: &wgpu::Buffer, x: u32, y: u32| -> [f32; 4] {
+            let data = buf.slice(..).get_mapped_range();
+            let base = (y as usize) * 256 + (x as usize) * 8;
+            let hs: &[u16] = bytemuck::cast_slice(&data[base..base + 8]);
+            [
+                f16_to_f32(hs[0]),
+                f16_to_f32(hs[1]),
+                f16_to_f32(hs[2]),
+                f16_to_f32(hs[3]),
+            ]
+        };
+
+        let tol = 0.01;
+        for y in 0..sh {
+            for x in 0..sw {
+                let r = read_px(&rb_ref, x, y);
+                let p = read_px(&rb_pp, x, y);
+                for c in 0..4 {
+                    assert!(
+                        (r[c] - p[c]).abs() <= tol,
+                        "pixel ({x},{y}) chan {c}: single-pass {r:?} vs ping-pong {p:?}"
+                    );
+                }
+                if x >= sw / 2 {
+                    // Composited region: must equal the CPU A-over-B reference exposed once
+                    // (×2^EV on rgb, alpha unchanged) — and so be non-sentinel, proving
+                    // neither path is silently blank and exposure landed exactly once.
+                    let (i, j) = ((x - sw / 2) as usize, y as usize);
+                    let mut want = cpu_blend(texel(&a_px, i, j), texel(&b_px, i, j), over);
+                    let scale = 2f32.powf(ev);
+                    want[0] *= scale;
+                    want[1] *= scale;
+                    want[2] *= scale;
+                    for c in 0..4 {
+                        assert!(
+                            (p[c] - want[c]).abs() <= tol,
+                            "pixel ({x},{y}) chan {c}: composite {p:?} vs cpu A-over-B×2^EV {want:?}"
+                        );
+                    }
+                } else {
+                    // Outside the image: both keep the α=−1 no-image sentinel.
+                    assert!(
+                        r[3] < 0.0 && p[3] < 0.0,
+                        "pixel ({x},{y}) should be sentinel"
+                    );
+                }
+            }
+        }
     }
 }

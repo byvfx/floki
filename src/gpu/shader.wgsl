@@ -58,7 +58,12 @@ struct Uniforms {
     bg_mode: u32,
     bg_grad_angle: f32,
     bg_checker_size: f32,
-    _pad3: u32,
+    // When 1, `tex_b` is the SCREEN-SIZED scene accumulation of the layer-stack
+    // ping-pong (#99), not an image texture, so it is sampled at the fragment's
+    // screen position instead of the image-local `in.uv`. 0 for single-pass
+    // composite / wipe / diff (tex_b is an image). Keep in lockstep with
+    // `Uniforms.composite_accum` in src/gpu/mod.rs.
+    composite_accum: u32,
 };
 
 @group(0) @binding(0) var tex_a: texture_2d<f32>;
@@ -168,9 +173,19 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     var color_a = textureSample(tex_a, samp_a, in.uv);
     var color_b = vec4<f32>(0.0);
-    
+
     if uniforms.is_diff_mode == 1u || uniforms.is_composite == 1u || uniforms.is_wipe_mode == 1u {
-        color_b = textureSample(tex_b, samp_b, in.uv);
+        // In the layer-stack accumulate pass (composite_accum==1) tex_b is the
+        // screen-sized scene accumulation, so sample it at the fragment's screen
+        // position — `in.uv` is image-local (0..1 across the image rect) and only
+        // coincides with screen space when the image fills the viewport. Single-pass
+        // composite / wipe / diff keep image-local uv (tex_b is an image texture).
+        let b_uv = select(
+            in.uv,
+            in.position.xy / vec2<f32>(textureDimensions(tex_b)),
+            uniforms.composite_accum == 1u,
+        );
+        color_b = textureSample(tex_b, samp_b, b_uv);
     }
 
     var r = color_a.r;
