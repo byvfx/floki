@@ -188,6 +188,17 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         color_b = textureSample(tex_b, samp_b, b_uv);
     }
 
+    // Per-layer opacity for the Layers-panel accumulate composite (#99 PR-B.4):
+    // premultiply this layer's color by its opacity, so the subsequent blend fades
+    // the layer's contribution (Over/Add: exact; Multiply/Screen: a reasonable
+    // premultiplied fade). Gated to the OCIO accumulate context (skip_checker==1)
+    // where the comp layers live — a no-op for a single OCIO image (opacity==1) and
+    // for diff (which is skip_checker==0 and returns above). The overscan dim does
+    // NOT interact: under OCIO it is applied post-transform in the blit, not here.
+    if uniforms.skip_checker == 1u {
+        color_a = color_a * uniforms.opacity;
+    }
+
     var r = color_a.r;
     var g = color_a.g;
     var b = color_a.b;

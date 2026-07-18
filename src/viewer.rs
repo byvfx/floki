@@ -119,8 +119,9 @@ pub enum CompareMode {
 }
 
 /// Compositing operator for [`CompareMode::Composite`] (premultiplied-alpha
-/// aware). Encoded for the shader via [`Self::as_u32`].
-#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+/// aware). Encoded for the shader via [`Self::as_u32`]. Serde-serializable so the
+/// Layers panel can persist each layer's blend (#99 PR-B; safe fieldless enum).
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug, serde::Serialize, serde::Deserialize)]
 pub enum BlendMode {
     #[default]
     Over,
@@ -131,6 +132,16 @@ pub enum BlendMode {
 }
 
 impl BlendMode {
+    /// Every variant, in menu order — the single list the blend pickers iterate
+    /// (the A/B Composite combo and the Layers-panel per-row combo, #99 PR-B.4).
+    pub const ALL: [Self; 5] = [
+        Self::Over,
+        Self::Under,
+        Self::Add,
+        Self::Multiply,
+        Self::Screen,
+    ];
+
     /// Integer encoding shared with the GPU. This is the **single source of
     /// truth** for the `blend_mode` mapping; the `switch` in `gpu/shader.wgsl`
     /// must use these same values (Over=0, Under=1, Add=2, Multiply=3, Screen=4).
@@ -177,6 +188,33 @@ struct CanvasLayout {
     /// draws need nothing further; only the Side-by-Side path lays B out separately
     /// and must apply B's own factor here.
     par_b: f32,
+}
+
+/// One resolved Layers-panel composite layer for [`ExrViewer::draw_comp_composite`]
+/// (#99 PR-B.3), in bottom→top order. The app builds these from
+/// `comp_stack.composite_at` + `comp_sources` (looking up each `Draw`'s source
+/// texture), so the viewer stays unaware of decode / source storage — it only
+/// folds the given bind groups through the accumulate ping-pong.
+pub struct CompDraw {
+    /// The layer's GPU texture bind group (its `CompSource`'s), bound as `tex_a`.
+    pub bind_group: std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>,
+    /// How this layer combines with the accumulation below it (ignored for the
+    /// bottom layer, which is a plain copy).
+    pub blend: BlendMode,
+    /// Layer opacity in `[0, 1]`.
+    pub opacity: f32,
+}
+
+/// Per-position flags for a comp layer at stack index `i` of `n` (#99 PR-B.3),
+/// returned as `(is_composite, is_top)`. The bottom layer (`i == 0`) is a plain
+/// copy into the cleared accumulation (`is_composite = false`, its blend unused);
+/// every layer above blends over the accumulation (`is_composite = true`). Only the
+/// top layer (`i == n-1`) applies the global view ops (exposure / channel
+/// isolation), so they hit the finished composite exactly once — the lower layers
+/// neutralize them (the exposure-once invariant from PR-A.4). Pure, so the ordering
+/// contract is unit-testable without a GPU.
+fn comp_layer_flags(i: usize, n: usize) -> (bool, bool) {
+    (i != 0, i + 1 == n)
 }
 
 /// Which feature the shared gradient editor is currently editing — the result of
@@ -360,6 +398,12 @@ struct DrawCtx<'a> {
     /// compounding per layer (`fs_main` applies both after the blend). `false` for
     /// every independent draw (single / wipe / side-by-side / the top composite draw).
     neutral_view_ops: std::cell::Cell<bool>,
+    /// Per-draw blend override for the N-layer Layers-panel composite (#99 PR-B.3):
+    /// each comp layer carries its own [`BlendMode`], unlike the single
+    /// `self.blend_mode` the A/B composite bakes into the base uniform. `Some(b)`
+    /// overrides `u.blend_mode` for the next draw; `None` (every A/B path) keeps the
+    /// base uniform's blend.
+    blend_override: std::cell::Cell<Option<BlendMode>>,
     /// Running FNV-1a hash of everything affecting the OCIO render, so the
     /// display transform is skipped on repaints that change nothing.
     ocio_sig: std::cell::Cell<u64>,
@@ -420,6 +464,13 @@ impl DrawCtx<'_> {
         if self.neutral_view_ops.get() {
             u.exposure = 0.0;
             u.channel_mode = 0; // ChannelMode::RGB
+        }
+
+        // Per-layer blend for the Layers-panel composite (#99 PR-B.3): the A/B
+        // composite bakes a single `self.blend_mode` into the base uniform, but each
+        // comp layer blends differently, so the emitter sets this per draw.
+        if let Some(blend) = self.blend_override.get() {
+            u.blend_mode = blend.as_u32();
         }
 
         let queue = &self.render_state.queue;
@@ -604,14 +655,14 @@ pub struct ExrViewer {
     /// map policy (cap-shrink eviction, layer invalidation, on-screen protection)
     /// lives in the unit-tested [`T2Ring`]; the app drives it every frame via
     /// `set_t2_cap`/`set_t2_frame`/`prebuild_t2` (#153).
-    t2: T2Ring<T2Texture>,
-    /// T2 ring for slot **B** in locked-step A/B compare (#166, #98 Phase 2).
-    /// Mirrors `t2`, but keyed on B's frame number and built for B's layer
-    /// (`active_layer` clamped to B's layer count), so the compared sequence
-    /// pre-uploads ahead of the playhead instead of re-packing + re-uploading a
-    /// fresh texture every locked-step frame. Empty / cap-0 unless B is a
-    /// sequence in an active compare.
-    t2_b: T2Ring<T2Texture>,
+    ///
+    /// **Per-`SourceId` (#99):** one ring per source, created lazily. Today the
+    /// only keys are the A/B compare slots ([`Self::T2_SOURCE_A`] /
+    /// [`Self::T2_SOURCE_B`]) — B mirrors A but keyed on B's frame number and built
+    /// for B's layer (`active_layer` clamped to B's layer count), pre-uploading the
+    /// compared sequence ahead of the playhead. An absent ring reads as disabled
+    /// (cap/len 0). Phase 2 rings the comp stack's N sources under their own ids.
+    t2_rings: std::collections::BTreeMap<crate::layer::SourceId, T2Ring<T2Texture>>,
     /// Reused staging buffer for the Rgba16Float pack (#142 U3): holds one
     /// layer's interleaved half bit-patterns, so `build_layer_texture` doesn't
     /// page-fault a fresh ~66 MB allocation every build during playback.
@@ -774,8 +825,7 @@ impl Default for ExrViewer {
             gpu_thumb_bg: None,
             gpu_textures: Vec::new(),
             gpu_textures_b: Vec::new(),
-            t2: T2Ring::new(),
-            t2_b: T2Ring::new(),
+            t2_rings: std::collections::BTreeMap::new(),
             t2_staging: Vec::new(),
             prefs: ViewerPrefs::default(),
             colormap_lut: Vec::new(),
@@ -1322,13 +1372,7 @@ impl ExrViewer {
                 egui::ComboBox::from_id_salt("blend_mode_select")
                     .selected_text(self.blend_mode.label())
                     .show_ui(ui, |ui| {
-                        for mode in [
-                            BlendMode::Over,
-                            BlendMode::Under,
-                            BlendMode::Add,
-                            BlendMode::Multiply,
-                            BlendMode::Screen,
-                        ] {
+                        for mode in BlendMode::ALL {
                             ui.selectable_value(&mut self.blend_mode, mode, mode.label());
                         }
                     });
@@ -2391,13 +2435,18 @@ impl ExrViewer {
 
             if let Some(gpu) = gpu_resources {
                 // A layer switch invalidates the per-frame T2 ring (textures are
-                // per-layer). Do this before binding/building below.
-                self.t2.ensure_layer(self.active_layer);
+                // per-layer). Do this before binding/building below. The ring is
+                // per-`SourceId` (#99); the primary (A) is `T2_SOURCE_A`.
+                let ring_a = self
+                    .t2_rings
+                    .entry(Self::T2_SOURCE_A)
+                    .or_insert_with(T2Ring::new);
+                ring_a.ensure_layer(self.active_layer);
                 // T2 (#56): bind the on-screen frame's pre-built texture if it is
                 // resident, so the swap is an instant bind, not a re-upload.
-                if self.t2.cap() > 0
-                    && let Some(frame) = self.t2.frame
-                    && let Some(t2) = self.t2.get(frame)
+                if ring_a.cap() > 0
+                    && let Some(frame) = ring_a.frame
+                    && let Some(t2) = ring_a.get(frame)
                 {
                     self.gpu_textures[self.active_layer] = Some(t2.bind_group.clone());
                 }
@@ -2412,25 +2461,28 @@ impl ExrViewer {
                     self.gpu_textures[self.active_layer] = Some(t2.bind_group.clone());
                     // Cache the freshly-built texture into the T2 ring for the
                     // on-screen frame (a lazy first paint feeds the ring).
-                    if self.t2.cap() > 0
-                        && let Some(frame) = self.t2.frame
+                    if ring_a.cap() > 0
+                        && let Some(frame) = ring_a.frame
                     {
-                        self.t2.insert(frame, t2);
-                        self.t2.evict_to_cap();
+                        ring_a.insert(frame, t2);
+                        ring_a.evict_to_cap();
                     }
                 }
                 if let Some(data_b) = exr_data_b {
-                    let layer_b = self
-                        .active_layer
-                        .min(data_b.logical_layers.len().saturating_sub(1));
-                    // A layer switch invalidates the per-frame B ring (per-layer).
-                    self.t2_b.ensure_layer(layer_b);
+                    let layer_b = self.t2_layer_for(data_b);
+                    // The compared source (B) rings under `T2_SOURCE_B`. A layer
+                    // switch invalidates its per-frame ring (per-layer).
+                    let ring_b = self
+                        .t2_rings
+                        .entry(Self::T2_SOURCE_B)
+                        .or_insert_with(T2Ring::new);
+                    ring_b.ensure_layer(layer_b);
                     // B T2 (#166): bind the on-screen B frame's pre-built texture
                     // if resident, so a locked-step B swap is an instant bind, not
                     // a re-upload (mirrors A above).
-                    if self.t2_b.cap() > 0
-                        && let Some(frame) = self.t2_b.frame
-                        && let Some(t2) = self.t2_b.get(frame)
+                    if ring_b.cap() > 0
+                        && let Some(frame) = ring_b.frame
+                        && let Some(t2) = ring_b.get(frame)
                     {
                         self.gpu_textures_b[layer_b] = Some(t2.bind_group.clone());
                     }
@@ -2440,11 +2492,11 @@ impl ExrViewer {
                     {
                         self.gpu_textures_b[layer_b] = Some(t2.bind_group.clone());
                         // Lazy first paint feeds the B ring for the on-screen frame.
-                        if self.t2_b.cap() > 0
-                            && let Some(frame) = self.t2_b.frame
+                        if ring_b.cap() > 0
+                            && let Some(frame) = ring_b.frame
                         {
-                            self.t2_b.insert(frame, t2);
-                            self.t2_b.evict_to_cap();
+                            ring_b.insert(frame, t2);
+                            ring_b.evict_to_cap();
                         }
                     }
                 }
@@ -3200,6 +3252,146 @@ impl ExrViewer {
         }
     }
 
+    /// Render the Layers-panel composite (#99 PR-B.3): fold `draws` bottom→top
+    /// through the OCIO scene ping-pong (the PR-A accumulate path), reusing
+    /// [`DrawCtx`] + [`crate::gpu::ocio_pass::OcioCallback`] verbatim — only the
+    /// draw *source* differs (the panel's N sources instead of A/B). `base_size` is
+    /// the bottom layer's pixel size; every layer currently draws at that one canvas
+    /// rect (per-layer placement is the follow-up, #102/#104), so a differently-
+    /// sized layer is stretched to fit for now.
+    ///
+    /// Requires OCIO active (the ping-pong lives on the OCIO path) + a GPU; the
+    /// caller ([`crate::app::ExrApp::draw_comp_central`]) gates on both and shows a
+    /// fallback message otherwise. A no-op when `draws` is empty. Global tone
+    /// (exposure / gamma / channel isolation / background) comes from the shared
+    /// viewer fields, so it applies to the composite exactly as to a single image;
+    /// per-composite tone controls land with the row controls (PR-B.4).
+    pub(crate) fn draw_comp_composite(
+        &mut self,
+        ui: &mut egui::Ui,
+        base_size: (usize, usize),
+        draws: &[CompDraw],
+        gpu_resources: &crate::gpu::GpuResources,
+        lut_bg_opt: Option<std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>>,
+    ) {
+        if draws.is_empty() {
+            return;
+        }
+        let render_state = gpu_resources.render_state();
+        let (bw, bh) = base_size;
+        let tex_size = egui::vec2(bw.max(1) as f32, bh.max(1) as f32);
+
+        let (rect, response) =
+            ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
+        self.last_canvas_rect = Some(rect);
+        // Shared pan/zoom with the A/B view (the scale/translation fields are the
+        // same); framing on first paint fits the base layer (no B extent).
+        self.handle_canvas_interaction(ui, rect, &response, tex_size, None);
+
+        let image_size = egui::vec2(tex_size.x * self.scale, tex_size.y * self.scale);
+        let image_rect = egui::Rect::from_center_size(rect.center() + self.translation, image_size);
+        // The comp stack has no separate display window yet: display == image.
+        let disp_rect = image_rect;
+        self.last_image_rect = Some(image_rect);
+
+        // Re-bake + upload the gradient LUTs on ramp change (stable handles otherwise).
+        self.sync_gradient_luts(gpu_resources);
+
+        let content = ui.ctx().content_rect();
+        let mut uniform_data =
+            self.build_frame_uniforms(image_rect, disp_rect, [content.width(), content.height()]);
+        // The composite is a stack, never a wipe — regardless of the A/B compare_mode
+        // the shared `build_frame_uniforms` reads.
+        uniform_data.is_wipe_mode = 0;
+
+        let gpu_state = gpu_resources.gpu_state.as_ref();
+        let ctx = DrawCtx {
+            render_state,
+            uniform_data,
+            uniform_buffer: gpu_state.uniform_buffer.clone(),
+            uniform_stride: gpu_state.uniform_stride,
+            active_lut_bg: lut_bg_opt.unwrap_or_else(|| gpu_state.default_lut_bind_group.clone()),
+            default_tex_bg: gpu_state.default_tex_bind_group.clone(),
+            ocio_active: self.ocio_active,
+            uniform_offset: std::cell::Cell::new(0u32),
+            overscan_factor: std::cell::Cell::new(1.0f32),
+            neutral_view_ops: std::cell::Cell::new(false),
+            blend_override: std::cell::Cell::new(None),
+            ocio_sig: std::cell::Cell::new(0xcbf29ce484222325u64),
+            ocio_draws: std::cell::RefCell::new(Vec::new()),
+        };
+
+        let painter = ui.painter().with_clip_rect(rect);
+        let n = draws.len();
+        for (i, d) in draws.iter().enumerate() {
+            let (is_composite, is_top) = comp_layer_flags(i, n);
+            // Neutralize the global view ops on every layer but the top, so exposure
+            // / channel isolation apply once to the finished composite (PR-A.4).
+            ctx.neutral_view_ops.set(!is_top);
+            // The bottom layer is a plain copy (blend unused); layers above carry
+            // their own blend.
+            ctx.blend_override
+                .set(if is_composite { Some(d.blend) } else { None });
+            // `tex_b` on an accumulate draw is the prior accumulation (bound by the
+            // ping-pong itself), so pass None here — the shader samples the scene
+            // target in screen space via `composite_accum`.
+            ctx.draw(
+                &painter,
+                d.bind_group.clone(),
+                None,
+                rect,
+                image_rect,
+                false, // is_diff
+                is_composite,
+                d.opacity,
+            );
+        }
+        ctx.neutral_view_ops.set(false);
+        ctx.blend_override.set(None);
+
+        let ocio_draws = std::mem::take(&mut *ctx.ocio_draws.borrow_mut());
+        if ocio_draws.is_empty() {
+            // Non-OCIO / no accumulate path: the N-layer composite needs an offscreen
+            // ping-pong the non-OCIO surface path doesn't have yet (the "OCIO-off
+            // display pass" follow-up). The caller only reaches here under OCIO, so
+            // this is just a guard.
+            return;
+        }
+        let blit_uniforms = crate::gpu::BlitUniforms {
+            display_min: [disp_rect.min.x, disp_rect.min.y],
+            display_max: [disp_rect.max.x, disp_rect.max.y],
+            screen_size: [content.width(), content.height()],
+            overscan_factor: 1.0,
+            bg_mode: self.prefs.background.mode.as_u32() as f32,
+            bg_checker_size: self.prefs.background.checker_size,
+            bg_grad_angle: self.prefs.background.gradient_angle,
+            gamma: self.gamma,
+            _pad_b: 0.0,
+            bg_checker_dark: rgb3_to_vec4(self.prefs.background.checker_dark),
+            bg_checker_light: rgb3_to_vec4(self.prefs.background.checker_light),
+            bg_solid: rgb3_to_vec4(self.prefs.background.solid),
+        };
+        let render_sig = (ctx.ocio_sig.get() ^ self.ocio_render_gen).wrapping_mul(0x100000001b3);
+        let scissor_pts = Some([
+            image_rect.min.x,
+            image_rect.min.y,
+            image_rect.max.x,
+            image_rect.max.y,
+        ]);
+        let callback = crate::gpu::ocio_pass::OcioCallback {
+            draws: ocio_draws,
+            accumulate: true,
+            display_format: render_state.target_format,
+            blit_uniforms,
+            scissor_pts,
+            render_sig,
+        };
+        painter.add(eframe::egui_wgpu::Callback::new_paint_callback(
+            painter.clip_rect(),
+            callback,
+        ));
+    }
+
     fn draw_canvas_gpu(
         &mut self,
         ui: &egui::Ui,
@@ -3246,6 +3438,7 @@ impl ExrViewer {
             uniform_offset: std::cell::Cell::new(0u32),
             overscan_factor: std::cell::Cell::new(1.0f32),
             neutral_view_ops: std::cell::Cell::new(false),
+            blend_override: std::cell::Cell::new(None),
             ocio_sig: std::cell::Cell::new(0xcbf29ce484222325u64),
             ocio_draws: std::cell::RefCell::new(Vec::new()),
         };
@@ -3560,57 +3753,105 @@ impl ExrViewer {
         })
     }
 
+    /// Build a standalone GPU texture + bind group for one AOV of an `ExrData`,
+    /// for the Layers-panel composite sources (#99 PR-B.2). Wraps
+    /// [`Self::build_layer_texture`] (all the F16/F32 packing logic) with a fresh
+    /// staging buffer and hands back just the two GPU handles the caller owns — the
+    /// `Texture` (kept to own the VRAM) and the `Arc<BindGroup>` (bound as a
+    /// composite layer). `None` if the AOV is out of range or the upload fails.
+    /// UI-thread only (`queue.write_texture`). `add` is rare, so the throwaway
+    /// staging `Vec` here — unlike the per-frame T2 path — is not worth pooling.
+    pub(crate) fn build_source_texture(
+        gpu_resources: &crate::gpu::GpuResources,
+        exr_data: &ExrData,
+        aov: usize,
+    ) -> Option<(
+        eframe::egui_wgpu::wgpu::Texture,
+        std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>,
+    )> {
+        let mut staging = Vec::new();
+        let t = Self::build_layer_texture(gpu_resources, exr_data, aov, &mut staging)?;
+        Some((t.texture, t.bind_group))
+    }
+
     // --- T2 GPU-texture ring (#56) -------------------------------------------
 
-    /// Set the VRAM-budgeted T2 capacity (frames). `0` disables pre-upload and
-    /// drops the ring → the lazy per-swap path. Shrinking evicts immediately.
-    /// Called every frame from `tick_budgets` — an unchanged cap is a no-op.
-    pub(crate) fn set_t2_cap(&mut self, cap: usize) {
-        self.t2.set_cap(cap);
+    /// T2-ring source ids while the app is A/B-pinned (#99): the primary (A) and
+    /// the compared follower (B), mirroring `ExrApp::{A,B}_SOURCE`. Phase 2 rings
+    /// the comp stack's N sources under their own ids.
+    const T2_SOURCE_A: crate::layer::SourceId = crate::layer::SourceId(0);
+    const T2_SOURCE_B: crate::layer::SourceId = crate::layer::SourceId(1);
+
+    /// `source`'s T2 ring, created empty on first use. Mutating entry points
+    /// (`set_t2_cap`, `set_t2_frame`) go through here; reads (`t2_cap`, `t2_len`)
+    /// tolerate an absent ring as "disabled".
+    fn t2_ring_mut(&mut self, source: crate::layer::SourceId) -> &mut T2Ring<T2Texture> {
+        self.t2_rings.entry(source).or_insert_with(T2Ring::new)
     }
 
-    /// Tell the viewer which sequence frame is on screen, so `ui()` binds its T2
-    /// texture. `None` for a single image (lazy path).
-    pub(crate) fn set_t2_frame(&mut self, frame: Option<u32>) {
-        self.t2.set_frame(frame);
+    /// The layer a source's T2 ring builds for: the active layer clamped to the
+    /// source's own layer count. A no-op for the primary (its active layer is
+    /// always in range); the clamp only bites a differently-shaped compared source
+    /// (#98 Phase 1 / #99). Kept as one helper so the ring's `ensure_layer` key,
+    /// the GPU build, and the bind all agree.
+    fn t2_layer_for(&self, exr_data: &ExrData) -> usize {
+        self.active_layer
+            .min(exr_data.logical_layers.len().saturating_sub(1))
     }
 
-    /// Current T2 capacity in frames (`0` = disabled).
-    pub(crate) fn t2_cap(&self) -> usize {
-        self.t2.cap()
+    /// Set the VRAM-budgeted T2 capacity (frames) for `source`. `0` disables
+    /// pre-upload and drops that ring → the lazy per-swap path. Shrinking evicts
+    /// immediately. Called every frame from `tick_budgets` — an unchanged cap is a
+    /// no-op. The app splits the VRAM budget across active sources (#166/#99), so
+    /// each source derives its own count from its own resolution.
+    pub(crate) fn set_t2_cap(&mut self, source: crate::layer::SourceId, cap: usize) {
+        self.t2_ring_mut(source).set_cap(cap);
     }
 
-    /// Number of GPU textures currently resident in the T2 ring (instrumentation).
-    pub(crate) fn t2_len(&self) -> usize {
-        self.t2.len()
+    /// Tell the viewer which sequence frame of `source` is on screen, so `ui()`
+    /// binds its T2 texture. `None` for a single image / non-sequence (lazy path).
+    pub(crate) fn set_t2_frame(&mut self, source: crate::layer::SourceId, frame: Option<u32>) {
+        self.t2_ring_mut(source).set_frame(frame);
     }
 
-    /// Pre-build the T2 texture for `(frame, active layer)` and ring it, evicting
-    /// to the cap. Returns `true` if it actually built (so the caller can amortize
-    /// uploads across frames). No-op — returns `false` — when disabled, already
-    /// resident, or the build fails. UI-thread only. Pass frames already resident
-    /// in the T1 cache; T2 never triggers a decode. The ring bookkeeping is
-    /// [`T2Ring`]'s; only the GPU build stays here.
+    /// `source`'s current T2 capacity in frames (`0` = disabled / no ring).
+    pub(crate) fn t2_cap(&self, source: crate::layer::SourceId) -> usize {
+        self.t2_rings.get(&source).map_or(0, |r| r.cap())
+    }
+
+    /// Number of GPU textures currently resident in `source`'s T2 ring
+    /// (instrumentation).
+    pub(crate) fn t2_len(&self, source: crate::layer::SourceId) -> usize {
+        self.t2_rings.get(&source).map_or(0, |r| r.len())
+    }
+
+    /// Pre-build the T2 texture for `(frame, source's layer)` and ring it under
+    /// `source`, evicting to the cap. Returns `true` if it actually built (so the
+    /// caller can amortize uploads across frames). No-op — returns `false` — when
+    /// disabled, already resident, or the build fails. UI-thread only. Pass frames
+    /// already resident in that source's T1 cache; T2 never triggers a decode. The
+    /// ring bookkeeping is [`T2Ring`]'s; only the GPU build stays here.
     pub(crate) fn prebuild_t2(
         &mut self,
+        source: crate::layer::SourceId,
         gpu: &crate::gpu::GpuResources,
         exr_data: &ExrData,
         frame: u32,
     ) -> bool {
-        if self.t2.cap() == 0 {
+        let layer = self.t2_layer_for(exr_data);
+        let ring = self.t2_rings.entry(source).or_insert_with(T2Ring::new);
+        if ring.cap() == 0 {
             return false;
         }
-        self.t2.ensure_layer(self.active_layer);
-        if self.t2.contains(frame) {
+        ring.ensure_layer(layer);
+        if ring.contains(frame) {
             return false;
         }
-        let Some(t2) =
-            Self::build_layer_texture(gpu, exr_data, self.active_layer, &mut self.t2_staging)
-        else {
+        let Some(t2) = Self::build_layer_texture(gpu, exr_data, layer, &mut self.t2_staging) else {
             return false;
         };
-        self.t2.insert(frame, t2);
-        self.t2.evict_to_cap();
+        ring.insert(frame, t2);
+        ring.evict_to_cap();
         true
     }
 
@@ -3619,83 +3860,23 @@ impl ExrViewer {
     /// from the fresh decode. Drop-only (no `destroy()`): if this frame is the one
     /// on screen, the bound bind group keeps the old texture alive until the next
     /// paint rebinds the fresh one — no in-flight draw is ever invalidated.
-    pub(crate) fn evict_t2_frame(&mut self, frame: u32) {
-        self.t2.evict_frame(frame);
-    }
-
-    /// Drop every T2 texture (new sequence / disabled / layer switch). Drop-only:
-    /// the on-screen frame's texture stays alive through its still-bound bind
-    /// group (cloned into `gpu_textures[active_layer]`) and is freed by wgpu once
-    /// that binding is replaced — critically, this clear can run *before* the
-    /// central panel rebinds for the just-advanced frame, so the bound frame may
-    /// differ from the ring's on-screen frame; dropping is safe for either, a
-    /// `destroy()` is not.
-    pub(crate) fn clear_t2(&mut self) {
-        self.t2.clear();
-    }
-
-    /// The B-slot layer for a compared image: the active layer clamped to B's
-    /// layer count (mirrors the bind path at `ui()` and #98 Phase 1). Kept as one
-    /// helper so the ring's `ensure_layer` key, the build, and the bind agree.
-    fn layer_b_for(&self, data_b: &ExrData) -> usize {
-        self.active_layer
-            .min(data_b.logical_layers.len().saturating_sub(1))
-    }
-
-    /// Set the VRAM-budgeted capacity of the **B** T2 ring (#166). `0` disables
-    /// B pre-upload → the lazy per-swap path. The app splits the VRAM budget
-    /// across A and B in `tick_budgets`, so this is A's `set_t2_cap` counterpart.
-    pub(crate) fn set_t2_cap_b(&mut self, cap: usize) {
-        self.t2_b.set_cap(cap);
-    }
-
-    /// Tell the viewer which B frame is on screen, so `ui()` binds its B T2
-    /// texture. `None` when B isn't a sequence (lazy path).
-    pub(crate) fn set_t2_frame_b(&mut self, frame: Option<u32>) {
-        self.t2_b.set_frame(frame);
-    }
-
-    /// Current B T2 capacity in frames (`0` = disabled).
-    pub(crate) fn t2_cap_b(&self) -> usize {
-        self.t2_b.cap()
-    }
-
-    /// Number of GPU textures resident in the B T2 ring (instrumentation).
-    pub(crate) fn t2_len_b(&self) -> usize {
-        self.t2_b.len()
-    }
-
-    /// Pre-build the B T2 texture for `(frame, B layer)` and ring it, evicting to
-    /// the cap. B counterpart of [`Self::prebuild_t2`]; the B layer is derived
-    /// from `exr_data` (active layer clamped to B's layer count). Returns `true`
-    /// if it built. Pass frames already resident in the `Slot::B` T1 cache.
-    pub(crate) fn prebuild_t2_b(
-        &mut self,
-        gpu: &crate::gpu::GpuResources,
-        exr_data: &ExrData,
-        frame: u32,
-    ) -> bool {
-        if self.t2_b.cap() == 0 {
-            return false;
+    pub(crate) fn evict_t2_frame(&mut self, source: crate::layer::SourceId, frame: u32) {
+        if let Some(ring) = self.t2_rings.get_mut(&source) {
+            ring.evict_frame(frame);
         }
-        let layer_b = self.layer_b_for(exr_data);
-        self.t2_b.ensure_layer(layer_b);
-        if self.t2_b.contains(frame) {
-            return false;
-        }
-        let Some(t2) = Self::build_layer_texture(gpu, exr_data, layer_b, &mut self.t2_staging)
-        else {
-            return false;
-        };
-        self.t2_b.insert(frame, t2);
-        self.t2_b.evict_to_cap();
-        true
     }
 
-    /// Drop every B T2 texture (new B sequence / B dropped / disabled). Drop-only,
-    /// like [`Self::clear_t2`].
-    pub(crate) fn clear_t2_b(&mut self) {
-        self.t2_b.clear();
+    /// Drop every T2 texture in `source`'s ring (new sequence / disabled / layer
+    /// switch / source dropped). Drop-only: the on-screen frame's texture stays
+    /// alive through its still-bound bind group (cloned into `gpu_textures*`) and is
+    /// freed by wgpu once that binding is replaced — critically, this clear can run
+    /// *before* the central panel rebinds for the just-advanced frame, so the bound
+    /// frame may differ from the ring's on-screen frame; dropping is safe for
+    /// either, a `destroy()` is not.
+    pub(crate) fn clear_t2(&mut self, source: crate::layer::SourceId) {
+        if let Some(ring) = self.t2_rings.get_mut(&source) {
+            ring.clear();
+        }
     }
 
     /// CPU contact-sheet thumbnail bake: decimate `layer_index` to the thumbnail
@@ -4308,6 +4489,35 @@ mod gui_tests {
     use eframe::egui;
     use egui_kittest::Harness;
     use exr::prelude::*;
+
+    #[test]
+    fn comp_layer_flags_bottom_copies_top_applies_view_ops() {
+        use super::comp_layer_flags;
+        // Single layer: it is both the bottom (plain copy, is_composite=false) and the
+        // top (applies view ops once).
+        assert_eq!(comp_layer_flags(0, 1), (false, true));
+        // Four-layer stack bottom→top: only i==0 is a copy; only i==3 is the top.
+        assert_eq!(
+            comp_layer_flags(0, 4),
+            (false, false),
+            "bottom: copy, not top"
+        );
+        assert_eq!(
+            comp_layer_flags(1, 4),
+            (true, false),
+            "middle blends, not top"
+        );
+        assert_eq!(
+            comp_layer_flags(2, 4),
+            (true, false),
+            "middle blends, not top"
+        );
+        assert_eq!(
+            comp_layer_flags(3, 4),
+            (true, true),
+            "top blends + view ops"
+        );
+    }
 
     #[test]
     fn t2_victim_evicts_furthest_and_protects_on_screen() {

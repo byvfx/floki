@@ -1351,6 +1351,7 @@ mod metal_tests {
         blend: u32,
         composite_accum: u32,
         exposure: f32,
+        opacity: f32,
     ) -> crate::gpu::Uniforms {
         crate::gpu::Uniforms {
             rect_min,
@@ -1362,7 +1363,7 @@ mod metal_tests {
             exposure,
             gamma: 1.0,
             diff_multiplier: 1.0,
-            opacity: 1.0,
+            opacity,
             wipe_angle: 0.0,
             channel_mode: 0,
             is_diff_mode: 0,
@@ -1429,20 +1430,27 @@ mod metal_tests {
 
         // Bottom→top premultiplied scene-linear stack (rgb <= alpha), all
         // semi-transparent. The bottom layer's blend is unused (drawn is_composite=0);
-        // the layers above exercise the three blends the plan calls highest-risk.
+        // the layers above exercise the three blends the plan calls highest-risk. Each
+        // carries a per-layer opacity (#99 PR-B.4): the bottom (is_composite=0 copy)
+        // and the Add layer are < 1, so the shader's premultiplied opacity scale is
+        // observable on both the copy and a composite draw.
         use crate::viewer::BlendMode;
-        let layers: [([f32; 4], u32); 4] = [
-            ([0.20, 0.10, 0.05, 0.50], BlendMode::Over.as_u32()), // base (is_composite=0)
-            ([0.30, 0.00, 0.00, 0.60], BlendMode::Over.as_u32()),
-            ([0.10, 0.15, 0.10, 0.30], BlendMode::Add.as_u32()),
-            ([0.50, 0.40, 0.60, 0.80], BlendMode::Multiply.as_u32()),
+        let layers: [([f32; 4], u32, f32); 4] = [
+            ([0.20, 0.10, 0.05, 0.50], BlendMode::Over.as_u32(), 0.80), // base (is_composite=0)
+            ([0.30, 0.00, 0.00, 0.60], BlendMode::Over.as_u32(), 1.00),
+            ([0.10, 0.15, 0.10, 0.30], BlendMode::Add.as_u32(), 0.50),
+            ([0.50, 0.40, 0.60, 0.80], BlendMode::Multiply.as_u32(), 1.00),
         ];
 
-        // Independent CPU reference: bottom is a straight copy, each layer above
-        // folds in via cpu_blend(layer, accum, blend).
-        let mut cpu = layers[0].0;
-        for (rgba, blend) in &layers[1..] {
-            cpu = cpu_blend(*rgba, cpu, *blend);
+        // Independent CPU reference: each layer's premultiplied color is scaled by its
+        // opacity (matching shader.wgsl's `color_a *= opacity` under skip_checker==1),
+        // then the bottom is a straight copy and each layer above folds in via
+        // cpu_blend(layer, accum, blend).
+        let premul_opacity =
+            |rgba: [f32; 4], o: f32| [rgba[0] * o, rgba[1] * o, rgba[2] * o, rgba[3] * o];
+        let mut cpu = premul_opacity(layers[0].0, layers[0].2);
+        for (rgba, blend, opacity) in &layers[1..] {
+            cpu = cpu_blend(premul_opacity(*rgba, *opacity), cpu, *blend);
         }
 
         // 1x1 targets keep readback row-padding trivial: a full-screen quad covers
@@ -1459,7 +1467,7 @@ mod metal_tests {
         let mut src_texs = Vec::new();
         let mut src_views = Vec::new();
         let mut src_bgs = Vec::new();
-        for (i, (rgba, _)) in layers.iter().enumerate() {
+        for (i, (rgba, _, _)) in layers.iter().enumerate() {
             let tex = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("layer-src"),
                 size: extent,
@@ -1548,9 +1556,9 @@ mod metal_tests {
         // accumulate draws use composite_accum=0 (the screen-normalized path is
         // exercised separately by `accumulate_matches_single_pass_composite_on_device`).
         let full = ([0.0, 0.0], [w as f32, h as f32], [w as f32, h as f32]);
-        for (i, (_, blend)) in layers.iter().enumerate() {
+        for (i, (_, blend, opacity)) in layers.iter().enumerate() {
             let is_comp = if i == 0 { 0 } else { 1 };
-            let u = accum_uniforms(full.0, full.1, full.2, is_comp, *blend, 0, 0.0);
+            let u = accum_uniforms(full.0, full.1, full.2, is_comp, *blend, 0, 0.0, *opacity);
             queue.write_buffer(
                 &gpu.uniform_buffer,
                 i as u64 * stride as u64,
@@ -1559,7 +1567,7 @@ mod metal_tests {
         }
         let exp_slot = layers.len() as u32;
         let ev = 1.0f32;
-        let u_exp = accum_uniforms(full.0, full.1, full.2, 0, 0, 0, ev);
+        let u_exp = accum_uniforms(full.0, full.1, full.2, 0, 0, 0, ev, 1.0);
         queue.write_buffer(
             &gpu.uniform_buffer,
             exp_slot as u64 * stride as u64,
@@ -1874,9 +1882,9 @@ mod metal_tests {
         // slot 2: ping-pong top (A over accumulation, composite_accum=1; exposure EV)
         let stride = gpu.uniform_stride;
         let us = [
-            accum_uniforms(rect_min, rect_max, screen, 1, over, 0, ev),
-            accum_uniforms(rect_min, rect_max, screen, 0, 0, 0, 0.0),
-            accum_uniforms(rect_min, rect_max, screen, 1, over, 1, ev),
+            accum_uniforms(rect_min, rect_max, screen, 1, over, 0, ev, 1.0),
+            accum_uniforms(rect_min, rect_max, screen, 0, 0, 0, 0.0, 1.0),
+            accum_uniforms(rect_min, rect_max, screen, 1, over, 1, ev, 1.0),
         ];
         for (i, u) in us.iter().enumerate() {
             queue.write_buffer(

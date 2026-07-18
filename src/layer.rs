@@ -18,8 +18,8 @@
 //!
 //! # The structural idea
 //!
-//! floki's current `Slot::{A,B}` + [`crate::viewer::CompareMode`] are a hardcoded
-//! two-input special case. This module generalizes them to a `Vec<Layer>`, and in
+//! floki's current A/B compare slots + [`crate::viewer::CompareMode`] are a
+//! hardcoded two-input special case. This module generalizes them to a `Vec<Layer>`, and in
 //! doing so splits the **two axes that `CompareMode` conflates**:
 //!
 //! - **Arrangement** — *where* visible layers are placed: one viewport, a wipe, or
@@ -41,7 +41,7 @@
 //! | Back-to-Beauty                | additive AOV layers of one source (`Add`)      |
 //! | Adjustment / Brush / Text     | non-image [`LayerSource`] variants             |
 //!
-//! Caches generalize too: the T1/T2 `(Slot, frame)` key (`src/cache.rs`) becomes
+//! Caches generalize too: the T1/T2 `(SourceId, frame)` key (`src/cache.rs`) becomes
 //! `(LayerId, source_frame)` — see [`Layer::cache_key`]. `LayerId` is stable
 //! across reordering, so moving a layer in the stack never invalidates its cache.
 
@@ -160,7 +160,7 @@ pub struct Layer {
 
 impl Layer {
     /// The cache key for this layer at a resolved source frame — the
-    /// generalization of the T1/T2 `(Slot, frame)` key (`src/cache.rs`).
+    /// generalization of the T1/T2 `(SourceId, frame)` key (`src/cache.rs`).
     #[allow(dead_code)] // consumed when the ring generalizes its key in #104
     #[must_use]
     pub fn cache_key(&self, source_frame: u32) -> (LayerId, u32) {
