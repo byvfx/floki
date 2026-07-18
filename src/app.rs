@@ -102,6 +102,11 @@ struct CompSource {
     /// Owns the texture's VRAM; not read directly (the bind group holds the view).
     #[allow(dead_code)]
     texture: Option<eframe::egui_wgpu::wgpu::Texture>,
+    /// The sequence frame `texture`/`bind_group` currently hold, for a **sequence**
+    /// source (#99 Phase 2). `None` for a still (one fixed texture) or before the
+    /// first per-frame build. `draw_comp_central` rebuilds from the T1 cache when
+    /// the resolved source frame moves off this.
+    cur_frame: Option<u32>,
 }
 
 /// serde default for `proxy_cache_gb` (#165): the on-disk proxy-cache size budget
@@ -1468,6 +1473,10 @@ impl ExrApp {
         // sequence. Ordered after A's own request so `pump_decode` sees A's want
         // first (A-playhead priority).
         self.sync_b_to_a();
+        // Comp-panel sequence layers (#99 Phase 2) also follow the shared playhead —
+        // each maps the global frame through its `Trim` and requests it, so the pump
+        // decodes it alongside A/B. No-op with no comp sequence layers.
+        self.sync_comp_followers();
         self.pump_decode();
     }
 
@@ -1524,6 +1533,57 @@ impl ExrApp {
             self.b_mut().pending = if needs_full { Some(frame) } else { None };
         } else {
             self.b_mut().pending = Some(frame);
+        }
+        self.pump_decode();
+    }
+
+    /// Advance each comp-panel **sequence** layer to its `Trim`-mapped source frame
+    /// for the current global playhead and request it (#99 Phase 2) — the comp
+    /// counterpart of [`Self::sync_b_to_a`]. A layer whose trim doesn't cover the
+    /// current global frame is blank (holds its last frame); a still (no follower)
+    /// is skipped. No-op with no comp sequence layers.
+    fn sync_comp_followers(&mut self) {
+        let global = self.playback.current_frame;
+        // Snapshot (source, source_frame) for each in-range sequence layer before
+        // mutating followers / requesting (avoids aliasing the `comp_stack` borrow).
+        let wants: Vec<(crate::layer::SourceId, u32)> = self
+            .comp_stack
+            .iter()
+            .filter_map(|l| match &l.source {
+                crate::layer::LayerSource::Image { source, .. }
+                    if self.followers.contains_key(source) =>
+                {
+                    l.trim.source_frame(global).map(|sf| (*source, sf))
+                }
+                _ => None,
+            })
+            .collect();
+        for (source, sf) in wants {
+            if let Some(st) = self.followers.get_mut(&source) {
+                st.current_frame = sf;
+            }
+            self.request_comp_frame(source, sf);
+        }
+    }
+
+    /// Request a comp source's `frame` for the pump (#99 Phase 2) — the comp
+    /// counterpart of [`Self::request_b_frame`]. A comp follower has no display slot
+    /// (`draw_comp_central` binds it from the T1 cache), so this only clears the
+    /// stale wait state and marks the frame awaited when it isn't already resident.
+    fn request_comp_frame(&mut self, source: crate::layer::SourceId, frame: u32) {
+        let resident = self.frame_cache.contains(source, frame);
+        let is_hole = self
+            .followers
+            .get(&source)
+            .and_then(|st| st.sequence.as_ref())
+            .is_none_or(|s| s.path_for(frame).is_none());
+        if let Some(st) = self.followers.get_mut(&source) {
+            st.loading = false;
+            st.pending = if is_hole || resident {
+                None
+            } else {
+                Some(frame)
+            };
         }
         self.pump_decode();
     }
@@ -5481,6 +5541,7 @@ impl ExrApp {
                 aov,
                 bind_group,
                 texture,
+                cur_frame: None,
             },
         );
     }
@@ -5516,6 +5577,41 @@ impl ExrApp {
             cs.bind_group = Some(bind_group);
             cs.aov = aov;
             cs.size = size;
+        }
+    }
+
+    /// Rebuild a **sequence** comp source's texture to hold `(source_frame, aov)`
+    /// from the T1-cached frame (#99 Phase 2), when the playhead or AOV moved off
+    /// what it currently holds. No-op if already current, headless, the frame isn't
+    /// resident (the last-built frame is held), or the build fails. This is what
+    /// makes an added comp layer *play*: each paint, `draw_comp_central` resolves
+    /// the layer's source frame and rebinds the decoded pixels for it.
+    fn ensure_comp_frame(&mut self, source: crate::layer::SourceId, source_frame: u32, aov: usize) {
+        let Some(cs) = self.comp_sources.get(&source) else {
+            return;
+        };
+        if cs.cur_frame == Some(source_frame) && cs.aov == aov {
+            return;
+        }
+        // Hold the current texture until the frame is actually resident in T1.
+        let Some(arc) = self.frame_cache.peek(source, source_frame) else {
+            return;
+        };
+        let Some(gpu) = self.gpu_resources.as_ref() else {
+            return;
+        };
+        let Some((texture, bind_group)) =
+            crate::viewer::ExrViewer::build_source_texture(gpu, &arc, aov)
+        else {
+            return;
+        };
+        let size = arc.logical_size(aov).unwrap_or((0, 0));
+        if let Some(cs) = self.comp_sources.get_mut(&source) {
+            cs.texture = Some(texture);
+            cs.bind_group = Some(bind_group);
+            cs.aov = aov;
+            cs.size = size;
+            cs.cur_frame = Some(source_frame);
         }
     }
 
@@ -5789,15 +5885,23 @@ impl ExrApp {
         self.viewer.ocio_active = self.ocio_enabled && self.ocio_ready;
         self.viewer.ocio_render_gen = self.ocio_render_gen;
 
-        // Resolve the model → concrete draws at the shared global playhead (stills
-        // sit at frame 0 via `Trim::full`; per-source sequence frames arrive w/ PR-C).
+        // Resolve the model → concrete draws at the shared global playhead. A still
+        // spans all frames (`Trim::full`) and binds its one texture; a sequence layer
+        // (#99 Phase 2) resolves its `source_frame` here and is dropped by
+        // `composite_at` outside its trim (blank there).
         let steps = self.comp_stack.composite_at(self.playback.current_frame);
 
-        // Rebuild any source texture whose layer switched AOV since it was last built
-        // (#99 PR-B.4.3), so the draw below binds the requested pass.
+        // Bring each source's texture current for what its draw wants: a sequence
+        // layer rebinds its resolved source frame from the T1 cache (this is what
+        // makes it *play*); a still just tracks AOV switches (#99 PR-B.4.3). Done
+        // before the draw list so the bind below is up to date.
         for step in &steps {
             if let crate::layer::Step::Draw(d) = step {
-                self.ensure_comp_aov(d.source, d.aov);
+                if self.followers.contains_key(&d.source) {
+                    self.ensure_comp_frame(d.source, d.source_frame, d.aov);
+                } else {
+                    self.ensure_comp_aov(d.source, d.aov);
+                }
             }
         }
 
@@ -6110,6 +6214,50 @@ mod tests {
         assert!(
             app.comp_sources.contains_key(&source),
             "the still source is still stored (its single texture)"
+        );
+    }
+
+    #[test]
+    fn sync_comp_followers_maps_the_global_playhead_through_the_trim() {
+        // A comp sequence layer follows the shared playhead (#99 Phase 2): the global
+        // frame maps through its Trim (in 1, out 5, offset 0 → source == global), it
+        // advances + awaits the mapped frame, and outside the trim it holds (blank).
+        let (_dir, paths) = write_sequence(5);
+        let mut app = ExrApp::default();
+        app.add_comp_source(paths[0].clone());
+        let source = crate::layer::SourceId(COMP_SOURCE_BASE);
+
+        // Opens on frame 1 (seeded + resident).
+        assert_eq!(app.followers.get(&source).unwrap().current_frame, 1);
+        assert!(app.frame_cache.contains(source, 1));
+
+        // Global 3 → source frame 3; not resident, so it's awaited for the pump.
+        app.playback.current_frame = 3;
+        app.sync_comp_followers();
+        let f = app.followers.get(&source).unwrap();
+        assert_eq!(f.current_frame, 3, "follower advanced to the mapped frame");
+        assert_eq!(f.pending, Some(3), "non-resident mapped frame is awaited");
+
+        // Global 2 is already resident (seed was 1, decode of 3 not simulated) — a
+        // resident frame is bound directly, nothing awaited.
+        app.frame_cache.insert(
+            source,
+            2,
+            app.comp_sources.get(&source).unwrap().exr_data.clone(),
+        );
+        app.playback.current_frame = 2;
+        app.sync_comp_followers();
+        let f = app.followers.get(&source).unwrap();
+        assert_eq!(f.current_frame, 2);
+        assert_eq!(f.pending, None, "resident frame needs no decode");
+
+        // Global 9 is past the trim (out 5): the layer is blank, follower holds.
+        app.playback.current_frame = 9;
+        app.sync_comp_followers();
+        assert_eq!(
+            app.followers.get(&source).unwrap().current_frame,
+            2,
+            "out-of-range global holds the last frame (blank layer)"
         );
     }
 
