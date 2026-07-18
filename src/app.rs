@@ -5497,9 +5497,24 @@ impl ExrApp {
         // and its layer's `Trim` spans the sequence range (blank outside it); a
         // lone still keeps the all-frames trim and its single decoded texture.
         let sequence = crate::sequence::detect_from_file(&path);
-        let trim = match &sequence {
-            Some(seq) => crate::layer::Trim::full(seq.range.0, seq.range.1),
-            None => crate::layer::Trim::full(0, u32::MAX),
+        // The opened frame of the sequence (its "current" frame).
+        let cf = sequence
+            .as_ref()
+            .map(|seq| seq.number_of(&path).unwrap_or(seq.range.0));
+        let trim = match (&sequence, cf) {
+            // Align the opened frame to the current playhead so the just-added layer
+            // is visible *immediately*: `offset = cf - global` makes
+            // `source_frame(global) == cf` right now, then it plays 1:1 with the
+            // transport and is blank outside `[lo, hi]`. Without a base plate the
+            // playhead is 0, so this shows the opened frame instead of dropping the
+            // layer as out-of-range (the bug where an added sequence went blank).
+            (Some(seq), Some(cf)) => crate::layer::Trim {
+                in_point: seq.range.0,
+                out_point: seq.range.1,
+                offset: i64::from(cf) - i64::from(self.playback.current_frame),
+            },
+            // A lone still spans all frames.
+            _ => crate::layer::Trim::full(0, u32::MAX),
         };
 
         let source = crate::layer::SourceId(self.comp_next_source);
@@ -5520,8 +5535,7 @@ impl ExrApp {
         // cache / eviction treat it like the A/B slots, and seed the cache with the
         // opened frame (its full decode) for an instant first hit — mirrors
         // `detect_sequence`. Stills register no follower (nothing to play).
-        if let Some(seq) = sequence {
-            let cf = seq.number_of(&path).unwrap_or(seq.range.0);
+        if let (Some(seq), Some(cf)) = (sequence, cf) {
             self.frame_cache.insert(source, cf, exr_data.clone());
             self.followers.insert(
                 source,
@@ -6219,44 +6233,47 @@ mod tests {
 
     #[test]
     fn sync_comp_followers_maps_the_global_playhead_through_the_trim() {
-        // A comp sequence layer follows the shared playhead (#99 Phase 2): the global
-        // frame maps through its Trim (in 1, out 5, offset 0 → source == global), it
-        // advances + awaits the mapped frame, and outside the trim it holds (blank).
+        // A comp sequence layer follows the shared playhead (#99 Phase 2). It's added
+        // with the opened frame *aligned to the current playhead*, so with the default
+        // playhead 0 opening on frame 1 → offset 1 → source_frame(g) = g + 1, blank
+        // outside [1, 5]. This alignment is what makes the layer visible immediately.
         let (_dir, paths) = write_sequence(5);
         let mut app = ExrApp::default();
         app.add_comp_source(paths[0].clone());
         let source = crate::layer::SourceId(COMP_SOURCE_BASE);
+        let layer_trim = app.comp_stack.iter().next().unwrap().trim;
 
-        // Opens on frame 1 (seeded + resident).
+        // Opens on frame 1 (seeded + resident); the current playhead 0 maps to it.
         assert_eq!(app.followers.get(&source).unwrap().current_frame, 1);
         assert!(app.frame_cache.contains(source, 1));
+        assert_eq!(
+            layer_trim.source_frame(0),
+            Some(1),
+            "opened frame aligned to the playhead so the layer shows immediately"
+        );
 
-        // Global 3 → source frame 3; not resident, so it's awaited for the pump.
+        // Global 0 maps to the resident opened frame (source 1): bound directly.
+        app.sync_comp_followers();
+        let f = app.followers.get(&source).unwrap();
+        assert_eq!(f.current_frame, 1);
+        assert_eq!(f.pending, None, "resident frame needs no decode");
+
+        // Global 3 → source frame 4; not resident, so it's awaited for the pump.
         app.playback.current_frame = 3;
         app.sync_comp_followers();
         let f = app.followers.get(&source).unwrap();
-        assert_eq!(f.current_frame, 3, "follower advanced to the mapped frame");
-        assert_eq!(f.pending, Some(3), "non-resident mapped frame is awaited");
-
-        // Global 2 is already resident (seed was 1, decode of 3 not simulated) — a
-        // resident frame is bound directly, nothing awaited.
-        app.frame_cache.insert(
-            source,
-            2,
-            app.comp_sources.get(&source).unwrap().exr_data.clone(),
+        assert_eq!(
+            f.current_frame, 4,
+            "follower advanced to the mapped frame (3 + offset 1)"
         );
-        app.playback.current_frame = 2;
-        app.sync_comp_followers();
-        let f = app.followers.get(&source).unwrap();
-        assert_eq!(f.current_frame, 2);
-        assert_eq!(f.pending, None, "resident frame needs no decode");
+        assert_eq!(f.pending, Some(4), "non-resident mapped frame is awaited");
 
-        // Global 9 is past the trim (out 5): the layer is blank, follower holds.
-        app.playback.current_frame = 9;
+        // Global 5 → source 6, past the range [1, 5]: blank, follower holds.
+        app.playback.current_frame = 5;
         app.sync_comp_followers();
         assert_eq!(
             app.followers.get(&source).unwrap().current_frame,
-            2,
+            4,
             "out-of-range global holds the last frame (blank layer)"
         );
     }
