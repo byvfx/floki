@@ -3289,8 +3289,7 @@ impl ExrViewer {
         self.handle_canvas_interaction(ui, rect, &response, tex_size, None);
 
         let image_size = egui::vec2(tex_size.x * self.scale, tex_size.y * self.scale);
-        let image_rect =
-            egui::Rect::from_center_size(rect.center() + self.translation, image_size);
+        let image_rect = egui::Rect::from_center_size(rect.center() + self.translation, image_size);
         // The comp stack has no separate display window yet: display == image.
         let disp_rect = image_rect;
         self.last_image_rect = Some(image_rect);
@@ -3372,8 +3371,7 @@ impl ExrViewer {
             bg_checker_light: rgb3_to_vec4(self.prefs.background.checker_light),
             bg_solid: rgb3_to_vec4(self.prefs.background.solid),
         };
-        let render_sig =
-            (ctx.ocio_sig.get() ^ self.ocio_render_gen).wrapping_mul(0x100000001b3);
+        let render_sig = (ctx.ocio_sig.get() ^ self.ocio_render_gen).wrapping_mul(0x100000001b3);
         let scissor_pts = Some([
             image_rect.min.x,
             image_rect.min.y,
@@ -4499,10 +4497,26 @@ mod gui_tests {
         // top (applies view ops once).
         assert_eq!(comp_layer_flags(0, 1), (false, true));
         // Four-layer stack bottom→top: only i==0 is a copy; only i==3 is the top.
-        assert_eq!(comp_layer_flags(0, 4), (false, false), "bottom: copy, not top");
-        assert_eq!(comp_layer_flags(1, 4), (true, false), "middle blends, not top");
-        assert_eq!(comp_layer_flags(2, 4), (true, false), "middle blends, not top");
-        assert_eq!(comp_layer_flags(3, 4), (true, true), "top blends + view ops");
+        assert_eq!(
+            comp_layer_flags(0, 4),
+            (false, false),
+            "bottom: copy, not top"
+        );
+        assert_eq!(
+            comp_layer_flags(1, 4),
+            (true, false),
+            "middle blends, not top"
+        );
+        assert_eq!(
+            comp_layer_flags(2, 4),
+            (true, false),
+            "middle blends, not top"
+        );
+        assert_eq!(
+            comp_layer_flags(3, 4),
+            (true, true),
+            "top blends + view ops"
+        );
     }
 
     #[test]

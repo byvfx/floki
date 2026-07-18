@@ -1446,7 +1446,8 @@ mod metal_tests {
         // opacity (matching shader.wgsl's `color_a *= opacity` under skip_checker==1),
         // then the bottom is a straight copy and each layer above folds in via
         // cpu_blend(layer, accum, blend).
-        let premul_opacity = |rgba: [f32; 4], o: f32| [rgba[0] * o, rgba[1] * o, rgba[2] * o, rgba[3] * o];
+        let premul_opacity =
+            |rgba: [f32; 4], o: f32| [rgba[0] * o, rgba[1] * o, rgba[2] * o, rgba[3] * o];
         let mut cpu = premul_opacity(layers[0].0, layers[0].2);
         for (rgba, blend, opacity) in &layers[1..] {
             cpu = cpu_blend(premul_opacity(*rgba, *opacity), cpu, *blend);

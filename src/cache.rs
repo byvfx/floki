@@ -73,7 +73,9 @@ impl FrameCache {
     /// Fetch a resident frame **without** touching LRU order — used by the T2
     /// pre-upload to read a cached frame's pixels without keeping it warm in T1.
     pub fn peek(&self, source: impl Into<SourceId>, frame: u32) -> Option<Arc<ExrData>> {
-        self.entries.get(&(source.into(), frame)).map(|e| e.data.clone())
+        self.entries
+            .get(&(source.into(), frame))
+            .map(|e| e.data.clone())
     }
 
     /// Insert (or replace) a frame, marking it most-recently-used. Does not evict;
@@ -167,7 +169,14 @@ impl FrameCache {
         let cap = capacity.max(1);
         let mut evicted = 0;
         while self.entries.len() > cap {
-            match self.pick_victim(playheads, primary, direction, playing, loop_wrap, read_behind) {
+            match self.pick_victim(
+                playheads,
+                primary,
+                direction,
+                playing,
+                loop_wrap,
+                read_behind,
+            ) {
                 Some(victim) => {
                     self.entries.remove(&victim);
                     evicted += 1;
@@ -216,8 +225,9 @@ impl FrameCache {
         // offset, so any behind frame outranks every ahead frame.
         const BEHIND_BIAS: u64 = 1 << 40;
 
-        let playhead_of =
-            |src: SourceId| -> Option<u32> { playheads.iter().find(|(s, _)| *s == src).map(|(_, p)| *p) };
+        let playhead_of = |src: SourceId| -> Option<u32> {
+            playheads.iter().find(|(s, _)| *s == src).map(|(_, p)| *p)
+        };
         let primary_playhead = playhead_of(primary);
 
         let evictability = |source: SourceId, frame: u32| -> u64 {
@@ -278,7 +288,12 @@ impl FrameCache {
                 !playheads.iter().any(|(s, p)| s == source && p == frame)
             })
             .map(|((source, frame), entry)| {
-                (*source, *frame, evictability(*source, *frame), entry.last_used)
+                (
+                    *source,
+                    *frame,
+                    evictability(*source, *frame),
+                    entry.last_used,
+                )
             })
             // Max evictability; on a tie, the least-recently-used (smallest
             // last_used) frame is the victim.
@@ -584,7 +599,10 @@ mod tests {
         fill(&mut c, SourceId(0), &[7, 8, 9, 10, 1]);
         c.evict_to(3, &[(A, 9)], A, Direction::Forward, true, Some((1, 10)), 1);
         assert!(c.contains(SourceId(0), 9), "playhead protected");
-        assert!(c.contains(SourceId(0), 8), "just-shown frame survives (#169)");
+        assert!(
+            c.contains(SourceId(0), 8),
+            "just-shown frame survives (#169)"
+        );
         assert!(c.contains(SourceId(0), 10), "nearest ahead kept");
         assert!(
             !c.contains(SourceId(0), 7),

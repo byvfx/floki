@@ -1172,11 +1172,7 @@ impl ExrApp {
 
         self.submit_job(LoadJob {
             path,
-            source: if is_b {
-                Self::B_SOURCE
-            } else {
-                Self::A_SOURCE
-            },
+            source: if is_b { Self::B_SOURCE } else { Self::A_SOURCE },
             seq_frame: false,
             frame: 0,
             epoch: self.playback.epoch,
@@ -2636,7 +2632,8 @@ impl ExrApp {
                     .and_then(|d| d.logical_size(self.viewer.active_layer))
             })
             .flatten();
-        self.viewer.set_t2_cap(Self::A_SOURCE, cap_from(a_avail, a_dims));
+        self.viewer
+            .set_t2_cap(Self::A_SOURCE, cap_from(a_avail, a_dims));
 
         // B ring: same per-source share, sized from B's own dims at the B layer
         // (active layer clamped to B's layer count). Disabled unless B is a live
@@ -5054,9 +5051,10 @@ impl ExrApp {
                         if let (Some(path), Some(data)) = (&self.loaded_file, &self.exr_data) {
                             files_to_show.push(("Image A", path, data));
                         }
-                        if let (Some(path), Some(data)) =
-                            (&self.followers[&Self::B_SOURCE].loaded_file, &self.exr_data_b)
-                        {
+                        if let (Some(path), Some(data)) = (
+                            &self.followers[&Self::B_SOURCE].loaded_file,
+                            &self.exr_data_b,
+                        ) {
                             files_to_show.push(("Image B", path, data));
                         }
 
@@ -5565,7 +5563,9 @@ impl ExrApp {
                     .iter()
                     .map(|l| {
                         let (source, aov) = match &l.source {
-                            crate::layer::LayerSource::Image { source, aov } => (Some(*source), *aov),
+                            crate::layer::LayerSource::Image { source, aov } => {
+                                (Some(*source), *aov)
+                            }
                             crate::layer::LayerSource::Adjustment => (None, 0),
                         };
                         let aov_names = source
@@ -5939,7 +5939,10 @@ mod tests {
 
         // The decoded pixels are stored keyed by that source; no GPU texture
         // headless, but the model + size are populated.
-        let cs = app.comp_sources.get(&source).expect("source decoded + stored");
+        let cs = app
+            .comp_sources
+            .get(&source)
+            .expect("source decoded + stored");
         assert_eq!(cs.size, (2, 2), "2×2 fixture dims");
         assert_eq!(cs.aov, 0);
         assert_eq!(cs.exr_data.logical_layers.len(), 1, "beauty layer decoded");
@@ -6012,7 +6015,11 @@ mod tests {
             app.add_comp_source(f.clone());
         }
         assert_eq!(app.comp_stack.len(), COMP_LAYER_CAP, "capped");
-        assert_eq!(app.comp_sources.len(), COMP_LAYER_CAP, "one source per layer");
+        assert_eq!(
+            app.comp_sources.len(),
+            COMP_LAYER_CAP,
+            "one source per layer"
+        );
     }
 
     #[test]
@@ -6187,7 +6194,10 @@ mod tests {
 
         assert!(app.exr_data.is_some(), "A data applied");
         assert!(app.exr_data_b.is_none(), "B reset when A changes");
-        assert!(app.b().loaded_file.is_none(), "B path cleared when A changes");
+        assert!(
+            app.b().loaded_file.is_none(),
+            "B path cleared when A changes"
+        );
         assert!(
             !app.loading_a && !app.b().loading,
             "both loading flags cleared (A discards any in-flight B)"
@@ -8160,7 +8170,8 @@ mod tests {
         app.b_mut().loaded_file = Some(b1.clone());
         app.detect_sequence_b(&b1);
         assert!(
-            app.b().sequence
+            app.b()
+                .sequence
                 .as_ref()
                 .is_some_and(|s| s.holes.contains(&3)),
             "B has a hole at 3"
@@ -8171,7 +8182,10 @@ mod tests {
         app.b_mut().loading = true;
         app.b_mut().pending = Some(2);
         app.request_b_frame(3);
-        assert!(!app.b().loading, "hole clears loading_b (pump stays ungated)");
+        assert!(
+            !app.b().loading,
+            "hole clears loading_b (pump stays ungated)"
+        );
         assert_eq!(app.b().pending, None, "no B frame awaited on a hole");
     }
 
