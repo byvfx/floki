@@ -107,16 +107,28 @@ Generalize the two-slot backend to N sources. This is the biggest phase but is
 so behavior is observable/unchanged; it's a refactor, not a feature. Add an on-device /
 headless test that a 3-source cache evicts per-source correctly.
 
-### Phase 2 — sequence-aware, playable comp layers  *(the visible payoff)*
+### Phase 2 — sequence-aware, playable comp layers  *(the visible payoff)*  **[DONE]**
 
-Wire the Layers panel onto the Phase-1 backend.
+Wired the Layers panel onto the Phase-1 backend.
 
-- `add_comp_source` detects the source's sequence (as `detect_sequence` does for Slot A),
-  registers a `SourceState`, and stores its frame range.
-- Each visible comp layer decodes its `Trim::source_frame(global)` off the shared
-  playhead; `draw_comp_central` binds the resident frame per source.
-- Result: **added layers play** on the transport — the exact gap surfaced in the B.2–B.4
-  smoke test.
+- **[DONE P2.1 `542c6c8`]** Reserve `SourceId` 0/1 for the A/B slots; comp sources allocate
+  from `COMP_SOURCE_BASE = 2` (else the first two would alias A/B in the shared cache/rings).
+- **[DONE P2.2 `d210383`]** `add_comp_source` runs `detect_from_file`; a numbered file registers
+  a `SourceState` follower (sequence + opened frame), its layer's `Trim` spans the range (blank
+  outside), and the opened frame seeds the T1 cache. `apply_load_result`'s follower branch now
+  splits **B** (display slot → `swap_b_frame`) from a **comp** follower (cache + repaint);
+  `remove_comp_layer` drops the follower + its cache.
+- **[DONE P2.3 `9551e21`]** `sync_comp_followers` (comp `sync_b_to_a`) runs at the playhead
+  chokepoint: each comp layer maps global→source via `Trim` and requests it; the pump decodes it
+  (`active_followers()`). `draw_comp_central`'s `ensure_comp_frame` rebinds each layer's resolved
+  source frame from the T1 cache (`CompSource.cur_frame` gates rebuilds); stills keep
+  `ensure_comp_aov`.
+- **Result: added comp layers PLAY** on the transport — the B.2–B.4 smoke-test gap closed.
+- **Scope:** comp layers follow the **A-driven** transport (load a base plate as slot A to drive
+  the clock); matching frame numbers play in lockstep, mismatched need a per-layer offset UI
+  (follow-up, #102/#104). Standalone comp-only playback is Phase 4. GPU render binding is unit-
+  tested at the sync layer; the OCIO+GPU composite reuses PR-B.3 infra — a manual smoke test
+  (base plate A + 2 comp sequences + play) is the end-to-end check.
 
 ### Phase 3 — unify the *render* (A/B through the comp machinery)
 
@@ -269,10 +281,15 @@ ring / pump path are all `SourceId`-native and N-source-shaped, with A/B pinned 
 special case. The only remaining Phase-1 item is the **`map_b_frame`→`Trim::source_frame`** swap — an
 independent behavior-change slice (blank-outside-range), landable whenever.
 
-**Resume next → Phase 2** (the visible payoff): make the Layers-panel `add_comp_source` detect a
-sequence + register a `SourceState` follower so **added comp layers play** on the shared transport.
-The backend now tracks any follower's playhead / in-flight / T2 ring / budget share, so this is the
-small follow-up the plan promised.
+**Phase 2 is DONE** (P2.1–P2.3): added comp sequence layers play on the A-driven transport. See the
+Phase 2 section above for the slice-by-slice breakdown.
+
+**Resume next → Phase 3** (unify the render — route A/B through the comp machinery): `ProgramInput
+{A,B}`→`SourceId`, `emit_mode_draws` iterates `program.draws`, thread the live frame into `resolve`,
+lift Wipe/SxS/Diff to arrangement-generic + the OCIO-off display pass. Or land the independent
+**`map_b_frame`→`Trim`** behavior slice first (small, closes the last Phase-1 item). Phase-2 follow-
+ups (not blocking): a per-comp-layer offset UI (mismatched frame ranges), standalone comp-only
+transport (folds into Phase 4), and gating comp-follower decode on the panel being shown.
 
 ### After Phase 1
 
