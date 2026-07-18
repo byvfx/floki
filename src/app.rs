@@ -527,9 +527,19 @@ pub struct ExrApp {
     show_help: bool,
     #[serde(skip)]
     show_settings: bool,
-    /// Whether the additive **Layers** panel is shown (#99 PR-B). Menu-toggled.
+    /// Whether the **Layers** panel is shown (#99). On by default now that the
+    /// layer stack is becoming the primary model (the A/B compare is on its way
+    /// out); still menu-toggleable.
     #[serde(skip)]
     show_layers_panel: bool,
+    /// The comp stack drives the global transport (#99 R4-lite): set when the first
+    /// added comp *sequence* establishes the playhead (there's no slot-A open), so
+    /// the timeline + playback keys light up. While set, the slot-A decode path is
+    /// bypassed (`request_sequence_frame` / `next_want` / the budget split) so the
+    /// clock-driving sequence isn't also decoded as the primary. A real slot-A open
+    /// reclaims the transport (clears this).
+    #[serde(skip)]
+    comp_drives_transport: bool,
     /// The Layers panel's composite stack: a viewer-independent N-layer stack the
     /// panel edits and (PR-B.3) composites via the PR-A accumulate ping-pong,
     /// separate from the A/B compare stack so the compare modes stay untouched.
@@ -725,7 +735,8 @@ impl Default for ExrApp {
             resource_monitor: crate::resource_monitor::ResourceMonitor::default(),
             show_help: false,
             show_settings: false,
-            show_layers_panel: false,
+            show_layers_panel: true,
+            comp_drives_transport: false,
             comp_stack: crate::layer::LayerStack::new(),
             comp_next_source: COMP_SOURCE_BASE,
             comp_sources: std::collections::HashMap::new(),
@@ -1174,6 +1185,9 @@ impl ExrApp {
             // to a frame path in the meantime (#109).
             self.open_gen_a += 1;
             self.loading_a = true;
+            // An explicit slot-A open reclaims the transport from any comp-driven
+            // clock (#99 R4-lite) — A_SOURCE decodes again.
+            self.comp_drives_transport = false;
             // An explicit slot-A open (re)evaluates sequence mode: opening one
             // frame of a numbered sequence enables playback over its siblings; a
             // lone image leaves single-image behavior unchanged (#7).
@@ -1433,6 +1447,15 @@ impl ExrApp {
     /// is requested, so playback never stalls.
     fn request_sequence_frame(&mut self, frame: u32) {
         self.error_msg = None;
+        // Comp stack drives the transport (#99 R4-lite): no slot-A sequence, so skip
+        // the slot-A request entirely and just advance the comp followers to the new
+        // playhead. (`self.playback.frame_path` points at the clock-driving comp
+        // sequence, but decoding it as A_SOURCE would double-decode + steal priority.)
+        if self.comp_drives_transport {
+            self.sync_comp_followers();
+            self.pump_decode();
+            return;
+        }
         let Some(path) = self.playback.frame_path(frame).map(Path::to_path_buf) else {
             // Hole: keep showing the last real frame; prefetch may still run.
             self.playback.pending = None;
@@ -1629,9 +1652,12 @@ impl ExrApp {
 
     /// Resident source count for the per-source budget splits (#99): the primary
     /// (Slot A) plus every active follower. Replaces the hardcoded `/2` A+B split
-    /// so N playing sources each get their fair T1/decode-ahead share.
+    /// so N playing sources each get their fair T1/decode-ahead share. The primary
+    /// isn't counted when the comp stack drives the transport (#99 R4-lite) — it
+    /// doesn't decode then — so the followers get the whole budget. Floored at 1.
     fn n_active_sources(&self) -> usize {
-        1 + self.active_followers().count()
+        let primary = usize::from(!self.comp_drives_transport);
+        (primary + self.active_followers().count()).max(1)
     }
 
     /// The protected on-screen playheads for T1 eviction (#99 unification): the
@@ -1943,6 +1969,12 @@ impl ExrApp {
     /// scheduler in its own frame space (its range as in/out, its playhead), with
     /// the master direction / loop.
     fn next_want(&self, source: crate::layer::SourceId, depth: usize) -> Option<u32> {
+        // No primary (slot-A) decode when the comp stack drives the transport
+        // (#99 R4-lite): `playback` holds a comp sequence for the clock, but that
+        // sequence decodes as its own follower, not as A_SOURCE.
+        if source == Self::A_SOURCE && self.comp_drives_transport {
+            return None;
+        }
         // Split the window RV-style (#169): ~25% reserved behind the playhead,
         // the rest ahead — so forward window + behind reservation together never
         // over-ask the ring (the #57 back-pressure contract holds for the sum).
@@ -5501,6 +5533,16 @@ impl ExrApp {
         let cf = sequence
             .as_ref()
             .map(|seq| seq.number_of(&path).unwrap_or(seq.range.0));
+        // The first comp sequence with no transport loaded drives the global clock
+        // (#99 R4-lite): enter it so the timeline + playback keys light up (mirrors
+        // opening a slot-A sequence). A base plate already active keeps its clock;
+        // added comp layers then align to it.
+        if let (Some(seq), Some(cf)) = (&sequence, cf)
+            && !self.playback.is_active()
+        {
+            self.playback.enter(seq.clone(), cf);
+            self.comp_drives_transport = true;
+        }
         let trim = match (&sequence, cf) {
             // Align the opened frame to the current playhead so the just-added layer
             // is visible *immediately*: `offset = cf - global` makes
@@ -5654,6 +5696,13 @@ impl ExrApp {
             // (no follower registered).
             self.followers.remove(&source);
             self.frame_cache.clear_slot(source);
+        }
+        // If the comp stack drove the transport and its last sequence is gone,
+        // release the clock (#99 R4-lite) so the timeline doesn't outlive its
+        // source.
+        if self.comp_drives_transport && self.active_followers().next().is_none() {
+            self.playback.clear();
+            self.comp_drives_transport = false;
         }
     }
 
@@ -6233,47 +6282,37 @@ mod tests {
 
     #[test]
     fn sync_comp_followers_maps_the_global_playhead_through_the_trim() {
-        // A comp sequence layer follows the shared playhead (#99 Phase 2). It's added
-        // with the opened frame *aligned to the current playhead*, so with the default
-        // playhead 0 opening on frame 1 → offset 1 → source_frame(g) = g + 1, blank
-        // outside [1, 5]. This alignment is what makes the layer visible immediately.
+        // A comp sequence layer follows the shared playhead (#99). Added with no base
+        // plate, the first sequence *drives the transport* (enter at its opened frame
+        // 1), so its Trim aligns 1:1: source_frame(g) == g, blank outside [1, 5].
         let (_dir, paths) = write_sequence(5);
         let mut app = ExrApp::default();
         app.add_comp_source(paths[0].clone());
         let source = crate::layer::SourceId(COMP_SOURCE_BASE);
-        let layer_trim = app.comp_stack.iter().next().unwrap().trim;
 
-        // Opens on frame 1 (seeded + resident); the current playhead 0 maps to it.
+        // The first comp sequence established the transport at its opened frame (R4-lite).
+        assert!(
+            app.playback.is_active(),
+            "the comp stack drives the transport"
+        );
+        assert_eq!(app.playback.current_frame, 1);
+        assert!(app.comp_drives_transport);
         assert_eq!(app.followers.get(&source).unwrap().current_frame, 1);
         assert!(app.frame_cache.contains(source, 1));
-        assert_eq!(
-            layer_trim.source_frame(0),
-            Some(1),
-            "opened frame aligned to the playhead so the layer shows immediately"
-        );
 
-        // Global 0 maps to the resident opened frame (source 1): bound directly.
-        app.sync_comp_followers();
-        let f = app.followers.get(&source).unwrap();
-        assert_eq!(f.current_frame, 1);
-        assert_eq!(f.pending, None, "resident frame needs no decode");
-
-        // Global 3 → source frame 4; not resident, so it's awaited for the pump.
+        // Global 3 → source frame 3; not resident, so it's awaited for the pump.
         app.playback.current_frame = 3;
         app.sync_comp_followers();
         let f = app.followers.get(&source).unwrap();
-        assert_eq!(
-            f.current_frame, 4,
-            "follower advanced to the mapped frame (3 + offset 1)"
-        );
-        assert_eq!(f.pending, Some(4), "non-resident mapped frame is awaited");
+        assert_eq!(f.current_frame, 3, "follower maps global 1:1");
+        assert_eq!(f.pending, Some(3), "non-resident mapped frame is awaited");
 
-        // Global 5 → source 6, past the range [1, 5]: blank, follower holds.
-        app.playback.current_frame = 5;
+        // Global 6 → source 6, past the range [1, 5]: blank, follower holds.
+        app.playback.current_frame = 6;
         app.sync_comp_followers();
         assert_eq!(
             app.followers.get(&source).unwrap().current_frame,
-            4,
+            3,
             "out-of-range global holds the last frame (blank layer)"
         );
     }
