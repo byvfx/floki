@@ -2020,4 +2020,150 @@ mod metal_tests {
             }
         }
     }
+
+    // R1 (#99 render-unify): the OCIO-off display-encode pipeline turns a
+    // scene-linear value into its sRGB-encoded display value on-device (validating
+    // the WGSL compiles + the OETF is correct). Renders a known linear grey through
+    // `GpuState::display_encode_pipeline` and reads the 8-bit result back:
+    // sRGB(0.5 linear) ≈ 0.7353 → 187/255; alpha carries through.
+    #[test]
+    fn display_encode_srgb_on_device() {
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let adapter = match pollster::block_on(
+            instance.request_adapter(&wgpu::RequestAdapterOptions::default()),
+        ) {
+            Ok(a) => a,
+            Err(_) => {
+                eprintln!("no GPU adapter available; skipping display-encode test");
+                return;
+            }
+        };
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("display-encode-test-device"),
+            required_features: wgpu::Features::FLOAT32_FILTERABLE,
+            ..Default::default()
+        }))
+        .expect("request_device");
+        let gpu = GpuState::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
+
+        let extent = wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        };
+
+        // Scene-linear source: a 1×1 Rgba32Float pixel at linear 0.5, alpha 1.
+        let scene = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("scene-lin"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let lin = [0.5f32, 0.5, 0.5, 1.0];
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &scene,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::bytes_of(&lin),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(16),
+                rows_per_image: Some(1),
+            },
+            extent,
+        );
+        let scene_view = scene.create_view(&wgpu::TextureViewDescriptor::default());
+        let scene_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("scene-bg"),
+            layout: &gpu.bind_group_layout_tex,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&scene_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&gpu.sampler),
+                },
+            ],
+        });
+
+        // Rgba8Unorm target (matches the `GpuState` target format above).
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("de-target"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("display-encode"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            rp.set_pipeline(&gpu.display_encode_pipeline);
+            rp.set_bind_group(0, &scene_bg, &[]);
+            rp.draw(0..3, 0..1);
+        }
+        let rb = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rb"),
+            size: 256,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &rb,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(256),
+                    rows_per_image: Some(1),
+                },
+            },
+            extent,
+        );
+        queue.submit([encoder.finish()]);
+        rb.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let data = rb.slice(..).get_mapped_range();
+        let got = data[0];
+        assert!(
+            (i32::from(got) - 187).abs() <= 2,
+            "sRGB-encoded 0.5 linear should be ~187/255, got {got}"
+        );
+        assert_eq!(data[3], 255, "alpha carried through");
+    }
 }
