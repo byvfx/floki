@@ -63,6 +63,13 @@ fn default_proxy_size() -> usize {
 /// bounded on 8 GB (see the roadmap); the panel disables Add at this many layers.
 const COMP_LAYER_CAP: usize = 6;
 
+/// First `SourceId` the Layers panel allocates for its sources (#99 Phase 2).
+/// `SourceId(0)` / `SourceId(1)` are reserved for the A/B compare slots
+/// ([`ExrApp::A_SOURCE`] / [`ExrApp::B_SOURCE`]) — the primary + locked-step
+/// follower — so comp sources start at 2 and never alias A/B in the shared T1
+/// cache / T2 rings / `followers` map once they decode as sequence followers.
+const COMP_SOURCE_BASE: u64 = 2;
+
 /// A decoded Layers-panel source (#99 PR-B.2): its pixels plus the GPU texture the
 /// composite ping-pong (PR-B.3) binds as a layer. One per `SourceId`, held in
 /// [`ExrApp::comp_sources`]. The `texture` handle is kept purely to own the VRAM
@@ -525,8 +532,10 @@ pub struct ExrApp {
     /// this field (`LayerStack` isn't `Serialize`, and ids are re-allocated on load).
     #[serde(skip)]
     comp_stack: crate::layer::LayerStack,
-    /// Monotonic allocator for the panel's `SourceId`s (#99 PR-B). Never reused, so
-    /// a removed-then-added source can't alias a stale decode/texture (PR-B.2).
+    /// Monotonic allocator for the panel's `SourceId`s (#99 PR-B). Starts at
+    /// [`COMP_SOURCE_BASE`] (2) so comp sources never alias the A/B slots (0/1);
+    /// never reused, so a removed-then-added source can't alias a stale
+    /// decode/texture (PR-B.2).
     #[serde(skip)]
     comp_next_source: u64,
     /// Decoded pixels + GPU texture for each Layers-panel source, keyed by the
@@ -713,7 +722,7 @@ impl Default for ExrApp {
             show_settings: false,
             show_layers_panel: false,
             comp_stack: crate::layer::LayerStack::new(),
-            comp_next_source: 0,
+            comp_next_source: COMP_SOURCE_BASE,
             comp_sources: std::collections::HashMap::new(),
             gpu_resources: None,
             ocio_path: String::new(),
@@ -5928,14 +5937,23 @@ mod tests {
         let mut app = ExrApp::default();
         app.add_comp_source(f);
 
-        // One model layer, at AOV 0, referencing source id 0.
+        // One model layer, at AOV 0, referencing the first comp source id
+        // (COMP_SOURCE_BASE = 2; ids 0/1 are reserved for the A/B compare slots).
         assert_eq!(app.comp_stack.len(), 1, "layer registered");
-        assert_eq!(app.comp_next_source, 1, "SourceId allocator advanced");
+        assert_eq!(
+            app.comp_next_source,
+            COMP_SOURCE_BASE + 1,
+            "SourceId allocator advanced"
+        );
         let layer = app.comp_stack.iter().next().unwrap();
         let crate::layer::LayerSource::Image { source, aov } = layer.source else {
             panic!("expected an image layer");
         };
-        assert_eq!((source, aov), (crate::layer::SourceId(0), 0));
+        assert_eq!((source, aov), (crate::layer::SourceId(COMP_SOURCE_BASE), 0));
+        assert!(
+            source != ExrApp::A_SOURCE && source != ExrApp::B_SOURCE,
+            "comp source must not alias the A/B compare slots"
+        );
 
         // The decoded pixels are stored keyed by that source; no GPU texture
         // headless, but the model + size are populated.
@@ -5957,7 +5975,10 @@ mod tests {
         app.add_comp_source(std::path::PathBuf::from("/nonexistent/does-not-exist.exr"));
         assert!(app.comp_stack.is_empty(), "no layer on decode failure");
         assert!(app.comp_sources.is_empty(), "no source stored");
-        assert_eq!(app.comp_next_source, 0, "SourceId not consumed");
+        assert_eq!(
+            app.comp_next_source, COMP_SOURCE_BASE,
+            "SourceId not consumed"
+        );
         assert!(app.error_msg.is_some(), "error surfaced to the status bar");
     }
 
@@ -5970,7 +5991,7 @@ mod tests {
         let mut app = ExrApp::default();
         app.add_comp_source(f);
         let id = app.comp_stack.iter().next().unwrap().id;
-        let source = crate::layer::SourceId(0);
+        let source = crate::layer::SourceId(COMP_SOURCE_BASE);
         assert!(app.comp_sources.contains_key(&source));
 
         app.remove_comp_layer(id);
@@ -5980,7 +6001,11 @@ mod tests {
             "orphaned source freed"
         );
         // Ids are never reused, so a re-add can't alias the freed source.
-        assert_eq!(app.comp_next_source, 1, "allocator not rewound");
+        assert_eq!(
+            app.comp_next_source,
+            COMP_SOURCE_BASE + 1,
+            "allocator not rewound"
+        );
     }
 
     #[test]
@@ -5993,7 +6018,7 @@ mod tests {
 
         let mut app = ExrApp::default();
         app.add_comp_source(f);
-        let source = crate::layer::SourceId(0);
+        let source = crate::layer::SourceId(COMP_SOURCE_BASE);
         let cs = app.comp_sources.get(&source).expect("source stored");
         assert_eq!(cs.exr_data.logical_layers.len(), 3, "3 passes → 3 AOVs");
         assert_eq!(cs.aov, 0, "starts on AOV 0");
