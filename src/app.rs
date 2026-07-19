@@ -5768,6 +5768,11 @@ impl ExrApp {
                     /// picker (#99 PR-B.4.3). Empty / single-entry ⇒ no picker shown.
                     aov: usize,
                     aov_names: Vec<String>,
+                    /// This layer's time offset (`Trim.offset`) + whether it's a sequence
+                    /// (#99): only a sequence layer gets the per-row time-offset control
+                    /// (a still spans all frames, so an offset is a no-op there).
+                    offset: i64,
+                    is_sequence: bool,
                 }
                 let rows: Vec<Row> = self
                     .comp_stack
@@ -5805,6 +5810,8 @@ impl ExrApp {
                             opacity: l.opacity,
                             aov,
                             aov_names,
+                            offset: l.trim.offset,
+                            is_sequence: source.is_some_and(|s| self.followers.contains_key(&s)),
                         }
                     })
                     .collect();
@@ -5812,6 +5819,9 @@ impl ExrApp {
                 let solo_active = self.comp_stack.solo_active();
                 let mut remove: Option<crate::layer::LayerId> = None;
                 let mut reorder: Option<(crate::layer::LayerId, usize)> = None;
+                // A time-offset edit re-maps a layer's source frame, so re-request the
+                // comp followers after the loop (the pump fetches the newly-needed frame).
+                let mut offset_changed = false;
 
                 // Display top-of-stack first: iterate high stack index → low.
                 for (i, row) in rows.iter().enumerate().rev() {
@@ -5879,6 +5889,23 @@ impl ExrApp {
                             {
                                 l.opacity = opacity;
                             }
+                            // Per-layer time offset (#99): slide a *sequence* layer along
+                            // the global timeline independently (`Trim.offset`; +ahead /
+                            // −behind). A still spans all frames, so it gets no control.
+                            if row.is_sequence {
+                                let mut offset = row.offset;
+                                if ui
+                                    .add(egui::DragValue::new(&mut offset).speed(0.25).suffix(" f"))
+                                    .on_hover_text(
+                                        "Time offset (frames): slide this layer along the timeline",
+                                    )
+                                    .changed()
+                                    && let Some(l) = self.comp_stack.get_mut(row.id)
+                                {
+                                    l.trim.offset = offset;
+                                    offset_changed = true;
+                                }
+                            }
                             // Blend (unused for the bottom layer, which is a plain
                             // copy — the base of the composite has nothing beneath it).
                             ui.add_enabled_ui(i > 0, |ui| {
@@ -5928,6 +5955,11 @@ impl ExrApp {
                 }
                 if let Some(id) = remove {
                     self.remove_comp_layer(id);
+                }
+                // A time-offset edit changed a layer's mapping — re-request each comp
+                // follower's newly-needed frame so the pump fetches it (#99).
+                if offset_changed {
+                    self.sync_comp_followers();
                 }
             });
     }
@@ -6314,6 +6346,32 @@ mod tests {
             app.followers.get(&source).unwrap().current_frame,
             3,
             "out-of-range global holds the last frame (blank layer)"
+        );
+    }
+
+    #[test]
+    fn per_layer_time_offset_reshifts_the_follower() {
+        // Editing a comp sequence layer's Trim offset (what the per-row time control
+        // does) slides it along the timeline: the follower maps the global frame
+        // through the new offset on the next sync (#99).
+        let (_dir, paths) = write_sequence(10);
+        let mut app = ExrApp::default();
+        app.add_comp_source(paths[0].clone());
+        let source = crate::layer::SourceId(COMP_SOURCE_BASE);
+        let id = app.comp_stack.iter().next().unwrap().id;
+
+        // Transport enters at frame 1, offset 0 → source_frame(global) == global.
+        app.playback.current_frame = 3;
+        app.sync_comp_followers();
+        assert_eq!(app.followers.get(&source).unwrap().current_frame, 3);
+
+        // Nudge the layer +2 frames (what the row DragValue writes), then re-sync.
+        app.comp_stack.get_mut(id).unwrap().trim.offset = 2;
+        app.sync_comp_followers();
+        assert_eq!(
+            app.followers.get(&source).unwrap().current_frame,
+            5,
+            "offset +2 shifts the follower's source frame (3 + 2)"
         );
     }
 
