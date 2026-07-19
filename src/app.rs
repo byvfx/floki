@@ -3536,11 +3536,15 @@ impl eframe::App for ExrApp {
         self.draw_playback_hud(ui.ctx());
         self.draw_menu_bar(ui);
         self.draw_status_bar(ui);
-        // Transport bar sits just above the status bar (added after it, so it
+        // Layers panel: a bottom track list (#99, Chaos-Player-style) — added after
+        // the status bar and before the transport, so top→bottom it stacks
+        // transport → layers → status (the tracks sit just above the status bar,
+        // below the transport controls).
+        self.draw_layers_panel(ui);
+        // Transport bar sits just above the layers panel (added after it, so it
         // stacks above); a no-op panel unless a sequence is loaded.
         self.draw_transport_bar(ui);
         self.draw_side_panel(ui);
-        self.draw_layers_panel(ui);
         self.draw_central_canvas(ui);
         // Pre-upload T2 GPU textures ahead of the playhead (#56). After the canvas
         // so the on-screen frame's texture exists; self-gates when T2 is off.
@@ -5714,9 +5718,9 @@ impl ExrApp {
         if !self.show_layers_panel || self.viewer.fullscreen {
             return;
         }
-        egui::Panel::right("layers_panel")
+        egui::Panel::bottom("layers_panel")
             .resizable(true)
-            .min_size(220.0)
+            .min_size(120.0)
             .show_inside(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.heading("Layers");
