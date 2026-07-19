@@ -5856,6 +5856,25 @@ impl ExrApp {
                             egui::RichText::new(&row.name).weak()
                         }));
 
+                        // Per-layer time offset (#99): slide a *sequence* layer along the
+                        // global timeline independently (`Trim.offset`; +ahead / −behind).
+                        // In the left flow (not the crowded right-aligned group) so it's
+                        // always visible. A still spans all frames, so it gets no control.
+                        if row.is_sequence {
+                            let mut offset = row.offset;
+                            if ui
+                                .add(egui::DragValue::new(&mut offset).speed(0.25).suffix(" f"))
+                                .on_hover_text(
+                                    "Time offset (frames): slide this layer along the timeline",
+                                )
+                                .changed()
+                                && let Some(l) = self.comp_stack.get_mut(row.id)
+                            {
+                                l.trim.offset = offset;
+                                offset_changed = true;
+                            }
+                        }
+
                         // Right-aligned per-row controls: remove, reorder, blend.
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.small_button("✕").on_hover_text("Remove layer").clicked() {
@@ -5888,23 +5907,6 @@ impl ExrApp {
                                 && let Some(l) = self.comp_stack.get_mut(row.id)
                             {
                                 l.opacity = opacity;
-                            }
-                            // Per-layer time offset (#99): slide a *sequence* layer along
-                            // the global timeline independently (`Trim.offset`; +ahead /
-                            // −behind). A still spans all frames, so it gets no control.
-                            if row.is_sequence {
-                                let mut offset = row.offset;
-                                if ui
-                                    .add(egui::DragValue::new(&mut offset).speed(0.25).suffix(" f"))
-                                    .on_hover_text(
-                                        "Time offset (frames): slide this layer along the timeline",
-                                    )
-                                    .changed()
-                                    && let Some(l) = self.comp_stack.get_mut(row.id)
-                                {
-                                    l.trim.offset = offset;
-                                    offset_changed = true;
-                                }
                             }
                             // Blend (unused for the bottom layer, which is a plain
                             // copy — the base of the composite has nothing beneath it).
