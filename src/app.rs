@@ -70,6 +70,146 @@ const COMP_LAYER_CAP: usize = 6;
 /// cache / T2 rings / `followers` map once they decode as sequence followers.
 const COMP_SOURCE_BASE: u64 = 2;
 
+/// Width of the timeline panel's track gutter (#99): the fixed-width left column
+/// holding a layer's visibility / solo / name / menu. Everything right of it is
+/// the shared time axis, so the frame ruler and every clip bar map frames to the
+/// same x.
+const TIMELINE_GUTTER_W: f32 = 220.0;
+
+/// Height of one row in the timeline panel (#99) — the ruler and each layer track.
+const TIMELINE_ROW_H: f32 = 22.0;
+
+/// Cache-fill strip colors (#172), shared by the ruler's bar and the per-track
+/// strips (#99): proxy/beauty-resident frames in a dim green, full-res on top in a
+/// brighter green — so a range that's only proxy-cached (it sharpens to full on
+/// pause) reads differently from a fully-cached one.
+const CACHE_PROXY_FILL: egui::Color32 = egui::Color32::from_rgb(52, 104, 72);
+const CACHE_FULL_FILL: egui::Color32 = egui::Color32::from_rgb(64, 168, 96);
+
+/// Frame ↔ x mapping for the timeline panel (#99). Built per row from that row's
+/// axis rect (every row allocates identically, so they all agree) and shared by
+/// the ruler and the layer clip bars, which is what makes a bar line up with the
+/// frame numbers above it. `f64` throughout: frame numbers on long sequences
+/// exceed f32-exact range, and the mapping has to stay monotonic.
+#[derive(Clone, Copy, Debug)]
+struct TimeAxis {
+    left: f32,
+    width: f32,
+    lo: u32,
+    hi: u32,
+}
+
+impl TimeAxis {
+    fn new(rect: egui::Rect, lo: u32, hi: u32) -> Self {
+        Self {
+            left: rect.left(),
+            width: rect.width(),
+            lo,
+            hi,
+        }
+    }
+
+    /// Frames spanned; `0` for a single-frame sequence (which maps to the center).
+    fn span(self) -> f64 {
+        f64::from(self.hi.saturating_sub(self.lo))
+    }
+
+    /// x of a global frame. Frames outside `[lo, hi]` clamp to the axis edges, so
+    /// a layer offset off the end of the timeline shows as a bar against the edge
+    /// rather than painting outside the panel.
+    fn x_of(self, frame: i64) -> f32 {
+        let span = self.span();
+        let t = if span == 0.0 {
+            0.5
+        } else {
+            (((frame - i64::from(self.lo)) as f64) / span) as f32
+        };
+        self.left + t.clamp(0.0, 1.0) * self.width
+    }
+
+    /// x of the *left edge of a frame's slot*, for strips where each frame owns an
+    /// equal-width cell over `lo..=hi` inclusive (the cache-fill bars) rather than
+    /// sitting on a tick.
+    fn slot_x(self, frame: i64) -> f32 {
+        let nslots = self.span() + 1.0;
+        let t = (((frame - i64::from(self.lo)) as f64) / nslots) as f32;
+        self.left + t.clamp(0.0, 1.0) * self.width
+    }
+
+    /// The global frame under `x` (clamped to the axis).
+    fn frame_at(self, x: f32) -> i64 {
+        let t = f64::from((x - self.left) / self.width.max(1.0)).clamp(0.0, 1.0);
+        i64::from(self.lo) + (t * self.span()).round() as i64
+    }
+}
+
+/// Coalesce a sorted frame set into contiguous runs, handing each `[start, end]`
+/// to `run` (#146): with a large RAM budget the ring holds thousands of frames,
+/// and painting one rect per frame tessellated thousands of shapes per repaint.
+/// Shared by the ruler's cache-fill bar and the per-track strips.
+fn for_each_frame_run(frames: &mut [u32], mut run: impl FnMut(u32, u32)) {
+    frames.sort_unstable();
+    let mut i = 0;
+    while i < frames.len() {
+        let start = frames[i];
+        let mut end = start;
+        while i + 1 < frames.len() && frames[i + 1] == end + 1 {
+            i += 1;
+            end = frames[i];
+        }
+        i += 1;
+        run(start, end);
+    }
+}
+
+/// Allocate one full-width timeline row and split it into `(gutter, axis)`.
+/// Allocating the row in a single call — rather than as two adjacent widgets —
+/// is what keeps the axis x-origin identical on every row: egui inserts
+/// `item_spacing` between separate allocations, which would stagger the rows.
+fn alloc_timeline_row(ui: &mut egui::Ui, axis_w: f32, h: f32) -> (egui::Rect, egui::Rect) {
+    let (row, _) = ui.allocate_exact_size(
+        egui::vec2(TIMELINE_GUTTER_W + axis_w, h),
+        egui::Sense::hover(),
+    );
+    let split = row.left() + TIMELINE_GUTTER_W;
+    (
+        egui::Rect::from_min_max(row.min, egui::pos2(split, row.bottom())),
+        egui::Rect::from_min_max(egui::pos2(split, row.top()), row.max),
+    )
+}
+
+/// A layer clip bar's span on the *global* timeline, from its source-space trim.
+/// `source = global + offset`, so `global = source - offset`. Returns `None` when
+/// the layer falls entirely outside `[lo, hi]` (it is blank across the whole
+/// visible timeline).
+fn track_span(trim: crate::layer::Trim, lo: u32, hi: u32) -> Option<(i64, i64)> {
+    let g_lo = i64::from(trim.in_point).saturating_sub(trim.offset);
+    let g_hi = i64::from(trim.out_point).saturating_sub(trim.offset);
+    if g_hi < i64::from(lo) || g_lo > i64::from(hi) {
+        return None;
+    }
+    Some((g_lo, g_hi))
+}
+
+/// The layer offset a clip drag lands on (#99): the bar is anchored to the frame
+/// the pointer grabbed, so the result is a function of the pointer's *absolute*
+/// position rather than an accumulation of per-event deltas (which drifts).
+/// Dragging right moves the layer later on the global timeline, which *decreases*
+/// the offset (`global = source - offset`).
+fn offset_after_drag(start_offset: i64, grab: i64, now: i64) -> i64 {
+    start_offset - (now - grab)
+}
+
+/// An in-progress clip-bar drag (#99). Holds the frame the pointer grabbed and
+/// the layer's offset at grab time, so every drag event re-derives the offset
+/// from scratch (see [`offset_after_drag`]).
+#[derive(Clone, Copy, Debug)]
+struct TrackDrag {
+    id: crate::layer::LayerId,
+    grab: i64,
+    start_offset: i64,
+}
+
 /// A decoded Layers-panel source (#99 PR-B.2): its pixels plus the GPU texture the
 /// composite ping-pong (PR-B.3) binds as a layer. One per `SourceId`, held in
 /// [`ExrApp::comp_sources`]. The `texture` handle is kept purely to own the VRAM
@@ -532,6 +672,10 @@ pub struct ExrApp {
     /// out); still menu-toggleable.
     #[serde(skip)]
     show_layers_panel: bool,
+    /// An in-progress timeline clip-bar drag (#99), or `None`. Purely transient
+    /// interaction state — the edit it produces lands in the layer's `Trim.offset`.
+    #[serde(skip)]
+    track_drag: Option<TrackDrag>,
     /// The comp stack drives the global transport (#99 R4-lite): set when the first
     /// added comp *sequence* establishes the playhead (there's no slot-A open), so
     /// the timeline + playback keys light up. While set, the slot-A decode path is
@@ -736,6 +880,7 @@ impl Default for ExrApp {
             show_help: false,
             show_settings: false,
             show_layers_panel: true,
+            track_drag: None,
             comp_drives_transport: false,
             comp_stack: crate::layer::LayerStack::new(),
             comp_next_source: COMP_SOURCE_BASE,
@@ -3536,14 +3681,11 @@ impl eframe::App for ExrApp {
         self.draw_playback_hud(ui.ctx());
         self.draw_menu_bar(ui);
         self.draw_status_bar(ui);
-        // Layers panel: a bottom track list (#99, Chaos-Player-style) — added after
-        // the status bar and before the transport, so top→bottom it stacks
-        // transport → layers → status (the tracks sit just above the status bar,
-        // below the transport controls).
-        self.draw_layers_panel(ui);
-        // Transport bar sits just above the layers panel (added after it, so it
-        // stacks above); a no-op panel unless a sequence is loaded.
-        self.draw_transport_bar(ui);
+        // The merged bottom timeline panel (#99, Chaos-Player layout): transport
+        // controls, the frame ruler, and the layer tracks — one panel so the bars
+        // share the ruler's x axis. Added after the status bar, so it sits just
+        // above it. A no-op unless a sequence is loaded or the tracks are shown.
+        self.draw_timeline_panel(ui);
         self.draw_side_panel(ui);
         self.draw_central_canvas(ui);
         // Pre-upload T2 GPU textures ahead of the playhead (#56). After the canvas
@@ -4139,10 +4281,11 @@ impl ExrApp {
 
                     ui.menu_button("View", |ui| {
                         ui.checkbox(&mut self.viewer.show_contact_sheet, "Contact Sheet");
-                        ui.checkbox(&mut self.show_layers_panel, "Layers")
+                        ui.checkbox(&mut self.show_layers_panel, "Layer tracks")
                             .on_hover_text(
-                                "Compositing layer stack: stack N sources as layers with \
-                                 per-layer blend / opacity / visibility (#99)",
+                                "Compositing layer stack as timeline tracks: stack N \
+                                 sources as layers with per-layer blend / opacity / \
+                                 visibility, and drag a layer's clip to retime it (#99)",
                             );
                         if ui.button("Viewport Background...").clicked() {
                             self.viewer.show_background_window = true;
@@ -4628,374 +4771,415 @@ impl ExrApp {
         self.show_playback_debug = open;
     }
 
-    /// Transport controls for image-sequence playback (#7). A no-op unless a
-    /// sequence is loaded. Scrubber + play/pause/stop/step/jump + reverse +
-    /// loop-mode + editable target fps and measured fps.
-    fn draw_transport_bar(&mut self, ui: &mut egui::Ui) {
-        use crate::playback::{Direction, LoopMode, Pacing};
-        if !self.playback.is_active() {
+    /// The merged bottom **timeline panel** (#99, Chaos-Player layout): transport
+    /// controls, the frame ruler, and one track per composite layer — all sharing a
+    /// single x axis, so a layer's clip bar lines up with the frame numbers above
+    /// it. Replaces the separate transport and Layers panels (aligning bars to a
+    /// ruler in a *different* panel would mean matching gutter widths by hand).
+    ///
+    /// Each section self-gates: the controls and ruler need an active transport,
+    /// the tracks need the Layers toggle. With neither, the panel doesn't show.
+    fn draw_timeline_panel(&mut self, ui: &mut egui::Ui) {
+        let transport = self.playback.is_active();
+        if self.viewer.fullscreen || (!transport && !self.show_layers_panel) {
             return;
         }
-        egui::Panel::bottom("transport_bar").show_inside(ui, |ui| {
-            ui.horizontal(|ui| {
-                let (lo, hi) = (self.playback.in_point, self.playback.out_point);
-                let playing = self.playback.is_playing();
+        egui::Panel::bottom("timeline_panel")
+            .resizable(true)
+            .show_inside(ui, |ui| {
+                // One axis width for every row in the panel, measured before any
+                // row is added (`available_width` is horizontal, so it's stable
+                // down the vertical layout).
+                let axis_w = (ui.available_width() - TIMELINE_GUTTER_W).max(64.0);
+                // The visible frame range comes from the driving sequence. `None`
+                // (stills-only stack, no transport) ⇒ no axis: tracks render
+                // gutter-only, as the old flat list did.
+                let range = self.playback.full_range();
 
-                if ui.button("|<").on_hover_text("Jump to in").clicked() {
-                    self.playback_scrub_to(lo);
+                if transport {
+                    self.draw_transport_controls(ui);
+                    self.draw_ruler_row(ui, axis_w, range);
                 }
-                if ui.button("<").on_hover_text("Step back (←)").clicked() {
-                    self.playback_step(-1);
+                if self.show_layers_panel {
+                    self.draw_layer_tracks(ui, axis_w, range);
                 }
-                if ui
-                    .button(if playing { "Pause" } else { "Play" })
-                    .on_hover_text("Play/Pause (Space)")
-                    .clicked()
-                {
-                    self.playback_toggle();
-                }
-                if ui
-                    .button("Stop")
-                    .on_hover_text("Stop (halt in place; |< rewinds to in)")
-                    .clicked()
-                {
-                    self.playback_stop();
-                }
-                if ui.button(">").on_hover_text("Step forward (→)").clicked() {
-                    self.playback_step(1);
-                }
-                if ui.button(">|").on_hover_text("Jump to out").clicked() {
-                    self.playback_scrub_to(hi);
-                }
+            });
+    }
 
-                ui.separator();
+    /// The frame-ruler row of the timeline panel: the frame readout in the gutter,
+    /// the scrubbable timeline over the shared axis.
+    fn draw_ruler_row(&mut self, ui: &mut egui::Ui, axis_w: f32, range: Option<(u32, u32)>) {
+        let (gutter, axis_rect) = alloc_timeline_row(ui, axis_w, TIMELINE_ROW_H);
+        let cur = self.playback.current_frame;
+        let (in_pt, out_pt) = (self.playback.in_point, self.playback.out_point);
+        // A hole holds the previous frame; flag it so the readout isn't mistaken
+        // for a decoded frame.
+        let hole = self.playback.frame_path(cur).is_none();
+        let mut g = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(gutter)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        g.set_clip_rect(gutter);
+        g.label(format!("{cur}  [{in_pt}–{out_pt}]"));
+        if hole {
+            g.label(egui::RichText::new("(hole)").weak());
+        }
+        if let Some((lo, hi)) = range {
+            self.draw_timeline(ui, axis_rect, lo, hi);
+        }
+    }
 
-                let mut reverse = self.playback.direction == Direction::Reverse;
-                if ui
-                    .toggle_value(&mut reverse, "Rev")
-                    .on_hover_text("Reverse play direction")
-                    .changed()
-                {
-                    self.playback.direction = if reverse {
-                        Direction::Reverse
-                    } else {
-                        Direction::Forward
-                    };
-                    // Direction change invalidates prefetch (it ran the other way).
-                    self.invalidate_inflight();
-                }
+    /// Transport controls for image-sequence playback (#7): play/pause/stop/step/
+    /// jump + reverse + loop-mode + pacing + in/out trim + editable target fps and
+    /// measured fps + the decode/cache toggles. The top row of the timeline panel
+    /// (#99); the caller gates on an active transport.
+    fn draw_transport_controls(&mut self, ui: &mut egui::Ui) {
+        use crate::playback::{Direction, LoopMode, Pacing};
+        ui.horizontal(|ui| {
+            let (lo, hi) = (self.playback.in_point, self.playback.out_point);
+            let playing = self.playback.is_playing();
 
-                let loop_label = match self.playback.loop_mode {
-                    LoopMode::Once => "Once",
-                    LoopMode::Loop => "Loop",
-                    LoopMode::PingPong => "Ping-Pong",
+            if ui.button("|<").on_hover_text("Jump to in").clicked() {
+                self.playback_scrub_to(lo);
+            }
+            if ui.button("<").on_hover_text("Step back (←)").clicked() {
+                self.playback_step(-1);
+            }
+            if ui
+                .button(if playing { "Pause" } else { "Play" })
+                .on_hover_text("Play/Pause (Space)")
+                .clicked()
+            {
+                self.playback_toggle();
+            }
+            if ui
+                .button("Stop")
+                .on_hover_text("Stop (halt in place; |< rewinds to in)")
+                .clicked()
+            {
+                self.playback_stop();
+            }
+            if ui.button(">").on_hover_text("Step forward (→)").clicked() {
+                self.playback_step(1);
+            }
+            if ui.button(">|").on_hover_text("Jump to out").clicked() {
+                self.playback_scrub_to(hi);
+            }
+
+            ui.separator();
+
+            let mut reverse = self.playback.direction == Direction::Reverse;
+            if ui
+                .toggle_value(&mut reverse, "Rev")
+                .on_hover_text("Reverse play direction")
+                .changed()
+            {
+                self.playback.direction = if reverse {
+                    Direction::Reverse
+                } else {
+                    Direction::Forward
                 };
-                if ui
-                    .button(loop_label)
-                    .on_hover_text("Cycle loop mode")
-                    .clicked()
-                {
-                    self.playback.loop_mode = match self.playback.loop_mode {
-                        LoopMode::Once => LoopMode::Loop,
-                        LoopMode::Loop => LoopMode::PingPong,
-                        LoopMode::PingPong => LoopMode::Once,
-                    };
-                }
+                // Direction change invalidates prefetch (it ran the other way).
+                self.invalidate_inflight();
+            }
 
-                // Pacing toggle (#7): stutter plays every frame; drop-frames holds
-                // wall-clock rate and skips. Wired through to `tick_playback`.
-                let drop = self.playback.pacing == Pacing::DropFrames;
-                let pacing_label = if drop { "Drop" } else { "Stutter" };
-                if ui
-                    .button(pacing_label)
-                    .on_hover_text(
-                        "Pacing when decode can't keep up. Stutter: play every \
+            let loop_label = match self.playback.loop_mode {
+                LoopMode::Once => "Once",
+                LoopMode::Loop => "Loop",
+                LoopMode::PingPong => "Ping-Pong",
+            };
+            if ui
+                .button(loop_label)
+                .on_hover_text("Cycle loop mode")
+                .clicked()
+            {
+                self.playback.loop_mode = match self.playback.loop_mode {
+                    LoopMode::Once => LoopMode::Loop,
+                    LoopMode::Loop => LoopMode::PingPong,
+                    LoopMode::PingPong => LoopMode::Once,
+                };
+            }
+
+            // Pacing toggle (#7): stutter plays every frame; drop-frames holds
+            // wall-clock rate and skips. Wired through to `tick_playback`.
+            let drop = self.playback.pacing == Pacing::DropFrames;
+            let pacing_label = if drop { "Drop" } else { "Stutter" };
+            if ui
+                .button(pacing_label)
+                .on_hover_text(
+                    "Pacing when decode can't keep up. Stutter: play every \
                          frame, fps drops. Drop: hold wall-clock rate, skip frames.",
-                    )
-                    .clicked()
-                {
-                    self.playback.pacing = if drop {
-                        Pacing::Stutter
-                    } else {
-                        Pacing::DropFrames
-                    };
-                }
-
-                ui.separator();
-
-                // In/out trim (#7). Set to the playhead; Reset restores the full
-                // sequence span.
-                if ui
-                    .button("Set In")
-                    .on_hover_text("Trim in point to the playhead (I)")
-                    .clicked()
-                {
-                    self.playback_set_in();
-                }
-                if ui
-                    .button("Set Out")
-                    .on_hover_text("Trim out point to the playhead (O)")
-                    .clicked()
-                {
-                    self.playback_set_out();
-                }
-                if ui
-                    .button("Reset")
-                    .on_hover_text("Reset trim to the full range")
-                    .clicked()
-                {
-                    self.playback_reset_trim();
-                }
-
-                ui.separator();
-
-                ui.add(
-                    egui::DragValue::new(&mut self.playback.fps_target)
-                        .range(1.0..=120.0)
-                        .speed(0.25)
-                        .suffix(" fps"),
                 )
-                .on_hover_text("Target fps");
-                ui.label(
-                    egui::RichText::new(format!("{:.1} actual", self.playback.measured_fps)).weak(),
-                );
+                .clicked()
+            {
+                self.playback.pacing = if drop {
+                    Pacing::Stutter
+                } else {
+                    Pacing::DropFrames
+                };
+            }
 
-                ui.separator();
+            ui.separator();
 
-                // T2 GPU pre-upload kill-switch (#56). Off → the lazy per-swap
-                // path (decode-ahead still smooths via the T1 ring).
-                if ui
-                    .checkbox(&mut self.t2_enabled, "GPU cache")
-                    .on_hover_text(
-                        "Pre-upload upcoming frames to GPU textures for smoother \
+            // In/out trim (#7). Set to the playhead; Reset restores the full
+            // sequence span.
+            if ui
+                .button("Set In")
+                .on_hover_text("Trim in point to the playhead (I)")
+                .clicked()
+            {
+                self.playback_set_in();
+            }
+            if ui
+                .button("Set Out")
+                .on_hover_text("Trim out point to the playhead (O)")
+                .clicked()
+            {
+                self.playback_set_out();
+            }
+            if ui
+                .button("Reset")
+                .on_hover_text("Reset trim to the full range")
+                .clicked()
+            {
+                self.playback_reset_trim();
+            }
+
+            ui.separator();
+
+            ui.add(
+                egui::DragValue::new(&mut self.playback.fps_target)
+                    .range(1.0..=120.0)
+                    .speed(0.25)
+                    .suffix(" fps"),
+            )
+            .on_hover_text("Target fps");
+            ui.label(
+                egui::RichText::new(format!("{:.1} actual", self.playback.measured_fps)).weak(),
+            );
+
+            ui.separator();
+
+            // T2 GPU pre-upload kill-switch (#56). Off → the lazy per-swap
+            // path (decode-ahead still smooths via the T1 ring).
+            if ui
+                .checkbox(&mut self.t2_enabled, "GPU cache")
+                .on_hover_text(
+                    "Pre-upload upcoming frames to GPU textures for smoother \
                          playback. Turn off if you see VRAM pressure.",
-                    )
-                    .changed()
-                    && !self.t2_enabled
-                {
-                    self.viewer.clear_t2(Self::A_SOURCE);
-                }
+                )
+                .changed()
+                && !self.t2_enabled
+            {
+                self.viewer.clear_t2(Self::A_SOURCE);
+            }
 
-                // A/B frame offset (#166): nudge the compared (B) sequence relative
-                // to A. Only shown when B is a locked-step sequence.
-                if self.b().sequence.is_some() {
-                    ui.separator();
-                    ui.label("A/B offset");
-                    let mut off = self.b().offset;
-                    if ui
-                        .add(
-                            egui::DragValue::new(&mut off)
-                                .range(-9999..=9999)
-                                .speed(0.1)
-                                .suffix(" f"),
-                        )
-                        .on_hover_text(
-                            "Frame offset of the compared (B) sequence relative to A: \
+            // A/B frame offset (#166): nudge the compared (B) sequence relative
+            // to A. Only shown when B is a locked-step sequence.
+            if self.b().sequence.is_some() {
+                ui.separator();
+                ui.label("A/B offset");
+                let mut off = self.b().offset;
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut off)
+                            .range(-9999..=9999)
+                            .speed(0.1)
+                            .suffix(" f"),
+                    )
+                    .on_hover_text(
+                        "Frame offset of the compared (B) sequence relative to A: \
                              nudge B ahead (+) or behind (−) to line up takes that \
                              start on different frames. Clamped to B's range.",
-                        )
-                        .changed()
-                    {
-                        self.b_mut().offset = off;
-                        // Re-align B to the new offset immediately.
-                        self.sync_b_to_a();
-                    }
-                }
-
-                ui.separator();
-
-                // Beauty-only playback decode kill-switch (#56, step 3). On → the
-                // ring decodes just the beauty/first layer while moving (faster
-                // decode, smaller frames for multi-part AOV EXRs); the settled
-                // frame is always re-decoded in full. Off → always decode all AOVs.
-                if ui
-                    .checkbox(&mut self.beauty_preview, "Beauty preview")
-                    .on_hover_text(
-                        "While playing, decode only the beauty/first layer for a \
-                         faster, lighter cache; the paused frame is always full. \
-                         Turn off if a file's first layer isn't its beauty.",
                     )
                     .changed()
                 {
-                    // Switching modes makes the cached ring (now the wrong decode
-                    // mode) stale; drop it so frames re-decode under the new mode.
-                    self.frame_cache.clear();
-                    self.invalidate_inflight();
-                    self.request_sequence_frame(self.playback.current_frame);
+                    self.b_mut().offset = off;
+                    // Re-align B to the new offset immediately.
+                    self.sync_b_to_a();
                 }
+            }
 
-                ui.separator();
+            ui.separator();
 
-                // Scrub-proxy kill-switch + size (#94). On → while moving, decode a
-                // tiny downsampled proxy so heavy footage plays and far more frames
-                // fit RAM; the paused frame is always re-decoded full-res. Self-gates
-                // to a full decode on small/tiled/deep files.
-                let proxy_changed = ui
-                    .checkbox(&mut self.proxy_enabled, "Scrub proxy")
-                    .on_hover_text(
-                        "While playing/scrubbing, decode a small downsampled proxy so \
+            // Beauty-only playback decode kill-switch (#56, step 3). On → the
+            // ring decodes just the beauty/first layer while moving (faster
+            // decode, smaller frames for multi-part AOV EXRs); the settled
+            // frame is always re-decoded in full. Off → always decode all AOVs.
+            if ui
+                .checkbox(&mut self.beauty_preview, "Beauty preview")
+                .on_hover_text(
+                    "While playing, decode only the beauty/first layer for a \
+                         faster, lighter cache; the paused frame is always full. \
+                         Turn off if a file's first layer isn't its beauty.",
+                )
+                .changed()
+            {
+                // Switching modes makes the cached ring (now the wrong decode
+                // mode) stale; drop it so frames re-decode under the new mode.
+                self.frame_cache.clear();
+                self.invalidate_inflight();
+                self.request_sequence_frame(self.playback.current_frame);
+            }
+
+            ui.separator();
+
+            // Scrub-proxy kill-switch + size (#94). On → while moving, decode a
+            // tiny downsampled proxy so heavy footage plays and far more frames
+            // fit RAM; the paused frame is always re-decoded full-res. Self-gates
+            // to a full decode on small/tiled/deep files.
+            let proxy_changed = ui
+                .checkbox(&mut self.proxy_enabled, "Scrub proxy")
+                .on_hover_text(
+                    "While playing/scrubbing, decode a small downsampled proxy so \
                          heavy footage plays smoothly and far more frames fit in RAM; \
                          the paused frame sharpens to full res. Great for slow or \
                          networked media.",
+                )
+                .changed();
+            let size_changed = self.proxy_enabled
+                && ui
+                    .add(
+                        egui::DragValue::new(&mut self.proxy_size)
+                            .range(256..=4096)
+                            .speed(16.0)
+                            .suffix(" px"),
                     )
-                    .changed();
-                let size_changed = self.proxy_enabled
-                    && ui
-                        .add(
-                            egui::DragValue::new(&mut self.proxy_size)
-                                .range(256..=4096)
-                                .speed(16.0)
-                                .suffix(" px"),
-                        )
-                        .on_hover_text(
-                            "Proxy size — the downsampled long-side resolution: higher \
+                    .on_hover_text(
+                        "Proxy size — the downsampled long-side resolution: higher \
                              = sharper but larger + fewer frames cached. The frame is \
                              decoded full (correct geometry) then box-filtered to this \
                              size on the way into the cache.",
-                        )
-                        .changed();
-                if proxy_changed || size_changed {
-                    // The cached ring is now the wrong decode mode/size — drop it so
-                    // frames re-decode (mirrors the Beauty-preview toggle). Also
-                    // forget the measured proxy byte-size so a new size re-measures
-                    // it (otherwise a larger proxy is budgeted at the old, smaller
-                    // size until restart).
-                    self.frame_cache.clear();
-                    self.proxy_bytes = None;
-                    self.invalidate_inflight();
-                    self.request_sequence_frame(self.playback.current_frame);
-                }
+                    )
+                    .changed();
+            if proxy_changed || size_changed {
+                // The cached ring is now the wrong decode mode/size — drop it so
+                // frames re-decode (mirrors the Beauty-preview toggle). Also
+                // forget the measured proxy byte-size so a new size re-measures
+                // it (otherwise a larger proxy is budgeted at the old, smaller
+                // size until restart).
+                self.frame_cache.clear();
+                self.proxy_bytes = None;
+                self.invalidate_inflight();
+                self.request_sequence_frame(self.playback.current_frame);
+            }
 
-                ui.separator();
+            ui.separator();
 
-                // On-disk proxy cache (#165). On → persist scrub proxies to
-                // ~/.floki/proxy-cache so a repeat pass / later session loads them
-                // instead of re-decoding; LRU-bounded by the GB budget beside it.
-                let disk_changed = ui
-                    .checkbox(&mut self.proxy_disk_cache, "Disk cache")
-                    .on_hover_text(
-                        "Persist scrub proxies to disk (~/.floki/proxy-cache) so a \
+            // On-disk proxy cache (#165). On → persist scrub proxies to
+            // ~/.floki/proxy-cache so a repeat pass / later session loads them
+            // instead of re-decoding; LRU-bounded by the GB budget beside it.
+            let disk_changed = ui
+                .checkbox(&mut self.proxy_disk_cache, "Disk cache")
+                .on_hover_text(
+                    "Persist scrub proxies to disk (~/.floki/proxy-cache) so a \
                          repeat pass or a later session loads them instantly instead \
                          of re-decoding — auto-invalidated when a frame is re-rendered. \
                          Huge for networked media and repeated review (dailies, shot \
                          iteration).",
+                )
+                .changed();
+            let budget_changed = self.proxy_disk_cache
+                && ui
+                    .add(
+                        egui::DragValue::new(&mut self.proxy_cache_gb)
+                            .range(1.0..=200.0)
+                            .speed(1.0)
+                            .suffix(" GB"),
                     )
-                    .changed();
-                let budget_changed = self.proxy_disk_cache
-                    && ui
-                        .add(
-                            egui::DragValue::new(&mut self.proxy_cache_gb)
-                                .range(1.0..=200.0)
-                                .speed(1.0)
-                                .suffix(" GB"),
-                        )
-                        .on_hover_text(
-                            "On-disk proxy-cache size budget in GB (gibibytes, 1024³ — \
+                    .on_hover_text(
+                        "On-disk proxy-cache size budget in GB (gibibytes, 1024³ — \
                              same unit as the RAM budget). A ceiling, not a reservation: \
                              the least-recently-used proxies are evicted first once it \
                              fills.",
-                        )
-                        .changed();
-                if disk_changed || budget_changed {
-                    self.proxy_cache.configure(
-                        self.proxy_disk_cache,
-                        crate::proxy_cache::gib_to_bytes(self.proxy_cache_gb),
-                    );
-                }
-                if self.proxy_disk_cache
-                    && ui
-                        .button("Clear")
-                        .on_hover_text("Delete all cached proxies from ~/.floki/proxy-cache.")
-                        .clicked()
-                {
-                    self.proxy_cache.clear();
-                }
+                    )
+                    .changed();
+            if disk_changed || budget_changed {
+                self.proxy_cache.configure(
+                    self.proxy_disk_cache,
+                    crate::proxy_cache::gib_to_bytes(self.proxy_cache_gb),
+                );
+            }
+            if self.proxy_disk_cache
+                && ui
+                    .button("Clear")
+                    .on_hover_text("Delete all cached proxies from ~/.floki/proxy-cache.")
+                    .clicked()
+            {
+                self.proxy_cache.clear();
+            }
 
-                ui.separator();
+            ui.separator();
 
-                // Eager precache kill-switch (#56, step 4). On → fill the whole
-                // in/out range into the ring up front (bounded by RAM); the
-                // cache-fill bar under the scrubber shows how much is resident. On
-                // by default (#165): scrub proxies keep the footprint small and the
-                // disk cache makes a repeat fill cheap, so warming the range is cheap.
-                if ui
-                    .checkbox(&mut self.precache, "Precache")
-                    .on_hover_text(
-                        "Cache the whole in/out range up front so it plays and \
+            // Eager precache kill-switch (#56, step 4). On → fill the whole
+            // in/out range into the ring up front (bounded by RAM); the
+            // cache-fill bar under the scrubber shows how much is resident. On
+            // by default (#165): scrub proxies keep the footprint small and the
+            // disk cache makes a repeat fill cheap, so warming the range is cheap.
+            if ui
+                .checkbox(&mut self.precache, "Precache")
+                .on_hover_text(
+                    "Cache the whole in/out range up front so it plays and \
                          loops with no decoding. Fills to the RAM budget; the bar \
                          under the scrubber shows the cached span. Cheap with scrub \
                          proxies + the disk cache on, so it's on by default.",
-                    )
-                    .changed()
-                    && self.precache
-                {
-                    // Kick the fill immediately; the chain self-sustains from
-                    // `apply_load_result` as each frame lands.
-                    self.precache_filled = false;
-                    self.pump_decode();
-                    ui.ctx().request_repaint();
-                }
-
-                ui.separator();
-
-                // User-assigned RAM budget for the T1 ring (#56). 0 = Auto (size
-                // from free RAM). A ceiling only — capped by the auto figure so it
-                // can't OOM; lets you bound RAM on a shared box or dogfood eviction.
-                ui.label("RAM");
-                ui.add(
-                    egui::DragValue::new(&mut self.ram_budget_gb)
-                        .range(0.0..=256.0)
-                        .speed(0.25)
-                        .custom_formatter(|n, _| {
-                            if n < f64::from(RAM_BUDGET_AUTO_BELOW_GB) {
-                                "Auto".to_string()
-                            } else {
-                                format!("{n:.1} GB")
-                            }
-                        }),
                 )
-                .on_hover_text(
-                    "Cap the RAM the frame cache may use (0 = Auto, sized from free \
+                .changed()
+                && self.precache
+            {
+                // Kick the fill immediately; the chain self-sustains from
+                // `apply_load_result` as each frame lands.
+                self.precache_filled = false;
+                self.pump_decode();
+                ui.ctx().request_repaint();
+            }
+
+            ui.separator();
+
+            // User-assigned RAM budget for the T1 ring (#56). 0 = Auto (size
+            // from free RAM). A ceiling only — capped by the auto figure so it
+            // can't OOM; lets you bound RAM on a shared box or dogfood eviction.
+            ui.label("RAM");
+            ui.add(
+                egui::DragValue::new(&mut self.ram_budget_gb)
+                    .range(0.0..=256.0)
+                    .speed(0.25)
+                    .custom_formatter(|n, _| {
+                        if n < f64::from(RAM_BUDGET_AUTO_BELOW_GB) {
+                            "Auto".to_string()
+                        } else {
+                            format!("{n:.1} GB")
+                        }
+                    }),
+            )
+            .on_hover_text(
+                "Cap the RAM the frame cache may use (0 = Auto, sized from free \
                      RAM). A ceiling only — it can't exceed what's free. Lower it to \
                      bound RAM on a shared box, or to dogfood the eviction paths.",
-                );
+            );
 
-                ui.separator();
+            ui.separator();
 
-                // Render-watch (#101): pick up frames as a render writes them.
-                if ui
-                    .checkbox(&mut self.watch_enabled, "Watch")
-                    .on_hover_text(
-                        "Watch the sequence folder and load frames as a render \
+            // Render-watch (#101): pick up frames as a render writes them.
+            if ui
+                .checkbox(&mut self.watch_enabled, "Watch")
+                .on_hover_text(
+                    "Watch the sequence folder and load frames as a render \
                          writes them (new frames extend the range; re-rendered \
                          frames refresh).",
-                    )
-                    .changed()
-                {
-                    // (Re)baseline on the next poll so existing frames aren't
-                    // mistaken for newly-arrived ones.
-                    self.watch_sigs.clear();
-                    self.last_watch_poll = None;
-                }
-                if self.watch_enabled {
-                    ui.checkbox(&mut self.watch_follow, "Follow")
-                        .on_hover_text("Park the playhead on the newest frame as it arrives.");
-                }
-            });
-
-            // Timeline row: full-width span with the trimmed region + holes drawn
-            // distinctly, plus the frame readout.
-            ui.horizontal(|ui| {
-                let cur = self.playback.current_frame;
-                let (in_pt, out_pt) = (self.playback.in_point, self.playback.out_point);
-                ui.label(format!("{cur}  [{in_pt}–{out_pt}]"));
-                // A hole holds the previous frame; flag it so the readout isn't
-                // mistaken for a decoded frame.
-                if self.playback.frame_path(cur).is_none() {
-                    ui.label(egui::RichText::new("(hole)").weak());
-                }
-                self.draw_timeline(ui);
-            });
+                )
+                .changed()
+            {
+                // (Re)baseline on the next poll so existing frames aren't
+                // mistaken for newly-arrived ones.
+                self.watch_sigs.clear();
+                self.last_watch_poll = None;
+            }
+            if self.watch_enabled {
+                ui.checkbox(&mut self.watch_follow, "Follow")
+                    .on_hover_text("Park the playhead on the newest frame as it arrives.");
+            }
         });
     }
 
@@ -5003,31 +5187,23 @@ impl ExrApp {
     /// `[in, out]` region is highlighted, holes are marked distinctly, the in/out
     /// edges and playhead are drawn as vertical ticks. Click or drag scrubs to the
     /// frame under the cursor (a P0 seek, clamped to the trim).
-    fn draw_timeline(&mut self, ui: &mut egui::Ui) {
-        let Some((lo, hi)) = self.playback.full_range() else {
-            return;
-        };
+    ///
+    /// `rect` is the row's axis area, already allocated by the caller (#99) so the
+    /// ruler and every layer clip bar below it share one frame↔x mapping.
+    fn draw_timeline(&mut self, ui: &mut egui::Ui, rect: egui::Rect, lo: u32, hi: u32) {
+        let axis = TimeAxis::new(rect, lo, hi);
         let (in_pt, out_pt) = (self.playback.in_point, self.playback.out_point);
         let cur = self.playback.current_frame;
-        let span = hi.saturating_sub(lo); // 0 for a single-frame sequence
 
-        let width = ui.available_width().max(64.0);
-        let (rect, resp) =
-            ui.allocate_exact_size(egui::vec2(width, 22.0), egui::Sense::click_and_drag());
+        let resp = ui.interact(
+            rect,
+            ui.id().with("timeline_ruler"),
+            egui::Sense::click_and_drag(),
+        );
         if ui.is_rect_visible(rect) {
             let painter = ui.painter_at(rect);
             let visuals = ui.visuals();
-            // Map a frame number to an x inside `rect` (single-frame → center).
-            let x_of = |f: u32| {
-                // f64 throughout so the mapping stays monotonic for long
-                // sequences (frame offsets can exceed u16/f32-exact ranges).
-                let t = if span == 0 {
-                    0.5
-                } else {
-                    (f64::from(f.saturating_sub(lo)) / f64::from(span)) as f32
-                };
-                rect.left() + t.clamp(0.0, 1.0) * rect.width()
-            };
+            let x_of = |f: u32| axis.x_of(i64::from(f));
 
             // Track background.
             painter.rect_filled(rect, 3.0, visuals.extreme_bg_color);
@@ -5047,34 +5223,17 @@ impl ExrApp {
             // sort is far cheaper. The gap to a full green bar is the part of
             // the range that doesn't fit the RAM budget (or hasn't decoded yet).
             let strip_top = rect.bottom() - 4.0;
-            let nslots = f64::from(span) + 1.0; // frames lo..=hi inclusive
-            let slot_x = |f: u32| {
-                rect.left() + ((f64::from(f.saturating_sub(lo)) / nslots) as f32) * rect.width()
-            };
-            // Two-tone (#172): proxy/beauty-resident frames in a dim green, full-res
-            // on top in a brighter green — so a range that's only proxy-cached (it
-            // sharpens to full on pause) reads differently from a fully-cached one.
-            let proxy_fill = egui::Color32::from_rgb(52, 104, 72);
-            let full_fill = egui::Color32::from_rgb(64, 168, 96);
-            // Coalesce a sorted frame set into contiguous runs and paint each as one
-            // rect (#146 — one shape per frame tessellated thousands per repaint).
             let paint_runs = |frames: &mut Vec<u32>, color: egui::Color32| {
-                frames.sort_unstable();
-                let mut i = 0;
-                while i < frames.len() {
-                    let start = frames[i];
-                    let mut end = start;
-                    while i + 1 < frames.len() && frames[i + 1] == end + 1 {
-                        i += 1;
-                        end = frames[i];
-                    }
-                    i += 1;
+                for_each_frame_run(frames, |start, end| {
                     let seg = egui::Rect::from_min_max(
-                        egui::pos2(slot_x(start), strip_top),
-                        egui::pos2(slot_x(end + 1).min(rect.right()), rect.bottom()),
+                        egui::pos2(axis.slot_x(i64::from(start)), strip_top),
+                        egui::pos2(
+                            axis.slot_x(i64::from(end) + 1).min(rect.right()),
+                            rect.bottom(),
+                        ),
                     );
                     painter.rect_filled(seg, 0.0, color);
-                }
+                });
             };
             // only the trimmed range is the precache target
             let in_range = |f: u32| f >= in_pt && f <= out_pt;
@@ -5083,13 +5242,13 @@ impl ExrApp {
                 .resident_frames(Self::A_SOURCE)
                 .filter(|&f| in_range(f))
                 .collect();
-            paint_runs(&mut resident, proxy_fill);
+            paint_runs(&mut resident, CACHE_PROXY_FILL);
             let mut full: Vec<u32> = self
                 .frame_cache
                 .resident_full_frames(Self::A_SOURCE)
                 .filter(|&f| in_range(f))
                 .collect();
-            paint_runs(&mut full, full_fill);
+            paint_runs(&mut full, CACHE_FULL_FILL);
             // Holes: distinct vertical marks across the full span.
             if let Some(seq) = self.playback.sequence.as_ref() {
                 let hole_color = egui::Color32::from_rgb(206, 92, 60);
@@ -5135,9 +5294,8 @@ impl ExrApp {
         if (resp.clicked() || resp.dragged())
             && let Some(pos) = resp.interact_pointer_pos()
         {
-            let t = f64::from((pos.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
-            let frame = lo + (t * f64::from(span)).round() as u32;
-            self.playback_scrub_to(frame);
+            // `frame_at` clamps to `[lo, hi]`, so the cast is always in range.
+            self.playback_scrub_to(axis.frame_at(pos.x).max(0) as u32);
         }
         if resp.drag_stopped() {
             self.scrub_active = false;
@@ -5710,264 +5868,428 @@ impl ExrApp {
         }
     }
 
-    /// The additive **Layers** panel (#99 PR-B): a right dock listing the panel's
-    /// composite stack top-to-bottom, with Add / remove. Per-layer blend / opacity /
-    /// visibility / solo / AOV controls and reorder land in PR-B.4; rendering the
-    /// stack via the accumulate ping-pong lands in PR-B.3.
-    fn draw_layers_panel(&mut self, ui: &mut egui::Ui) {
-        if !self.show_layers_panel || self.viewer.fullscreen {
+    /// The **layer tracks** section of the timeline panel (#99, Chaos-Player
+    /// layout): one row per composite layer, top-of-stack first. The gutter holds
+    /// visibility / solo / name plus a `⋮` menu with the rest of the layer's
+    /// controls; right of it the layer's clip bar sits on the panel's shared time
+    /// axis, showing its `[in, out] + offset` span and draggable to retime it.
+    ///
+    /// `range` is the visible global frame range, or `None` when no transport is
+    /// loaded (a stills-only stack) — the rows are then gutter-only, as the old
+    /// flat list was.
+    fn draw_layer_tracks(&mut self, ui: &mut egui::Ui, axis_w: f32, range: Option<(u32, u32)>) {
+        ui.horizontal(|ui| {
+            ui.heading("Layers");
+            ui.label(
+                egui::RichText::new(format!("{}/{}", self.comp_stack.len(), COMP_LAYER_CAP)).weak(),
+            );
+            let at_cap = self.comp_stack.len() >= COMP_LAYER_CAP;
+            ui.add_enabled_ui(!at_cap, |ui| {
+                if ui
+                    .button("➕  Add source…")
+                    .on_disabled_hover_text("Layer cap reached")
+                    .clicked()
+                    && let Some(path) = FileDialog::new()
+                        .add_filter("EXR Image", &["exr"])
+                        .pick_file()
+                {
+                    self.add_comp_source(path);
+                }
+            });
+        });
+        ui.separator();
+
+        if self.comp_stack.is_empty() {
+            ui.weak("No layers yet. Add a source to begin.");
             return;
         }
-        egui::Panel::bottom("layers_panel")
-            .resizable(true)
-            .min_size(120.0)
-            .show_inside(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.heading("Layers");
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{}/{}",
-                            self.comp_stack.len(),
-                            COMP_LAYER_CAP
-                        ))
-                        .weak(),
-                    );
-                });
-                ui.separator();
-
-                let at_cap = self.comp_stack.len() >= COMP_LAYER_CAP;
-                ui.add_enabled_ui(!at_cap, |ui| {
-                    if ui
-                        .button("➕  Add source…")
-                        .on_disabled_hover_text("Layer cap reached")
-                        .clicked()
-                        && let Some(path) = FileDialog::new()
-                            .add_filter("EXR Image", &["exr"])
-                            .pick_file()
-                    {
-                        self.add_comp_source(path);
+        {
+            // Per-row controls (#99 PR-B.4): visibility / solo / blend / reorder /
+            // remove. Snapshot each row's id + display state up front (bottom→top)
+            // so the widgets can mutate `comp_stack` without aliasing an `iter()`
+            // borrow; the index `i` in this Vec is the layer's stack index (0 =
+            // bottom). Deferred edits (reorder / remove restructure the stack) are
+            // recorded and applied once after the loop.
+            struct Row {
+                id: crate::layer::LayerId,
+                name: String,
+                enabled: bool,
+                solo: bool,
+                blend: crate::viewer::BlendMode,
+                opacity: f32,
+                /// Current AOV index + the source's AOV names, for the per-row AOV
+                /// picker (#99 PR-B.4.3). Empty / single-entry ⇒ no picker shown.
+                aov: usize,
+                aov_names: Vec<String>,
+                /// This layer's time mapping + whether it's a sequence (#99): the
+                /// clip bar's span comes from the trim, and only a sequence layer is
+                /// retimeable (a still spans all frames, so an offset is a no-op).
+                trim: crate::layer::Trim,
+                is_sequence: bool,
+                /// The layer's pixel source, for the per-track cache-fill strip.
+                source: Option<crate::layer::SourceId>,
+            }
+            let rows: Vec<Row> = self
+                .comp_stack
+                .iter()
+                .map(|l| {
+                    let (source, aov) = match &l.source {
+                        crate::layer::LayerSource::Image { source, aov } => (Some(*source), *aov),
+                        crate::layer::LayerSource::Adjustment => (None, 0),
+                    };
+                    let aov_names = source
+                        .and_then(|s| self.comp_sources.get(&s))
+                        .map(|cs| {
+                            cs.exr_data
+                                .logical_layers
+                                .iter()
+                                .enumerate()
+                                .map(|(i, ll)| {
+                                    if ll.name.is_empty() {
+                                        format!("layer {i}")
+                                    } else {
+                                        ll.name.clone()
+                                    }
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    Row {
+                        id: l.id,
+                        name: l.name.clone(),
+                        enabled: l.enabled,
+                        solo: l.solo,
+                        blend: l.blend,
+                        opacity: l.opacity,
+                        aov,
+                        aov_names,
+                        trim: l.trim,
+                        is_sequence: source.is_some_and(|s| self.followers.contains_key(&s)),
+                        source,
                     }
-                });
-                ui.separator();
+                })
+                .collect();
+            let count = rows.len();
+            let solo_active = self.comp_stack.solo_active();
+            let mut remove: Option<crate::layer::LayerId> = None;
+            let mut reorder: Option<(crate::layer::LayerId, usize)> = None;
+            // A time-offset edit re-maps a layer's source frame, so re-request the
+            // comp followers after the loop (the pump fetches the newly-needed frame).
+            let mut offset_changed = false;
 
-                if self.comp_stack.is_empty() {
-                    ui.weak("No layers yet. Add a source to begin.");
-                    return;
-                }
+            // Vertical extent of the track lanes, for the playhead drawn across
+            // all of them once the rows are laid out.
+            let mut lanes: Option<egui::Rect> = None;
 
-                // Per-row controls (#99 PR-B.4): visibility / solo / blend / reorder /
-                // remove. Snapshot each row's id + display state up front (bottom→top)
-                // so the widgets can mutate `comp_stack` without aliasing an `iter()`
-                // borrow; the index `i` in this Vec is the layer's stack index (0 =
-                // bottom). Deferred edits (reorder / remove restructure the stack) are
-                // recorded and applied once after the loop.
-                struct Row {
-                    id: crate::layer::LayerId,
-                    name: String,
-                    enabled: bool,
-                    solo: bool,
-                    blend: crate::viewer::BlendMode,
-                    opacity: f32,
-                    /// Current AOV index + the source's AOV names, for the per-row AOV
-                    /// picker (#99 PR-B.4.3). Empty / single-entry ⇒ no picker shown.
-                    aov: usize,
-                    aov_names: Vec<String>,
-                    /// This layer's time offset (`Trim.offset`) + whether it's a sequence
-                    /// (#99): only a sequence layer gets the per-row time-offset control
-                    /// (a still spans all frames, so an offset is a no-op there).
-                    offset: i64,
-                    is_sequence: bool,
-                }
-                let rows: Vec<Row> = self
-                    .comp_stack
-                    .iter()
-                    .map(|l| {
-                        let (source, aov) = match &l.source {
-                            crate::layer::LayerSource::Image { source, aov } => {
-                                (Some(*source), *aov)
-                            }
-                            crate::layer::LayerSource::Adjustment => (None, 0),
-                        };
-                        let aov_names = source
-                            .and_then(|s| self.comp_sources.get(&s))
-                            .map(|cs| {
-                                cs.exr_data
-                                    .logical_layers
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(i, ll)| {
-                                        if ll.name.is_empty() {
-                                            format!("layer {i}")
-                                        } else {
-                                            ll.name.clone()
-                                        }
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        Row {
-                            id: l.id,
-                            name: l.name.clone(),
-                            enabled: l.enabled,
-                            solo: l.solo,
-                            blend: l.blend,
-                            opacity: l.opacity,
-                            aov,
-                            aov_names,
-                            offset: l.trim.offset,
-                            is_sequence: source.is_some_and(|s| self.followers.contains_key(&s)),
+            // Display top-of-stack first: iterate high stack index → low.
+            for (i, row) in rows.iter().enumerate().rev() {
+                let (gutter, lane) = alloc_timeline_row(ui, axis_w, TIMELINE_ROW_H);
+                lanes = Some(lanes.map_or(lane, |r: egui::Rect| r.union(lane)));
+                // Whether this layer reaches the composite at all (disabled, or
+                // hidden by a solo elsewhere) — greys both the name and the bar.
+                let renders = if solo_active { row.solo } else { row.enabled };
+
+                // ── Gutter: visibility / solo / name / the ⋮ menu ──────────────
+                let mut g = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(gutter)
+                        .layout(egui::Layout::right_to_left(egui::Align::Center)),
+                );
+                g.set_clip_rect(gutter);
+                // The ⋮ menu holds every control that doesn't earn permanent
+                // gutter space; laid out right-to-left so it pins to the gutter's
+                // right edge and the name gets whatever is left.
+                g.menu_button("⋮", |ui| {
+                    // Blend (unused for the bottom layer, which is a plain copy —
+                    // the base of the composite has nothing beneath it).
+                    ui.add_enabled_ui(i > 0, |ui| {
+                        let mut blend = row.blend;
+                        egui::ComboBox::from_id_salt((row.id, "blend"))
+                            .selected_text(blend.label())
+                            .width(110.0)
+                            .show_ui(ui, |ui| {
+                                for mode in crate::viewer::BlendMode::ALL {
+                                    ui.selectable_value(&mut blend, mode, mode.label());
+                                }
+                            });
+                        if blend != row.blend
+                            && let Some(l) = self.comp_stack.get_mut(row.id)
+                        {
+                            l.blend = blend;
                         }
-                    })
-                    .collect();
-                let count = rows.len();
-                let solo_active = self.comp_stack.solo_active();
-                let mut remove: Option<crate::layer::LayerId> = None;
-                let mut reorder: Option<(crate::layer::LayerId, usize)> = None;
-                // A time-offset edit re-maps a layer's source frame, so re-request the
-                // comp followers after the loop (the pump fetches the newly-needed frame).
-                let mut offset_changed = false;
-
-                // Display top-of-stack first: iterate high stack index → low.
-                for (i, row) in rows.iter().enumerate().rev() {
+                    });
+                    // Opacity 0–100% (applies to every layer, including the bottom
+                    // — the shader premultiplies its color by this).
                     ui.horizontal(|ui| {
-                        // Visibility. Dimmed (but not disabled) while a solo is active,
-                        // since solo overrides `enabled` in the composite.
-                        let mut enabled = row.enabled;
+                        ui.label("Opacity");
+                        let mut opacity = row.opacity;
                         if ui
-                            .checkbox(&mut enabled, "")
-                            .on_hover_text("Visible")
+                            .add(
+                                egui::DragValue::new(&mut opacity)
+                                    .range(0.0..=1.0)
+                                    .speed(0.01)
+                                    .fixed_decimals(2),
+                            )
                             .changed()
                             && let Some(l) = self.comp_stack.get_mut(row.id)
                         {
-                            l.enabled = enabled;
+                            l.opacity = opacity;
                         }
-                        // Solo: isolate this layer (any solo hides non-soloed layers).
-                        if ui
-                            .selectable_label(row.solo, "S")
-                            .on_hover_text("Solo")
-                            .clicked()
+                    });
+                    // AOV picker: which logical layer (pass) of the source to show.
+                    // Only for multi-layer EXRs — a single-beauty source has nothing
+                    // to choose. Changing it rebuilds the source texture next frame
+                    // (`ensure_comp_aov`).
+                    if row.aov_names.len() > 1 {
+                        let mut aov = row.aov.min(row.aov_names.len() - 1);
+                        egui::ComboBox::from_id_salt((row.id, "aov"))
+                            .selected_text(row.aov_names[aov].clone())
+                            .width(110.0)
+                            .show_ui(ui, |ui| {
+                                for (idx, nm) in row.aov_names.iter().enumerate() {
+                                    ui.selectable_value(&mut aov, idx, nm);
+                                }
+                            });
+                        if aov != row.aov
                             && let Some(l) = self.comp_stack.get_mut(row.id)
+                            && let crate::layer::LayerSource::Image { aov: a, .. } = &mut l.source
                         {
-                            l.solo = !row.solo;
+                            *a = aov;
                         }
-
-                        // Name, greyed when it won't render (disabled, or hidden by a
-                        // solo elsewhere).
-                        let renders = if solo_active { row.solo } else { row.enabled };
-                        ui.add(egui::Label::new(if renders {
-                            egui::RichText::new(&row.name)
-                        } else {
-                            egui::RichText::new(&row.name).weak()
-                        }));
-
-                        // Per-layer time offset (#99): slide a *sequence* layer along the
-                        // global timeline independently (`Trim.offset`; +ahead / −behind).
-                        // In the left flow (not the crowded right-aligned group) so it's
-                        // always visible. A still spans all frames, so it gets no control.
-                        if row.is_sequence {
-                            let mut offset = row.offset;
+                    }
+                    // Precise time offset, for typing an exact value where dragging
+                    // the clip bar is the coarse gesture. A still spans all frames,
+                    // so an offset is a no-op there and the control is omitted.
+                    if row.is_sequence {
+                        ui.horizontal(|ui| {
+                            ui.label("Offset");
+                            let mut offset = row.trim.offset;
                             if ui
                                 .add(egui::DragValue::new(&mut offset).speed(0.25).suffix(" f"))
-                                .on_hover_text(
-                                    "Time offset (frames): slide this layer along the timeline",
-                                )
+                                .on_hover_text("Slide this layer along the timeline")
                                 .changed()
                                 && let Some(l) = self.comp_stack.get_mut(row.id)
                             {
                                 l.trim.offset = offset;
                                 offset_changed = true;
                             }
-                        }
-
-                        // Right-aligned per-row controls: remove, reorder, blend.
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("✕").on_hover_text("Remove layer").clicked() {
-                                remove = Some(row.id);
-                            }
-                            // ⬆ moves toward the top of the composite (higher index);
-                            // ⬇ toward the bottom. Disabled at the ends.
-                            ui.add_enabled_ui(i + 1 < count, |ui| {
-                                if ui.small_button("⬆").on_hover_text("Move up").clicked() {
-                                    reorder = Some((row.id, i + 1));
-                                }
-                            });
-                            ui.add_enabled_ui(i > 0, |ui| {
-                                if ui.small_button("⬇").on_hover_text("Move down").clicked() {
-                                    reorder = Some((row.id, i - 1));
-                                }
-                            });
-                            // Opacity 0–100% (applies to every layer, including the
-                            // bottom — the shader premultiplies its color by this).
-                            let mut opacity = row.opacity;
-                            if ui
-                                .add(
-                                    egui::DragValue::new(&mut opacity)
-                                        .range(0.0..=1.0)
-                                        .speed(0.01)
-                                        .fixed_decimals(2),
-                                )
-                                .on_hover_text("Opacity")
-                                .changed()
-                                && let Some(l) = self.comp_stack.get_mut(row.id)
-                            {
-                                l.opacity = opacity;
-                            }
-                            // Blend (unused for the bottom layer, which is a plain
-                            // copy — the base of the composite has nothing beneath it).
-                            ui.add_enabled_ui(i > 0, |ui| {
-                                let mut blend = row.blend;
-                                egui::ComboBox::from_id_salt((row.id, "blend"))
-                                    .selected_text(blend.label())
-                                    .width(90.0)
-                                    .show_ui(ui, |ui| {
-                                        for mode in crate::viewer::BlendMode::ALL {
-                                            ui.selectable_value(&mut blend, mode, mode.label());
-                                        }
-                                    });
-                                if blend != row.blend
-                                    && let Some(l) = self.comp_stack.get_mut(row.id)
-                                {
-                                    l.blend = blend;
-                                }
-                            });
-                            // AOV picker: which logical layer (pass) of the source to
-                            // show. Only for multi-layer EXRs — a single-beauty source
-                            // has nothing to choose. Changing it rebuilds the source
-                            // texture next frame (`ensure_comp_aov`).
-                            if row.aov_names.len() > 1 {
-                                let mut aov = row.aov.min(row.aov_names.len() - 1);
-                                egui::ComboBox::from_id_salt((row.id, "aov"))
-                                    .selected_text(row.aov_names[aov].clone())
-                                    .width(90.0)
-                                    .show_ui(ui, |ui| {
-                                        for (idx, nm) in row.aov_names.iter().enumerate() {
-                                            ui.selectable_value(&mut aov, idx, nm);
-                                        }
-                                    });
-                                if aov != row.aov
-                                    && let Some(l) = self.comp_stack.get_mut(row.id)
-                                    && let crate::layer::LayerSource::Image { aov: a, .. } =
-                                        &mut l.source
-                                {
-                                    *a = aov;
-                                }
-                            }
                         });
+                    }
+                    ui.separator();
+                    // ⬆ moves toward the top of the composite (higher index); ⬇
+                    // toward the bottom. Disabled at the ends.
+                    ui.add_enabled_ui(i + 1 < count, |ui| {
+                        if ui.button("⬆  Move up").clicked() {
+                            reorder = Some((row.id, i + 1));
+                            ui.close();
+                        }
                     });
+                    ui.add_enabled_ui(i > 0, |ui| {
+                        if ui.button("⬇  Move down").clicked() {
+                            reorder = Some((row.id, i - 1));
+                            ui.close();
+                        }
+                    });
+                    if ui.button("✕  Remove layer").clicked() {
+                        remove = Some(row.id);
+                        ui.close();
+                    }
+                });
+                // The remaining gutter width, left-to-right: visibility, solo, name.
+                g.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    // Visibility. Dimmed (but not disabled) while a solo is active,
+                    // since solo overrides `enabled` in the composite.
+                    let mut enabled = row.enabled;
+                    if ui
+                        .checkbox(&mut enabled, "")
+                        .on_hover_text("Visible")
+                        .changed()
+                        && let Some(l) = self.comp_stack.get_mut(row.id)
+                    {
+                        l.enabled = enabled;
+                    }
+                    // Solo: isolate this layer (any solo hides non-soloed layers).
+                    if ui
+                        .selectable_label(row.solo, "S")
+                        .on_hover_text("Solo")
+                        .clicked()
+                        && let Some(l) = self.comp_stack.get_mut(row.id)
+                    {
+                        l.solo = !row.solo;
+                    }
+                    // Name, greyed when it won't render. Truncated rather than
+                    // wrapped: the gutter is a fixed width shared with every row.
+                    let text = if renders {
+                        egui::RichText::new(&row.name)
+                    } else {
+                        egui::RichText::new(&row.name).weak()
+                    };
+                    ui.add(egui::Label::new(text).truncate())
+                        .on_hover_text(&row.name);
+                });
+                drop(g);
+
+                // ── Clip bar on the shared time axis ──────────────────────────
+                let Some((lo, hi)) = range else { continue };
+                let axis = TimeAxis::new(lane, lo, hi);
+                let painter = ui.painter_at(lane);
+                let visuals = ui.visuals();
+                let lane_bg = lane.shrink2(egui::vec2(0.0, 2.0));
+                painter.rect_filled(lane_bg, 2.0, visuals.extreme_bg_color);
+
+                let Some((g_lo, g_hi)) = track_span(row.trim, lo, hi) else {
+                    // The layer is blank across the whole visible timeline. Mark
+                    // the edge it ran off so it isn't silently missing.
+                    let ran_off_the_start = i64::from(row.trim.out_point)
+                        .saturating_sub(row.trim.offset)
+                        < i64::from(lo);
+                    let x = if ran_off_the_start {
+                        lane.left() + 1.5
+                    } else {
+                        lane.right() - 1.5
+                    };
+                    painter.line_segment(
+                        [
+                            egui::pos2(x, lane_bg.top()),
+                            egui::pos2(x, lane_bg.bottom()),
+                        ],
+                        egui::Stroke::new(3.0_f32, visuals.warn_fg_color),
+                    );
+                    continue;
+                };
+
+                // Clip extents use slot mapping (each frame owns an equal cell)
+                // so a one-frame layer still has visible width; `max` keeps a
+                // clip clamped to a sliver of the axis from vanishing entirely.
+                let (x0, x1) = (axis.slot_x(g_lo), axis.slot_x(g_hi + 1));
+                let bar = egui::Rect::from_min_max(
+                    egui::pos2(x0, lane_bg.top()),
+                    egui::pos2(x1.max(x0 + 3.0).min(lane.right()), lane_bg.bottom()),
+                );
+                let fill = if renders {
+                    visuals.selection.bg_fill
+                } else {
+                    visuals.selection.bg_fill.gamma_multiply(0.35)
+                };
+                painter.rect_filled(bar, 2.0, fill);
+
+                // Per-track cache-fill strip (#99): which of *this* layer's frames
+                // are resident, in its own place on the global timeline. The T1
+                // cache is `SourceId`-keyed, so this is the same two-tone readout
+                // the ruler gives slot A — per layer. Source frames map to global
+                // by `global = source - offset`, so a contiguous source run stays
+                // contiguous. Sequence layers only (a still has no ring).
+                if let Some(src) = row.source.filter(|s| self.followers.contains_key(s)) {
+                    let strip_top = bar.bottom() - 3.0;
+                    let clip = ui.painter_at(bar);
+                    let to_global = |f: u32| {
+                        let g = i64::from(f).saturating_sub(row.trim.offset);
+                        (g >= i64::from(lo) && g <= i64::from(hi)).then_some(g as u32)
+                    };
+                    let paint_runs = |frames: &mut Vec<u32>, color: egui::Color32| {
+                        for_each_frame_run(frames, |start, end| {
+                            let seg = egui::Rect::from_min_max(
+                                egui::pos2(axis.slot_x(i64::from(start)), strip_top),
+                                egui::pos2(
+                                    axis.slot_x(i64::from(end) + 1).min(bar.right()),
+                                    bar.bottom(),
+                                ),
+                            );
+                            clip.rect_filled(seg, 0.0, color);
+                        });
+                    };
+                    let mut resident: Vec<u32> = self
+                        .frame_cache
+                        .resident_frames(src)
+                        .filter_map(to_global)
+                        .collect();
+                    paint_runs(&mut resident, CACHE_PROXY_FILL);
+                    let mut full: Vec<u32> = self
+                        .frame_cache
+                        .resident_full_frames(src)
+                        .filter_map(to_global)
+                        .collect();
+                    paint_runs(&mut full, CACHE_FULL_FILL);
                 }
-                // Apply the structural edits after the loop (each restructures the Vec).
-                if let Some((id, to)) = reorder {
-                    self.comp_stack.move_to(id, to);
+
+                // ── Drag the clip to retime the layer ─────────────────────────
+                // A still spans all frames, so its offset is a no-op: hover only.
+                let resp = ui.interact(
+                    bar,
+                    ui.id().with(("track", row.id)),
+                    if row.is_sequence {
+                        egui::Sense::click_and_drag()
+                    } else {
+                        egui::Sense::hover()
+                    },
+                );
+                let resp = resp.on_hover_text(format!(
+                    "{}\nframes {g_lo}–{g_hi}   offset {} f{}",
+                    row.name,
+                    row.trim.offset,
+                    if row.is_sequence {
+                        "\ndrag to slide this layer along the timeline"
+                    } else {
+                        ""
+                    }
+                ));
+                if row.is_sequence {
+                    if resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                    }
+                    if resp.drag_started()
+                        && let Some(p) = resp.interact_pointer_pos()
+                    {
+                        self.track_drag = Some(TrackDrag {
+                            id: row.id,
+                            grab: axis.frame_at(p.x),
+                            start_offset: row.trim.offset,
+                        });
+                    }
+                    if resp.dragged()
+                        && let Some(p) = resp.interact_pointer_pos()
+                        && let Some(d) = self.track_drag
+                        && d.id == row.id
+                    {
+                        let offset = offset_after_drag(d.start_offset, d.grab, axis.frame_at(p.x));
+                        if let Some(l) = self.comp_stack.get_mut(row.id)
+                            && l.trim.offset != offset
+                        {
+                            l.trim.offset = offset;
+                            offset_changed = true;
+                        }
+                    }
+                    if resp.drag_stopped() {
+                        self.track_drag = None;
+                        // Settle: the pump fetches whatever the final offset needs.
+                        offset_changed = true;
+                    }
                 }
-                if let Some(id) = remove {
-                    self.remove_comp_layer(id);
-                }
-                // A time-offset edit changed a layer's mapping — re-request each comp
-                // follower's newly-needed frame so the pump fetches it (#99).
-                if offset_changed {
-                    self.sync_comp_followers();
-                }
-            });
+            }
+
+            // Playhead across every lane (drawn last, on top of the bars) so the
+            // tracks read as one timeline with the ruler above them.
+            if let (Some(lanes), Some((lo, hi))) = (lanes, range) {
+                let x = TimeAxis::new(lanes, lo, hi).x_of(i64::from(self.playback.current_frame));
+                ui.painter().line_segment(
+                    [egui::pos2(x, lanes.top()), egui::pos2(x, lanes.bottom())],
+                    egui::Stroke::new(1.5_f32, ui.visuals().strong_text_color()),
+                );
+            }
+
+            // Apply the structural edits after the loop (each restructures the Vec).
+            if let Some((id, to)) = reorder {
+                self.comp_stack.move_to(id, to);
+            }
+            if let Some(id) = remove {
+                self.remove_comp_layer(id);
+            }
+            // A time-offset edit changed a layer's mapping — re-request each comp
+            // follower's newly-needed frame so the pump fetches it (#99).
+            if offset_changed {
+                self.sync_comp_followers();
+            }
+        }
     }
 
     /// Render the Layers-panel composite in the central canvas (#99 PR-B.3):
@@ -6170,6 +6492,170 @@ mod tests {
             .write()
             .to_file(path)
             .expect("write multi-pass exr fixture");
+    }
+
+    // --- Timeline panel: the shared frame↔x axis (#99) -----------------------
+    // The ruler and every layer clip bar map frames through one `TimeAxis`, so
+    // these are the guarantees that make a bar line up with the ruler above it.
+
+    fn axis(lo: u32, hi: u32) -> TimeAxis {
+        TimeAxis::new(
+            egui::Rect::from_min_size(egui::pos2(100.0, 0.0), egui::vec2(200.0, 22.0)),
+            lo,
+            hi,
+        )
+    }
+
+    #[test]
+    fn time_axis_maps_the_range_across_the_rect_and_clamps_outside_it() {
+        let a = axis(1000, 1100);
+        assert!((a.x_of(1000) - 100.0).abs() < 0.01, "lo at the left edge");
+        assert!((a.x_of(1100) - 300.0).abs() < 0.01, "hi at the right edge");
+        assert!(
+            (a.x_of(1050) - 200.0).abs() < 0.01,
+            "midpoint at the center"
+        );
+        // A layer dragged off either end must paint against the edge, never
+        // outside the panel.
+        assert!((a.x_of(500) - 100.0).abs() < 0.01, "before lo clamps left");
+        assert!((a.x_of(9999) - 300.0).abs() < 0.01, "after hi clamps right");
+        // A single-frame sequence has no span to divide by: it sits centered.
+        assert!((axis(7, 7).x_of(7) - 200.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn time_axis_frame_at_round_trips_x_of() {
+        let a = axis(1000, 1100);
+        for f in [1000, 1001, 1037, 1099, 1100] {
+            assert_eq!(a.frame_at(a.x_of(f)), f, "round trip at {f}");
+        }
+        // Scrubbing past either end lands on the end frame, not out of range —
+        // `draw_timeline` casts the result to `u32` on that guarantee.
+        assert_eq!(a.frame_at(-500.0), 1000);
+        assert_eq!(a.frame_at(9999.0), 1100);
+    }
+
+    #[test]
+    fn slot_x_gives_the_last_frame_a_real_cell() {
+        // Cache-fill strips and clip bars give each frame an equal cell over
+        // `lo..=hi` *inclusive*, so a one-frame clip still has visible width and
+        // frame `hi`'s cell reaches the right edge.
+        let a = axis(0, 3); // 4 frames ⇒ 4 cells of 50 px
+        assert!((a.slot_x(0) - 100.0).abs() < 0.01);
+        assert!((a.slot_x(1) - 150.0).abs() < 0.01);
+        assert!((a.slot_x(3) - 250.0).abs() < 0.01);
+        assert!(
+            (a.slot_x(4) - 300.0).abs() < 0.01,
+            "hi's cell ends at the edge"
+        );
+    }
+
+    // --- Timeline panel: clip spans + drag arithmetic (#99) ------------------
+
+    #[test]
+    fn track_span_maps_the_trim_into_global_frames() {
+        use crate::layer::Trim;
+        // `source = global + offset`, so the bar sits at `source - offset`.
+        let t = Trim {
+            in_point: 10,
+            out_point: 20,
+            offset: 0,
+        };
+        assert_eq!(track_span(t, 0, 100), Some((10, 20)));
+        // A positive offset makes the layer *lead* the playhead, so its clip
+        // moves earlier on the global timeline; a negative one moves it later.
+        assert_eq!(track_span(Trim { offset: 5, ..t }, 0, 100), Some((5, 15)));
+        assert_eq!(track_span(Trim { offset: -5, ..t }, 0, 100), Some((15, 25)));
+        // Partly visible still draws (the bar clamps at the edge)...
+        assert_eq!(track_span(t, 15, 100), Some((10, 20)));
+        // ...but a layer entirely off the visible timeline has no bar at all.
+        assert_eq!(track_span(t, 50, 100), None, "ends before the range");
+        assert_eq!(track_span(t, 0, 5), None, "starts after the range");
+    }
+
+    #[test]
+    fn track_span_handles_a_stills_all_frames_trim() {
+        // A still is `Trim::full(0, u32::MAX)`: its bar spans the whole timeline
+        // and the i64 arithmetic must not overflow at the u32 ceiling.
+        let t = crate::layer::Trim::full(0, u32::MAX);
+        let (lo, hi) = track_span(t, 1000, 1100).expect("a still is always visible");
+        assert!(lo <= 1000 && hi >= 1100);
+    }
+
+    #[test]
+    fn dragging_a_clip_right_moves_it_later_on_the_timeline() {
+        // Grab frame 20 on a layer at offset 0 and drop it on frame 30: the clip
+        // moved 10 frames later, so the offset drops by 10 (`global = source -
+        // offset`). Dragging back left is the exact inverse.
+        assert_eq!(offset_after_drag(0, 20, 30), -10);
+        assert_eq!(offset_after_drag(0, 20, 10), 10);
+        // Re-deriving from the grab frame (rather than accumulating per-event
+        // deltas) means a jittery drag that returns to where it started restores
+        // the original offset exactly — no drift.
+        let start = 7;
+        for now in [20, 25, 31, 24, 20] {
+            let landed = offset_after_drag(start, 20, now);
+            assert_eq!(landed, start - (now - 20));
+        }
+        assert_eq!(offset_after_drag(start, 20, 20), start);
+    }
+
+    // --- Timeline panel: layout (#99) ----------------------------------------
+
+    #[test]
+    fn timeline_panel_lays_out_tracks_for_sequence_and_still_layers() {
+        use egui_kittest::Harness;
+        let dir = tempfile::tempdir().unwrap();
+        // The two track shapes the panel has to lay out: a comp *sequence* (two
+        // numbered frames ⇒ `detect_from_file` finds a range, so the layer gets a
+        // real `[in, out]` clip) and a lone *still* (`Trim::full`, spanning the
+        // whole axis).
+        let s1 = dir.path().join("seq.0001.exr");
+        let s2 = dir.path().join("seq.0002.exr");
+        let still = dir.path().join("still.exr");
+        for p in [&s1, &s2, &still] {
+            write_rgba_exr(p);
+        }
+
+        let mut app = ExrApp::default();
+        app.add_comp_source(s1);
+        app.add_comp_source(still);
+        assert_eq!(app.comp_stack.len(), 2);
+        assert!(
+            app.playback.is_active(),
+            "the first comp sequence takes the clock (#99 R4-lite), so the panel \
+             draws its transport + ruler as well as the tracks"
+        );
+
+        let mut h = Harness::new_ui_state(|ui, app: &mut ExrApp| app.draw_timeline_panel(ui), app);
+        h.run_steps(1);
+        let app = std::mem::take(h.state_mut());
+        // Laying out the tracks must not disturb the model.
+        assert_eq!(app.comp_stack.len(), 2, "drawing is not an edit");
+    }
+
+    #[test]
+    fn timeline_panel_draws_gutter_only_tracks_without_a_transport() {
+        // A stills-only stack has no sequence, so `full_range()` is `None` and
+        // there is no time axis to place clips on. The rows must still lay out
+        // (gutter-only, as the old flat list did) rather than panicking on a
+        // missing range.
+        use egui_kittest::Harness;
+        let dir = tempfile::tempdir().unwrap();
+        let still = dir.path().join("still.exr");
+        write_rgba_exr(&still);
+
+        let mut app = ExrApp::default();
+        app.add_comp_source(still);
+        assert!(
+            !app.playback.is_active(),
+            "a still establishes no transport"
+        );
+        assert!(app.playback.full_range().is_none());
+
+        let mut h = Harness::new_ui_state(|ui, app: &mut ExrApp| app.draw_timeline_panel(ui), app);
+        h.run_steps(1);
+        assert_eq!(h.state().comp_stack.len(), 1);
     }
 
     // --- Layers panel: decode-on-add (#99 PR-B.2) ----------------------------
