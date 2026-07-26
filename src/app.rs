@@ -1337,6 +1337,10 @@ impl ExrApp {
             // frame of a numbered sequence enables playback over its siblings; a
             // lone image leaves single-image behavior unchanged (#7).
             self.detect_sequence(&path);
+            // Re-point the base track at the new A if we're mid-composite (#99 R3),
+            // so its name + range track the just-opened plate; the texture refreshes
+            // as the new frame lands.
+            self.update_base_layer(&path);
         } else {
             self.b_mut().loaded_file = Some(path.clone());
             self.b_mut().loading = true;
@@ -3449,6 +3453,8 @@ impl ExrApp {
             self.b_mut().loading = false;
             self.clear_b_sequence(); // locked-step B goes with A (#98)
             self.playback.clear();
+            // Closing the plate drops its base track from any composite (#99 R3).
+            self.remove_base_layer();
             self.reset_viewer_session();
         }
         self.error_msg = None;
@@ -5649,6 +5655,105 @@ impl ExrApp {
         }
     }
 
+    /// The `LayerId` of the slot-A **base track** (#99 R3), if the composite holds
+    /// one. The base is the sole layer referencing [`Self::A_SOURCE`] — the opened
+    /// image, rendered as the bottom of the stack while compositing.
+    fn base_layer_id(&self) -> Option<crate::layer::LayerId> {
+        self.comp_stack.iter().find_map(|l| match l.source {
+            crate::layer::LayerSource::Image { source, .. } if source == Self::A_SOURCE => {
+                Some(l.id)
+            }
+            _ => None,
+        })
+    }
+
+    /// Push the opened image (slot A) as the **bottom track** of the composite
+    /// (#99 R3), so once you add a comp layer the base plate is *in* the stack
+    /// rather than vanishing. A real `LayerSource::Image { source: A_SOURCE }`
+    /// layer: `draw_comp_composite` binds it like any other, and it shows as a
+    /// (non-removable, clock-pinned) track. Registers a `CompSource` at `A_SOURCE`
+    /// whose texture is built lazily each paint from the live A frame
+    /// ([`Self::ensure_base_frame`]). Caller ensures a file is open.
+    fn add_base_layer(&mut self) {
+        let Some(path) = self.loaded_file.as_ref() else {
+            return;
+        };
+        let name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "base".to_string());
+        let Some(exr_data) = self.exr_data.clone() else {
+            return;
+        };
+        // A's range drives the clock at offset 0 (source frame == global frame); a
+        // lone still spans all frames.
+        let trim = match self.playback.full_range() {
+            Some((lo, hi)) => crate::layer::Trim {
+                in_point: lo,
+                out_point: hi,
+                offset: 0,
+            },
+            None => crate::layer::Trim::full(0, u32::MAX),
+        };
+        let aov = self.viewer.active_layer;
+        let id = self.comp_stack.push_image(name, Self::A_SOURCE, aov, trim);
+        self.comp_stack.move_to(id, 0); // bottom of the stack
+        let size = exr_data.logical_size(aov).unwrap_or((0, 0));
+        self.comp_sources.insert(
+            Self::A_SOURCE,
+            CompSource {
+                exr_data,
+                size,
+                aov,
+                bind_group: None,
+                texture: None,
+                cur_frame: None,
+            },
+        );
+    }
+
+    /// Re-point the base track at a freshly-opened slot A (#99 R3): its name +
+    /// range, and force a texture rebuild next paint (the new image may reuse the
+    /// old frame number, which would otherwise skip the rebuild). No-op if there is
+    /// no base track. Called from `open_file`, after `detect_sequence` has set the
+    /// new range.
+    fn update_base_layer(&mut self, path: &std::path::Path) {
+        let Some(id) = self.base_layer_id() else {
+            return;
+        };
+        let name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "base".to_string());
+        let trim = match self.playback.full_range() {
+            Some((lo, hi)) => crate::layer::Trim {
+                in_point: lo,
+                out_point: hi,
+                offset: 0,
+            },
+            None => crate::layer::Trim::full(0, u32::MAX),
+        };
+        if let Some(l) = self.comp_stack.get_mut(id) {
+            l.name = name;
+            l.trim = trim;
+        }
+        if let Some(cs) = self.comp_sources.get_mut(&Self::A_SOURCE) {
+            cs.cur_frame = None;
+        }
+    }
+
+    /// Remove the slot-A base track + its comp source (#99 R3), if present. Unlike
+    /// a comp source, `A_SOURCE` is A's *own* transport cache / T2 ring, not a
+    /// follower — so this drops only the model layer + the `comp_sources` entry and
+    /// must NEVER `clear_slot`/touch `followers` for it. Called when the last comp
+    /// source is removed and when A is unloaded.
+    fn remove_base_layer(&mut self) {
+        if let Some(id) = self.base_layer_id() {
+            self.comp_stack.remove(id);
+            self.comp_sources.remove(&Self::A_SOURCE);
+        }
+    }
+
     /// Add a source to the Layers-panel stack (#99 PR-B.2): **decode-on-demand**.
     /// Synchronously decodes `path` (the panel is a paused, cap-6 workflow, so it
     /// reuses [`ExrData::load`] directly rather than the A/B decode worker), then —
@@ -5657,6 +5762,10 @@ impl ExrApp {
     /// can bind it. On a decode error nothing is added; the error surfaces in the
     /// status bar. Headless (no `gpu_resources`) still registers the model layer +
     /// pixels, just without a texture.
+    ///
+    /// When this is the *first* comp source and a file is open as slot A, the
+    /// opened image is pushed first as the bottom **base track** (#99 R3) so the
+    /// plate composites underneath the added layers.
     fn add_comp_source(&mut self, path: std::path::PathBuf) {
         if self.comp_stack.len() >= COMP_LAYER_CAP {
             return;
@@ -5720,6 +5829,13 @@ impl ExrApp {
             // A lone still spans all frames.
             _ => crate::layer::Trim::full(0, u32::MAX),
         };
+
+        // The first comp source, with a plate open as slot A, promotes that plate
+        // to the bottom base track first (#99 R3) — so it's beneath the layer we're
+        // about to add. `comp_drives_transport` (no slot A) has no plate to add.
+        if self.comp_stack.is_empty() && self.loaded_file.is_some() && self.exr_data.is_some() {
+            self.add_base_layer();
+        }
 
         let source = crate::layer::SourceId(self.comp_next_source);
         self.comp_next_source += 1;
@@ -5833,6 +5949,42 @@ impl ExrApp {
         }
     }
 
+    /// Bring the slot-A **base track**'s texture current for the on-screen frame
+    /// (#99 R3) — the base-plate analogue of [`Self::ensure_comp_frame`]. Slot A is
+    /// the master transport, not a follower, so its pixels come straight from the
+    /// live `self.exr_data` (already swapped to each frame by the decode path)
+    /// rather than the T1 cache. Rebuilds only when the playhead or AOV moved off
+    /// what the texture holds; a still keeps `current_frame == 0` and builds once.
+    /// No-op headless or if the build fails (the last texture is held).
+    fn ensure_base_frame(&mut self, aov: usize) {
+        let cur = self.playback.current_frame;
+        let Some(cs) = self.comp_sources.get(&Self::A_SOURCE) else {
+            return;
+        };
+        if cs.cur_frame == Some(cur) && cs.aov == aov {
+            return;
+        }
+        let Some(data) = self.exr_data.clone() else {
+            return;
+        };
+        let Some(gpu) = self.gpu_resources.as_ref() else {
+            return;
+        };
+        let Some((texture, bind_group)) =
+            crate::viewer::ExrViewer::build_source_texture(gpu, &data, aov)
+        else {
+            return;
+        };
+        let size = data.logical_size(aov).unwrap_or((0, 0));
+        if let Some(cs) = self.comp_sources.get_mut(&Self::A_SOURCE) {
+            cs.texture = Some(texture);
+            cs.bind_group = Some(bind_group);
+            cs.aov = aov;
+            cs.size = size;
+            cs.cur_frame = Some(cur);
+        }
+    }
+
     /// Remove a Layers-panel layer and free its source's pixels/VRAM once no other
     /// layer references it (#99 PR-B.2). A source can be shared by several layers
     /// (e.g. back-to-beauty AOVs of one file), so its [`CompSource`] is dropped
@@ -5858,6 +6010,13 @@ impl ExrApp {
             // (no follower registered).
             self.followers.remove(&source);
             self.frame_cache.clear_slot(source);
+        }
+        // Removing the last comp source leaves only the slot-A base track (#99 R3);
+        // drop it too so the composite empties and the classic viewer takes back
+        // over (readout / histogram / compare modes). `remove_base_layer` is careful
+        // not to touch A's real cache / transport.
+        if self.comp_stack.len() == 1 && self.base_layer_id().is_some() {
+            self.remove_base_layer();
         }
         // If the comp stack drove the transport and its last sequence is gone,
         // release the clock (#99 R4-lite) so the timeline doesn't outlive its
@@ -5926,6 +6085,9 @@ impl ExrApp {
                 /// retimeable (a still spans all frames, so an offset is a no-op).
                 trim: crate::layer::Trim,
                 is_sequence: bool,
+                /// The slot-A base track (#99 R3): the opened plate as the bottom
+                /// layer. Clock-pinned (no retime) and non-removable via the panel.
+                is_base: bool,
                 /// The layer's pixel source, for the per-track cache-fill strip.
                 source: Option<crate::layer::SourceId>,
             }
@@ -5936,6 +6098,15 @@ impl ExrApp {
                     let (source, aov) = match &l.source {
                         crate::layer::LayerSource::Image { source, aov } => (Some(*source), *aov),
                         crate::layer::LayerSource::Adjustment => (None, 0),
+                    };
+                    // The base track is slot A itself (the master transport), not a
+                    // decode follower, so its sequence-ness comes from the transport;
+                    // a comp source's comes from its follower registration.
+                    let is_base = source == Some(Self::A_SOURCE);
+                    let is_sequence = if is_base {
+                        self.playback.sequence.is_some()
+                    } else {
+                        source.is_some_and(|s| self.followers.contains_key(&s))
                     };
                     let aov_names = source
                         .and_then(|s| self.comp_sources.get(&s))
@@ -5964,7 +6135,8 @@ impl ExrApp {
                         aov,
                         aov_names,
                         trim: l.trim,
-                        is_sequence: source.is_some_and(|s| self.followers.contains_key(&s)),
+                        is_sequence,
+                        is_base,
                         source,
                     }
                 })
@@ -5988,6 +6160,10 @@ impl ExrApp {
                 // Whether this layer reaches the composite at all (disabled, or
                 // hidden by a solo elsewhere) — greys both the name and the bar.
                 let renders = if solo_active { row.solo } else { row.enabled };
+                // A layer can be slid in time only if it's a sequence AND not the
+                // base track (#99 R3): the base is the master clock, pinned at
+                // offset 0 — retiming it would desync everything below.
+                let retimeable = row.is_sequence && !row.is_base;
 
                 // ── Gutter: visibility / solo / name / the ⋮ menu ──────────────
                 let mut g = ui.new_child(
@@ -6058,9 +6234,10 @@ impl ExrApp {
                         }
                     }
                     // Precise time offset, for typing an exact value where dragging
-                    // the clip bar is the coarse gesture. A still spans all frames,
-                    // so an offset is a no-op there and the control is omitted.
-                    if row.is_sequence {
+                    // the clip bar is the coarse gesture. Omitted where retiming is a
+                    // no-op or forbidden: a still (all frames) or the base track (the
+                    // clock, pinned at 0).
+                    if retimeable {
                         ui.horizontal(|ui| {
                             ui.label("Offset");
                             let mut offset = row.trim.offset;
@@ -6090,7 +6267,9 @@ impl ExrApp {
                             ui.close();
                         }
                     });
-                    if ui.button("✕  Remove layer").clicked() {
+                    // The base track (the opened plate) isn't removed here — it's
+                    // closed via File ▸ Close Image A (#99 R3).
+                    if !row.is_base && ui.button("✕  Remove layer").clicked() {
                         remove = Some(row.id);
                         ui.close();
                     }
@@ -6178,8 +6357,11 @@ impl ExrApp {
                 // cache is `SourceId`-keyed, so this is the same two-tone readout
                 // the ruler gives slot A — per layer. Source frames map to global
                 // by `global = source - offset`, so a contiguous source run stays
-                // contiguous. Sequence layers only (a still has no ring).
-                if let Some(src) = row.source.filter(|s| self.followers.contains_key(s)) {
+                // contiguous. Sequence layers only (a still has no ring); the base
+                // track reads slot A's own `frame_cache` (#99 R3).
+                if row.is_sequence
+                    && let Some(src) = row.source
+                {
                     let strip_top = bar.bottom() - 3.0;
                     let clip = ui.painter_at(bar);
                     let to_global = |f: u32| {
@@ -6213,11 +6395,12 @@ impl ExrApp {
                 }
 
                 // ── Drag the clip to retime the layer ─────────────────────────
-                // A still spans all frames, so its offset is a no-op: hover only.
+                // Only a retimeable clip drags; a still or the base track is hover-
+                // only (offset is a no-op / forbidden).
                 let resp = ui.interact(
                     bar,
                     ui.id().with(("track", row.id)),
-                    if row.is_sequence {
+                    if retimeable {
                         egui::Sense::click_and_drag()
                     } else {
                         egui::Sense::hover()
@@ -6227,13 +6410,15 @@ impl ExrApp {
                     "{}\nframes {g_lo}–{g_hi}   offset {} f{}",
                     row.name,
                     row.trim.offset,
-                    if row.is_sequence {
+                    if retimeable {
                         "\ndrag to slide this layer along the timeline"
+                    } else if row.is_base {
+                        "\nbase plate — pinned to the transport"
                     } else {
                         ""
                     }
                 ));
-                if row.is_sequence {
+                if retimeable {
                     if resp.hovered() {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
                     }
@@ -6320,7 +6505,10 @@ impl ExrApp {
         // before the draw list so the bind below is up to date.
         for step in &steps {
             if let crate::layer::Step::Draw(d) = step {
-                if self.followers.contains_key(&d.source) {
+                if d.source == Self::A_SOURCE {
+                    // The slot-A base track (#99 R3): pixels from the live A frame.
+                    self.ensure_base_frame(d.aov);
+                } else if self.followers.contains_key(&d.source) {
                     self.ensure_comp_frame(d.source, d.source_frame, d.aov);
                 } else {
                     self.ensure_comp_aov(d.source, d.aov);
@@ -6802,6 +6990,110 @@ mod tests {
             app.comp_sources.contains_key(&source),
             "the still source is still stored (its single texture)"
         );
+    }
+
+    // --- R3: slot A joins the composite as the bottom base track (#99) --------
+
+    /// Open a still as slot A directly (headless: `open_file` is async), then add a
+    /// comp source. Returns the app with A + one comp layer.
+    fn app_with_open_a_still() -> (tempfile::TempDir, ExrApp) {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("plate.exr");
+        let comp = dir.path().join("over.exr");
+        write_rgba_exr(&a);
+        write_rgba_exr(&comp);
+        let mut app = ExrApp {
+            loaded_file: Some(a.clone()),
+            exr_data: Some(std::sync::Arc::new(ExrData::load(&a).unwrap())),
+            ..Default::default()
+        };
+        app.add_comp_source(comp);
+        (dir, app)
+    }
+
+    #[test]
+    fn adding_the_first_comp_source_promotes_open_a_to_the_base_track() {
+        let (_dir, app) = app_with_open_a_still();
+        assert_eq!(
+            app.comp_stack.len(),
+            2,
+            "the opened plate + the added layer"
+        );
+        // Bottom of the stack (index 0) is slot A.
+        let bottom = app.comp_stack.iter().next().unwrap();
+        assert!(
+            matches!(bottom.source, crate::layer::LayerSource::Image { source, .. } if source == ExrApp::A_SOURCE),
+            "the base track references A_SOURCE"
+        );
+        assert_eq!(
+            app.base_layer_id(),
+            Some(bottom.id),
+            "the base is discoverable as the A_SOURCE layer"
+        );
+        assert!(
+            app.comp_sources.contains_key(&ExrApp::A_SOURCE),
+            "a CompSource is registered for the base plate"
+        );
+    }
+
+    #[test]
+    fn removing_the_last_comp_source_drops_the_base_and_leaves_a_untouched() {
+        let (_dir, mut app) = app_with_open_a_still();
+        // Seed A's own T1 cache to prove base removal never clears it (the
+        // `clear_slot(A_SOURCE)` footgun).
+        app.frame_cache
+            .insert(ExrApp::A_SOURCE, 1, app.exr_data.clone().unwrap());
+
+        // Remove the added comp source (the top layer).
+        let comp_id = app.comp_stack.iter().last().unwrap().id;
+        assert_ne!(Some(comp_id), app.base_layer_id());
+        app.remove_comp_layer(comp_id);
+
+        assert!(
+            app.comp_stack.is_empty(),
+            "base auto-removed with the last comp source → classic viewer takes over"
+        );
+        assert!(app.base_layer_id().is_none());
+        assert!(!app.comp_sources.contains_key(&ExrApp::A_SOURCE));
+        // Slot A itself is untouched: still open, cache intact.
+        assert!(app.loaded_file.is_some() && app.exr_data.is_some());
+        assert!(
+            app.frame_cache.contains(ExrApp::A_SOURCE, 1),
+            "base removal must not clear A's real transport cache"
+        );
+    }
+
+    #[test]
+    fn base_track_trim_spans_the_a_sequence_range_at_offset_zero() {
+        let (dir, paths) = write_sequence(5);
+        let comp = dir.path().join("over.exr");
+        write_rgba_exr(&comp);
+        let mut app = ExrApp {
+            loaded_file: Some(paths[0].clone()),
+            exr_data: Some(std::sync::Arc::new(ExrData::load(&paths[0]).unwrap())),
+            ..Default::default()
+        };
+        app.detect_sequence(&paths[0]); // playback range (1, 5)
+        app.add_comp_source(comp);
+
+        let base = app.comp_stack.get(app.base_layer_id().unwrap()).unwrap();
+        assert_eq!(
+            (base.trim.in_point, base.trim.out_point, base.trim.offset),
+            (1, 5, 0),
+            "the base spans A's range at offset 0 — it drives the clock"
+        );
+    }
+
+    #[test]
+    fn add_comp_source_without_an_open_a_adds_no_base() {
+        // No plate open: the comp sequence drives the transport itself (#99 R4-lite)
+        // and there is no slot A to promote — so no base track.
+        let (_dir, paths) = write_sequence(5);
+        let mut app = ExrApp::default();
+        app.add_comp_source(paths[0].clone());
+        assert!(app.base_layer_id().is_none(), "no plate → no base track");
+        assert_eq!(app.comp_stack.len(), 1, "only the comp source");
+        assert!(app.comp_drives_transport);
     }
 
     #[test]
