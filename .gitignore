@@ -17,3 +17,6 @@ docs/review/
 
 # Archived/old screenshots (kept locally, not versioned)
 assets/old-screenshots/
+# Proprietary reference screenshots (kept locally for design reference, not
+# versioned): the Chaos Player layout reference for the #99 layer-stack UI.
+assets/pdplayer.png

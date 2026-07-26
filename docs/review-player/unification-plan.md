@@ -130,31 +130,65 @@ Wired the Layers panel onto the Phase-1 backend.
   tested at the sync layer; the OCIO+GPU composite reuses PR-B.3 infra — a manual smoke test
   (base plate A + 2 comp sequences + play) is the end-to-end check.
 
-### Phase 3 — unify the *render* (A/B through the comp machinery)
+### Phase 3 — unify the *render* (A/B through the comp machinery)  *(partly done via the R-series)*
 
-Route `emit_mode_draws` through the panel's proven loop.
+The comp path is now a full viewport — the **new-render half** of Phase 3 is built: the
+accumulate ping-pong renders in any colour mode (**R1/R2**), threads the live frame + per-layer
+`aov` (Phase 2), and folds the base plate in (**R3**). What is **not yet done** is retiring the
+*old* A/B render path in favour of it:
 
-- `render_program.rs`: `ProgramInput{A,B}` → a `SourceId`/`LayerId` handle; delete
-  `input_of`'s A/B collapse; `new_ab_stack`'s 2-tuple → the shared `LayerStack`; thread
-  the **live frame** into `resolve` (currently fixed at `0`); replace the single
-  `is_composite` bool with `comp_layer_flags`-style per-index folding.
-- `viewer.rs`: replace `gpu_textures`/`gpu_textures_b` + `pick_b` with the per-`SourceId`
-  texture map; make `emit_mode_draws` **iterate `program.draws`**, binding each from the
-  map (like `draw_comp_composite`) instead of the arrangement-hardcoded `bg_a`+`pick_b`.
-- Generalize `active_layer` (one global AOV) → per-layer `aov` (the panel already stores
-  it per source).
-- Keep `Arrangement` as the viewport axis; lift Wipe / Side-by-Side / Diff geometry out
-  of the A/B-only `emit_mode_draws` arms into arrangement-generic code (the #104 work).
-  The OCIO-off display pass for N-layer non-OCIO composite lands here too.
+- **[TODO]** `render_program.rs`: `ProgramInput{A,B}` → a `SourceId`/`LayerId` handle; delete
+  `input_of`'s A/B collapse; `new_ab_stack`'s 2-tuple → the shared `LayerStack`; thread the **live
+  frame** into `resolve` (currently fixed at `0`); the single `is_composite` bool → `comp_layer_
+  flags`-style per-index folding (the pattern `draw_comp_composite` already uses).
+- **[TODO]** `viewer.rs`: replace `gpu_textures`/`gpu_textures_b` + `pick_b` with the per-`SourceId`
+  texture map; make `emit_mode_draws` **iterate `program.draws`**, binding each from the map (like
+  `draw_comp_composite`) instead of the arrangement-hardcoded `bg_a`+`pick_b`.
+- **[DONE via R1/R2]** the OCIO-off display pass for a non-OCIO composite.
+- **[TODO]** keep `Arrangement` as the viewport axis; lift Wipe / Side-by-Side / Diff geometry out
+  of the A/B-only `emit_mode_draws` arms into arrangement-generic code (#104). **This is where the
+  compare modes come back** for the comp path.
 
-### Phase 4 — collapse to one model
+### Phase 4 / R4 — collapse to one model  ← **RESUME HERE (handoff below)**
 
-- Open-file **adds/sets a layer** on the one stack; the A/B compare UI and the Layers
-  panel become two views over the same `LayerStack`.
-- Delete the now-dead `_b`/`comp_*` duplication and the `CompareMode`→`configure` shim,
-  replaced by direct stack editing + an `Arrangement` selector.
-- Persistence (the deferred B.5) applies to the one stack: nested `Vec<LayerPersist>`
-  (path + name/blend/opacity/enabled/solo/aov/trim), re-decoded on load.
+The R-series has already delivered the pieces R4 stands on: the base plate is a real layer (R3),
+the comp path renders standalone (R1/R2) and drives the transport (R4-lite), and the UI is the
+bottom timeline tracks. R4 finishes the collapse:
+
+- **Open / drop = add a layer.** `open_file` should *add/set a layer* on the one stack (the R3 base
+  hook is the seam — generalize "promote A on the first comp source" into "every open adds a
+  layer"). The A/B compare UI and the Layers panel become two views over the same `LayerStack`.
+- **Drop = add a layer.** Reroute `handle_drag_and_drop` (`app.rs`, the "Drop for A / Drop for B"
+  split via `route_dropped_exrs`) to `add_comp_source`. **Open design Q:** replace the A/B split
+  drop outright, or keep it until compare-modes-as-arrangements lands? (Also queued separately in
+  the session memory as a standalone follow-up.)
+- **Delete the `_b`/`comp_*` duplication** and the `CompareMode`→`configure` shim, replaced by
+  direct stack editing + an `Arrangement` selector. Depends on the Phase-3 `emit_mode_draws`
+  retire + compare-modes-as-arrangements above (do that first, or R4 loses the compare modes).
+- **Persistence (deferred B.5).** A nested `Vec<LayerPersist>` on `ExrApp` (path + name / blend /
+  opacity / enabled / solo / aov / trim), re-decoded on load; re-alloc `LayerId`/`SourceId`. NEVER
+  `#[serde(flatten)]` (wipes `app.ron`). `BlendMode` already has serde. Independent of the render
+  retire — landable any time.
+
+#### R4 handoff — state as of `7379fd5` (2026-07-26)
+
+- **Branch:** `feat/layer-stack-play`, PR **#190** (draft), 13 ahead of `main`, CI green. All of
+  Phase 1 + Phase 2 + the R-series above are on it.
+- **Two render paths coexist by design.** Classic `viewer.ui` (A/B, compare modes, pixel readout,
+  histogram) runs with **0 comp sources**; `draw_comp_central` (the comp path) runs with **≥1**.
+  R4's job is to make the comp path the *only* path — which requires porting readout / histogram /
+  compare-as-arrangements into it **before** deleting `viewer.ui`'s A/B arms, or those features
+  regress. Sequencing matters: **Phase-3 render-retire + compare-as-arrangements → then the
+  `_b`/`comp_*` deletion.** Persistence can land independently at any point.
+- **The R3 base-layer seam** (`add_base_layer` / `ensure_base_frame` in `app.rs`) is the natural
+  starting point for "open = add a layer": it already turns slot A into a stack layer rendered
+  through the comp path.
+- **Non-blocking follow-ups** (record, don't let them gate R4): reuse A's T2 ring in
+  `ensure_base_frame` (skip the per-frame re-upload); a `.cube` LUT in the OCIO-off display-encode
+  (R2 is sRGB-only); the lazy 2nd scene target (`ocio_pass.rs`, wasted for single-image OCIO); the
+  ruler cache-fill bar reading only `A_SOURCE` (misleading in comp-drives-transport mode —
+  dissolves once A is always a layer); the independent `map_b_frame`→`Trim::source_frame` slice
+  (last Phase-1 item, blank-outside-range).
 
 ## Risks & de-risking
 
@@ -221,7 +255,49 @@ Branch `feat/layer-stack-panel` (stacked on PR-A #188). Each slice is CI-green
   are now both `SourceId`-keyed** — the remaining P1.4 TODOs (N-source pump list, `cache::Slot`
   deletion) are unblocked.
 
-## Execution checklist — remaining Phase 1 (resume here)
+### Render foundation + timeline UI  (post-Phase-2, branch `feat/layer-stack-play`, PR #190)
+
+The R-series makes the comp path a self-sufficient viewport (renders in any colour mode, drives
+the transport, base plate included) and dresses the panel as Chaos-Player timeline tracks — the
+groundwork the final collapse (**R4**) sits on. All in `src/app.rs` + the GPU render files.
+
+- **R1** `7ebda89` — OCIO-**off** display-encode pipeline: `DISPLAY_ENCODE_SHADER` +
+  `GpuState.display_encode_pipeline` (linear→sRGB), the OCIO-off twin of the OCIO pass-2 display
+  transform. On-device test `display_encode_srgb_on_device`.
+- **R2** `ff5f946` — the composite renders in **any** colour mode. `DrawCtx.force_accumulate`
+  (comp always folds through the ping-pong), `OcioCallback.use_display_encode` (`= !ocio_active`,
+  runs `display_encode_pipeline` in pass-2's slot); `draw_comp_central` drops its `ocio_active`
+  gate. Composite no longer requires OCIO.
+- **Visibility fix** `4d73e66` — an added comp *sequence* went blank (playhead 0 outside its
+  range): `add_comp_source` sets `Trim.offset = cf - global` so the opened frame is visible at
+  add-time.
+- **R4-lite** `1b4fd03` — the comp stack drives the transport + the panel is on by default:
+  `add_comp_source` `playback.enter`s the first comp sequence when there's no transport;
+  `comp_drives_transport` gates the slot-A decode path off (no double-decode); `open_file`
+  reclaims the clock; `remove_comp_layer` releases it with the last comp sequence.
+- **Per-layer time offset** `2ef1102` + `47bd65d` — each sequence layer gets an editable
+  `Trim.offset` (slide a layer in time), re-requested via `sync_comp_followers`.
+- **Panel → bottom** `b163218` — `draw_layers_panel` becomes `egui::Panel::bottom` (Chaos-Player
+  layout), reordered so top→bottom is viewport → transport → layers → status.
+- **Timeline tracks** `374ff2c` — the plain-list rows become **clip bars on a shared frame
+  ruler**. The transport + Layers panels merge into one `Panel::bottom("timeline_panel")`
+  (`draw_timeline_panel`) so bars share the ruler's x; `draw_transport_bar` → `draw_transport_
+  controls`, `draw_layers_panel` → `draw_layer_tracks`. New primitives (unit-tested headless):
+  `TimeAxis` (frame↔x, clamps off-range), `for_each_frame_run` (shared run-coalescer, #146),
+  `alloc_timeline_row`, `track_span`, `offset_after_drag` (grab-anchored, drift-free), `TrackDrag`.
+  Each layer = narrow gutter (eye/solo/name + `⋮` menu) + a clip bar with its own two-tone
+  cache-fill strip, draggable to retime. NLE drag convention (drag right → later).
+- **R3 — base plate in the stack** `7379fd5` — slot A becomes a real bottom **base track**
+  (`LayerSource::Image{source: A_SOURCE}`), so adding a comp layer no longer makes the plate
+  vanish. Helpers `base_layer_id` / `add_base_layer` / `update_base_layer` / `remove_base_layer` /
+  `ensure_base_frame` (rebuilds A's composite texture from the live `self.exr_data`, since A is the
+  master transport, not a follower). Lifecycle hooks in `add_comp_source` / `remove_comp_layer` /
+  `open_file` / `unload`. The base is clock-pinned (no retime) and non-removable via the panel;
+  `remove_base_layer` touches only the model + `comp_sources`, never A's real `frame_cache` /
+  `followers`. **Routing stays conservative** (user decision): 0 comp sources → classic `viewer.ui`
+  (readout / histogram / compare modes intact); ≥1 comp source → comp path with the plate at bottom.
+
+## Execution checklist — Phase 1  *(complete; kept for reference — resume point is Phase 4 / R4 below)*
 
 Symbols are stable; line numbers drift (grep the name). Keep A/B pinned to
 `SourceId(0)`/`SourceId(1)` throughout so behavior is observable/unchanged.
@@ -284,15 +360,13 @@ independent behavior-change slice (blank-outside-range), landable whenever.
 **Phase 2 is DONE** (P2.1–P2.3): added comp sequence layers play on the A-driven transport. See the
 Phase 2 section above for the slice-by-slice breakdown.
 
-**Resume next → Phase 3** (unify the render — route A/B through the comp machinery): `ProgramInput
-{A,B}`→`SourceId`, `emit_mode_draws` iterates `program.draws`, thread the live frame into `resolve`,
-lift Wipe/SxS/Diff to arrangement-generic + the OCIO-off display pass. Or land the independent
-**`map_b_frame`→`Trim`** behavior slice first (small, closes the last Phase-1 item). Phase-2 follow-
-ups (not blocking): a per-comp-layer offset UI (mismatched frame ranges), standalone comp-only
-transport (folds into Phase 4), and gating comp-follower decode on the panel being shown.
+**The render foundation + timeline UI (R-series) is DONE** (`7ebda89`…`7379fd5`): the comp path
+renders standalone in any colour mode, drives the transport, includes the base plate, and the panel
+is the Chaos-Player bottom timeline tracks. See the "Render foundation" progress-log block above.
 
-### After Phase 1
-
-Phase 2 (make Layers-panel `add_comp_source` detect a sequence + register a `SourceState`
-so comp layers play) becomes a small follow-up. Then Phase 3 (render unify) and Phase 4
-(collapse + persistence). See the per-Phase sections above.
+**Resume next → Phase 4 / R4 (collapse to one model)** — see the *"Phase 4 / R4"* section and its
+**R4 handoff** above for the concrete steps, sequencing, and open questions. In short: open/drop =
+add a layer; retire the old A/B `emit_mode_draws` render path (Phase-3 render-retire) with compare
+modes reborn as `Arrangement`s; delete the `_b`/`comp_*` duplication; land layer persistence
+(independent). The independent **`map_b_frame`→`Trim`** slice (last Phase-1 item, blank-outside-
+range) can still land any time.
