@@ -1319,6 +1319,12 @@ impl ExrApp {
     /// `load_rx` and applied in [`Self::apply_load_result`]. Records the path
     /// up-front and raises the matching `loading_*` flag (which drives the
     /// spinner and keeps repaints flowing).
+    ///
+    /// Unreachable via the unified open/drop flow (#99 R4): open/drop now add a
+    /// layer through [`Self::open_layer`]. Retained for the legacy A/B compare
+    /// path until render-retire (Phase 3) revives it as an `Arrangement` or the
+    /// `_b`/`comp_*` collapse deletes it.
+    #[allow(dead_code)]
     fn open_file(&mut self, path: PathBuf, is_b: bool) {
         if !is_b {
             self.recent_files.retain(|p| p != &path);
@@ -1361,6 +1367,19 @@ impl ExrApp {
             beauty_only: false,
             proxy_target: None,
         });
+    }
+
+    /// Bring a file into the stack as a new layer — the unified open/drop entry
+    /// (#99 R4). Records recent files, ensures the Layers panel is visible, then
+    /// decodes + adds the layer via [`Self::add_comp_source`] (a synchronous
+    /// decode: it promotes slot A to a base track on the first add, drives the
+    /// transport for the first sequence, and caps at [`COMP_LAYER_CAP`]).
+    fn open_layer(&mut self, path: PathBuf) {
+        self.recent_files.retain(|p| p != &path);
+        self.recent_files.insert(0, path.clone());
+        self.recent_files.truncate(10);
+        self.show_layers_panel = true;
+        self.add_comp_source(path);
     }
 
     /// Send a decode job to the worker, **respawning it if it has died** (#…).
@@ -3485,69 +3504,40 @@ impl ExrApp {
         a + b
     }
 
-    /// Load EXR files dragged onto the window. While files are dragged over the
-    /// window a left/right split overlay is drawn; on drop a single file routes
-    /// by position (right half → reference Image B) and multiple files load
-    /// first → A, second → B with the rest ignored. Non-EXR drops are ignored.
+    /// Load EXR files dragged onto the window as new layers (#99 R4). While files
+    /// are dragged over the window a single "Drop to add layer" overlay is drawn;
+    /// on drop every `.exr` is added to the stack via [`Self::open_layer`], in
+    /// drop order (up to the layer cap). Non-EXR drops are ignored.
     fn handle_drag_and_drop(&mut self, ctx: &egui::Context) {
-        // Hover preview while files are dragged in (before release). The cursor
-        // position updates during the drag, so highlight the half it's currently
-        // over — the half that will receive the drop — to make A vs B obvious.
-        if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+        // Hover preview while files are dragged in (before release). Dropping is
+        // no longer position-dependent — the whole window is one drop target.
+        let hovered = ctx.input(|i| i.raw.hovered_files.len());
+        if hovered > 0 {
             let screen = ctx.content_rect();
-            let cx = screen.center().x;
-            // The OS cursor moves during the drag even though winit delivers no
-            // events, so query it directly (see `live_dropped_right`).
-            let target_b = live_dropped_right(ctx).unwrap_or(false);
-
             let painter = ctx.layer_painter(egui::LayerId::new(
                 egui::Order::Foreground,
                 egui::Id::new("dnd_overlay"),
             ));
-            let left = egui::Rect::from_min_max(screen.min, egui::pos2(cx, screen.max.y));
-            let right = egui::Rect::from_min_max(egui::pos2(cx, screen.min.y), screen.max);
-            let active = if target_b { right } else { left };
-
-            // Dim the whole window, then brighten the active half so it reads as
-            // the live drop target.
             painter.rect_filled(screen, 0.0, egui::Color32::from_black_alpha(150));
-            painter.rect_filled(
-                active,
-                0.0,
-                egui::Color32::from_rgba_unmultiplied(40, 90, 160, 70),
-            );
             painter.rect_stroke(
-                active,
+                screen,
                 0.0,
                 egui::Stroke::new(3.0_f32, egui::Color32::from_rgb(90, 160, 240)),
                 egui::StrokeKind::Inside,
             );
-            painter.line_segment(
-                [
-                    egui::pos2(cx, screen.top()),
-                    egui::pos2(cx, screen.bottom()),
-                ],
-                (2.0, egui::Color32::from_white_alpha(180)),
-            );
-
-            let font = egui::FontId::proportional(28.0);
-            let bright = egui::Color32::WHITE;
-            let dim = egui::Color32::from_white_alpha(110);
+            let label = if hovered > 1 {
+                format!("Drop to add {hovered} layers")
+            } else {
+                "Drop to add layer".to_string()
+            };
             painter.text(
-                egui::pos2(screen.left() + screen.width() * 0.25, screen.center().y),
+                screen.center(),
                 egui::Align2::CENTER_CENTER,
-                "Drop for A",
-                font.clone(),
-                if target_b { dim } else { bright },
+                label,
+                egui::FontId::proportional(28.0),
+                egui::Color32::WHITE,
             );
-            painter.text(
-                egui::pos2(screen.left() + screen.width() * 0.75, screen.center().y),
-                egui::Align2::CENTER_CENTER,
-                "Drop for B (reference)",
-                font,
-                if target_b { bright } else { dim },
-            );
-            // Keep repainting so the highlight tracks the cursor smoothly.
+            // Keep repainting so the overlay shows promptly during the drag.
             ctx.request_repaint();
         }
 
@@ -3561,68 +3551,10 @@ impl ExrApp {
             .filter_map(|f| f.path)
             .filter(|p| is_exr_path(p))
             .collect();
-        let dropped_right = live_dropped_right(ctx).unwrap_or(false);
-        for (path, is_b) in route_dropped_exrs(&exr_paths, dropped_right) {
-            self.open_file(path, is_b);
+        for path in exr_paths {
+            self.open_layer(path);
         }
     }
-}
-
-/// Global OS cursor position in SCREEN-SPACE POINTS — the same space as
-/// `ViewportInfo::inner_rect` — queried directly from the OS rather than via
-/// winit events. During an external file drag winit delivers no cursor-move
-/// events, so egui's pointer is stale, but the OS cursor itself keeps moving.
-/// `None` on unsupported platforms.
-///
-/// Note the per-platform coordinate space: macOS `CGEvent` locations are already
-/// in points (global display space), whereas Windows `GetCursorPos` returns
-/// physical pixels, so only the Windows path divides by `pixels_per_point`.
-fn global_cursor_pos_points(pixels_per_point: f32) -> Option<egui::Pos2> {
-    #[cfg(target_os = "windows")]
-    {
-        use windows::Win32::Foundation::POINT;
-        use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
-        let mut p = POINT::default();
-        // SAFETY: `GetCursorPos` writes a valid POINT; we pass a live pointer to it.
-        unsafe { GetCursorPos(&mut p).ok()? };
-        Some(egui::pos2(
-            p.x as f32 / pixels_per_point,
-            p.y as f32 / pixels_per_point,
-        ))
-    }
-    #[cfg(target_os = "macos")]
-    {
-        use core_graphics::event::CGEvent;
-        use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
-        // A null-ish event created from a session source carries the *current*
-        // cursor location (the documented `CGEventCreate(NULL)` idiom). Already
-        // in screen-space points, so `pixels_per_point` is not needed here.
-        let _ = pixels_per_point;
-        let src = CGEventSource::new(CGEventSourceStateID::CombinedSessionState).ok()?;
-        let loc = CGEvent::new(src).ok()?.location();
-        Some(egui::pos2(loc.x as f32, loc.y as f32))
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        let _ = pixels_per_point;
-        None
-    }
-}
-
-/// Whether `cursor_points` (screen-space points) is in the right half of
-/// `window_rect` (also screen-space points) — i.e. the drop targets Image B.
-/// Only X matters, so the cross-platform Y-origin difference is irrelevant.
-/// Pure / testable.
-fn cursor_targets_right(cursor_points: egui::Pos2, window_rect: egui::Rect) -> bool {
-    cursor_points.x >= window_rect.center().x
-}
-
-/// Live drop-target side this frame from the OS cursor + window rect, or `None`
-/// if either is unavailable (caller defaults to A / left).
-fn live_dropped_right(ctx: &egui::Context) -> Option<bool> {
-    let rect = ctx.input(|i| i.viewport().inner_rect)?;
-    let cursor = global_cursor_pos_points(ctx.pixels_per_point())?;
-    Some(cursor_targets_right(cursor, rect))
 }
 
 /// True if `path` has a (case-insensitive) `.exr` extension.
@@ -3630,17 +3562,6 @@ fn is_exr_path(path: &std::path::Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("exr"))
-}
-
-/// Map dropped EXR paths to `(path, is_b)` load requests. A single file routes
-/// by drop position (`dropped_right` → Image B); multiple files load first → A,
-/// second → B, and any extras are ignored.
-fn route_dropped_exrs(paths: &[PathBuf], dropped_right: bool) -> Vec<(PathBuf, bool)> {
-    match paths {
-        [] => Vec::new(),
-        [single] => vec![(single.clone(), dropped_right)],
-        [a, b, ..] => vec![(a.clone(), false), (b.clone(), true)],
-    }
 }
 
 impl eframe::App for ExrApp {
@@ -4211,20 +4132,11 @@ impl ExrApp {
                                 .add_filter("EXR Image", &["exr"])
                                 .pick_file()
                             {
-                                self.open_file(path, false);
+                                self.open_layer(path);
                             }
                             ui.close();
                         }
-                        if ui.button("Open Reference (Image B)...").clicked() {
-                            if let Some(path) = FileDialog::new()
-                                .add_filter("EXR Image", &["exr"])
-                                .pick_file()
-                            {
-                                self.open_file(path, true);
-                            }
-                            ui.close();
-                        }
-                        ui.menu_button("Open Recent A", |ui| {
+                        ui.menu_button("Open Recent", |ui| {
                             if self.recent_files.is_empty() {
                                 ui.label("No recent files");
                             } else {
@@ -4240,28 +4152,7 @@ impl ExrApp {
                                     }
                                 }
                                 if let Some(path) = clicked_path {
-                                    self.open_file(path, false);
-                                    ui.close();
-                                }
-                            }
-                        });
-                        ui.menu_button("Open Recent B", |ui| {
-                            if self.recent_files.is_empty() {
-                                ui.label("No recent files");
-                            } else {
-                                let mut clicked_path = None;
-                                for path in &self.recent_files {
-                                    if ui
-                                        .button(
-                                            path.file_name().unwrap_or_default().to_string_lossy(),
-                                        )
-                                        .clicked()
-                                    {
-                                        clicked_path = Some(path.clone());
-                                    }
-                                }
-                                if let Some(path) = clicked_path {
-                                    self.open_file(path, true);
+                                    self.open_layer(path);
                                     ui.close();
                                 }
                             }
@@ -5717,6 +5608,11 @@ impl ExrApp {
     /// old frame number, which would otherwise skip the rebuild). No-op if there is
     /// no base track. Called from `open_file`, after `detect_sequence` has set the
     /// new range.
+    ///
+    /// Reached only from the legacy [`Self::open_file`], now unreachable via the
+    /// unified open/drop flow (#99 R4) — kept for the compare path until
+    /// render-retire (Phase 3).
+    #[allow(dead_code)]
     fn update_base_layer(&mut self, path: &std::path::Path) {
         let Some(id) = self.base_layer_id() else {
             return;
@@ -5768,6 +5664,11 @@ impl ExrApp {
     /// plate composites underneath the added layers.
     fn add_comp_source(&mut self, path: std::path::PathBuf) {
         if self.comp_stack.len() >= COMP_LAYER_CAP {
+            // Report rather than silently drop — a multi-file drop past the cap
+            // otherwise reads as if every file landed (#99 R4, no-silent-caps).
+            self.error_msg = Some(format!(
+                "Layer limit reached ({COMP_LAYER_CAP}) — remove a layer to add more."
+            ));
             return;
         }
         // Decode first: a failed load must leave the stack untouched (no dangling
@@ -6052,7 +5953,7 @@ impl ExrApp {
                         .add_filter("EXR Image", &["exr"])
                         .pick_file()
                 {
-                    self.add_comp_source(path);
+                    self.open_layer(path);
                 }
             });
         });
@@ -6564,10 +6465,14 @@ impl ExrApp {
 
     fn draw_central_canvas(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default().show_inside(ui, |ui| {
-            // The Layers-panel composite takes over the viewport when the panel is
-            // active with sources (#99 PR-B.3), separate from the A/B path below
-            // (which is untouched — the compare modes are unaffected).
-            if self.show_layers_panel && !self.comp_stack.is_empty() {
+            // The comp stack takes over the viewport whenever it has layers (#99
+            // R4) — the unified open/drop flow adds every file here, so this is the
+            // primary path. The `show_layers_panel` toggle now hides only the
+            // timeline *tracks* (see `draw_timeline_panel`), not the composite, so
+            // toggling it off shows the composite full-screen instead of a blank.
+            // The A/B path below only runs with an empty stack (legacy compare,
+            // reachable until render-retire ports it in).
+            if !self.comp_stack.is_empty() {
                 self.draw_comp_central(ui);
                 return;
             }
@@ -7774,69 +7679,58 @@ mod tests {
     }
 
     #[test]
-    fn route_single_drop_uses_position() {
-        let p = vec![PathBuf::from("a.exr")];
-        assert_eq!(
-            route_dropped_exrs(&p, false),
-            vec![(PathBuf::from("a.exr"), false)],
-            "left half loads as A"
-        );
-        assert_eq!(
-            route_dropped_exrs(&p, true),
-            vec![(PathBuf::from("a.exr"), true)],
-            "right half loads as B"
-        );
-    }
+    fn open_layer_adds_a_source_and_records_recent() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("layer.exr");
+        write_rgba_exr(&f);
 
-    #[test]
-    fn route_multi_drop_is_a_then_b_rest_ignored() {
-        let paths = vec![
-            PathBuf::from("a.exr"),
-            PathBuf::from("b.exr"),
-            PathBuf::from("c.exr"),
-        ];
-        // Position is ignored once there are 2+ files: first → A, second → B.
+        // Prove the unified entry re-shows the panel even if it was toggled off.
+        let mut app = ExrApp {
+            show_layers_panel: false,
+            ..Default::default()
+        };
+        app.open_layer(f.clone());
+
         assert_eq!(
-            route_dropped_exrs(&paths, true),
-            vec![
-                (PathBuf::from("a.exr"), false),
-                (PathBuf::from("b.exr"), true),
-            ],
+            app.comp_stack.len(),
+            1,
+            "the dropped/opened file became a layer"
+        );
+        assert_eq!(app.comp_sources.len(), 1, "one source backs the layer");
+        assert_eq!(
+            app.recent_files.first(),
+            Some(&f),
+            "the file is recorded as most-recent"
+        );
+        assert!(
+            app.show_layers_panel,
+            "opening a layer shows the Layers panel"
         );
     }
 
     #[test]
-    fn route_empty_drop_is_noop() {
-        assert!(route_dropped_exrs(&[], false).is_empty());
-    }
+    fn add_comp_source_past_cap_reports_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("layer.exr");
+        write_rgba_exr(&f);
 
-    #[test]
-    fn cursor_targets_right_splits_on_window_center() {
-        // Window spanning screen-points x: 0..1000 (center 500).
-        let rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1000.0, 800.0));
-        assert!(!cursor_targets_right(egui::pos2(499.0, 10.0), rect));
-        assert!(cursor_targets_right(egui::pos2(501.0, 10.0), rect));
-        // Exactly at center counts as right (`>=`).
-        assert!(cursor_targets_right(egui::pos2(500.0, 10.0), rect));
-    }
+        let mut app = ExrApp::default();
+        for _ in 0..COMP_LAYER_CAP {
+            app.add_comp_source(f.clone());
+        }
+        assert_eq!(app.comp_stack.len(), COMP_LAYER_CAP);
+        assert!(app.error_msg.is_none(), "no error while filling to the cap");
 
-    #[test]
-    fn cursor_targets_right_uses_window_screen_center_not_origin() {
-        // Off-origin window (e.g. dragged to the right of the primary monitor):
-        // screen-points x 400..1400, center 900. Proves we compare against the
-        // window's *screen-space* center, so multi-monitor / moved windows work.
-        let rect = egui::Rect::from_min_max(egui::pos2(400.0, 0.0), egui::pos2(1400.0, 800.0));
-        assert!(!cursor_targets_right(egui::pos2(850.0, 0.0), rect));
-        assert!(cursor_targets_right(egui::pos2(950.0, 0.0), rect));
-    }
-
-    #[test]
-    fn cursor_targets_right_handles_negative_origin_monitor() {
-        // Secondary monitor to the left of primary: screen-points x -1920..-920,
-        // center -1420. Cursor at -1500 is left of center -> A.
-        let rect = egui::Rect::from_min_max(egui::pos2(-1920.0, 0.0), egui::pos2(-920.0, 800.0));
-        assert!(!cursor_targets_right(egui::pos2(-1500.0, 0.0), rect));
-        assert!(cursor_targets_right(egui::pos2(-1000.0, 0.0), rect));
+        // One past the cap stays capped and reports it, rather than silently
+        // dropping the file (so a multi-file drop past the cap is visible).
+        app.add_comp_source(f.clone());
+        assert_eq!(app.comp_stack.len(), COMP_LAYER_CAP, "stays capped");
+        assert!(
+            app.error_msg
+                .as_deref()
+                .is_some_and(|m| m.contains("Layer limit")),
+            "over-cap add reports the cap"
+        );
     }
 
     // --- Sequence playback (#7, Phase 2) -------------------------------------
