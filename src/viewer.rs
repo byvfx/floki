@@ -3375,7 +3375,18 @@ impl ExrViewer {
             bg_checker_light: rgb3_to_vec4(self.prefs.background.checker_light),
             bg_solid: rgb3_to_vec4(self.prefs.background.solid),
         };
-        let render_sig = (ctx.ocio_sig.get() ^ self.ocio_render_gen).wrapping_mul(0x100000001b3);
+        // Fold the display stage into the signature (comp path): toggling OCIO leaves
+        // pass-1's scene-linear uniforms — hence `ocio_sig` — unchanged, and the
+        // Enable-OCIO checkbox doesn't bump `ocio_render_gen`, so without this a toggle
+        // would keep the stale cached `display_view` from the prior mode (the OCIO
+        // transform vs the OCIO-off sRGB display-encode).
+        let display_stage_salt = if self.ocio_active {
+            0
+        } else {
+            0x9E37_79B9_7F4A_7C15
+        };
+        let render_sig = (ctx.ocio_sig.get() ^ self.ocio_render_gen ^ display_stage_salt)
+            .wrapping_mul(0x100000001b3);
         let scissor_pts = Some([
             image_rect.min.x,
             image_rect.min.y,

@@ -331,6 +331,12 @@ pub struct OcioTargets {
     /// an accumulate draw can read the prior accumulation. `[0]`=`scene_view`,
     /// `[1]`=`scene_view_b`.
     accum_tex_bg: [wgpu::BindGroup; 2],
+    /// Cached scene-input bind group for the OCIO-off display-encode pass (R2), over
+    /// `bind_group_layout_tex` (scene view + sampler) — the OCIO-off twin of
+    /// `scene_bind_group`. Built eagerly in `new` (its layout + sampler are known there,
+    /// unlike the OCIO pass's), rebuilt only on resize. Avoids a per-dirty-frame
+    /// `create_bind_group`.
+    display_encode_scene_bg: wgpu::BindGroup,
     /// `render_sig` of the content currently in `display_view`; lets `prepare` skip the
     /// two passes when nothing changed. `None` after (re)creation forces a first render.
     last_render_sig: Option<u64>,
@@ -460,6 +466,22 @@ impl OcioTargets {
                 ],
             })
         });
+        // OCIO-off display-encode scene input, cached like `accum_tex_bg` (same
+        // `tex_layout` + `tex_sampler` = `bind_group_layout_tex` + `gpu.sampler`).
+        let display_encode_scene_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("display-encode scene input (cached)"),
+            layout: tex_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&scene_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(tex_sampler),
+                },
+            ],
+        });
         let blit_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("OCIO blit uniform buffer"),
             size: std::mem::size_of::<crate::gpu::BlitUniforms>() as u64,
@@ -498,6 +520,7 @@ impl OcioTargets {
             scene_view,
             scene_view_b,
             accum_tex_bg,
+            display_encode_scene_bg,
             display_view,
             blit_bind_group,
             blit_uniform_buffer,
@@ -766,21 +789,8 @@ impl eframe::egui_wgpu::CallbackTrait for OcioCallback {
             if self.use_display_encode {
                 // OCIO-off (R2): sRGB-encode the scene-linear accumulate into the
                 // display target with the config-independent display-encode pipeline,
-                // then the blit garnishes it exactly like the OCIO path.
-                let scene_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("display-encode scene input"),
-                    layout: &gpu.bind_group_layout_tex,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(&targets.scene_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::Sampler(&gpu.sampler),
-                        },
-                    ],
-                });
+                // then the blit garnishes it exactly like the OCIO path. The scene-input
+                // bind group is cached on `OcioTargets` (built once in `new`).
                 let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("display-encode (OCIO-off)"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -801,7 +811,7 @@ impl eframe::egui_wgpu::CallbackTrait for OcioCallback {
                     rp.set_scissor_rect(x, y, sw, sh);
                 }
                 rp.set_pipeline(&gpu.display_encode_pipeline);
-                rp.set_bind_group(0, &scene_bg, &[]);
+                rp.set_bind_group(0, &targets.display_encode_scene_bg, &[]);
                 rp.draw(0..3, 0..1);
             } else {
                 let Some(ocio) = ocio else {
