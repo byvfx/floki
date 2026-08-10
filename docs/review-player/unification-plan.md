@@ -1,8 +1,10 @@
 # Layer-Stack Unification — making the layer model core to floki
 
-> Status: **proposed plan** (2026-07-16). Supersedes the ad-hoc PR-C/PR-D framing.
-> Builds on the shipped additive Layers panel (epic #99, PR-B) and the layer model
-> spine (`src/layer.rs`, #103). See `layer-model.md` for the model itself.
+> Status: **in progress** (updated 2026-08). Phases 1–2 + the R-series are done; the R4 collapse is
+> underway — open/drop = add a layer and the comp-path pixel readout have landed. Resume point and
+> concrete next steps: the **R4 handoff** section below. Supersedes the ad-hoc PR-C/PR-D framing.
+> Builds on the shipped additive Layers panel (epic #99, PR-B) and the layer model spine
+> (`src/layer.rs`, #103). See `layer-model.md` for the model itself.
 
 ## The goal
 
@@ -145,6 +147,10 @@ accumulate ping-pong renders in any colour mode (**R1/R2**), threads the live fr
   texture map; make `emit_mode_draws` **iterate `program.draws`**, binding each from the map (like
   `draw_comp_composite`) instead of the arrangement-hardcoded `bg_a`+`pick_b`.
 - **[DONE via R1/R2]** the OCIO-off display pass for a non-OCIO composite.
+- **[DONE `ab63b16`]** **pixel readout** ported into the comp path (`draw_comp_central` →
+  `sample_comp_readout` + the pure `top_sample_source` / `comp_hover_pixel` helpers; the status-bar
+  row reuses `draw_nuke_status_line`). Samples the **top layer's raw source pixels** (the A/B
+  analogue), not the composited GPU result. Porting the **histogram** in is still **[TODO]**.
 - **[TODO]** keep `Arrangement` as the viewport axis; lift Wipe / Side-by-Side / Diff geometry out
   of the A/B-only `emit_mode_draws` arms into arrangement-generic code (#104). **This is where the
   compare modes come back** for the comp path.
@@ -155,13 +161,15 @@ The R-series has already delivered the pieces R4 stands on: the base plate is a 
 the comp path renders standalone (R1/R2) and drives the transport (R4-lite), and the UI is the
 bottom timeline tracks. R4 finishes the collapse:
 
-- **Open / drop = add a layer.** `open_file` should *add/set a layer* on the one stack (the R3 base
-  hook is the seam — generalize "promote A on the first comp source" into "every open adds a
-  layer"). The A/B compare UI and the Layers panel become two views over the same `LayerStack`.
-- **Drop = add a layer.** Reroute `handle_drag_and_drop` (`app.rs`, the "Drop for A / Drop for B"
-  split via `route_dropped_exrs`) to `add_comp_source`. **Open design Q:** replace the A/B split
-  drop outright, or keep it until compare-modes-as-arrangements lands? (Also queued separately in
-  the session memory as a standalone follow-up.)
+- **[DONE `03ec2cf`] Open / drop = add a layer (literal).** Every open/drop routes through the new
+  `open_layer` → `add_comp_source` (records recents, shows the panel). `handle_drag_and_drop` lost
+  the "Drop for A / Drop for B" split for a single "Drop to add layer" overlay; the four A/B-split
+  drop helpers + the B-reference menu items are deleted. `draw_central_canvas` enters the comp path
+  on a non-empty stack alone (the panel toggle now hides only the tracks, not the composite). The
+  legacy `open_file` / `update_base_layer` are kept `#[allow(dead_code)]` until the render-retire
+  step deletes or revives them. **Design decision (user): the literal variant** — a single image
+  renders through the comp path and loses readout / histogram / compare until render-retire ports
+  them in (readout has since landed, see Phase 3).
 - **Delete the `_b`/`comp_*` duplication** and the `CompareMode`→`configure` shim, replaced by
   direct stack editing + an `Arrangement` selector. Depends on the Phase-3 `emit_mode_draws`
   retire + compare-modes-as-arrangements above (do that first, or R4 loses the compare modes).
@@ -170,25 +178,31 @@ bottom timeline tracks. R4 finishes the collapse:
   `#[serde(flatten)]` (wipes `app.ron`). `BlendMode` already has serde. Independent of the render
   retire — landable any time.
 
-#### R4 handoff — state as of `7379fd5` (2026-07-26)
+#### R4 handoff — state as of `cad0a56` (2026-08)
 
-- **Branch:** `feat/layer-stack-play`, PR **#190** (draft), 13 ahead of `main`, CI green. All of
-  Phase 1 + Phase 2 + the R-series above are on it.
-- **Two render paths coexist by design.** Classic `viewer.ui` (A/B, compare modes, pixel readout,
-  histogram) runs with **0 comp sources**; `draw_comp_central` (the comp path) runs with **≥1**.
-  R4's job is to make the comp path the *only* path — which requires porting readout / histogram /
-  compare-as-arrangements into it **before** deleting `viewer.ui`'s A/B arms, or those features
-  regress. Sequencing matters: **Phase-3 render-retire + compare-as-arrangements → then the
-  `_b`/`comp_*` deletion.** Persistence can land independently at any point.
-- **The R3 base-layer seam** (`add_base_layer` / `ensure_base_frame` in `app.rs`) is the natural
-  starting point for "open = add a layer": it already turns slot A into a stack layer rendered
-  through the comp path.
-- **Non-blocking follow-ups** (record, don't let them gate R4): reuse A's T2 ring in
-  `ensure_base_frame` (skip the per-frame re-upload); a `.cube` LUT in the OCIO-off display-encode
-  (R2 is sRGB-only); the lazy 2nd scene target (`ocio_pass.rs`, wasted for single-image OCIO); the
-  ruler cache-fill bar reading only `A_SOURCE` (misleading in comp-drives-transport mode —
-  dissolves once A is always a layer); the independent `map_b_frame`→`Trim::source_frame` slice
-  (last Phase-1 item, blank-outside-range).
+- **Branch:** `feat/layer-stack-play`, PR **#190** (ready for review), 17 ahead of `main`, CI green.
+  Phase 1 + Phase 2 + the R-series + the R4 collapse-so-far are all on it.
+- **Done since `7379fd5`:** open/drop = add a layer (`03ec2cf`, literal); **pixel readout** in the
+  comp path (`ab63b16`); two Copilot review fixes on the R2 OCIO-off path (`cad0a56` — fold the
+  display stage into the comp-path `render_sig` so an OCIO toggle re-renders; cache the display-encode
+  scene bind group on `OcioTargets`).
+- **Routing now:** `draw_central_canvas` runs the comp path whenever `comp_stack` is non-empty; the
+  classic `viewer.ui` A/B path is only reachable with an **empty** stack, which no longer happens via
+  the UI (open/drop always add a layer). It is *retained, not deleted* — the render-retire step below
+  revives compare modes as `Arrangement`s and **then** the `_b`/`comp_*` deletion removes it.
+- **RESUME AT — render-retire (Phase 3).** In `emit_mode_draws` iterate `program.draws` over a
+  per-`SourceId` texture map (kill `gpu_textures_b` / `pick_b`); lift Wipe / Side-by-Side / Diff
+  geometry into arrangement-generic code — **this brings compare modes back** in the comp path; port
+  the **histogram** in (readout is done). THEN delete the `_b`/`comp_*` duplication + the
+  `CompareMode`→`configure` shim, and drop the `#[allow(dead_code)]` on `open_file` /
+  `update_base_layer`. Persistence (`Vec<LayerPersist>`, path + name/blend/opacity/enabled/solo/aov/
+  trim; NEVER `#[serde(flatten)]`) is independent — landable any time.
+- **Readout fast-follows:** the floating cursor tooltip (`viewer.rs` `Window::new("Pixel Tooltip")` —
+  factor its swatch/HSVL block out and reuse); expose the aperture combo (1 / 3×3 / 9×9) in comp mode.
+- **Non-blocking follow-ups:** reuse A's T2 ring in `ensure_base_frame`; a `.cube` LUT in the OCIO-off
+  display-encode (R2 is sRGB-only); the lazy 2nd scene target (`ocio_pass.rs`, wasted for single-image
+  OCIO); the ruler cache-fill bar reading only `A_SOURCE`; the `map_b_frame`→`Trim::source_frame` slice
+  — now effectively folded into the `_b` deletion (B is unreachable under the literal collapse).
 
 ## Risks & de-risking
 
@@ -297,6 +311,25 @@ groundwork the final collapse (**R4**) sits on. All in `src/app.rs` + the GPU re
   `followers`. **Routing stays conservative** (user decision): 0 comp sources → classic `viewer.ui`
   (readout / histogram / compare modes intact); ≥1 comp source → comp path with the plate at bottom.
 
+### R4 collapse — open/drop = a layer, comp-path readout  (branch `feat/layer-stack-play`, PR #190)
+
+- **Open / drop = add a layer** `03ec2cf` — the literal collapse. New `open_layer` is the one entry
+  (records recents, shows the panel, `add_comp_source`); it backs drag-drop, File > Open, Open Recent,
+  and the panel Add button. `handle_drag_and_drop` → a single "Drop to add layer" overlay; the four
+  A/B-split drop helpers (`route_dropped_exrs` / `live_dropped_right` / `cursor_targets_right` /
+  `global_cursor_pos_points`) + the B-reference menu items removed. `draw_central_canvas`'s gate
+  decoupled from `show_layers_panel`. Cap surfaced via `error_msg`. Legacy `open_file` /
+  `update_base_layer` kept `#[allow(dead_code)]`. Net −106 lines.
+- **Pixel readout in the comp path** `ab63b16` — `sample_pixel` → `pub(crate)`; `draw_comp_central`
+  records the topmost drawable layer (`comp_readout`) and, after the draw, samples its source pixels
+  under the cursor into the shared `last_hover_pos_img` / `last_sampled_val_a` (honors
+  `suppress_sampling` so it blanks during playback); `draw_status_bar` gains a comp row reusing
+  `draw_nuke_status_line`. Two pure helpers (`top_sample_source`, `comp_hover_pixel`) unit-tested.
+- **Copilot review fixes** `cad0a56` — (1) fold a display-stage salt into the comp-path `render_sig`
+  so toggling OCIO on a static frame re-renders (was leaving a stale `display_view`); (2) cache the
+  OCIO-off display-encode scene bind group on `OcioTargets` (built in `new`), the twin of
+  `scene_bind_group`, instead of a per-dirty-frame `create_bind_group`.
+
 ## Execution checklist — Phase 1  *(complete; kept for reference — resume point is Phase 4 / R4 below)*
 
 Symbols are stable; line numbers drift (grep the name). Keep A/B pinned to
@@ -364,9 +397,11 @@ Phase 2 section above for the slice-by-slice breakdown.
 renders standalone in any colour mode, drives the transport, includes the base plate, and the panel
 is the Chaos-Player bottom timeline tracks. See the "Render foundation" progress-log block above.
 
-**Resume next → Phase 4 / R4 (collapse to one model)** — see the *"Phase 4 / R4"* section and its
-**R4 handoff** above for the concrete steps, sequencing, and open questions. In short: open/drop =
-add a layer; retire the old A/B `emit_mode_draws` render path (Phase-3 render-retire) with compare
-modes reborn as `Arrangement`s; delete the `_b`/`comp_*` duplication; land layer persistence
-(independent). The independent **`map_b_frame`→`Trim`** slice (last Phase-1 item, blank-outside-
-range) can still land any time.
+**Resume next → render-retire (Phase 3), then the `_b`/`comp_*` deletion.** Open/drop = add a layer
+and the comp-path pixel readout have landed (`03ec2cf` / `ab63b16`, plus the `cad0a56` review fixes);
+see the **R4 handoff** above for the concrete resume steps and sequencing. In short: in
+`emit_mode_draws` iterate `program.draws` over a per-`SourceId` texture map and lift Wipe / SxS / Diff
+into arrangement-generic code (compare modes return), port the histogram in, then delete the
+`_b`/`comp_*` duplication and drop the `#[allow(dead_code)]` on `open_file` / `update_base_layer`.
+Layer persistence (`Vec<LayerPersist>`) is independent. Readout fast-follows: the floating cursor
+tooltip + the aperture combo in comp mode.
