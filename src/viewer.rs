@@ -4011,7 +4011,7 @@ impl ExrViewer {
         Some(ctx.load_texture("exr_viewer", color_image, egui::TextureOptions::LINEAR))
     }
 
-    fn sample_pixel(
+    pub(crate) fn sample_pixel(
         &self,
         exr_data: &ExrData,
         layer_index: usize,

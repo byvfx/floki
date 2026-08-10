@@ -709,6 +709,13 @@ pub struct ExrApp {
     #[serde(skip)]
     comp_sources: std::collections::HashMap<crate::layer::SourceId, CompSource>,
 
+    /// The topmost drawable comp layer under the cursor — `(source, aov)` — for the
+    /// status-bar pixel readout (#99 R4). Set each frame by [`Self::draw_comp_central`]
+    /// and read the next frame by [`Self::draw_status_bar`] (which runs first — the same
+    /// one-frame lag the A/B readout has). Runtime-only.
+    #[serde(skip)]
+    comp_readout: Option<(crate::layer::SourceId, usize)>,
+
     /// App-owned GPU core (#54): the single home for the persistent `GpuState`
     /// and the OCIO pass publisher. `None` in the CPU-only path (no wgpu
     /// device) and during `Default::default()` / before `new(cc)` wires it up.
@@ -885,6 +892,7 @@ impl Default for ExrApp {
             comp_stack: crate::layer::LayerStack::new(),
             comp_next_source: COMP_SOURCE_BASE,
             comp_sources: std::collections::HashMap::new(),
+            comp_readout: None,
             gpu_resources: None,
             ocio_path: String::new(),
             lut_path: String::new(),
@@ -3564,6 +3572,43 @@ fn is_exr_path(path: &std::path::Path) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("exr"))
 }
 
+/// The topmost drawable layer in a resolved composite — the last `Step::Draw`
+/// whose source is drawable (per `drawable`) → `(source, aov)`. This is the layer
+/// the comp-path pixel readout samples (top-of-stack under the cursor); `None` when
+/// nothing drawable is present. Mirrors `draw_comp_central`'s draw-list skip rule,
+/// factored out pure (`drawable` is the caller's `comp_sources` texture check).
+fn top_sample_source(
+    steps: &[crate::layer::Step],
+    drawable: impl Fn(crate::layer::SourceId) -> bool,
+) -> Option<(crate::layer::SourceId, usize)> {
+    steps.iter().rev().find_map(|step| match step {
+        crate::layer::Step::Draw(d) if drawable(d.source) => Some((d.source, d.aov)),
+        _ => None,
+    })
+}
+
+/// Map a screen position over the composite `image_rect` to a source pixel of a
+/// layer sized `size`. Normalized (fraction across the rect × source size) so a
+/// layer whose size differs from the base still maps correctly under the
+/// stretch-to-base display. `None` outside `[0, 1)` on either axis, or for a
+/// zero-sized / zero-area rect. Pure / testable.
+fn comp_hover_pixel(
+    pos: egui::Pos2,
+    image_rect: egui::Rect,
+    size: (usize, usize),
+) -> Option<(usize, usize)> {
+    let (w, h) = size;
+    if w == 0 || h == 0 || image_rect.width() <= 0.0 || image_rect.height() <= 0.0 {
+        return None;
+    }
+    let u = (pos.x - image_rect.min.x) / image_rect.width();
+    let v = (pos.y - image_rect.min.y) / image_rect.height();
+    if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
+        return None;
+    }
+    Some(((u * w as f32) as usize, (v * h as f32) as usize))
+}
+
 impl eframe::App for ExrApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         // Mirror the viewer-owned display prefs (#151) into the serde bridge so the
@@ -4451,6 +4496,36 @@ impl ExrApp {
                         self.viewer.last_sampled_val_b,
                         phys_idx_b,
                         layer_name_b,
+                    );
+                }
+
+                // Comp-path readout (#99 R4): the topmost layer under the cursor.
+                // In comp mode `exr_data` / `exr_data_b` are None, so the A/B rows
+                // above render nothing and this is the sole readout row.
+                if let Some((src, aov)) = self.comp_readout
+                    && let Some(cs) = self.comp_sources.get(&src)
+                {
+                    let ll = cs.exr_data.logical_layers.get(aov);
+                    let phys_idx = ll.map(|l| l.physical_index).unwrap_or(0);
+                    let layer_name = ll.map(|l| l.name.as_str()).unwrap_or("");
+                    // Row label = the comp layer's name (which of N is on top).
+                    let prefix = self
+                        .comp_stack
+                        .iter()
+                        .find(|l| {
+                            matches!(l.source,
+                                crate::layer::LayerSource::Image { source, .. } if source == src)
+                        })
+                        .map(|l| l.name.as_str())
+                        .unwrap_or("Layer");
+                    draw_nuke_status_line(
+                        ui,
+                        prefix,
+                        Some(cs.exr_data.as_ref()),
+                        self.viewer.last_hover_pos_img,
+                        self.viewer.last_sampled_val_a,
+                        phys_idx,
+                        layer_name,
                     );
                 }
             });
@@ -6442,6 +6517,20 @@ impl ExrApp {
             });
         }
 
+        // Pixel readout (#99 R4) targets the topmost drawable layer under the cursor
+        // — the honest analogue of the A/B path, which samples raw source pixels, not
+        // the composited result. Record it independent of hover (so the status-bar
+        // row persists) and clone its pixels (cheap Arc) so the sample below doesn't
+        // borrow `self` across the GPU draw.
+        let top = top_sample_source(&steps, |s| {
+            self.comp_sources
+                .get(&s)
+                .is_some_and(|c| c.bind_group.is_some())
+        });
+        self.comp_readout = top;
+        let top_exr =
+            top.and_then(|(s, aov)| self.comp_sources.get(&s).map(|c| (c.exr_data.clone(), aov)));
+
         // The composite renders in any color mode (#99 R2): OCIO on → the OCIO
         // display transform; OCIO off → the sRGB display-encode pass. Only a GPU
         // and a drawable layer are required.
@@ -6461,6 +6550,47 @@ impl ExrApp {
                 ui.label(msg);
             });
         }
+
+        // Sample after the draw so `last_image_rect` is this frame's, and after the
+        // `gpu_resources` borrow above is released. Unconditional: no drawable / no
+        // hover / suppressed clears the readout (status bar then shows `x=--`).
+        self.sample_comp_readout(ui, top_exr);
+    }
+
+    /// Populate the pixel-readout fields (`last_hover_pos_img` / `last_sampled_val_a`)
+    /// from the cursor over the composite (#99 R4). `top` is the topmost drawable
+    /// layer's pixels + aov. Clears the readout when playback suppresses sampling, the
+    /// pointer is off the image, or there is no drawable layer.
+    fn sample_comp_readout(
+        &mut self,
+        ui: &egui::Ui,
+        top: Option<(std::sync::Arc<ExrData>, usize)>,
+    ) {
+        let suppressed = self.playback.sampling_suppressed();
+        let hover = if suppressed {
+            None
+        } else {
+            ui.input(|i| i.pointer.hover_pos())
+        };
+        let sampled = match (self.viewer.last_image_rect, hover, &top) {
+            (Some(ir), Some(pos), Some((exr, aov))) if ir.contains(pos) => {
+                let size = exr.logical_size(*aov).unwrap_or((0, 0));
+                comp_hover_pixel(pos, ir, size)
+                    .map(|(x, y)| (x, y, self.viewer.sample_pixel(exr, *aov, x, y)))
+            }
+            _ => None,
+        };
+        match sampled {
+            Some((x, y, v)) => {
+                self.viewer.last_hover_pos_img = Some((x, y));
+                self.viewer.last_sampled_val_a = v;
+            }
+            None => {
+                self.viewer.last_hover_pos_img = None;
+                self.viewer.last_sampled_val_a = None;
+            }
+        }
+        self.viewer.last_sampled_val_b = None;
     }
 
     fn draw_central_canvas(&mut self, ui: &mut egui::Ui) {
@@ -7676,6 +7806,66 @@ mod tests {
         assert!(!is_exr_path(std::path::Path::new("note.txt")));
         assert!(!is_exr_path(std::path::Path::new("exr"))); // bare name, no extension
         assert!(!is_exr_path(std::path::Path::new("archive.exr.zip")));
+    }
+
+    #[test]
+    fn top_sample_source_picks_the_last_drawable_draw() {
+        use crate::layer::{LayerStack, SourceId, Trim};
+        let mut stack = LayerStack::new();
+        let s_bottom = SourceId(2);
+        let s_top = SourceId(3);
+        stack.push_image("bottom", s_bottom, 0, Trim::full(0, u32::MAX));
+        stack.push_image("top", s_top, 1, Trim::full(0, u32::MAX));
+        let steps = stack.composite_at(0);
+
+        // All drawable → the top (last) layer wins, carrying its own aov.
+        assert_eq!(top_sample_source(&steps, |_| true), Some((s_top, 1)));
+        // Top not drawable → the next drawable below it.
+        assert_eq!(
+            top_sample_source(&steps, |s| s == s_bottom),
+            Some((s_bottom, 0))
+        );
+        // Nothing drawable → None.
+        assert_eq!(top_sample_source(&steps, |_| false), None);
+    }
+
+    #[test]
+    fn comp_hover_pixel_maps_normalized_and_rejects_outside() {
+        let rect = egui::Rect::from_min_size(egui::pos2(100.0, 50.0), egui::vec2(200.0, 100.0));
+        // Center → center pixel of a 200×100 source.
+        assert_eq!(
+            comp_hover_pixel(egui::pos2(200.0, 100.0), rect, (200, 100)),
+            Some((100, 50))
+        );
+        // Min corner → (0, 0).
+        assert_eq!(
+            comp_hover_pixel(egui::pos2(100.0, 50.0), rect, (200, 100)),
+            Some((0, 0))
+        );
+        // Just outside (left / above) → None.
+        assert_eq!(
+            comp_hover_pixel(egui::pos2(99.0, 100.0), rect, (200, 100)),
+            None
+        );
+        assert_eq!(
+            comp_hover_pixel(egui::pos2(200.0, 49.0), rect, (200, 100)),
+            None
+        );
+        // Far edge (u or v == 1.0) is excluded → None.
+        assert_eq!(
+            comp_hover_pixel(egui::pos2(300.0, 100.0), rect, (200, 100)),
+            None
+        );
+        // Zero-sized source → None.
+        assert_eq!(
+            comp_hover_pixel(egui::pos2(150.0, 75.0), rect, (0, 0)),
+            None
+        );
+        // Differing size maps by fraction (stretch-correct): a 50×25 top layer.
+        assert_eq!(
+            comp_hover_pixel(egui::pos2(200.0, 100.0), rect, (50, 25)),
+            Some((25, 12))
+        );
     }
 
     #[test]
