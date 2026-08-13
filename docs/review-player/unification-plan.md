@@ -341,6 +341,13 @@ groundwork the final collapse (**R4**) sits on. All in `src/app.rs` + the GPU re
   `viewer.active_layer`). The `#192` bottom-bar channel toggle is retired (the bar supersedes it) and
   the File ▸ Close Image A/B items removed (`unload` parked `#[allow(dead_code)]`). `LayerStack::iter`
   widened to `DoubleEndedIterator` for top→bottom walks.
+- **Anamorphic unsqueeze in the comp path** (#194) — the collapse dropped the #179 unsqueeze (it
+  lived only in `viewer::ui`), so anamorphic footage rendered squeezed. `draw_comp_composite` now
+  applies `unsqueeze_factor(base_par)` as the same CPU-side horizontal geometry stretch the A/B path
+  uses (framing fits the unsqueezed extents; the uniform stretch keeps `comp_hover_pixel` correct
+  with no extra term). `base_par` is the bottom drawable layer's header PAR, threaded through
+  `draw_comp_central`. An **Unsqueeze** checkbox is surfaced in `draw_comp_layer_bar` for anamorphic
+  layers, since the comp path doesn't draw the classic Display ▾ menu.
 
 ## Execution checklist — Phase 1  *(complete; kept for reference — resume point is Phase 4 / R4 below)*
 

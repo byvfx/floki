@@ -3298,6 +3298,7 @@ impl ExrViewer {
         &mut self,
         ui: &mut egui::Ui,
         base_size: (usize, usize),
+        base_par: f32,
         draws: &[CompDraw],
         gpu_resources: &crate::gpu::GpuResources,
         lut_bg_opt: Option<std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>>,
@@ -3308,15 +3309,28 @@ impl ExrViewer {
         let render_state = gpu_resources.render_state();
         let (bw, bh) = base_size;
         let tex_size = egui::vec2(bw.max(1) as f32, bh.max(1) as f32);
+        // Anamorphic unsqueeze (#194 / #179): stretch the composite horizontally by
+        // the base layer's `pixelAspectRatio` (honoring the `anamorphic_unsqueeze`
+        // toggle + manual override), the same CPU-side geometry stretch the classic
+        // A/B path applies. The stretch is uniform across the image rect, so the
+        // cursor→pixel readout (`comp_hover_pixel` on `last_image_rect`) stays correct
+        // with no extra term.
+        let par = self.unsqueeze_factor(base_par);
 
         let (rect, response) =
             ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
         self.last_canvas_rect = Some(rect);
         // Shared pan/zoom with the A/B view (the scale/translation fields are the
-        // same); framing on first paint fits the base layer (no B extent).
-        self.handle_canvas_interaction(ui, rect, &response, tex_size, None);
+        // same); framing on first paint fits the *unsqueezed* base layer extents.
+        self.handle_canvas_interaction(
+            ui,
+            rect,
+            &response,
+            egui::vec2(tex_size.x * par, tex_size.y),
+            None,
+        );
 
-        let image_size = egui::vec2(tex_size.x * self.scale, tex_size.y * self.scale);
+        let image_size = egui::vec2(tex_size.x * self.scale * par, tex_size.y * self.scale);
         let image_rect = egui::Rect::from_center_size(rect.center() + self.translation, image_size);
         // The comp stack has no separate display window yet: display == image.
         let disp_rect = image_rect;

@@ -6169,6 +6169,12 @@ impl ExrApp {
                     .collect()
             })
             .unwrap_or_default();
+        // The current layer's header pixel aspect, to gate the anamorphic toggle
+        // below (#194) — only worth showing for non-square-pixel footage.
+        let cur_par = source
+            .and_then(|s| self.comp_sources.get(&s))
+            .map(|cs| cs.exr_data.image.attributes.pixel_aspect)
+            .unwrap_or(1.0);
 
         ui.horizontal(|ui| {
             // Which layer is current (Nuke's input selector). Only worth showing
@@ -6220,6 +6226,17 @@ impl ExrApp {
             ui.selectable_value(&mut mode, ChannelMode::B, "B");
             ui.selectable_value(&mut mode, ChannelMode::A, "A");
             self.viewer.set_channel_mode(mode);
+
+            // Anamorphic unsqueeze toggle (#194), surfaced here since the comp path
+            // doesn't draw the classic viewer's Display ▾ menu. Only for non-square
+            // pixels; the render stretch uses the base layer's PAR (`base_par`).
+            if (cur_par - 1.0).abs() > f32::EPSILON {
+                ui.separator();
+                ui.checkbox(&mut self.viewer.prefs.anamorphic_unsqueeze, "Unsqueeze")
+                    .on_hover_text(format!(
+                        "Stretch anamorphic footage to display aspect (header PAR {cur_par})"
+                    ));
+            }
         });
         ui.separator();
     }
@@ -6747,6 +6764,9 @@ impl ExrApp {
         // layer defines the shared canvas size.
         let mut draws: Vec<crate::viewer::CompDraw> = Vec::new();
         let mut base_size = (0usize, 0usize);
+        // The bottom drawable layer defines the canvas, so its header pixel aspect
+        // drives the anamorphic unsqueeze for the whole composite (#194 / #179).
+        let mut base_par = 1.0_f32;
         for step in &steps {
             let crate::layer::Step::Draw(d) = step else {
                 continue; // Adjustment layers (#102) don't render yet.
@@ -6759,6 +6779,7 @@ impl ExrApp {
             };
             if draws.is_empty() {
                 base_size = cs.size;
+                base_par = cs.exr_data.image.attributes.pixel_aspect;
             }
             draws.push(crate::viewer::CompDraw {
                 bind_group,
@@ -6789,7 +6810,7 @@ impl ExrApp {
         {
             let lut = self.lut_bg.clone();
             self.viewer
-                .draw_comp_composite(ui, base_size, &draws, gpu, lut);
+                .draw_comp_composite(ui, base_size, base_par, &draws, gpu, lut);
         } else {
             let msg = if self.gpu_resources.is_none() {
                 "No GPU: the compositing viewport is unavailable."
