@@ -174,6 +174,24 @@ field empty it uses the built-in ACES config, or `$OCIO` if that environment var
 (e.g. `OCIO=ocio://studio-config-latest`). See [`floki-ocio/README.md`](floki-ocio/README.md)
 for backend/build details.
 
+### Windows quick build (`scripts/run-windows.ps1`)
+
+Because OCIO (and its shaderc dependency) build native code, a Windows dev box needs
+`cmake` + `ninja` + `python` + the MSVC toolchain on `PATH`, plus a prebuilt OpenColorIO to
+link against for the default `system-ocio` backend. Those tools usually exist but aren't on
+`PATH` (cmake/ninja ship inside Visual Studio 2022; python via Anaconda). The helper script
+assembles that environment (imports `vcvars64`, prepends the bundled tools, points
+`system-ocio` at a vcpkg OCIO) and then runs cargo:
+
+```powershell
+scripts\run-windows.ps1 test          # fmt --check, clippy -D warnings, cargo test
+scripts\run-windows.ps1               # cargo run --release  (default task)
+scripts\run-windows.ps1 run -- "D:\shots\comp.exr"
+```
+
+Paths default to a common layout and are overridable via `FLOKI_VCPKG`, `FLOKI_ANACONDA`,
+and `FLOKI_VSPATH`. It's a **local dev convenience only** — CI does not use it.
+
 ## Debugging & Logging
 
 The app initializes [`env_logger`](https://docs.rs/env_logger), so runtime logging is
