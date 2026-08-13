@@ -716,6 +716,14 @@ pub struct ExrApp {
     #[serde(skip)]
     comp_readout: Option<(crate::layer::SourceId, usize)>,
 
+    /// The comp layer the viewer's AOV / channel controls + EXR Info act on —
+    /// Nuke's "current" layer (#99 R4 follow-up). Set to the newest layer on
+    /// open/add and by clicking a layer in the viewport bar or a timeline track;
+    /// resolved (with a top-of-stack fallback for a stale/empty selection) by
+    /// [`Self::active_comp_layer`]. Runtime-only.
+    #[serde(skip)]
+    selected_comp_layer: Option<crate::layer::LayerId>,
+
     /// App-owned GPU core (#54): the single home for the persistent `GpuState`
     /// and the OCIO pass publisher. `None` in the CPU-only path (no wgpu
     /// device) and during `Default::default()` / before `new(cc)` wires it up.
@@ -893,6 +901,7 @@ impl Default for ExrApp {
             comp_next_source: COMP_SOURCE_BASE,
             comp_sources: std::collections::HashMap::new(),
             comp_readout: None,
+            selected_comp_layer: None,
             gpu_resources: None,
             ocio_path: String::new(),
             lut_path: String::new(),
@@ -3442,6 +3451,12 @@ impl ExrApp {
     /// resets the viewer, dropping every `Arc<BindGroup>` GPU handle. Unloading
     /// B only clears B; the viewer's `textures_b`/`gpu_textures_b` are freed on
     /// the next `viewer.ui` pass when its layer count falls to zero.
+    ///
+    /// The File ▸ Close Image A/B menu items that called this were removed in the
+    /// #99 collapse (layers are closed from the timeline track ⋮ menu). Kept — like
+    /// `open_file`/`update_base_layer` — for the render-retire step to revive as the
+    /// base-plate close path.
+    #[allow(dead_code)]
     fn unload(&mut self, is_b: bool) {
         if is_b {
             self.exr_data_b = None;
@@ -4203,19 +4218,6 @@ impl ExrApp {
                             }
                         });
                         ui.separator();
-                        ui.add_enabled_ui(self.exr_data.is_some(), |ui| {
-                            if ui.button("Close Image A").clicked() {
-                                self.unload(false);
-                                ui.close();
-                            }
-                        });
-                        ui.add_enabled_ui(self.exr_data_b.is_some(), |ui| {
-                            if ui.button("Close Image B").clicked() {
-                                self.unload(true);
-                                ui.close();
-                            }
-                        });
-                        ui.separator();
                         if ui.button("Quit").clicked() {
                             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                         }
@@ -4295,6 +4297,10 @@ impl ExrApp {
         // window when Image B is loaded) is added first, it expands the parent UI's
         // bottom edge past the window and the bottom panel anchors off-screen.
         egui::Panel::bottom("status_bar").show_inside(ui, |ui| {
+            // Channel isolation now lives in the comp viewport's top control bar
+            // (`draw_comp_layer_bar`, #99 R4) and the classic viewer's own control
+            // row, so the bottom-bar quick toggle (#192) was retired to avoid a
+            // duplicate "Channel:" row.
             if let Some(status) = &self.snapshot_status {
                 ui.label(egui::RichText::new(status).weak());
             }
@@ -5291,31 +5297,94 @@ impl ExrApp {
                             ui.separator();
                         }
 
-                        let mut files_to_show = vec![];
+                        // (section label, display filename, decoded data, comp layer
+                        // id). `comp_layer` is `Some` for a layer-stack source — its
+                        // pass list drives that layer's AOV; `None` for the classic
+                        // A/B slots, whose pass list drives `viewer.active_layer`.
+                        // Owned `Arc` clones (cheap) so nothing borrows `self` across
+                        // the render loop (which mutates `self` on a pass click).
+                        type InfoEntry = (
+                            String,
+                            String,
+                            std::sync::Arc<ExrData>,
+                            Option<crate::layer::LayerId>,
+                        );
+                        let mut files_to_show: Vec<InfoEntry> = vec![];
                         if let (Some(path), Some(data)) = (&self.loaded_file, &self.exr_data) {
-                            files_to_show.push(("Image A", path, data));
+                            files_to_show.push((
+                                "Image A".to_string(),
+                                path.file_name()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                                    .into_owned(),
+                                data.clone(),
+                                None,
+                            ));
                         }
                         if let (Some(path), Some(data)) = (
                             &self.followers[&Self::B_SOURCE].loaded_file,
                             &self.exr_data_b,
                         ) {
-                            files_to_show.push(("Image B", path, data));
+                            files_to_show.push((
+                                "Image B".to_string(),
+                                path.file_name()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                                    .into_owned(),
+                                data.clone(),
+                                None,
+                            ));
+                        }
+                        // Comp / layer-stack path (#99 R4): `exr_data` is None, so show
+                        // the current layer's source metadata first (Nuke-style), then
+                        // the rest of the stack top→bottom.
+                        if files_to_show.is_empty() {
+                            let cur = self.active_comp_layer();
+                            let ids: Vec<crate::layer::LayerId> = {
+                                let mut v: Vec<_> =
+                                    self.comp_stack.iter().rev().map(|l| l.id).collect();
+                                if let Some(c) = cur {
+                                    v.retain(|&id| id != c);
+                                    v.insert(0, c);
+                                }
+                                v
+                            };
+                            for id in ids {
+                                let Some(l) = self.comp_stack.get(id) else {
+                                    continue;
+                                };
+                                let source = match &l.source {
+                                    crate::layer::LayerSource::Image { source, .. } => {
+                                        Some(*source)
+                                    }
+                                    crate::layer::LayerSource::Adjustment => None,
+                                };
+                                if let Some(cs) = source.and_then(|s| self.comp_sources.get(&s)) {
+                                    let label = if cur == Some(id) {
+                                        "Current Layer"
+                                    } else {
+                                        "Layer"
+                                    };
+                                    files_to_show.push((
+                                        label.to_string(),
+                                        l.name.clone(),
+                                        cs.exr_data.clone(),
+                                        Some(id),
+                                    ));
+                                }
+                            }
                         }
 
                         if !files_to_show.is_empty() {
                             egui::ScrollArea::vertical().show(ui, |ui| {
-                                for (idx, (label, path, exr_data)) in
+                                for (idx, (label, name, exr_data, comp_layer)) in
                                     files_to_show.iter().enumerate()
                                 {
                                     if idx > 0 {
                                         ui.separator();
                                         ui.add_space(10.0);
                                     }
-                                    ui.heading(format!(
-                                        "{}: {}",
-                                        label,
-                                        path.file_name().unwrap_or_default().to_string_lossy()
-                                    ));
+                                    ui.heading(format!("{label}: {name}"));
                                     ui.add_space(5.0);
 
                                     egui::CollapsingHeader::new("Image Metadata")
@@ -5364,11 +5433,40 @@ impl ExrApp {
                                     ui.separator();
                                     ui.heading("Layers");
 
+                                    // Which pass is active for this entry, and where a
+                                    // click retargets it: a comp layer drives its own
+                                    // AOV (`LayerSource::Image.aov`); the classic A/B
+                                    // slots drive the shared `viewer.active_layer`.
+                                    let active_pass = match comp_layer {
+                                        Some(id) => self
+                                            .comp_stack
+                                            .get(*id)
+                                            .and_then(|l| match &l.source {
+                                                crate::layer::LayerSource::Image {
+                                                    aov, ..
+                                                } => Some(*aov),
+                                                crate::layer::LayerSource::Adjustment => None,
+                                            })
+                                            .unwrap_or(0),
+                                        None => self.viewer.active_layer,
+                                    };
                                     for (i, ll) in exr_data.logical_layers.iter().enumerate() {
-                                        let is_selected = self.viewer.active_layer == i;
+                                        let is_selected = active_pass == i;
 
                                         if ui.selectable_label(is_selected, &ll.name).clicked() {
-                                            self.viewer.active_layer = i;
+                                            match comp_layer {
+                                                Some(id) => {
+                                                    if let Some(l) = self.comp_stack.get_mut(*id)
+                                                        && let crate::layer::LayerSource::Image {
+                                                            aov,
+                                                            ..
+                                                        } = &mut l.source
+                                                    {
+                                                        *aov = i;
+                                                    }
+                                                }
+                                                None => self.viewer.active_layer = i,
+                                            }
                                         }
 
                                         if is_selected
@@ -5815,7 +5913,10 @@ impl ExrApp {
 
         let source = crate::layer::SourceId(self.comp_next_source);
         self.comp_next_source += 1;
-        self.comp_stack.push_image(name, source, 0, trim);
+        let layer_id = self.comp_stack.push_image(name, source, 0, trim);
+        // A freshly added layer becomes the "current" layer the viewport bar's AOV /
+        // channel controls + EXR Info act on (Nuke-style, #99 R4 follow-up).
+        self.selected_comp_layer = Some(layer_id);
 
         // Build the GPU texture for AOV 0 (matching `push_image`'s aov). Absent a
         // GPU device (headless / CPU-only) the source is stored pixels-only.
@@ -5973,6 +6074,10 @@ impl ExrApp {
             crate::layer::LayerSource::Adjustment => None,
         });
         self.comp_stack.remove(id);
+        // Drop a stale selection so `active_comp_layer` falls back to the top layer.
+        if self.selected_comp_layer == Some(id) {
+            self.selected_comp_layer = None;
+        }
         // GC the source if the removed layer was its last reference.
         if let Some(source) = source
             && !self.comp_stack.iter().any(|l| {
@@ -6001,6 +6106,122 @@ impl ExrApp {
             self.playback.clear();
             self.comp_drives_transport = false;
         }
+    }
+
+    /// The comp layer the viewport bar's AOV / channel controls + EXR Info operate
+    /// on — Nuke's "current" layer. Prefers the explicit
+    /// [`Self::selected_comp_layer`]; when unset or stale (its layer was removed),
+    /// falls back to the **topmost** layer so there is always a current layer while
+    /// the stack is non-empty. `None` only for an empty stack.
+    fn active_comp_layer(&self) -> Option<crate::layer::LayerId> {
+        if let Some(id) = self.selected_comp_layer
+            && self.comp_stack.get(id).is_some()
+        {
+            return Some(id);
+        }
+        // `iter()` is bottom→top, so the last layer is the top of the stack.
+        self.comp_stack.iter().last().map(|l| l.id)
+    }
+
+    /// Nuke-style "current layer" control bar for the comp viewport (#99 R4
+    /// follow-up): a layer picker (which of the stack is current), that layer's
+    /// AOV / pass pulldown, and R/G/B/A channel isolation — the classic
+    /// single-image control row, restored for the layer-stack path so you can load
+    /// a layer and look through its AOVs / channels. Reuses the per-track AOV combo
+    /// (`aov_names`) + [`crate::viewer::ExrViewer::set_channel_mode`].
+    fn draw_comp_layer_bar(&mut self, ui: &mut egui::Ui) {
+        let Some(layer_id) = self.active_comp_layer() else {
+            return;
+        };
+        // Snapshot the current layer's source + AOV + the whole stack's names up
+        // front, so the combo closures below only mutate simple fields (no aliasing
+        // borrow of `self.comp_stack` while a picker is open).
+        let (source, aov) = match self.comp_stack.get(layer_id).map(|l| &l.source) {
+            Some(crate::layer::LayerSource::Image { source, aov }) => (Some(*source), *aov),
+            _ => (None, 0),
+        };
+        // Top→bottom for the picker, matching the stack's visual order.
+        let layer_list: Vec<(crate::layer::LayerId, String)> = self
+            .comp_stack
+            .iter()
+            .rev()
+            .map(|l| (l.id, l.name.clone()))
+            .collect();
+        let cur_name = self
+            .comp_stack
+            .get(layer_id)
+            .map(|l| l.name.clone())
+            .unwrap_or_else(|| "—".to_string());
+        let aov_names: Vec<String> = source
+            .and_then(|s| self.comp_sources.get(&s))
+            .map(|cs| {
+                cs.exr_data
+                    .logical_layers
+                    .iter()
+                    .enumerate()
+                    .map(|(i, ll)| {
+                        if ll.name.is_empty() {
+                            format!("layer {i}")
+                        } else {
+                            ll.name.clone()
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        ui.horizontal(|ui| {
+            // Which layer is current (Nuke's input selector). Only worth showing
+            // with more than one layer to choose from.
+            if layer_list.len() > 1 {
+                ui.label("Layer:");
+                egui::ComboBox::from_id_salt("comp_current_layer")
+                    .selected_text(cur_name)
+                    .show_ui(ui, |ui| {
+                        for (id, nm) in &layer_list {
+                            if ui.selectable_label(*id == layer_id, nm).clicked() {
+                                self.selected_comp_layer = Some(*id);
+                            }
+                        }
+                    });
+                ui.separator();
+            }
+
+            // The current layer's AOV / pass pulldown (multi-pass EXRs only).
+            if aov_names.len() > 1 {
+                ui.label("Pass:");
+                let mut new_aov = aov.min(aov_names.len() - 1);
+                egui::ComboBox::from_id_salt("comp_current_aov")
+                    .selected_text(aov_names[new_aov].clone())
+                    .width(150.0)
+                    .show_ui(ui, |ui| {
+                        for (idx, nm) in aov_names.iter().enumerate() {
+                            ui.selectable_value(&mut new_aov, idx, nm);
+                        }
+                    });
+                if new_aov != aov
+                    && let Some(l) = self.comp_stack.get_mut(layer_id)
+                    && let crate::layer::LayerSource::Image { aov: a, .. } = &mut l.source
+                {
+                    *a = new_aov;
+                }
+                ui.separator();
+            }
+
+            // Channel isolation — the same C/R/G/B/A the classic top row had; the
+            // composite honors `channel_mode` on its top layer.
+            ui.label("Channel:");
+            use crate::viewer::ChannelMode;
+            let mut mode = self.viewer.channel_mode;
+            ui.selectable_value(&mut mode, ChannelMode::RGB, "RGB")
+                .on_hover_text("Show all channels (C)");
+            ui.selectable_value(&mut mode, ChannelMode::R, "R");
+            ui.selectable_value(&mut mode, ChannelMode::G, "G");
+            ui.selectable_value(&mut mode, ChannelMode::B, "B");
+            ui.selectable_value(&mut mode, ChannelMode::A, "A");
+            self.viewer.set_channel_mode(mode);
+        });
+        ui.separator();
     }
 
     /// The **layer tracks** section of the timeline panel (#99, Chaos-Player
@@ -6243,8 +6464,9 @@ impl ExrApp {
                             ui.close();
                         }
                     });
-                    // The base track (the opened plate) isn't removed here — it's
-                    // closed via File ▸ Close Image A (#99 R3).
+                    // The base track (the opened plate) isn't removed here — its
+                    // close path is revived in the render-retire step (#99 R3); the
+                    // File ▸ Close Image A menu that closed it was removed in R4.
                     if !row.is_base && ui.button("✕  Remove layer").clicked() {
                         remove = Some(row.id);
                         ui.close();
@@ -6274,13 +6496,29 @@ impl ExrApp {
                     }
                     // Name, greyed when it won't render. Truncated rather than
                     // wrapped: the gutter is a fixed width shared with every row.
-                    let text = if renders {
+                    // Clicking it makes this the "current" layer the viewport bar's
+                    // AOV / channel controls + EXR Info act on (#99 R4); the current
+                    // layer's name is bold.
+                    let is_current = self.selected_comp_layer == Some(row.id);
+                    let mut text = if renders {
                         egui::RichText::new(&row.name)
                     } else {
                         egui::RichText::new(&row.name).weak()
                     };
-                    ui.add(egui::Label::new(text).truncate())
-                        .on_hover_text(&row.name);
+                    if is_current {
+                        text = text.strong();
+                    }
+                    if ui
+                        .add(
+                            egui::Label::new(text)
+                                .truncate()
+                                .sense(egui::Sense::click()),
+                        )
+                        .on_hover_text("Click to make this the current layer")
+                        .clicked()
+                    {
+                        self.selected_comp_layer = Some(row.id);
+                    }
                 });
                 drop(g);
 
@@ -6461,6 +6699,18 @@ impl ExrApp {
     /// non-OCIO composite is a follow-up. Assumes the panel is shown with a
     /// non-empty stack (the caller gates on that).
     fn draw_comp_central(&mut self, ui: &mut egui::Ui) {
+        // The comp path doesn't run the full viewer `ui`, so its `handle_hotkeys`
+        // (and the C/R/G/B/A shortcuts within) never fire here. Service the
+        // channel-isolation shortcuts directly so keyboard isolation works in comp
+        // mode too, matching the status-bar quick toggle (#192).
+        self.viewer.handle_channel_hotkeys(ui);
+
+        // Nuke-style current-layer control bar at the top of the viewport (#99 R4
+        // follow-up): pick the current layer, page through its AOVs/passes, and
+        // isolate channels — the classic single-image control row, restored for the
+        // layer-stack path. Drawn before the composite so it sits above it.
+        self.draw_comp_layer_bar(ui);
+
         // Mirror the per-frame viewer state the slot-A path sets before `viewer.ui`,
         // so the composite honors the same tone / OCIO / LUT settings.
         self.viewer.enable_lut = self.enable_lut && self.lut_bg.is_some();
@@ -6602,6 +6852,34 @@ impl ExrApp {
             // toggling it off shows the composite full-screen instead of a blank.
             // The A/B path below only runs with an empty stack (legacy compare,
             // reachable until render-retire ports it in).
+            //
+            // Contact Sheet (#191) is a single-image, per-layer/pass grid, so it
+            // takes priority over the composite: route through `viewer.ui` (the sole
+            // owner of the sheet dispatch + the control bar that hosts the toggle to
+            // exit) against the slot-A source, which stays populated in comp mode.
+            // Without this the toggle only lived inside the legacy branch below and
+            // the comp path never reached it, so the checkbox did nothing.
+            if self.viewer.show_contact_sheet && self.exr_data.is_some() {
+                if let Some(data) = &self.exr_data {
+                    // Same per-frame app→viewer state the legacy branch sets (#151);
+                    // inlined rather than shared because a `&mut self` helper would
+                    // collide with the `&self.exr_data` borrow below.
+                    self.viewer.enable_lut = self.enable_lut && self.lut_bg.is_some();
+                    self.viewer.lut_domain_min = self.lut_domain_min;
+                    self.viewer.lut_domain_max = self.lut_domain_max;
+                    self.viewer.ocio_active = self.ocio_enabled && self.ocio_ready;
+                    self.viewer.ocio_render_gen = self.ocio_render_gen;
+                    self.viewer.suppress_sampling = self.playback.sampling_suppressed();
+                    self.viewer.ui(
+                        ui,
+                        data,
+                        self.exr_data_b.as_deref(),
+                        self.gpu_resources.as_ref(),
+                        self.lut_bg.clone(),
+                    );
+                }
+                return;
+            }
             if !self.comp_stack.is_empty() {
                 self.draw_comp_central(ui);
                 return;
@@ -6962,6 +7240,55 @@ mod tests {
             app.comp_next_source,
             COMP_SOURCE_BASE + 1,
             "allocator not rewound"
+        );
+    }
+
+    #[test]
+    fn active_comp_layer_tracks_selection_with_a_top_fallback() {
+        // The Nuke-style "current layer" (#99 R4): adding a layer selects it; an
+        // explicit selection wins; removing the selected layer falls back to the
+        // top of the stack; an empty stack has no current layer.
+        let dir = tempfile::tempdir().unwrap();
+        let (f0, f1) = (dir.path().join("a.exr"), dir.path().join("b.exr"));
+        write_rgba_exr(&f0);
+        write_rgba_exr(&f1);
+
+        let mut app = ExrApp::default();
+        assert_eq!(
+            app.active_comp_layer(),
+            None,
+            "empty stack → no current layer"
+        );
+
+        app.add_comp_source(f0);
+        let bottom = app.comp_stack.iter().next().unwrap().id;
+        assert_eq!(
+            app.selected_comp_layer,
+            Some(bottom),
+            "adding a layer selects it"
+        );
+
+        app.add_comp_source(f1);
+        // `iter()` is bottom→top, so the second add is the top (last) layer.
+        let top = app.comp_stack.iter().last().unwrap().id;
+        assert_eq!(
+            app.active_comp_layer(),
+            Some(top),
+            "the newest layer is current"
+        );
+
+        // An explicit selection of the bottom layer wins over the top fallback.
+        app.selected_comp_layer = Some(bottom);
+        assert_eq!(app.active_comp_layer(), Some(bottom));
+
+        // Removing the selected layer drops the selection; the resolver then
+        // falls back to the topmost remaining layer.
+        app.remove_comp_layer(bottom);
+        assert_eq!(app.selected_comp_layer, None, "stale selection cleared");
+        assert_eq!(
+            app.active_comp_layer(),
+            Some(top),
+            "falls back to the top of the stack"
         );
     }
 

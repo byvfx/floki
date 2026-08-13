@@ -957,40 +957,67 @@ impl ExrViewer {
             if !editing && i.modifiers.shift && i.key_pressed(egui::Key::G) {
                 self.reset_gamma();
             }
-
-            if !editing && !self.show_contact_sheet {
-                if i.key_pressed(egui::Key::F) {
-                    self.first_frame = true;
-                }
-                let prev_mode = self.channel_mode;
-                if i.key_pressed(egui::Key::R) {
-                    self.channel_mode = ChannelMode::R;
-                }
-                // Plain G only — Shift+G is the gamma reset handled above.
-                if i.key_pressed(egui::Key::G) && !i.modifiers.shift {
-                    self.channel_mode = ChannelMode::G;
-                }
-                if i.key_pressed(egui::Key::B) {
-                    self.channel_mode = ChannelMode::B;
-                }
-                if i.key_pressed(egui::Key::A) {
-                    self.channel_mode = ChannelMode::A;
-                }
-                if i.key_pressed(egui::Key::C) {
-                    self.channel_mode = ChannelMode::RGB;
-                }
-                if self.channel_mode != prev_mode {
-                    self.thumbnails.fill(None);
-                    self.thumbnails_b.fill(None);
-                    self.invalidate_gpu_thumbnails(true, true);
-                }
-            }
         });
+
+        // Channel-isolation (+ frame-fit) shortcuts run in their own input pass so
+        // the comp path — which doesn't run the full viewer `ui` — can reuse them
+        // (#192) without re-entering this `ui.input` closure (a nested borrow).
+        self.handle_channel_hotkeys(ui);
 
         if fullscreen_changed {
             ui.ctx()
                 .send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
         }
+    }
+
+    /// Service the C/R/G/B/A channel-isolation shortcuts (and `F` frame-fit). Split
+    /// out of `handle_hotkeys` so the comp central path can offer one-keystroke
+    /// isolation in comp mode (#192), where the full viewer `ui` (and thus
+    /// `handle_hotkeys`) never runs. Suppressed while a text field wants keyboard
+    /// input or the contact sheet is open, matching `handle_hotkeys`.
+    pub fn handle_channel_hotkeys(&mut self, ui: &egui::Ui) {
+        if ui.ctx().egui_wants_keyboard_input() || self.show_contact_sheet {
+            return;
+        }
+        let next = ui.input(|i| {
+            if i.key_pressed(egui::Key::F) {
+                self.first_frame = true;
+            }
+            let mut next = self.channel_mode;
+            if i.key_pressed(egui::Key::R) {
+                next = ChannelMode::R;
+            }
+            // Plain G only — Shift+G is the gamma reset handled by `handle_hotkeys`.
+            if i.key_pressed(egui::Key::G) && !i.modifiers.shift {
+                next = ChannelMode::G;
+            }
+            if i.key_pressed(egui::Key::B) {
+                next = ChannelMode::B;
+            }
+            if i.key_pressed(egui::Key::A) {
+                next = ChannelMode::A;
+            }
+            if i.key_pressed(egui::Key::C) {
+                next = ChannelMode::RGB;
+            }
+            next
+        });
+        self.set_channel_mode(next);
+    }
+
+    /// Set the channel-isolation mode, invalidating the cached CPU + GPU
+    /// thumbnails on an actual change. The single owner of that invalidation so
+    /// it can't drift between the C/R/G/B/A hotkeys, the top control row, and the
+    /// status-bar quick toggle (#192) — the composite honors `channel_mode` on its
+    /// top layer, so this drives isolation in comp mode too.
+    pub fn set_channel_mode(&mut self, mode: ChannelMode) {
+        if self.channel_mode == mode {
+            return;
+        }
+        self.channel_mode = mode;
+        self.thumbnails.fill(None);
+        self.thumbnails_b.fill(None);
+        self.invalidate_gpu_thumbnails(true, true);
     }
 
     /// Drain the GPU contact-sheet thumbnail caches (#67), queuing every
@@ -1180,17 +1207,13 @@ impl ExrViewer {
 
             ui.separator();
             ui.label("Channel:");
-            let prev_mode = self.channel_mode;
-            ui.selectable_value(&mut self.channel_mode, ChannelMode::RGB, "RGB (C)");
-            ui.selectable_value(&mut self.channel_mode, ChannelMode::R, "R");
-            ui.selectable_value(&mut self.channel_mode, ChannelMode::G, "G");
-            ui.selectable_value(&mut self.channel_mode, ChannelMode::B, "B");
-            ui.selectable_value(&mut self.channel_mode, ChannelMode::A, "A");
-            if self.channel_mode != prev_mode {
-                self.thumbnails.fill(None);
-                self.thumbnails_b.fill(None);
-                self.invalidate_gpu_thumbnails(true, true);
-            }
+            let mut mode = self.channel_mode;
+            ui.selectable_value(&mut mode, ChannelMode::RGB, "RGB (C)");
+            ui.selectable_value(&mut mode, ChannelMode::R, "R");
+            ui.selectable_value(&mut mode, ChannelMode::G, "G");
+            ui.selectable_value(&mut mode, ChannelMode::B, "B");
+            ui.selectable_value(&mut mode, ChannelMode::A, "A");
+            self.set_channel_mode(mode);
 
             ui.separator();
             // Sample aperture as a compact dropdown.
@@ -4806,6 +4829,38 @@ mod gui_tests {
             h.state().viewer.channel_mode,
             before,
             "channel hotkeys must not fire in contact-sheet mode"
+        );
+    }
+
+    #[test]
+    fn channel_hotkeys_work_via_comp_entry_point() {
+        // The comp path never runs the full viewer `ui` (and thus `handle_hotkeys`),
+        // so it calls `handle_channel_hotkeys` directly (#192). Driving that entry
+        // point alone must still isolate channels — and stay inert with the contact
+        // sheet open, matching the full hotkey path.
+        let mut h = Harness::new_ui_state(
+            |ui, s: &mut State| s.viewer.handle_channel_hotkeys(ui),
+            State {
+                viewer: ExrViewer::default(),
+                has_b: false,
+            },
+        );
+
+        h.key_press(egui::Key::B);
+        h.run();
+        assert_eq!(
+            h.state().viewer.channel_mode,
+            ChannelMode::B,
+            "the comp-path channel entry point must isolate B"
+        );
+
+        h.state_mut().viewer.show_contact_sheet = true;
+        h.key_press(egui::Key::R);
+        h.run();
+        assert_eq!(
+            h.state().viewer.channel_mode,
+            ChannelMode::B,
+            "channel hotkeys must stay inert in contact-sheet mode via the comp entry point"
         );
     }
 

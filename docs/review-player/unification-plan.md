@@ -329,6 +329,18 @@ groundwork the final collapse (**R4**) sits on. All in `src/app.rs` + the GPU re
   so toggling OCIO on a static frame re-renders (was leaving a stale `display_view`); (2) cache the
   OCIO-off display-encode scene bind group on `OcioTargets` (built in `new`), the twin of
   `scene_bind_group`, instead of a per-dirty-frame `create_bind_group`.
+- **Nuke-style current-layer bar + EXR Info restore** — the literal collapse dropped the classic
+  single-image control row / EXR Info in the comp path (readout since landed; these had not). Rather
+  than reviving `open_file`, restore them *in* the comp path (user decision — Nuke model: load a
+  layer, select it, page through its AOVs/channels). New `selected_comp_layer` (Nuke's "current"
+  layer) — set on open/add + by clicking a timeline track name (bold when current), resolved with a
+  top-of-stack fallback by `active_comp_layer`. `draw_comp_layer_bar` draws a viewport-top row:
+  layer picker · the current layer's AOV/pass pulldown (reuses the per-track combo) · R/G/B/A
+  isolation. `draw_side_panel` EXR Info now populates from the current comp layer's `CompSource`
+  (then the rest of the stack); its pass list routes clicks to that layer's `aov` (not
+  `viewer.active_layer`). The `#192` bottom-bar channel toggle is retired (the bar supersedes it) and
+  the File ▸ Close Image A/B items removed (`unload` parked `#[allow(dead_code)]`). `LayerStack::iter`
+  widened to `DoubleEndedIterator` for top→bottom walks.
 
 ## Execution checklist — Phase 1  *(complete; kept for reference — resume point is Phase 4 / R4 below)*
 

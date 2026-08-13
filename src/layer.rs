@@ -246,9 +246,10 @@ impl LayerStack {
         self.layout = layout;
     }
 
-    /// Layers bottom-to-top.
+    /// Layers bottom-to-top. Double-ended so callers can walk top→bottom via
+    /// `.rev()` (the viewport bar / EXR Info list the stack top-first).
     #[allow(dead_code)] // stack query API; landed ahead of #104
-    pub fn iter(&self) -> impl Iterator<Item = &Layer> {
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &Layer> {
         self.layers.iter()
     }
 
