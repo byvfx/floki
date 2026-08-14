@@ -1,8 +1,10 @@
 # Layer-Stack Unification — making the layer model core to floki
 
 > Status: **in progress** (updated 2026-08). Phases 1–2 + the R-series are done; the R4 collapse is
-> underway — open/drop = add a layer and the comp-path pixel readout have landed. Resume point and
-> concrete next steps: the **R4 handoff** section below. Supersedes the ad-hoc PR-C/PR-D framing.
+> underway — open/drop = add a layer, the comp-path readout / EXR Info / histogram, and **comp
+> Side-by-Side** (render-retire Slice 2a) have landed. Next: Wipe + Diff (Slice 2b), then the A/B
+> retire. Resume point and concrete next steps: the **R4 handoff** section below. Supersedes the
+> ad-hoc PR-C/PR-D framing.
 > Builds on the shipped additive Layers panel (epic #99, PR-B) and the layer model spine
 > (`src/layer.rs`, #103). See `layer-model.md` for the model itself.
 
@@ -150,10 +152,12 @@ accumulate ping-pong renders in any colour mode (**R1/R2**), threads the live fr
 - **[DONE `ab63b16`]** **pixel readout** ported into the comp path (`draw_comp_central` →
   `sample_comp_readout` + the pure `top_sample_source` / `comp_hover_pixel` helpers; the status-bar
   row reuses `draw_nuke_status_line`). Samples the **top layer's raw source pixels** (the A/B
-  analogue), not the composited GPU result. Porting the **histogram** in is still **[TODO]**.
-- **[TODO]** keep `Arrangement` as the viewport axis; lift Wipe / Side-by-Side / Diff geometry out
-  of the A/B-only `emit_mode_draws` arms into arrangement-generic code (#104). **This is where the
-  compare modes come back** for the comp path.
+  analogue), not the composited GPU result. The **histogram** has since landed too.
+- **[PARTLY DONE]** keep `Arrangement` as the viewport axis; lift Wipe / Side-by-Side / Diff geometry
+  out of the A/B-only `emit_mode_draws` arms into arrangement-generic code (#104). **This is where the
+  compare modes come back** for the comp path. **Side-by-Side is done** (Slice 2a below — and *not*
+  by making `emit_mode_draws` generic; the comp path grew its own geometry and the A/B arm stays put
+  until Slice 3 deletes it). Wipe + Diff remain (Slice 2b).
 
 > **CORRECTION (2026-08-14):** the first two TODO bullets above are **stale**. `Arrangement` already
 > exists as a real enum (`render_program.rs`, `Stacked | Wipe{position} | SideBySide | Diff`) and is
@@ -181,9 +185,16 @@ non-accumulate 2-input pass reintroduced.
   that storage. It was a holdover from the "make `emit_mode_draws` generic" framing the "delete, not
   evolve" correction invalidated. Refactoring code we then delete is wasted motion; go straight to
   Slice 2.
-- **Slice 2 — Arrangements in the comp path.** **UX model (locked): compose vs current layer** — A =
-  the full composite, B = the `active_comp_layer` (the timeline-selected "current" layer); zero new
-  selection UI. New `ExrApp::comp_arrangement: Arrangement` (default `Stacked`) surfaced in
+- **Slice 2 — Arrangements in the comp path.** ~~**UX model (locked): compose vs current layer**~~ —
+  A = the full composite, B = the `active_comp_layer` (the timeline-selected "current" layer); zero
+  new selection UI. **REVISED TWICE on first use (2026-08-14), and the second revision is the model:**
+  a compare shows the **two layers themselves** — pane A = the `Layer:` (current) layer, pane B = the
+  `vs:` layer (`compare_b_layer`, Nuke's second viewer input, defaulting via the pure
+  `default_compare_b` to the topmost non-current layer). *Any* "composite vs a layer" framing is
+  wrong: side A contains side B by construction, so the compared content shows up twice — first as
+  "B duplicates the top of the comp", then, after B became its own pick, as "the nebula still shows
+  up on the left". Only when the compare is off (`Stacked`) does the viewport show the composite. New
+  `ExrApp::comp_arrangement: Arrangement` (default `Stacked`) surfaced in
   `draw_comp_layer_bar`. Geometry helpers extracted **pure + unit-tested** (`side_by_side_layout`,
   `wipe_line_endpoints`), same pattern as `comp_hover_pixel`. Sub-slices: **2a SideBySide** (fits the
   accumulate model — two draw-groups at disjoint rects, ship first); **2b Wipe + Diff** (needs the
@@ -194,26 +205,65 @@ non-accumulate 2-input pass reintroduced.
 
   > **CORRECTION (2026-08-14): "2a SxS fits the accumulate model" was WRONG.** The composite uses a
   > two-target **ping-pong**, and each accumulate draw does a whole-target `LoadOp::Clear` + only
-  > rasterizes its own rect. So two disjoint-rect groups in one pass can't coexist — the final target
-  > keeps only the *last* group's rect (verified on-device: side A/composite drops to a sliver, side B
-  > renders). SxS **requires** the offscreen-per-side path, not as a fast-follow but as the *only*
-  > correct approach. **Landed as scaffolding** (`comp_arrangement` field + `Compare:` selector + the
-  > pure `side_by_side_layout` helper + tests, `#[allow(dead_code)]` until wired); the single-pass
-  > render was reverted.
+  > rasterizes its own rect. So two disjoint-rect groups in one *accumulate sequence* can't coexist —
+  > the final target keeps only the *last* group's rect (verified on-device: side A/composite drops to
+  > a sliver, side B renders). **Landed as scaffolding** (`comp_arrangement` field + `Compare:`
+  > selector + the pure `side_by_side_layout` helper + tests, `#[allow(dead_code)]` until wired); the
+  > single-pass render was reverted.
   >
-  > **Offscreen-per-side plan (from the GPU pipeline map):** `display`/`scene` targets on `OcioTargets`
-  > are already sampleable (`TEXTURE_BINDING`). (1) Add two display-format sampleable targets
-  > `compare_a`/`compare_b` to `OcioTargets` (clone the `display` descriptor; add to resize + `Drop`).
-  > (2) Add a rect-placing textured-quad pipeline+shader to `GpuState` (VS = the `shader.wgsl:112-135`
-  > `mix(rect_min, rect_max, pos)` math; FS = passthrough; layout over a tex+sampler+small-uniform).
-  > (3) Give `OcioCallback` a `two_group: Option<{draws_a, draws_b, rect_a, rect_b}>` mode: `prepare`
-  > runs the existing accumulate+display stage **parameterized to output into `compare_a`** for group A
-  > and `compare_b` for group B (today pass-2 hardcodes `targets.display_view`); then a final pass (in
-  > `prepare`→`display_view` + normal blit, or directly in `paint`) draws the two textures at their
-  > rects. Use **one** callback (the shared `display_view`/`last_render_sig` is exactly what breaks two
-  > callbacks). The coverage/checker seam (blit reads `scene_view` α) needs on-device care — simplest
-  > v1 does the two-quad placement in `paint` on a plain bg, checker/transparency polish after. Wipe +
-  > Diff (2b) then become trivial: each side is one sampled texture the wipe/diff shader combines.
+  > **SUPERSEDED (2026-08-14):** that correction went on to conclude SxS "requires the
+  > offscreen-per-side path" — two new `compare_a`/`compare_b` targets, a new rect-placing pipeline +
+  > shader, and a `two_group` mode on `OcioCallback`. **It doesn't.** See **2a [DONE]** below for what
+  > actually shipped: one extra `LoadOp::Load` render pass, no new GPU resources at all.
+
+- **[DONE] Slice 2a — SideBySide via a placed overlay pass.** The premise that made the
+  offscreen-per-side build look necessary was that *both* sides are accumulate groups. Neither is: a
+  compare draws **one layer per pane**, so pane B needs no ping-pong at all and pane A is a one-layer
+  "composite". Pane A still goes through the accumulate path unchanged — every draw's `target_rect`
+  is now `rect_a` instead of the full image rect, and the parity `start=(N-1)%2` still lands it in
+  `scene_view` (so this stays correct if a pane ever becomes multi-layer again) — and pane B is
+  emitted as one independent placed draw into a **second pass-1 render pass with
+  `LoadOp::Load`** (`OcioCallback::overlay_draws`, "pass 1b"). `pipeline_linear` is `blend: None` +
+  `ColorWrites::ALL`, and the two rects abut without overlapping, so B overwrites colour *and* alpha
+  only under its own quad and leaves A untouched; everything outside both keeps the α=−1 no-image
+  sentinel the blit discards on. Pass 2 (OCIO transform *or* the OCIO-off display-encode) and the
+  final blit then run **once, unchanged**, over the combined scene — so both panes get the display
+  transform and the view ops exactly once, which the two-offscreen design would have had to
+  reconstruct by hand. Net: **zero** new textures, pipelines, or bind groups. The same overlay pass
+  generalizes to N panes (contact-sheet / #104 N-way compare), since each is just another placed draw
+  at a disjoint rect.
+  - `draw_comp_composite` takes `arrangement` + a `CompSideB` (texture + native size + its own PAR).
+    `draw_comp_central` resolves **both** panes with the pure `comp_layer_draw` and, when the compare
+    is live, **replaces the composite draw list with pane A's single layer** (canvas size / PAR taken
+    from it) — so neither pane is a composite. **Falls back to `Stacked`** unless *both* panes
+    resolve (a layer can be hidden / soloed out / trimmed blank / textureless); a half-drawn split is
+    never shown.
+  - **Both panes are explicit picks:** pane A = the `Layer:` (current) layer, pane B = the new `vs:`
+    picker (`compare_b_layer`), defaulting via the pure `default_compare_b` to the topmost non-current
+    layer. See the Slice 2 revision note above for the two wrong models this replaced.
+  - The GPU callback is installed into a painter slot **reserved before** the divider
+    (`painter.add(Shape::Noop)` → `painter.set`), mirroring `draw_canvas_gpu`. Appending it last
+    paints the composite quad straight over the divider line, which is invisible then.
+  - `disp_rect` in SxS is the **union** of both panes, not `rect_a` — `display_min/max` gates the
+    shader's overscan dim, so a `rect_a`-only value would silently force side B's layer opacity to 1.
+  - `framing_bounds` now takes `side_by_side: bool` instead of `CompareMode` (so the comp path drives
+    it from its own `Arrangement`, and one more `CompareMode` dependency dies ahead of Slice 3);
+    `handle_canvas_interaction` gained the matching parameter, so first-paint fit spans both panes.
+  - `scissor_pts` is `None` in SxS (mirroring the A/B path); `comp_arrangement` is salted into
+    `render_sig` alongside the display-stage salt.
+  - Per-pane pixel readout: new `last_image_rect_b` + the pure `pick_comp_side`, so hovering the
+    compare pane samples *that* layer and renames the status-bar row, instead of reporting the
+    composite's top layer. Hovering outside both panes blanks.
+  - `Normalize Size` (the existing shared `normalize_side_by_side`) sits beside the `vs:` picker.
+    New pure tests: `pick_comp_side`, `comp_layer_draw`, `default_compare_b`;
+    `side_by_side_layout` stops being dead code and `framing_bounds`' test moves to the bool.
+- **Slice 2b — Wipe + Diff.** Still needs its own mechanism, and the overlay pass does **not**
+  generalize to it: wipe/diff are single-pass **2-input** shader draws (`tex_a`+`tex_b`,
+  `is_wipe_mode`/`is_diff`), and side A now lives *in* `scene_view` — which a wipe pass would have to
+  read and write at once. Expect either a third scene target or a wipe pass that samples the
+  accumulation via `accum_tex_bg` into the other ping-pong target. `draw_comp_composite`'s hardwired
+  `is_wipe_mode = 0` / `is_diff = false` become arrangement-dependent there. Diff also opts out of
+  OCIO (display-space heat map).
 - **Slice 3 — retire the A/B path.** Delete `emit_mode_draws`, `gpu_textures_b`, `pick_b`,
   `render_program.rs` (keep/relocate only `Arrangement`, or fold into `layer::Layout`), `CompareMode`,
   the `configure` shim, and the `_b`/`comp_*` duplication; route `draw_central_canvas` through the
@@ -222,8 +272,8 @@ non-accumulate 2-input pass reintroduced.
   deleted symbol for hidden readers (status bar / EXR Info / histogram were re-homed into the comp
   path). Persistence (`Vec<LayerPersist>`, never `#[serde(flatten)]`) is an independent fast-follow.
 
-**Order:** 2a → 2b → 3 (Slice 1 dropped). Each slice CI-green (default + `system-ocio`), no throwaway
-code.
+**Order:** 2a **[DONE]** → 2b → 3 (Slice 1 dropped). Each slice CI-green (default + `system-ocio`), no
+throwaway code.
 
 ### Phase 4 / R4 — collapse to one model  ← **RESUME HERE (handoff below)**
 
@@ -260,13 +310,14 @@ bottom timeline tracks. R4 finishes the collapse:
   classic `viewer.ui` A/B path is only reachable with an **empty** stack, which no longer happens via
   the UI (open/drop always add a layer). It is *retained, not deleted* — the render-retire step below
   revives compare modes as `Arrangement`s and **then** the `_b`/`comp_*` deletion removes it.
-- **RESUME AT — render-retire (Phase 3).** In `emit_mode_draws` iterate `program.draws` over a
-  per-`SourceId` texture map (kill `gpu_textures_b` / `pick_b`); lift Wipe / Side-by-Side / Diff
-  geometry into arrangement-generic code — **this brings compare modes back** in the comp path; port
-  the **histogram** in (readout is done). THEN delete the `_b`/`comp_*` duplication + the
-  `CompareMode`→`configure` shim, and drop the `#[allow(dead_code)]` on `open_file` /
-  `update_base_layer`. Persistence (`Vec<LayerPersist>`, path + name/blend/opacity/enabled/solo/aov/
-  trim; NEVER `#[serde(flatten)]`) is independent — landable any time.
+- **RESUME AT — render-retire (Phase 3), Slice 2b.** Side-by-Side is back in the comp path (Slice 2a,
+  above) and the histogram is ported; **Wipe + Diff are what remain** before Slice 3. They do *not*
+  ride on 2a's overlay pass — see the 2b bullet for why (2-input shader draws vs. side A living in
+  `scene_view`). THEN Slice 3: delete `emit_mode_draws` / `gpu_textures_b` / `pick_b` /
+  `render_program.rs` / the `_b`/`comp_*` duplication + the `CompareMode`→`configure` shim, and drop
+  the `#[allow(dead_code)]` on `open_file` / `update_base_layer`. Persistence (`Vec<LayerPersist>`,
+  path + name/blend/opacity/enabled/solo/aov/trim; NEVER `#[serde(flatten)]`) is independent —
+  landable any time.
 - **Readout fast-follows:** the floating cursor tooltip (`viewer.rs` `Window::new("Pixel Tooltip")` —
   factor its swatch/HSVL block out and reuse); expose the aperture combo (1 / 3×3 / 9×9) in comp mode.
 - **Non-blocking follow-ups:** reuse A's T2 ring in `ensure_base_frame`; a `.cube` LUT in the OCIO-off
@@ -428,6 +479,19 @@ groundwork the final collapse (**R4**) sits on. All in `src/app.rs` + the GPU re
   sampling — which lived in `viewer::ui` — is ported into `sample_comp_readout` (checks `shift` only,
   so Shift+Ctrl+Click works). New **View ▸ Info panel** toggle (`show_side_panel`) shows/hides the left
   panel.
+- **Side-by-Side in the comp path** (render-retire Slice 2a) — the first compare mode back after the
+  collapse. Side A (the composite) accumulates into `rect_a`; side B (the current layer, a *single*
+  layer, so no ping-pong needed) is one placed draw in a new `LoadOp::Load` pass-1b
+  (`OcioCallback::overlay_draws`), and pass 2 + the blit run once over the combined scene, unchanged.
+  **No new GPU targets, pipelines, or bind groups** — superseding the doc's offscreen-per-side plan,
+  which assumed both sides were accumulate groups. `draw_comp_composite` takes `arrangement` +
+  `CompSideB`; `disp_rect` is the union of both panes (it gates the shader's overscan dim, so
+  `rect_a` alone would force side B's opacity to 1); `framing_bounds` /
+  `handle_canvas_interaction` swap `CompareMode` for a `side_by_side: bool` so first-paint fit spans
+  both panes; `scissor_pts` is `None` and the arrangement is salted into `render_sig`. Per-pane pixel
+  readout via the new `last_image_rect_b` + pure `pick_comp_side` (hovering a pane samples *that*
+  layer and renames the status row). `Normalize Size` surfaced beside the `Compare:` combo. New pure
+  tests: `pick_comp_side`, `comp_side_b_draw`; `side_by_side_layout` is no longer dead code.
 
 ## Execution checklist — Phase 1  *(complete; kept for reference — resume point is Phase 4 / R4 below)*
 
@@ -496,11 +560,10 @@ Phase 2 section above for the slice-by-slice breakdown.
 renders standalone in any colour mode, drives the transport, includes the base plate, and the panel
 is the Chaos-Player bottom timeline tracks. See the "Render foundation" progress-log block above.
 
-**Resume next → render-retire (Phase 3), then the `_b`/`comp_*` deletion.** Open/drop = add a layer
-and the comp-path pixel readout have landed (`03ec2cf` / `ab63b16`, plus the `cad0a56` review fixes);
-see the **R4 handoff** above for the concrete resume steps and sequencing. In short: in
-`emit_mode_draws` iterate `program.draws` over a per-`SourceId` texture map and lift Wipe / SxS / Diff
-into arrangement-generic code (compare modes return), port the histogram in, then delete the
+**Resume next → render-retire (Phase 3) Slice 2b, then the `_b`/`comp_*` deletion.** Open/drop = add a
+layer, the comp-path pixel readout, the histogram, and **comp Side-by-Side** (Slice 2a) have landed;
+see the **R4 handoff** above for the concrete resume steps and sequencing. In short: bring **Wipe +
+Diff** into the comp path (they need their own mechanism, not 2a's overlay pass), then delete the
 `_b`/`comp_*` duplication and drop the `#[allow(dead_code)]` on `open_file` / `update_base_layer`.
 Layer persistence (`Vec<LayerPersist>`) is independent. Readout fast-follows: the floating cursor
 tooltip + the aperture combo in comp mode.

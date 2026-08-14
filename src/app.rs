@@ -721,6 +721,22 @@ pub struct ExrApp {
     #[serde(skip)]
     comp_readout: Option<(crate::layer::SourceId, usize)>,
 
+    /// Which layer fills the compare pane (side B) in a non-`Stacked` arrangement
+    /// (#99 Slice 2a) — Nuke's second viewer input, chosen explicitly via the `vs:`
+    /// picker rather than tied to the "current" layer. `None` = use the default from
+    /// [`default_compare_b`] (the topmost layer that isn't current), so the two panes
+    /// differ out of the box instead of side B duplicating the top of the composite.
+    /// Runtime-only.
+    #[serde(skip)]
+    compare_b_layer: Option<crate::layer::LayerId>,
+
+    /// The compare layer's `(source, aov)` — side B of a Side-by-Side (#99 Slice 2a).
+    /// When the cursor is over that pane, [`Self::sample_comp_readout`] promotes this
+    /// into `comp_readout` so the status-bar row names and samples the pane actually
+    /// under the cursor. `None` outside Side-by-Side. Runtime-only.
+    #[serde(skip)]
+    comp_readout_b: Option<(crate::layer::SourceId, usize)>,
+
     /// The comp layer the viewer's AOV / channel controls + EXR Info act on —
     /// Nuke's "current" layer (#99 R4 follow-up). Set to the newest layer on
     /// open/add and by clicking a layer in the viewport bar or a timeline track;
@@ -915,6 +931,8 @@ impl Default for ExrApp {
             comp_next_source: COMP_SOURCE_BASE,
             comp_sources: std::collections::HashMap::new(),
             comp_readout: None,
+            comp_readout_b: None,
+            compare_b_layer: None,
             selected_comp_layer: None,
             comp_arrangement: crate::render_program::Arrangement::Stacked,
             gpu_resources: None,
@@ -3617,6 +3635,41 @@ fn top_sample_source(
     })
 }
 
+/// The default compare pane (side B) for a stack whose layers are `ids` **bottom→top**
+/// and whose current layer is `current` (#99 Slice 2a). Picks the topmost layer that
+/// *isn't* the current one, so the two panes differ without the user choosing anything
+/// — side A is the whole composite, so defaulting B to the current layer (which is
+/// itself top-of-stack by default) would make the compare look redundant. Falls back to
+/// the only layer when there is just one, and `None` for an empty stack. Pure.
+fn default_compare_b(
+    ids: &[crate::layer::LayerId],
+    current: Option<crate::layer::LayerId>,
+) -> Option<crate::layer::LayerId> {
+    ids.iter()
+        .rev()
+        .find(|id| Some(**id) != current)
+        .or_else(|| ids.last())
+        .copied()
+}
+
+/// One named layer's draw in a resolved composite — the `Step::Draw` carrying `layer`,
+/// if that layer is both present at this frame (`composite_at` drops hidden / soloed-out
+/// / trimmed-blank layers) and drawable (per `drawable`). Resolves **both** panes of a
+/// comp Side-by-Side (#99 Slice 2a), which shows two individual layers rather than the
+/// composite; `None` for either pane means the compare can't be drawn and the caller
+/// falls back to `Stacked`. Pure.
+fn comp_layer_draw(
+    steps: &[crate::layer::Step],
+    layer: Option<crate::layer::LayerId>,
+    drawable: impl Fn(crate::layer::SourceId) -> bool,
+) -> Option<&crate::layer::Draw> {
+    let layer = layer?;
+    steps.iter().find_map(|step| match step {
+        crate::layer::Step::Draw(d) if d.id == layer && drawable(d.source) => Some(d),
+        _ => None,
+    })
+}
+
 /// Map a screen position over the composite `image_rect` to a source pixel of a
 /// layer sized `size`. Normalized (fraction across the rect × source size) so a
 /// layer whose size differs from the base still maps correctly under the
@@ -6168,6 +6221,20 @@ impl ExrApp {
         self.comp_stack.iter().last().map(|l| l.id)
     }
 
+    /// The layer filling the compare pane (side B) — Nuke's second viewer input
+    /// (#99 Slice 2a). Prefers the explicit [`Self::compare_b_layer`]; when unset or
+    /// stale (its layer was removed) falls back to [`default_compare_b`], which avoids
+    /// the current layer so the panes differ by default. `None` only for an empty stack.
+    fn compare_b(&self) -> Option<crate::layer::LayerId> {
+        if let Some(id) = self.compare_b_layer
+            && self.comp_stack.get(id).is_some()
+        {
+            return Some(id);
+        }
+        let ids: Vec<_> = self.comp_stack.iter().map(|l| l.id).collect();
+        default_compare_b(&ids, self.active_comp_layer())
+    }
+
     /// Nuke-style "current layer" control bar for the comp viewport (#99 R4
     /// follow-up): a layer picker (which of the stack is current), that layer's
     /// AOV / pass pulldown, and R/G/B/A channel isolation — the classic
@@ -6292,6 +6359,32 @@ impl ExrApp {
                         ui.selectable_value(&mut arr, Arrangement::SideBySide, "Side by Side");
                     });
                 self.comp_arrangement = arr;
+
+                if arr != Arrangement::Stacked {
+                    // Which layer fills the compare pane — Nuke's second viewer input.
+                    // Side A is always the whole composite; this picks what it is shown
+                    // against, independent of the "current" layer above.
+                    let cmp_b = self.compare_b();
+                    let cmp_b_name = cmp_b
+                        .and_then(|id| self.comp_stack.get(id))
+                        .map(|l| l.name.clone())
+                        .unwrap_or_else(|| "—".to_string());
+                    ui.label("vs:");
+                    egui::ComboBox::from_id_salt("comp_compare_b")
+                        .selected_text(cmp_b_name)
+                        .show_ui(ui, |ui| {
+                            for (id, nm) in &layer_list {
+                                if ui.selectable_label(Some(*id) == cmp_b, nm).clicked() {
+                                    self.compare_b_layer = Some(*id);
+                                }
+                            }
+                        });
+                    // Matches the compare layer's on-screen height to the composite's,
+                    // so differently-sized plates compare at the same scale (the A/B
+                    // path's "Normalize Size", shared field).
+                    ui.checkbox(&mut self.viewer.normalize_side_by_side, "Normalize Size")
+                        .on_hover_text("Scale the compare layer to the composite's height");
+                }
             }
 
             // Anamorphic unsqueeze toggle (#194), surfaced here since the comp path
@@ -6865,9 +6958,82 @@ impl ExrApp {
                 .get(&s)
                 .is_some_and(|c| c.bind_group.is_some())
         });
-        self.comp_readout = top;
         let top_exr =
             top.and_then(|(s, aov)| self.comp_sources.get(&s).map(|c| (c.exr_data.clone(), aov)));
+
+        // A compare arrangement (#99 Slice 2a) shows the **two layers themselves**, not
+        // the composite: pane A is the `Layer:` (current) layer, pane B the `vs:` one,
+        // each drawn alone. Comparing a layer against a composite that already contains
+        // it just showed the same content twice. Both must be drawable at this frame
+        // (not hidden / soloed out / trimmed blank / textureless) or we fall back to
+        // `Stacked` — better the plain composite than an empty pane.
+        let drawable = |s: crate::layer::SourceId| {
+            self.comp_sources
+                .get(&s)
+                .is_some_and(|c| c.bind_group.is_some())
+        };
+        let compare = self.comp_arrangement != crate::render_program::Arrangement::Stacked;
+        let side_a_draw = compare
+            .then(|| comp_layer_draw(&steps, self.active_comp_layer(), drawable))
+            .flatten();
+        let side_b_draw = compare
+            .then(|| comp_layer_draw(&steps, self.compare_b(), drawable))
+            .flatten()
+            // Both panes or neither: a compare with only one resolvable side is a
+            // fallback to `Stacked`, not a half-drawn split.
+            .filter(|_| side_a_draw.is_some());
+        let side_b = side_b_draw.and_then(|d| {
+            let cs = self.comp_sources.get(&d.source)?;
+            Some(crate::viewer::CompSideB {
+                draw: crate::viewer::CompDraw {
+                    bind_group: cs.bind_group.clone()?,
+                    blend: d.blend,
+                    opacity: d.opacity,
+                },
+                tex_size: egui::vec2(cs.size.0.max(1) as f32, cs.size.1.max(1) as f32),
+                par: cs.exr_data.image.attributes.pixel_aspect,
+            })
+        });
+        // The compare layer's own pixels, for the per-pane readout.
+        self.comp_readout_b = side_b_draw.map(|d| (d.source, d.aov));
+        let side_b_exr = side_b_draw.and_then(|d| {
+            self.comp_sources
+                .get(&d.source)
+                .map(|c| (c.exr_data.clone(), d.aov))
+        });
+
+        // With the compare live, pane A is the current layer *alone*, so replace the
+        // composite draw list with that one layer (and take the canvas size / PAR from
+        // it). Side B is already a lone placed draw, so both panes are single layers.
+        let arrangement = match (side_a_draw, side_b.is_some()) {
+            (Some(a), true) => {
+                if let Some(cs) = self.comp_sources.get(&a.source)
+                    && let Some(bind_group) = cs.bind_group.clone()
+                {
+                    draws = vec![crate::viewer::CompDraw {
+                        bind_group,
+                        blend: a.blend,
+                        opacity: a.opacity,
+                    }];
+                    base_size = cs.size;
+                    base_par = cs.exr_data.image.attributes.pixel_aspect;
+                }
+                self.comp_arrangement
+            }
+            _ => crate::render_program::Arrangement::Stacked,
+        };
+        // Pane A's readout follows pane A: the current layer in compare mode, the
+        // composite's topmost drawable layer otherwise.
+        let (top, top_exr) = match (side_a_draw, arrangement) {
+            (Some(a), arr) if arr != crate::render_program::Arrangement::Stacked => (
+                Some((a.source, a.aov)),
+                self.comp_sources
+                    .get(&a.source)
+                    .map(|c| (c.exr_data.clone(), a.aov)),
+            ),
+            _ => (top, top_exr),
+        };
+        self.comp_readout = top;
 
         // The composite renders in any color mode (#99 R2): OCIO on → the OCIO
         // display transform; OCIO off → the sRGB display-encode pass. Only a GPU
@@ -6876,8 +7042,16 @@ impl ExrApp {
             && let Some(gpu) = self.gpu_resources.as_ref()
         {
             let lut = self.lut_bg.clone();
-            self.viewer
-                .draw_comp_composite(ui, base_size, base_par, &draws, gpu, lut);
+            self.viewer.draw_comp_composite(
+                ui,
+                base_size,
+                base_par,
+                &draws,
+                arrangement,
+                side_b,
+                gpu,
+                lut,
+            );
         } else {
             let msg = if self.gpu_resources.is_none() {
                 "No GPU: the compositing viewport is unavailable."
@@ -6892,17 +7066,20 @@ impl ExrApp {
         // Sample after the draw so `last_image_rect` is this frame's, and after the
         // `gpu_resources` borrow above is released. Unconditional: no drawable / no
         // hover / suppressed clears the readout (status bar then shows `x=--`).
-        self.sample_comp_readout(ui, top_exr);
+        self.sample_comp_readout(ui, top_exr, side_b_exr);
     }
 
     /// Populate the pixel-readout fields (`last_hover_pos_img` / `last_sampled_val_a`)
     /// from the cursor over the composite (#99 R4). `top` is the topmost drawable
-    /// layer's pixels + aov. Clears the readout when playback suppresses sampling, the
+    /// layer's pixels + aov; `side_b` is the current layer's, sampled instead when the
+    /// cursor is over the Side-by-Side compare pane (#99 Slice 2a) so each pane reports
+    /// its *own* values. Clears the readout when playback suppresses sampling, the
     /// pointer is off the image, or there is no drawable layer.
     fn sample_comp_readout(
         &mut self,
         ui: &egui::Ui,
         top: Option<(std::sync::Arc<ExrData>, usize)>,
+        side_b: Option<(std::sync::Arc<ExrData>, usize)>,
     ) {
         let suppressed = self.playback.sampling_suppressed();
         let hover = if suppressed {
@@ -6910,8 +7087,29 @@ impl ExrApp {
         } else {
             ui.input(|i| i.pointer.hover_pos())
         };
-        let sampled = match (self.viewer.last_image_rect, hover, &top) {
-            (Some(ir), Some(pos), Some((exr, aov))) if ir.contains(pos) => {
+        // Resolve which pane the cursor is over, then sample that pane's own source
+        // against its own rect. Outside Side-by-Side `last_image_rect_b` is `None`, so
+        // this collapses to the single-composite case.
+        let rect_a = self.viewer.last_image_rect;
+        let rect_b = self.viewer.last_image_rect_b;
+        let picked = hover
+            .zip(rect_a)
+            .and_then(|(pos, ir)| crate::viewer::pick_comp_side(pos, ir, rect_b));
+        // Name the status-bar row after the pane actually sampled, not always the
+        // composite's top layer.
+        if picked == Some(crate::viewer::CompSide::B)
+            && let Some(b) = self.comp_readout_b
+        {
+            self.comp_readout = Some(b);
+        }
+        let side = match picked {
+            Some(crate::viewer::CompSide::A) => rect_a.map(|ir| (ir, &top)),
+            // `pick_comp_side` returns B only when `rect_b` is set.
+            Some(crate::viewer::CompSide::B) => rect_b.map(|ir| (ir, &side_b)),
+            None => None,
+        };
+        let sampled = match (side, hover) {
+            (Some((ir, Some((exr, aov)))), Some(pos)) => {
                 let size = exr.logical_size(*aov).unwrap_or((0, 0));
                 comp_hover_pixel(pos, ir, size)
                     .map(|(x, y)| (x, y, self.viewer.sample_pixel(exr, *aov, x, y)))
@@ -8277,6 +8475,58 @@ mod tests {
         );
         // Nothing drawable → None.
         assert_eq!(top_sample_source(&steps, |_| false), None);
+    }
+
+    #[test]
+    fn default_compare_b_avoids_the_current_layer() {
+        use crate::layer::{LayerStack, SourceId, Trim};
+        // `LayerId` is opaque, so mint real ones from a stack (bottom→top).
+        let mut stack = LayerStack::new();
+        let a = stack.push_image("a", SourceId(2), 0, Trim::full(0, u32::MAX));
+        let b = stack.push_image("b", SourceId(3), 0, Trim::full(0, u32::MAX));
+        let c = stack.push_image("c", SourceId(4), 0, Trim::full(0, u32::MAX));
+        let ids = [a, b, c];
+
+        // Current is the top layer (the usual default) → compare against the next one
+        // down, so the two panes aren't showing the same thing.
+        assert_eq!(default_compare_b(&ids, Some(c)), Some(b));
+        // Current is lower → the topmost layer is the natural counterpart.
+        assert_eq!(default_compare_b(&ids, Some(a)), Some(c));
+        assert_eq!(default_compare_b(&ids, Some(b)), Some(c));
+        // No current layer → the top of the stack.
+        assert_eq!(default_compare_b(&ids, None), Some(c));
+        // A single layer can only compare against itself.
+        assert_eq!(default_compare_b(&[a], Some(a)), Some(a));
+        // Empty stack → nothing to compare.
+        assert_eq!(default_compare_b(&[], Some(a)), None);
+    }
+
+    #[test]
+    fn comp_layer_draw_resolves_a_named_layer_or_falls_back() {
+        use crate::layer::{LayerStack, SourceId, Trim};
+        let mut stack = LayerStack::new();
+        let s_bottom = SourceId(2);
+        let s_top = SourceId(3);
+        let bottom = stack.push_image("bottom", s_bottom, 0, Trim::full(0, u32::MAX));
+        let top = stack.push_image("top", s_top, 1, Trim::full(0, u32::MAX));
+        let steps = stack.composite_at(0);
+
+        // The current layer resolves to its own draw, wherever it sits in the stack.
+        let d = comp_layer_draw(&steps, Some(bottom), |_| true).expect("bottom resolves");
+        assert_eq!((d.source, d.aov), (s_bottom, 0));
+        let d = comp_layer_draw(&steps, Some(top), |_| true).expect("top resolves");
+        assert_eq!((d.source, d.aov), (s_top, 1));
+
+        // Not drawable (no texture yet) → None, so the caller falls back to Stacked.
+        assert!(comp_layer_draw(&steps, Some(top), |s| s == s_bottom).is_none());
+        // No selection at all → None.
+        assert!(comp_layer_draw(&steps, None, |_| true).is_none());
+        // Selected but absent from this frame's composite (hidden / trimmed blank).
+        let hidden = stack.push_image("hidden", SourceId(4), 0, Trim::full(0, u32::MAX));
+        assert!(
+            comp_layer_draw(&steps, Some(hidden), |_| true).is_none(),
+            "a layer missing from these steps has no side-B draw"
+        );
     }
 
     #[test]

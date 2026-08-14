@@ -562,6 +562,15 @@ pub struct OcioCallback {
     /// slot instead of the OCIO transform, so the layer-stack composite renders
     /// with OCIO disabled. When false this is the normal OCIO display path.
     pub use_display_encode: bool,
+    /// Independent placed draws folded into `scene_view` *after* pass 1, each with
+    /// `LoadOp::Load` so they keep whatever the accumulate left behind (#99 Slice 2a).
+    /// Comp Side-by-Side uses this for the current-layer pane: side A accumulates into
+    /// its own sub-rect, then side B — a single layer, so it needs no ping-pong — is
+    /// laid into the disjoint sub-rect beside it. `pipeline_linear` is `blend: None`
+    /// with `ColorWrites::ALL`, so each overwrites colour *and* alpha only where its
+    /// quad covers, leaving the α=−1 no-image sentinel everywhere else. Pass 2 and the
+    /// blit then run once over the combined scene, unchanged.
+    pub overlay_draws: Vec<OcioPass1Draw>,
     pub display_format: wgpu::TextureFormat,
     pub blit_uniforms: crate::gpu::BlitUniforms,
     /// Visible image bounds in egui points (xmin, ymin, xmax, ymax). The OCIO transform is
@@ -765,6 +774,40 @@ impl eframe::egui_wgpu::CallbackTrait for OcioCallback {
                 rp.set_viewport(0.0, 0.0, w as f32, h as f32, 0.0, 1.0);
                 rp.set_pipeline(&gpu.pipeline_linear);
                 for d in &self.draws {
+                    rp.set_bind_group(0, d.bg_a.as_ref(), &[]);
+                    rp.set_bind_group(1, d.bg_b.as_ref(), &[]);
+                    rp.set_bind_group(2, &gpu.uniform_bind_group, &[d.uniform_offset]);
+                    rp.set_bind_group(3, d.lut_bg.as_ref(), &[]);
+                    rp.draw(0..6, 0..1);
+                }
+            }
+
+            // Pass 1b (comp Side-by-Side, #99 Slice 2a): lay independent draws into the
+            // scene alongside the accumulate result. `LoadOp::Load` keeps pass 1's output
+            // (the parity `start=(N-1)%2` guarantees it landed in `scene_view`), and each
+            // draw's vertex stage maps only its own rect, so a disjoint pane overwrites
+            // just its own pixels. One pass suffices: these draws are independent of each
+            // other and never sample the scene.
+            if !self.overlay_draws.is_empty() {
+                let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("OCIO pass 1b (placed overlay)"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &targets.scene_view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                rp.set_viewport(0.0, 0.0, w as f32, h as f32, 0.0, 1.0);
+                rp.set_pipeline(&gpu.pipeline_linear);
+                for d in &self.overlay_draws {
                     rp.set_bind_group(0, d.bg_a.as_ref(), &[]);
                     rp.set_bind_group(1, d.bg_b.as_ref(), &[]);
                     rp.set_bind_group(2, &gpu.uniform_bind_group, &[d.uniform_offset]);

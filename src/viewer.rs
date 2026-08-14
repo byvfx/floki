@@ -40,13 +40,17 @@ fn rgb3_to_vec4(c: [f32; 3]) -> [f32; 4] {
 /// when enabled), so framing must fit their *combined* width or the second image
 /// spills off-screen. Mirrors the SBS layout in [`ExrViewer::emit_mode_draws`],
 /// measured in unscaled space (the `scale` cancels out of the fit ratio).
+///
+/// Takes `side_by_side` as a plain bool rather than a [`CompareMode`] so the comp path
+/// can drive it from its own `Arrangement` (#99 Slice 2a) — the A/B compare enum is
+/// slated for deletion with the render retire.
 fn framing_bounds(
-    mode: CompareMode,
+    side_by_side: bool,
     normalize_sbs: bool,
     tex_size: egui::Vec2,
     tex_size_b: Option<egui::Vec2>,
 ) -> egui::Vec2 {
-    let Some(size_b) = tex_size_b.filter(|_| mode == CompareMode::SideBySide) else {
+    let Some(size_b) = tex_size_b.filter(|_| side_by_side) else {
         return tex_size; // single image, or B not loaded
     };
     // Normalized B is scaled so its height matches A's; otherwise B keeps its own
@@ -205,6 +209,47 @@ pub struct CompDraw {
     pub opacity: f32,
 }
 
+/// The right-hand pane of a comp Side-by-Side (#99 Slice 2a). A compare shows the two
+/// *layers themselves* — pane A the current layer, pane B this one — so the caller
+/// reduces `draws` to pane A's single layer and hands pane B here. Because it is one
+/// layer it needs no accumulate ping-pong: it is laid into the scene beside pane A as a
+/// single placed overlay draw.
+pub(crate) struct CompSideB {
+    /// The layer's texture + blend/opacity, resolved exactly like a `CompDraw`.
+    pub draw: CompDraw,
+    /// The layer's own full-res pixel dimensions, so its pane keeps its own aspect
+    /// instead of being stretched to the composite's canvas.
+    pub tex_size: egui::Vec2,
+    /// The layer's own header pixel aspect, for its own anamorphic unsqueeze.
+    pub par: f32,
+}
+
+/// Which Side-by-Side pane a cursor is over. Pure so the hover→pane mapping is
+/// unit-testable without a GPU.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum CompSide {
+    /// The composite pane (the whole canvas when not side-by-side).
+    A,
+    /// The current-layer pane.
+    B,
+}
+
+/// Pick the Side-by-Side pane under `pos` (#99 Slice 2a). `rect_b` is `None` outside
+/// Side-by-Side, where the whole image rect is the composite. B is tested first: the
+/// two rects abut exactly, so a cursor on the shared edge belongs to B — matching the
+/// render, where side B's overlay draw is laid down last and wins that pixel column.
+/// Returns `None` when the cursor is over neither pane. Pure.
+pub(crate) fn pick_comp_side(
+    pos: egui::Pos2,
+    rect_a: egui::Rect,
+    rect_b: Option<egui::Rect>,
+) -> Option<CompSide> {
+    if rect_b.is_some_and(|r| r.contains(pos)) {
+        return Some(CompSide::B);
+    }
+    rect_a.contains(pos).then_some(CompSide::A)
+}
+
 /// Per-position flags for a comp layer at stack index `i` of `n` (#99 PR-B.3),
 /// returned as `(is_composite, is_top)`. The bottom layer (`i == 0`) is a plain
 /// copy into the cleared accumulation (`is_composite = false`, its blend unused);
@@ -218,12 +263,8 @@ fn comp_layer_flags(i: usize, n: usize) -> (bool, bool) {
 }
 
 /// The two placed image rects + divider x for a Side-by-Side arrangement. Pure
-/// geometry so it's unit-testable without a GPU and shared by the render path, the
-/// hover→pixel mapping, and (Slice 2) the comp Side-by-Side path.
-// Landed ahead of its consumer (#153): the comp Side-by-Side render is the
-// offscreen-per-side GPU build (#99 render-retire, Slice 2) — this geometry + its
-// unit test are banked; the renderer that calls it follows.
-#[allow(dead_code)]
+/// geometry so it's unit-testable without a GPU and shared by the render path and the
+/// hover→pixel mapping.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) struct SxsLayout {
     pub rect_a: egui::Rect,
@@ -237,7 +278,6 @@ pub(crate) struct SxsLayout {
 /// native `tex_size_b` × `scale` × `par_b`, or — when `normalize` — rescaled so B's
 /// height matches A's. Both are vertically centered in a combined rect anchored at
 /// `canvas_center + translation`. Pure.
-#[allow(dead_code)] // landed ahead of the offscreen SxS render (#99 Slice 2, #153)
 pub(crate) fn side_by_side_layout(
     canvas_center: egui::Pos2,
     translation: egui::Vec2,
@@ -841,6 +881,12 @@ pub struct ExrViewer {
     /// `None` falls back to `last_canvas_rect`. Transient.
     pub last_image_rect: Option<egui::Rect>,
 
+    /// The current-layer pane's rect in a comp Side-by-Side (#99 Slice 2a); `None` in
+    /// every other arrangement, where `last_image_rect` covers the whole image. Paired
+    /// with [`pick_comp_side`] so the pixel readout samples the pane under the cursor
+    /// rather than always reporting the composite. Transient.
+    pub last_image_rect_b: Option<egui::Rect>,
+
     /// Annotation overlay (#45) — all transient (per-session, never persisted).
     /// Shapes are stored in image space so they track pan/zoom.
     pub annotations: Vec<Annotation>,
@@ -946,6 +992,7 @@ impl Default for ExrViewer {
             row2_full_height: 0.0,
             last_canvas_rect: None,
             last_image_rect: None,
+            last_image_rect_b: None,
             annotations: Vec::new(),
             anno_tool: AnnotationTool::None,
             anno_color: egui::Color32::RED,
@@ -2607,7 +2654,14 @@ impl ExrViewer {
                 // and the first-paint fit account for the wider anamorphic image.
                 let fit_size = egui::vec2(tex_size.x * par, tex_size.y);
                 let fit_size_b = tex_size_b.map(|b| egui::vec2(b.x * par_b, b.y));
-                self.handle_canvas_interaction(ui, rect, &response, fit_size, fit_size_b);
+                self.handle_canvas_interaction(
+                    ui,
+                    rect,
+                    &response,
+                    fit_size,
+                    fit_size_b,
+                    self.compare_mode == CompareMode::SideBySide,
+                );
                 // Render Image — the x extent carries the anamorphic unsqueeze (#179).
                 let image_size = egui::vec2(tex_size.x * self.scale * par, tex_size.y * self.scale);
                 // Per-axis screen scale for all screen↔image coordinate mapping
@@ -2636,6 +2690,8 @@ impl ExrViewer {
 
                 // Record what the snapshot should crop to (#52): the active image area
                 // rather than the whole canvas (which includes the background).
+                // The classic A/B path has no comp Side-by-Side pane.
+                self.last_image_rect_b = None;
                 self.last_image_rect = Some(crate::snapshot::active_area_rect(
                     rect,
                     disp_rect,
@@ -3358,18 +3414,27 @@ impl ExrViewer {
     /// Global tone (exposure / gamma / channel isolation / background) comes from the
     /// shared viewer fields, so it applies to the composite exactly as to a single
     /// image; per-composite tone controls land with the row controls (PR-B.4).
+    #[allow(clippy::too_many_arguments)] // frame geometry + draws + arrangement + gpu handles
     pub(crate) fn draw_comp_composite(
         &mut self,
         ui: &mut egui::Ui,
         base_size: (usize, usize),
         base_par: f32,
         draws: &[CompDraw],
+        arrangement: crate::render_program::Arrangement,
+        side_b: Option<CompSideB>,
         gpu_resources: &crate::gpu::GpuResources,
         lut_bg_opt: Option<std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>>,
     ) {
         if draws.is_empty() {
             return;
         }
+        // Side-by-Side needs a resolved current layer; without one (hidden, soloed out,
+        // trimmed blank) the caller already falls back, but guard here too so the
+        // geometry below can rely on the pair.
+        let side_b = side_b
+            .filter(|_| matches!(arrangement, crate::render_program::Arrangement::SideBySide));
+        let is_sbs = side_b.is_some();
         let render_state = gpu_resources.render_state();
         let (bw, bh) = base_size;
         let tex_size = egui::vec2(bw.max(1) as f32, bh.max(1) as f32);
@@ -3386,19 +3451,50 @@ impl ExrViewer {
         self.last_canvas_rect = Some(rect);
         // Shared pan/zoom with the A/B view (the scale/translation fields are the
         // same); framing on first paint fits the *unsqueezed* base layer extents.
+        // Side-by-Side lays the composite and the current layer out horizontally, so the
+        // first-paint fit must span both or the second pane spills off-screen.
+        let par_b = side_b.as_ref().map(|b| self.unsqueeze_factor(b.par));
+        let fit_b = side_b
+            .as_ref()
+            .zip(par_b)
+            .map(|(b, pb)| egui::vec2(b.tex_size.x * pb, b.tex_size.y));
         self.handle_canvas_interaction(
             ui,
             rect,
             &response,
             egui::vec2(tex_size.x * par, tex_size.y),
-            None,
+            fit_b,
+            is_sbs,
         );
 
         let image_size = egui::vec2(tex_size.x * self.scale * par, tex_size.y * self.scale);
-        let image_rect = egui::Rect::from_center_size(rect.center() + self.translation, image_size);
-        // The comp stack has no separate display window yet: display == image.
-        let disp_rect = image_rect;
+        // Side-by-Side: the composite takes the left pane and the current layer the
+        // right, abutting at the divider. Otherwise the composite owns the whole rect.
+        let sxs = side_b.as_ref().zip(par_b).map(|(b, pb)| {
+            side_by_side_layout(
+                rect.center(),
+                self.translation,
+                self.scale,
+                image_size,
+                b.tex_size,
+                pb,
+                self.normalize_side_by_side,
+            )
+        });
+        let image_rect = match sxs {
+            Some(l) => l.rect_a,
+            None => egui::Rect::from_center_size(rect.center() + self.translation, image_size),
+        };
+        // The comp stack has no separate display window yet: display == image. In
+        // Side-by-Side the "display" region spans both panes, so the background gradient
+        // and the display transform cover the whole layout.
+        let disp_rect = match sxs {
+            Some(l) => l.rect_a.union(l.rect_b),
+            None => image_rect,
+        };
         self.last_image_rect = Some(image_rect);
+        // The current-layer pane, for the per-pane pixel readout (`pick_comp_side`).
+        self.last_image_rect_b = sxs.map(|l| l.rect_b);
 
         // Re-bake + upload the gradient LUTs on ramp change (stable handles otherwise).
         self.sync_gradient_luts(gpu_resources);
@@ -3429,6 +3525,10 @@ impl ExrViewer {
         };
 
         let painter = ui.painter().with_clip_rect(rect);
+        // Reserve the image slot BEFORE the divider so the GPU quad renders *beneath*
+        // it (same layer, insertion order) — appending the callback last would paint
+        // the composite straight over the line. Mirrors `draw_canvas_gpu`'s slot.
+        let slot = painter.add(egui::Shape::Noop);
         let n = draws.len();
         for (i, d) in draws.iter().enumerate() {
             let (is_composite, is_top) = comp_layer_flags(i, n);
@@ -3462,6 +3562,37 @@ impl ExrViewer {
             // only if `draws` had no bindable layer — nothing to composite.
             return;
         }
+
+        // Side B (the current layer) is a *single* layer, so it needs no ping-pong: emit
+        // it as an independent placed draw after taking the accumulate group, and the
+        // callback lays it into the scene beside side A with `LoadOp::Load`. It gets the
+        // global view ops like any standalone image (`neutral_view_ops` stays false), so
+        // both panes are exposed and display-transformed identically.
+        let overlay_draws = match (sxs, side_b.as_ref()) {
+            (Some(l), Some(b)) => {
+                ctx.draw(
+                    &painter,
+                    b.draw.bind_group.clone(),
+                    None,
+                    rect,
+                    l.rect_b,
+                    false, // is_diff
+                    false, // is_composite — a plain placed copy, not an accumulate fold
+                    b.draw.opacity,
+                );
+                let taken = std::mem::take(&mut *ctx.ocio_draws.borrow_mut());
+                // The divider, drawn over both panes like the A/B path's.
+                painter.line_segment(
+                    [
+                        egui::pos2(l.divider_x, disp_rect.min.y),
+                        egui::pos2(l.divider_x, disp_rect.max.y),
+                    ],
+                    (2.0, egui::Color32::GRAY),
+                );
+                taken
+            }
+            _ => Vec::new(),
+        };
         let blit_uniforms = crate::gpu::BlitUniforms {
             display_min: [disp_rect.min.x, disp_rect.min.y],
             display_max: [disp_rect.max.x, disp_rect.max.y],
@@ -3486,9 +3617,16 @@ impl ExrViewer {
         } else {
             0x9E37_79B9_7F4A_7C15
         };
-        let render_sig = (ctx.ocio_sig.get() ^ self.ocio_render_gen ^ display_stage_salt)
-            .wrapping_mul(0x100000001b3);
-        let scissor_pts = Some([
+        // Salt the arrangement in too, so switching Stacked↔Side-by-Side always
+        // re-renders even if the per-draw uniforms happened to hash the same.
+        let arrangement_salt = if is_sbs { 0x517C_C1B7_2722_0A95 } else { 0 };
+        let render_sig =
+            (ctx.ocio_sig.get() ^ self.ocio_render_gen ^ display_stage_salt ^ arrangement_salt)
+                .wrapping_mul(0x100000001b3);
+        // Side-by-Side spans the canvas with two panes, so the display transform runs
+        // unscissored rather than over just the composite's rect (the A/B path does the
+        // same); otherwise scissor to the single image region.
+        let scissor_pts = (!is_sbs).then_some([
             image_rect.min.x,
             image_rect.min.y,
             image_rect.max.x,
@@ -3499,15 +3637,16 @@ impl ExrViewer {
             accumulate: true,
             // OCIO off → the display stage is the sRGB display-encode pass (R2).
             use_display_encode: !self.ocio_active,
+            overlay_draws,
             display_format: render_state.target_format,
             blit_uniforms,
             scissor_pts,
             render_sig,
         };
-        painter.add(eframe::egui_wgpu::Callback::new_paint_callback(
-            painter.clip_rect(),
-            callback,
-        ));
+        painter.set(
+            slot,
+            eframe::egui_wgpu::Callback::new_paint_callback(painter.clip_rect(), callback),
+        );
     }
 
     fn draw_canvas_gpu(
@@ -3670,6 +3809,9 @@ impl ExrViewer {
                         // The A/B path emits this callback only under OCIO, so it always
                         // takes the OCIO display transform, never the display-encode pass.
                         use_display_encode: false,
+                        // The A/B path places both images as pass-1 draws (it never
+                        // accumulates side-by-side), so it needs no overlay group.
+                        overlay_draws: Vec::new(),
                         display_format,
                         blit_uniforms,
                         scissor_pts,
@@ -4280,12 +4422,13 @@ impl ExrViewer {
         response: &egui::Response,
         tex_size: egui::Vec2,
         tex_size_b: Option<egui::Vec2>,
+        side_by_side: bool,
     ) {
         if self.first_frame {
             // Fit the whole visible layout, not just A: Side-by-Side is wider than
             // the A image (A + B), so framing on `tex_size` alone clips B.
             let fit = framing_bounds(
-                self.compare_mode,
+                side_by_side,
                 self.normalize_side_by_side,
                 tex_size,
                 tex_size_b,
@@ -4341,7 +4484,7 @@ impl ExrViewer {
         self.last_canvas_rect = Some(rect);
         // Proxy first-paint is always the single slot-A image (no B), so framing
         // has no combined layout to fit.
-        self.handle_canvas_interaction(ui, rect, &response, tex_size, None);
+        self.handle_canvas_interaction(ui, rect, &response, tex_size, None, false);
 
         let image_size = tex_size * self.scale;
         let image_rect = egui::Rect::from_min_size(
@@ -4349,6 +4492,7 @@ impl ExrViewer {
             image_size,
         );
         self.last_image_rect = Some(image_rect);
+        self.last_image_rect_b = None; // proxy is always a single image
 
         // Paint the tone-baked proxy texture, upscaled via linear filtering into
         // the full image rect. egui uploads the texture to the GPU itself, so this
@@ -4701,6 +4845,55 @@ mod gui_tests {
     }
 
     #[test]
+    fn pick_comp_side_routes_the_cursor_to_the_pane_under_it() {
+        use super::{CompSide, pick_comp_side, side_by_side_layout};
+        let center = egui::pos2(500.0, 300.0);
+        let l = side_by_side_layout(
+            center,
+            egui::Vec2::ZERO,
+            1.0,
+            egui::vec2(200.0, 100.0),
+            egui::vec2(100.0, 100.0),
+            1.0,
+            false,
+        );
+
+        // Inside each pane → that pane.
+        assert_eq!(
+            pick_comp_side(egui::pos2(400.0, 300.0), l.rect_a, Some(l.rect_b)),
+            Some(CompSide::A)
+        );
+        assert_eq!(
+            pick_comp_side(egui::pos2(600.0, 300.0), l.rect_a, Some(l.rect_b)),
+            Some(CompSide::B)
+        );
+        // Outside both → None (the readout blanks rather than reporting a lie).
+        assert_eq!(
+            pick_comp_side(egui::pos2(100.0, 300.0), l.rect_a, Some(l.rect_b)),
+            None
+        );
+        assert_eq!(
+            pick_comp_side(egui::pos2(400.0, 900.0), l.rect_a, Some(l.rect_b)),
+            None
+        );
+        // The rects abut exactly; the shared edge belongs to B, matching the render
+        // (B's overlay draw is laid down last and wins that column).
+        assert_eq!(
+            pick_comp_side(egui::pos2(l.divider_x, 300.0), l.rect_a, Some(l.rect_b)),
+            Some(CompSide::B)
+        );
+        // No B pane (any non-side-by-side arrangement) → the composite owns the rect.
+        assert_eq!(
+            pick_comp_side(egui::pos2(400.0, 300.0), l.rect_a, None),
+            Some(CompSide::A)
+        );
+        assert_eq!(
+            pick_comp_side(egui::pos2(600.0, 300.0), l.rect_a, None),
+            None
+        );
+    }
+
+    #[test]
     fn t2_victim_evicts_furthest_and_protects_on_screen() {
         use super::t2_victim;
         // On-screen frame 5; the furthest resident frame is evicted, never 5.
@@ -4794,19 +4987,18 @@ mod gui_tests {
         use super::framing_bounds;
         let a = egui::vec2(1920.0, 1080.0);
         let b = egui::vec2(1000.0, 2000.0);
-        // Every non-SBS mode frames the A image, regardless of B or normalize.
-        assert_eq!(framing_bounds(CompareMode::SingleA, true, a, Some(b)), a);
-        assert_eq!(framing_bounds(CompareMode::Composite, false, a, Some(b)), a);
-        assert_eq!(framing_bounds(CompareMode::DiffMatte, true, a, Some(b)), a);
+        // Every non-SBS arrangement frames the A image, regardless of B or normalize.
+        assert_eq!(framing_bounds(false, true, a, Some(b)), a);
+        assert_eq!(framing_bounds(false, false, a, Some(b)), a);
         // SBS with no B loaded falls back to the single image.
-        assert_eq!(framing_bounds(CompareMode::SideBySide, true, a, None), a);
+        assert_eq!(framing_bounds(true, true, a, None), a);
         // SBS unnormalized: combined width, tallest height.
         assert_eq!(
-            framing_bounds(CompareMode::SideBySide, false, a, Some(b)),
+            framing_bounds(true, false, a, Some(b)),
             egui::vec2(2920.0, 2000.0)
         );
         // SBS normalized: B scaled to A's height (1080) → width 1000*1080/2000 = 540.
-        let f = framing_bounds(CompareMode::SideBySide, true, a, Some(b));
+        let f = framing_bounds(true, true, a, Some(b));
         assert!((f.x - 2460.0).abs() < 0.01, "combined width {f:?}");
         assert!(
             (f.y - 1080.0).abs() < 0.01,
