@@ -175,12 +175,12 @@ accumulate at the live frame from `comp_sources`, but only ever `Stacked`). Reti
 **only** the accumulate path — so compare modes are not a trivial addition; Wipe/Diff need the
 non-accumulate 2-input pass reintroduced.
 
-- **Slice 1 — texture-map unification** (behavior-preserving, A/B pinned). Replace
-  `gpu_textures`/`gpu_textures_b` + `pick_b` with a `SourceId`-keyed bind lookup
-  (`gpu_binds: BTreeMap<SourceId, Vec<Option<Arc<BindGroup>>>>`, A/B pinned to the reserved ids).
-  Intermediate `bind_of(input)` helper first (pure indirection), then swap the storage. Touches
-  `sync_texture_caches`, the populate block, the `.fill(None)` clears, every `emit_mode_draws` arm.
-  Zero visible change; covered by existing `render_program` tests + one new headless equivalence test.
+- ~~**Slice 1 — texture-map unification.**~~ **DROPPED (2026-08-14).** It refactored
+  `gpu_textures`/`gpu_textures_b` + `pick_b`, which are used *only* in the A/B render path that Slice 3
+  deletes — and Slice 2's "compose vs current layer" sources side B from `comp_sources`, never from
+  that storage. It was a holdover from the "make `emit_mode_draws` generic" framing the "delete, not
+  evolve" correction invalidated. Refactoring code we then delete is wasted motion; go straight to
+  Slice 2.
 - **Slice 2 — Arrangements in the comp path.** **UX model (locked): compose vs current layer** — A =
   the full composite, B = the `active_comp_layer` (the timeline-selected "current" layer); zero new
   selection UI. New `ExrApp::comp_arrangement: Arrangement` (default `Stacked`) surfaced in
@@ -191,6 +191,29 @@ non-accumulate 2-input pass reintroduced.
   full N-vs-N via offscreen-per-side is a fast-follow). `draw_comp_composite`'s hardwired
   `force_accumulate=true` / `is_wipe_mode=0` become arrangement-dependent; fold `comp_arrangement` +
   current-layer id into `render_sig`.
+
+  > **CORRECTION (2026-08-14): "2a SxS fits the accumulate model" was WRONG.** The composite uses a
+  > two-target **ping-pong**, and each accumulate draw does a whole-target `LoadOp::Clear` + only
+  > rasterizes its own rect. So two disjoint-rect groups in one pass can't coexist — the final target
+  > keeps only the *last* group's rect (verified on-device: side A/composite drops to a sliver, side B
+  > renders). SxS **requires** the offscreen-per-side path, not as a fast-follow but as the *only*
+  > correct approach. **Landed as scaffolding** (`comp_arrangement` field + `Compare:` selector + the
+  > pure `side_by_side_layout` helper + tests, `#[allow(dead_code)]` until wired); the single-pass
+  > render was reverted.
+  >
+  > **Offscreen-per-side plan (from the GPU pipeline map):** `display`/`scene` targets on `OcioTargets`
+  > are already sampleable (`TEXTURE_BINDING`). (1) Add two display-format sampleable targets
+  > `compare_a`/`compare_b` to `OcioTargets` (clone the `display` descriptor; add to resize + `Drop`).
+  > (2) Add a rect-placing textured-quad pipeline+shader to `GpuState` (VS = the `shader.wgsl:112-135`
+  > `mix(rect_min, rect_max, pos)` math; FS = passthrough; layout over a tex+sampler+small-uniform).
+  > (3) Give `OcioCallback` a `two_group: Option<{draws_a, draws_b, rect_a, rect_b}>` mode: `prepare`
+  > runs the existing accumulate+display stage **parameterized to output into `compare_a`** for group A
+  > and `compare_b` for group B (today pass-2 hardcodes `targets.display_view`); then a final pass (in
+  > `prepare`→`display_view` + normal blit, or directly in `paint`) draws the two textures at their
+  > rects. Use **one** callback (the shared `display_view`/`last_render_sig` is exactly what breaks two
+  > callbacks). The coverage/checker seam (blit reads `scene_view` α) needs on-device care — simplest
+  > v1 does the two-quad placement in `paint` on a plain bg, checker/transparency polish after. Wipe +
+  > Diff (2b) then become trivial: each side is one sampled texture the wipe/diff shader combines.
 - **Slice 3 — retire the A/B path.** Delete `emit_mode_draws`, `gpu_textures_b`, `pick_b`,
   `render_program.rs` (keep/relocate only `Arrangement`, or fold into `layer::Layout`), `CompareMode`,
   the `configure` shim, and the `_b`/`comp_*` duplication; route `draw_central_canvas` through the
@@ -199,7 +222,8 @@ non-accumulate 2-input pass reintroduced.
   deleted symbol for hidden readers (status bar / EXR Info / histogram were re-homed into the comp
   path). Persistence (`Vec<LayerPersist>`, never `#[serde(flatten)]`) is an independent fast-follow.
 
-**Order:** 1 → 2a → 2b → 3. Each slice CI-green (default + `system-ocio`), no throwaway code.
+**Order:** 2a → 2b → 3 (Slice 1 dropped). Each slice CI-green (default + `system-ocio`), no throwaway
+code.
 
 ### Phase 4 / R4 — collapse to one model  ← **RESUME HERE (handoff below)**
 

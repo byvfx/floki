@@ -217,6 +217,65 @@ fn comp_layer_flags(i: usize, n: usize) -> (bool, bool) {
     (i != 0, i + 1 == n)
 }
 
+/// The two placed image rects + divider x for a Side-by-Side arrangement. Pure
+/// geometry so it's unit-testable without a GPU and shared by the render path, the
+/// hover→pixel mapping, and (Slice 2) the comp Side-by-Side path.
+// Landed ahead of its consumer (#153): the comp Side-by-Side render is the
+// offscreen-per-side GPU build (#99 render-retire, Slice 2) — this geometry + its
+// unit test are banked; the renderer that calls it follows.
+#[allow(dead_code)]
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) struct SxsLayout {
+    pub rect_a: egui::Rect,
+    pub rect_b: egui::Rect,
+    /// Screen-x of the divider between the two images (== `rect_b.min.x`).
+    pub divider_x: f32,
+}
+
+/// Lay out two images side by side (#179 / #99 render-retire): A on the left at
+/// `image_size_a` (already carrying A's unsqueeze), B on the right sized from its
+/// native `tex_size_b` × `scale` × `par_b`, or — when `normalize` — rescaled so B's
+/// height matches A's. Both are vertically centered in a combined rect anchored at
+/// `canvas_center + translation`. Pure.
+#[allow(dead_code)] // landed ahead of the offscreen SxS render (#99 Slice 2, #153)
+pub(crate) fn side_by_side_layout(
+    canvas_center: egui::Pos2,
+    translation: egui::Vec2,
+    scale: f32,
+    image_size_a: egui::Vec2,
+    tex_size_b: egui::Vec2,
+    par_b: f32,
+    normalize: bool,
+) -> SxsLayout {
+    let image_size_b = if normalize && tex_size_b.y != 0.0 {
+        // Match B's height to A's on-screen height (`image_size_a.y == tex.y*scale`).
+        let scale_b = image_size_a.y / tex_size_b.y;
+        egui::vec2(tex_size_b.x * scale_b * par_b, tex_size_b.y * scale_b)
+    } else {
+        egui::vec2(tex_size_b.x * scale * par_b, tex_size_b.y * scale)
+    };
+    let combined = egui::vec2(
+        image_size_a.x + image_size_b.x,
+        image_size_a.y.max(image_size_b.y),
+    );
+    let combined_rect = egui::Rect::from_center_size(canvas_center + translation, combined);
+    let cy = combined_rect.center().y;
+
+    let mut rect_a = egui::Rect::from_min_size(combined_rect.min, image_size_a);
+    rect_a.set_center(egui::pos2(rect_a.center().x, cy));
+    let mut rect_b = egui::Rect::from_min_size(
+        egui::pos2(combined_rect.min.x + image_size_a.x, combined_rect.min.y),
+        image_size_b,
+    );
+    rect_b.set_center(egui::pos2(rect_b.center().x, cy));
+
+    SxsLayout {
+        rect_a,
+        rect_b,
+        divider_x: rect_b.min.x,
+    }
+}
+
 /// Which feature the shared gradient editor is currently editing — the result of
 /// "Apply" / "Save as preset" is routed accordingly.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -4604,6 +4663,39 @@ mod gui_tests {
             (true, true),
             "top blends + view ops"
         );
+    }
+
+    #[test]
+    fn side_by_side_layout_places_a_left_b_right_with_divider() {
+        use super::side_by_side_layout;
+        let center = egui::pos2(500.0, 300.0);
+        let z = egui::Vec2::ZERO;
+        let a = egui::vec2(200.0, 100.0);
+        let b_tex = egui::vec2(100.0, 100.0);
+
+        // No normalize, scale 1, par 1: B keeps its native size. A left, B right,
+        // divider at A's right edge; combined width = 300, so left edge = 350.
+        let l = side_by_side_layout(center, z, 1.0, a, b_tex, 1.0, false);
+        assert_eq!(l.rect_a.min.x, 350.0, "A starts at the combined left edge");
+        assert_eq!(l.rect_a.width(), 200.0);
+        assert_eq!(l.divider_x, l.rect_b.min.x, "divider sits at B's left edge");
+        assert_eq!(l.rect_b.min.x, l.rect_a.max.x, "B abuts A, no gap");
+        assert_eq!(l.rect_b.width(), 100.0);
+        // Both vertically centered on the same row.
+        assert_eq!(l.rect_a.center().y, l.rect_b.center().y);
+        assert_eq!(l.rect_a.center().y, center.y);
+
+        // Normalize scales B's height to A's (100), so its 1:1 native becomes 100×100
+        // — here already equal, but a taller B would shrink to match.
+        let b_tall = egui::vec2(50.0, 200.0);
+        let ln = side_by_side_layout(center, z, 1.0, a, b_tall, 1.0, true);
+        assert_eq!(ln.rect_b.height(), 100.0, "B normalized to A's height");
+        assert_eq!(ln.rect_b.width(), 25.0, "B width scaled proportionally");
+
+        // Translation shifts the whole combined rect.
+        let lt = side_by_side_layout(center, egui::vec2(10.0, -20.0), 1.0, a, b_tex, 1.0, false);
+        assert_eq!(lt.rect_a.min.x, 360.0);
+        assert_eq!(lt.rect_a.center().y, center.y - 20.0);
     }
 
     #[test]

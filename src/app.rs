@@ -729,6 +729,14 @@ pub struct ExrApp {
     #[serde(skip)]
     selected_comp_layer: Option<crate::layer::LayerId>,
 
+    /// Viewport arrangement for the comp path (#99 render-retire, Slice 2): how the
+    /// composite is presented against the **current layer** (`active_comp_layer`).
+    /// `Stacked` = the plain composite; `SideBySide`/`Wipe`/`Diff` compare the
+    /// composite (side A) against the current layer (side B). The comp-path analogue
+    /// of the A/B `compare_mode`. Runtime-only.
+    #[serde(skip)]
+    comp_arrangement: crate::render_program::Arrangement,
+
     /// App-owned GPU core (#54): the single home for the persistent `GpuState`
     /// and the OCIO pass publisher. `None` in the CPU-only path (no wgpu
     /// device) and during `Default::default()` / before `new(cc)` wires it up.
@@ -908,6 +916,7 @@ impl Default for ExrApp {
             comp_sources: std::collections::HashMap::new(),
             comp_readout: None,
             selected_comp_layer: None,
+            comp_arrangement: crate::render_program::Arrangement::Stacked,
             gpu_resources: None,
             ocio_path: String::new(),
             lut_path: String::new(),
@@ -6262,6 +6271,28 @@ impl ExrApp {
             ui.selectable_value(&mut mode, ChannelMode::B, "B");
             ui.selectable_value(&mut mode, ChannelMode::A, "A");
             self.viewer.set_channel_mode(mode);
+
+            // Compare arrangement (#99 render-retire, Slice 2): how the composite
+            // (side A) is presented against the current layer (side B). Only
+            // meaningful with ≥2 layers. Wipe/Diff arrive in Slice 2b.
+            if layer_list.len() > 1 {
+                ui.separator();
+                ui.label("Compare:");
+                use crate::render_program::Arrangement;
+                let mut arr = self.comp_arrangement;
+                egui::ComboBox::from_id_salt("comp_arrangement")
+                    .selected_text(match arr {
+                        Arrangement::Stacked => "Stacked",
+                        Arrangement::SideBySide => "Side by Side",
+                        Arrangement::Wipe { .. } => "Wipe",
+                        Arrangement::Diff => "Diff",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut arr, Arrangement::Stacked, "Stacked");
+                        ui.selectable_value(&mut arr, Arrangement::SideBySide, "Side by Side");
+                    });
+                self.comp_arrangement = arr;
+            }
 
             // Anamorphic unsqueeze toggle (#194), surfaced here since the comp path
             // doesn't draw the classic viewer's Display ▾ menu. Only for non-square
