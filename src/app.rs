@@ -6357,6 +6357,16 @@ impl ExrApp {
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut arr, Arrangement::Stacked, "Stacked");
                         ui.selectable_value(&mut arr, Arrangement::SideBySide, "Side by Side");
+                        // Wipe carries a position, but the live geometry comes from the
+                        // viewer's `wipe_center` / `wipe_angle` (dragged on the handle),
+                        // so this literal is just the selector value.
+                        if ui
+                            .selectable_label(matches!(arr, Arrangement::Wipe { .. }), "Wipe")
+                            .clicked()
+                        {
+                            arr = Arrangement::Wipe { position: 0.5 };
+                        }
+                        ui.selectable_value(&mut arr, Arrangement::Diff, "Diff");
                     });
                 self.comp_arrangement = arr;
 
@@ -6379,11 +6389,12 @@ impl ExrApp {
                                 }
                             }
                         });
-                    // Matches the compare layer's on-screen height to the composite's,
-                    // so differently-sized plates compare at the same scale (the A/B
-                    // path's "Normalize Size", shared field).
-                    ui.checkbox(&mut self.viewer.normalize_side_by_side, "Normalize Size")
-                        .on_hover_text("Scale the compare layer to the composite's height");
+                    // Only Side-by-Side lays the panes out separately; Wipe and Diff
+                    // overlay both layers in one rect, where normalizing is meaningless.
+                    if arr == Arrangement::SideBySide {
+                        ui.checkbox(&mut self.viewer.normalize_side_by_side, "Normalize Size")
+                            .on_hover_text("Match the compare layer's height to pane A's");
+                    }
                 }
             }
 
@@ -7092,9 +7103,10 @@ impl ExrApp {
         // this collapses to the single-composite case.
         let rect_a = self.viewer.last_image_rect;
         let rect_b = self.viewer.last_image_rect_b;
+        let wipe = self.viewer.last_wipe;
         let picked = hover
             .zip(rect_a)
-            .and_then(|(pos, ir)| crate::viewer::pick_comp_side(pos, ir, rect_b));
+            .and_then(|(pos, ir)| crate::viewer::comp_hover_side(pos, ir, rect_b, wipe));
         // Name the status-bar row after the pane actually sampled, not always the
         // composite's top layer.
         if picked == Some(crate::viewer::CompSide::B)
@@ -7104,8 +7116,9 @@ impl ExrApp {
         }
         let side = match picked {
             Some(crate::viewer::CompSide::A) => rect_a.map(|ir| (ir, &top)),
-            // `pick_comp_side` returns B only when `rect_b` is set.
-            Some(crate::viewer::CompSide::B) => rect_b.map(|ir| (ir, &side_b)),
+            // Side-by-Side gives pane B its own rect; Wipe overlays both layers in
+            // pane A's rect, so B is sampled against that one.
+            Some(crate::viewer::CompSide::B) => rect_b.or(rect_a).map(|ir| (ir, &side_b)),
             None => None,
         };
         let sampled = match (side, hover) {

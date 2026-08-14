@@ -224,6 +224,131 @@ pub(crate) struct CompSideB {
     pub par: f32,
 }
 
+/// Where each compare pane lands on screen, per arrangement (#99 Slice 2a/2b).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) struct CompPanes {
+    /// Pane A's rect — the whole image rect in every arrangement but Side-by-Side.
+    pub image_rect: egui::Rect,
+    /// Pane B's own rect. `Some` **only** for Side-by-Side: Wipe and Diff combine both
+    /// layers inside `image_rect` in a single shader draw, so they have no second rect.
+    pub rect_b: Option<egui::Rect>,
+    /// The region the display stage + background cover — both panes in Side-by-Side.
+    pub disp_rect: egui::Rect,
+    /// Screen-x of the Side-by-Side divider, `None` otherwise.
+    pub divider_x: Option<f32>,
+}
+
+/// Resolve the on-screen pane geometry for a comp arrangement. Side-by-Side splits the
+/// canvas into two abutting panes via [`side_by_side_layout`]; **every other**
+/// arrangement — Stacked, and the two single-rect 2-input modes Wipe and Diff — gives
+/// pane A the whole rect. `side_b` is `Some((tex_size, par))` whenever a compare is
+/// live, which is *not* the same as "the panes are split": keying the split on side B's
+/// presence squeezes Wipe/Diff into the left half. Pure, so that distinction is
+/// unit-testable without a GPU.
+pub(crate) fn comp_pane_layout(
+    arrangement: crate::render_program::Arrangement,
+    canvas_center: egui::Pos2,
+    translation: egui::Vec2,
+    scale: f32,
+    image_size_a: egui::Vec2,
+    side_b: Option<(egui::Vec2, f32)>,
+    normalize: bool,
+) -> CompPanes {
+    let split = matches!(arrangement, crate::render_program::Arrangement::SideBySide)
+        .then_some(side_b)
+        .flatten();
+    match split {
+        Some((tex_size_b, par_b)) => {
+            let l = side_by_side_layout(
+                canvas_center,
+                translation,
+                scale,
+                image_size_a,
+                tex_size_b,
+                par_b,
+                normalize,
+            );
+            CompPanes {
+                image_rect: l.rect_a,
+                rect_b: Some(l.rect_b),
+                disp_rect: l.rect_a.union(l.rect_b),
+                divider_x: Some(l.divider_x),
+            }
+        }
+        None => {
+            let image_rect =
+                egui::Rect::from_center_size(canvas_center + translation, image_size_a);
+            CompPanes {
+                image_rect,
+                rect_b: None,
+                // The comp stack has no separate display window yet: display == image.
+                disp_rect: image_rect,
+                divider_x: None,
+            }
+        }
+    }
+}
+
+/// The drawn wipe line: its handle centre plus the two endpoints spanning the image.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) struct WipeLine {
+    pub center: egui::Pos2,
+    pub p1: egui::Pos2,
+    pub p2: egui::Pos2,
+}
+
+/// Screen geometry of the wipe divider over `image_rect`: `wipe_center` is normalized
+/// (0..1 across the rect) and `angle_deg` rotates the split. The line runs
+/// perpendicular to the split normal `(cos θ, sin θ)` and is extended past the rect's
+/// diagonal so it always spans the image. Pure, and shared by the A/B and comp paths so
+/// the two can't drift.
+pub(crate) fn wipe_line_endpoints(
+    image_rect: egui::Rect,
+    wipe_center: [f32; 2],
+    angle_deg: f32,
+) -> WipeLine {
+    let center = egui::pos2(
+        image_rect.min.x + image_rect.width() * wipe_center[0],
+        image_rect.min.y + image_rect.height() * wipe_center[1],
+    );
+    let a = angle_deg.to_radians();
+    let dir = egui::vec2(-a.sin(), a.cos());
+    let max_dist = image_rect.width().hypot(image_rect.height());
+    WipeLine {
+        center,
+        p1: center + dir * max_dist,
+        p2: center - dir * max_dist,
+    }
+}
+
+/// Which side of the wipe a screen position falls on, matching `fs_main`'s split
+/// exactly: the offset from the wipe centre is measured **in rect-relative pixels**
+/// (uv scaled by the rect size, so a non-square image doesn't skew the angle) and
+/// projected onto the normal `(cos θ, sin θ)`; `dist >= 0` is the `tex_b` side. Pure,
+/// so the wipe pixel readout can name the layer actually under the cursor.
+pub(crate) fn wipe_side_at(
+    pos: egui::Pos2,
+    image_rect: egui::Rect,
+    wipe_center: [f32; 2],
+    angle_deg: f32,
+) -> CompSide {
+    let size = image_rect.size();
+    let uv = egui::vec2(
+        (pos.x - image_rect.min.x) / size.x.max(f32::EPSILON),
+        (pos.y - image_rect.min.y) / size.y.max(f32::EPSILON),
+    );
+    let to_pixel = egui::vec2(
+        (uv.x - wipe_center[0]) * size.x,
+        (uv.y - wipe_center[1]) * size.y,
+    );
+    let a = angle_deg.to_radians();
+    if to_pixel.x * a.cos() + to_pixel.y * a.sin() >= 0.0 {
+        CompSide::B
+    } else {
+        CompSide::A
+    }
+}
+
 /// Which Side-by-Side pane a cursor is over. Pure so the hover→pane mapping is
 /// unit-testable without a GPU.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -248,6 +373,25 @@ pub(crate) fn pick_comp_side(
         return Some(CompSide::B);
     }
     rect_a.contains(pos).then_some(CompSide::A)
+}
+
+/// Which compare pane the cursor is over, across every arrangement (#99 Slice 2b): a
+/// Wipe (`wipe` = `Some((centre, angle))`) overlays both layers in `rect_a` and splits
+/// on the wipe line, while Side-by-Side splits on two rects. `None` when the cursor is
+/// over neither pane, so the readout blanks rather than reporting the wrong layer.
+/// Pure.
+pub(crate) fn comp_hover_side(
+    pos: egui::Pos2,
+    rect_a: egui::Rect,
+    rect_b: Option<egui::Rect>,
+    wipe: Option<([f32; 2], f32)>,
+) -> Option<CompSide> {
+    match wipe {
+        Some((center, angle)) => rect_a
+            .contains(pos)
+            .then(|| wipe_side_at(pos, rect_a, center, angle)),
+        None => pick_comp_side(pos, rect_a, rect_b),
+    }
 }
 
 /// Per-position flags for a comp layer at stack index `i` of `n` (#99 PR-B.3),
@@ -887,6 +1031,12 @@ pub struct ExrViewer {
     /// rather than always reporting the composite. Transient.
     pub last_image_rect_b: Option<egui::Rect>,
 
+    /// `(wipe_center, wipe_angle)` when the last comp frame drew a Wipe (#99 Slice 2b);
+    /// `None` otherwise. Wipe overlays both layers in one rect, so the pixel readout
+    /// splits on the wipe line ([`comp_hover_side`]) rather than on two rects.
+    /// Transient.
+    pub last_wipe: Option<([f32; 2], f32)>,
+
     /// Annotation overlay (#45) — all transient (per-session, never persisted).
     /// Shapes are stored in image space so they track pan/zoom.
     pub annotations: Vec<Annotation>,
@@ -993,6 +1143,7 @@ impl Default for ExrViewer {
             last_canvas_rect: None,
             last_image_rect: None,
             last_image_rect_b: None,
+            last_wipe: None,
             annotations: Vec::new(),
             anno_tool: AnnotationTool::None,
             anno_color: egui::Color32::RED,
@@ -2692,6 +2843,7 @@ impl ExrViewer {
                 // rather than the whole canvas (which includes the background).
                 // The classic A/B path has no comp Side-by-Side pane.
                 self.last_image_rect_b = None;
+                self.last_wipe = None;
                 self.last_image_rect = Some(crate::snapshot::active_area_rect(
                     rect,
                     disp_rect,
@@ -3311,22 +3463,12 @@ impl ExrViewer {
                 );
 
                 // Draw the rotated wipe line and handle.
-                let center_screen = egui::pos2(
-                    image_rect.min.x + image_rect.width() * self.wipe_center[0],
-                    image_rect.min.y + image_rect.height() * self.wipe_center[1],
-                );
-                let angle_rad = self.wipe_angle.to_radians();
-                // Line direction is perpendicular to the normal (cos, sin).
-                let dir = egui::vec2(-angle_rad.sin(), angle_rad.cos());
-                let max_dist = image_rect.width().hypot(image_rect.height());
-                let p1 = center_screen + dir * max_dist;
-                let p2 = center_screen - dir * max_dist;
-
+                let w = wipe_line_endpoints(image_rect, self.wipe_center, self.wipe_angle);
                 let alpha = (self.wipe_line_opacity * 255.0) as u8;
                 let color = egui::Color32::from_white_alpha(alpha);
 
-                p.line_segment([p1, p2], (2.0, color));
-                p.circle_filled(center_screen, 8.0, color);
+                p.line_segment([w.p1, w.p2], (2.0, color));
+                p.circle_filled(w.center, 8.0, color);
             }
             render_program::Arrangement::SideBySide => {
                 let bg_b_opt = pick_b();
@@ -3432,9 +3574,16 @@ impl ExrViewer {
         // Side-by-Side needs a resolved current layer; without one (hidden, soloed out,
         // trimmed blank) the caller already falls back, but guard here too so the
         // geometry below can rely on the pair.
-        let side_b = side_b
-            .filter(|_| matches!(arrangement, crate::render_program::Arrangement::SideBySide));
-        let is_sbs = side_b.is_some();
+        use crate::render_program::Arrangement;
+        let side_b = side_b.filter(|_| arrangement != Arrangement::Stacked);
+        let is_sbs = side_b.is_some() && arrangement == Arrangement::SideBySide;
+        // Wipe and Diff are single **2-input** draws (`tex_a` + `tex_b`, split or
+        // differenced in the shader) over one shared rect, not two placed draws. Both
+        // panes are single layers, so each binds directly as an image texture — no
+        // offscreen round-trip, and `composite_accum` stays 0 so the shader samples
+        // `tex_b` at image-local uv.
+        let is_wipe = side_b.is_some() && matches!(arrangement, Arrangement::Wipe { .. });
+        let is_diff = side_b.is_some() && arrangement == Arrangement::Diff;
         let render_state = gpu_resources.render_state();
         let (bw, bh) = base_size;
         let tex_size = egui::vec2(bw.max(1) as f32, bh.max(1) as f32);
@@ -3468,33 +3617,30 @@ impl ExrViewer {
         );
 
         let image_size = egui::vec2(tex_size.x * self.scale * par, tex_size.y * self.scale);
-        // Side-by-Side: the composite takes the left pane and the current layer the
-        // right, abutting at the divider. Otherwise the composite owns the whole rect.
-        let sxs = side_b.as_ref().zip(par_b).map(|(b, pb)| {
-            side_by_side_layout(
-                rect.center(),
-                self.translation,
-                self.scale,
-                image_size,
-                b.tex_size,
-                pb,
-                self.normalize_side_by_side,
-            )
-        });
-        let image_rect = match sxs {
-            Some(l) => l.rect_a,
-            None => egui::Rect::from_center_size(rect.center() + self.translation, image_size),
-        };
-        // The comp stack has no separate display window yet: display == image. In
-        // Side-by-Side the "display" region spans both panes, so the background gradient
-        // and the display transform cover the whole layout.
-        let disp_rect = match sxs {
-            Some(l) => l.rect_a.union(l.rect_b),
-            None => image_rect,
-        };
+        let panes = comp_pane_layout(
+            arrangement,
+            rect.center(),
+            self.translation,
+            self.scale,
+            image_size,
+            side_b.as_ref().zip(par_b).map(|(b, pb)| (b.tex_size, pb)),
+            self.normalize_side_by_side,
+        );
+        let image_rect = panes.image_rect;
+        let disp_rect = panes.disp_rect;
         self.last_image_rect = Some(image_rect);
-        // The current-layer pane, for the per-pane pixel readout (`pick_comp_side`).
-        self.last_image_rect_b = sxs.map(|l| l.rect_b);
+        // The pane-B rect, for the per-pane pixel readout (`pick_comp_side`). `None`
+        // outside Side-by-Side: Wipe overlays both layers in the *same* rect, so its
+        // readout splits via `wipe_side_at` (see `comp_hover_side`), and Diff is a
+        // false-colour blend of both.
+        self.last_image_rect_b = panes.rect_b;
+        // Drag the wipe handle / scroll to rotate, exactly as the A/B path does. Runs
+        // before the uniforms + the line are built, so a drag lands this same frame.
+        if is_wipe {
+            self.handle_wipe_interaction(ui, image_rect);
+        }
+        // Recorded *after* the drag, so the readout splits on the line as drawn.
+        self.last_wipe = is_wipe.then_some((self.wipe_center, self.wipe_angle));
 
         // Re-bake + upload the gradient LUTs on ramp change (stable handles otherwise).
         self.sync_gradient_luts(gpu_resources);
@@ -3502,9 +3648,9 @@ impl ExrViewer {
         let content = ui.ctx().content_rect();
         let mut uniform_data =
             self.build_frame_uniforms(image_rect, disp_rect, [content.width(), content.height()]);
-        // The composite is a stack, never a wipe — regardless of the A/B compare_mode
-        // the shared `build_frame_uniforms` reads.
-        uniform_data.is_wipe_mode = 0;
+        // A stack is never a wipe, whatever the A/B `compare_mode` the shared
+        // `build_frame_uniforms` reads says; the comp Wipe arrangement drives it here.
+        uniform_data.is_wipe_mode = u32::from(is_wipe);
 
         let gpu_state = gpu_resources.gpu_state.as_ref();
         let ctx = DrawCtx {
@@ -3529,8 +3675,43 @@ impl ExrViewer {
         // it (same layer, insertion order) — appending the callback last would paint
         // the composite straight over the line. Mirrors `draw_canvas_gpu`'s slot.
         let slot = painter.add(egui::Shape::Noop);
-        let n = draws.len();
-        for (i, d) in draws.iter().enumerate() {
+
+        // Wipe / Diff: one draw binding pane A as `tex_a` and pane B as `tex_b`, both at
+        // the same rect; the shader splits on the wipe line or emits the difference heat
+        // map. Diff is a display-space false colour, so `DrawCtx::draw` routes it past
+        // the accumulate path to an immediate callback (`ocio_draws` stays empty and the
+        // early return below is the exit) — the same opt-out the A/B path uses.
+        if is_wipe || is_diff {
+            let b = side_b.as_ref().expect("wipe/diff imply a resolved pane B");
+            ctx.draw(
+                &painter,
+                draws[0].bind_group.clone(),
+                Some(b.draw.bind_group.clone()),
+                rect,
+                image_rect,
+                is_diff,
+                false, // not an accumulate fold: tex_b is an image, not the scene
+                1.0,
+            );
+            if is_wipe {
+                // The draggable wipe line + handle, over the image (the reserved slot
+                // keeps the GPU quad underneath). Clipped to the image like the A/B
+                // path: the endpoints are deliberately pushed past the rect's diagonal
+                // so the line spans the image at any angle, and without the clip that
+                // overshoot runs across the whole viewport.
+                let wp = painter.with_clip_rect(image_rect);
+                let w = wipe_line_endpoints(image_rect, self.wipe_center, self.wipe_angle);
+                let color = egui::Color32::from_white_alpha((self.wipe_line_opacity * 255.0) as u8);
+                wp.line_segment([w.p1, w.p2], (2.0, color));
+                wp.circle_filled(w.center, 8.0, color);
+            }
+        }
+
+        // Wipe/Diff already emitted their single 2-input draw; the accumulate fold below
+        // is for Stacked (the whole composite) and Side-by-Side pane A.
+        let stack_draws = if is_wipe || is_diff { &[][..] } else { draws };
+        let n = stack_draws.len();
+        for (i, d) in stack_draws.iter().enumerate() {
             let (is_composite, is_top) = comp_layer_flags(i, n);
             // Neutralize the global view ops on every layer but the top, so exposure
             // / channel isolation apply once to the finished composite (PR-A.4).
@@ -3568,27 +3749,31 @@ impl ExrViewer {
         // callback lays it into the scene beside side A with `LoadOp::Load`. It gets the
         // global view ops like any standalone image (`neutral_view_ops` stays false), so
         // both panes are exposed and display-transformed identically.
-        let overlay_draws = match (sxs, side_b.as_ref()) {
-            (Some(l), Some(b)) => {
+        // Side-by-Side only — `rect_b` is `None` elsewhere, so Wipe/Diff (which already
+        // consumed pane B as `tex_b` above) can't also place it as a second pane.
+        let overlay_draws = match (panes.rect_b, side_b.as_ref()) {
+            (Some(rect_b), Some(b)) => {
                 ctx.draw(
                     &painter,
                     b.draw.bind_group.clone(),
                     None,
                     rect,
-                    l.rect_b,
+                    rect_b,
                     false, // is_diff
                     false, // is_composite — a plain placed copy, not an accumulate fold
                     b.draw.opacity,
                 );
                 let taken = std::mem::take(&mut *ctx.ocio_draws.borrow_mut());
                 // The divider, drawn over both panes like the A/B path's.
-                painter.line_segment(
-                    [
-                        egui::pos2(l.divider_x, disp_rect.min.y),
-                        egui::pos2(l.divider_x, disp_rect.max.y),
-                    ],
-                    (2.0, egui::Color32::GRAY),
-                );
+                if let Some(x) = panes.divider_x {
+                    painter.line_segment(
+                        [
+                            egui::pos2(x, disp_rect.min.y),
+                            egui::pos2(x, disp_rect.max.y),
+                        ],
+                        (2.0, egui::Color32::GRAY),
+                    );
+                }
                 taken
             }
             _ => Vec::new(),
@@ -4493,6 +4678,7 @@ impl ExrViewer {
         );
         self.last_image_rect = Some(image_rect);
         self.last_image_rect_b = None; // proxy is always a single image
+        self.last_wipe = None;
 
         // Paint the tone-baked proxy texture, upscaled via linear filtering into
         // the full image rect. egui uploads the texture to the GPU itself, so this
@@ -4890,6 +5076,106 @@ mod gui_tests {
         assert_eq!(
             pick_comp_side(egui::pos2(600.0, 300.0), l.rect_a, None),
             None
+        );
+    }
+
+    #[test]
+    fn comp_pane_layout_splits_only_in_side_by_side() {
+        use super::comp_pane_layout;
+        use crate::render_program::Arrangement;
+        let center = egui::pos2(500.0, 300.0);
+        let z = egui::Vec2::ZERO;
+        let size_a = egui::vec2(200.0, 100.0);
+        let b = Some((egui::vec2(100.0, 100.0), 1.0));
+
+        // Side-by-Side: two abutting panes, a divider, and a display region spanning
+        // both.
+        let sbs = comp_pane_layout(Arrangement::SideBySide, center, z, 1.0, size_a, b, false);
+        let rect_b = sbs.rect_b.expect("side-by-side has a second pane");
+        assert_eq!(sbs.image_rect.width(), 200.0);
+        assert_eq!(rect_b.min.x, sbs.image_rect.max.x, "panes abut");
+        assert_eq!(sbs.divider_x, Some(rect_b.min.x));
+        assert_eq!(sbs.disp_rect, sbs.image_rect.union(rect_b));
+
+        // Wipe and Diff combine both layers in ONE rect: pane A owns the whole image,
+        // there is no second rect, and no divider. Regression guard — keying the split
+        // on "side B exists" (it does for every compare) squeezed these into the left
+        // half and drew a stray second pane beside them.
+        for arr in [Arrangement::Wipe { position: 0.5 }, Arrangement::Diff] {
+            let p = comp_pane_layout(arr, center, z, 1.0, size_a, b, false);
+            assert_eq!(p.rect_b, None, "{arr:?} has no second pane");
+            assert_eq!(p.divider_x, None, "{arr:?} has no divider");
+            assert_eq!(p.image_rect.width(), 200.0, "{arr:?} keeps the full rect");
+            assert_eq!(p.image_rect.center(), center, "{arr:?} stays centered");
+            assert_eq!(p.disp_rect, p.image_rect, "{arr:?} display == image");
+        }
+
+        // Stacked ignores side B entirely, present or not.
+        let st = comp_pane_layout(Arrangement::Stacked, center, z, 1.0, size_a, b, false);
+        assert_eq!(st.rect_b, None);
+        assert_eq!(st.image_rect.center(), center);
+        // Side-by-Side with no resolvable pane B falls back to the single rect.
+        let none = comp_pane_layout(Arrangement::SideBySide, center, z, 1.0, size_a, None, false);
+        assert_eq!(none.rect_b, None);
+        assert_eq!(none.image_rect.center(), center);
+    }
+
+    #[test]
+    fn wipe_line_endpoints_centers_and_spans_the_image() {
+        use super::wipe_line_endpoints;
+        let rect = egui::Rect::from_min_size(egui::pos2(100.0, 50.0), egui::vec2(200.0, 100.0));
+
+        // Centered, 0°: a vertical line through the rect's middle.
+        let w = wipe_line_endpoints(rect, [0.5, 0.5], 0.0);
+        assert_eq!(w.center, egui::pos2(200.0, 100.0));
+        assert!((w.p1.x - w.center.x).abs() < 1e-3, "vertical at 0°: {w:?}");
+        assert!((w.p2.x - w.center.x).abs() < 1e-3, "vertical at 0°: {w:?}");
+        // Extended past the diagonal, so it always spans the image.
+        let diag = rect.width().hypot(rect.height());
+        assert!((w.p1 - w.center).length() >= diag - 1e-3);
+
+        // The normalized centre maps across the rect.
+        let off = wipe_line_endpoints(rect, [0.25, 0.75], 0.0);
+        assert_eq!(off.center, egui::pos2(150.0, 125.0));
+
+        // 90°: the line runs horizontally (perpendicular to the (cos, sin) normal).
+        let w90 = wipe_line_endpoints(rect, [0.5, 0.5], 90.0);
+        assert!(
+            (w90.p1.y - w90.center.y).abs() < 1e-3,
+            "horizontal: {w90:?}"
+        );
+    }
+
+    #[test]
+    fn comp_hover_side_splits_on_the_wipe_line_and_falls_back_to_rects() {
+        use super::{CompSide, comp_hover_side};
+        let rect = egui::Rect::from_min_size(egui::pos2(100.0, 50.0), egui::vec2(200.0, 100.0));
+        let wipe = Some(([0.5f32, 0.5f32], 0.0f32));
+
+        // At 0° the normal is +x, so right of centre is tex_b (pane B) — matching
+        // `fs_main`'s `dist >= 0` test.
+        assert_eq!(
+            comp_hover_side(egui::pos2(250.0, 100.0), rect, None, wipe),
+            Some(CompSide::B)
+        );
+        assert_eq!(
+            comp_hover_side(egui::pos2(150.0, 100.0), rect, None, wipe),
+            Some(CompSide::A)
+        );
+        // Outside the image → no readout at all.
+        assert_eq!(
+            comp_hover_side(egui::pos2(50.0, 100.0), rect, None, wipe),
+            None
+        );
+        // No wipe → the Side-by-Side two-rect split.
+        let rect_b = egui::Rect::from_min_size(egui::pos2(300.0, 50.0), egui::vec2(200.0, 100.0));
+        assert_eq!(
+            comp_hover_side(egui::pos2(350.0, 100.0), rect, Some(rect_b), None),
+            Some(CompSide::B)
+        );
+        assert_eq!(
+            comp_hover_side(egui::pos2(150.0, 100.0), rect, Some(rect_b), None),
+            Some(CompSide::A)
         );
     }
 

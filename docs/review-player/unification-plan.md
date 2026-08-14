@@ -1,10 +1,10 @@
 # Layer-Stack Unification — making the layer model core to floki
 
 > Status: **in progress** (updated 2026-08). Phases 1–2 + the R-series are done; the R4 collapse is
-> underway — open/drop = add a layer, the comp-path readout / EXR Info / histogram, and **comp
-> Side-by-Side** (render-retire Slice 2a) have landed. Next: Wipe + Diff (Slice 2b), then the A/B
-> retire. Resume point and concrete next steps: the **R4 handoff** section below. Supersedes the
-> ad-hoc PR-C/PR-D framing.
+> underway — open/drop = add a layer, the comp-path readout / EXR Info / histogram, and **all four
+> compare arrangements** (render-retire Slices 2a+2b) have landed, so nothing user-visible is left on
+> the A/B path. Next: **Slice 3, the A/B retire**. Resume point and concrete next steps: the **R4
+> handoff** section below. Supersedes the ad-hoc PR-C/PR-D framing.
 > Builds on the shipped additive Layers panel (epic #99, PR-B) and the layer model spine
 > (`src/layer.rs`, #103). See `layer-model.md` for the model itself.
 
@@ -257,13 +257,30 @@ non-accumulate 2-input pass reintroduced.
   - `Normalize Size` (the existing shared `normalize_side_by_side`) sits beside the `vs:` picker.
     New pure tests: `pick_comp_side`, `comp_layer_draw`, `default_compare_b`;
     `side_by_side_layout` stops being dead code and `framing_bounds`' test moves to the bool.
-- **Slice 2b — Wipe + Diff.** Still needs its own mechanism, and the overlay pass does **not**
-  generalize to it: wipe/diff are single-pass **2-input** shader draws (`tex_a`+`tex_b`,
-  `is_wipe_mode`/`is_diff`), and side A now lives *in* `scene_view` — which a wipe pass would have to
-  read and write at once. Expect either a third scene target or a wipe pass that samples the
-  accumulation via `accum_tex_bg` into the other ping-pong target. `draw_comp_composite`'s hardwired
-  `is_wipe_mode = 0` / `is_diff = false` become arrangement-dependent there. Diff also opts out of
-  OCIO (display-space heat map).
+- **[DONE] Slice 2b — Wipe + Diff.** This section previously predicted 2b would need "a third scene
+  target, or a wipe pass that samples the accumulation via `accum_tex_bg`", because side A lived *in*
+  `scene_view` and a 2-input wipe would have to read and write it at once. **That was already stale
+  when written:** the layer-vs-layer revision (Slice 2 note) made pane A a plain layer texture, so
+  the hazard evaporated. Wipe and Diff are just what they are on the A/B path — a **single 2-input
+  draw**, pane A as `tex_a` and pane B as `tex_b`, at one shared rect, with `is_wipe_mode` / `is_diff`
+  doing the work in `fs_main`. `composite_accum` stays 0, so `tex_b` is sampled at image-local uv.
+  **No new GPU resources here either.**
+  - Wipe stays colour-managed: it is one accumulate draw (`n = 1`), so pass 1 binds pane B as its
+    `tex_b` and the display stage runs normally. Diff keeps the A/B path's opt-out — `DrawCtx::draw`
+    routes `is_diff` past the accumulate path to an immediate `ExrCallback`, so `ocio_draws` comes
+    back empty and the existing early return *is* the exit. `is_wipe_mode = 0` /
+    `is_diff = false` in `draw_comp_composite` became arrangement-dependent.
+  - `wipe_line_endpoints` extracted **pure + unit-tested** and now shared by the A/B path, so the two
+    can't drift; `handle_wipe_interaction` (drag the handle, scroll to rotate) is reused as-is.
+  - Wipe overlays both layers in **one** rect, so the per-pane readout can't key on `last_image_rect_b`.
+    New pure `wipe_side_at` mirrors `fs_main`'s split exactly (rect-relative pixels projected on the
+    `(cos θ, sin θ)` normal, `dist >= 0` ⇒ `tex_b`), and `comp_hover_side` composes it with the
+    Side-by-Side two-rect case behind one call. `ExrViewer::last_wipe` carries the frame's
+    centre/angle to the readout.
+  - **Follow-up:** the Diff controls (`diff_multiplier` / `diff_metric` / `diff_floor`) and the wipe
+    angle / line-opacity sliders still live only in the A/B compare toolbar — the comp bar exposes
+    neither, so comp Diff runs on defaults. Surface them in `draw_comp_layer_bar` (or fold that
+    toolbar in) with the Slice 3 retire.
 - **Slice 3 — retire the A/B path.** Delete `emit_mode_draws`, `gpu_textures_b`, `pick_b`,
   `render_program.rs` (keep/relocate only `Arrangement`, or fold into `layer::Layout`), `CompareMode`,
   the `configure` shim, and the `_b`/`comp_*` duplication; route `draw_central_canvas` through the
@@ -272,8 +289,15 @@ non-accumulate 2-input pass reintroduced.
   deleted symbol for hidden readers (status bar / EXR Info / histogram were re-homed into the comp
   path). Persistence (`Vec<LayerPersist>`, never `#[serde(flatten)]`) is an independent fast-follow.
 
-**Order:** 2a **[DONE]** → 2b → 3 (Slice 1 dropped). Each slice CI-green (default + `system-ocio`), no
-throwaway code.
+**Order:** 2a **[DONE]** → 2b **[DONE]** → 3 (Slice 1 dropped). Each slice CI-green (default +
+`system-ocio`), no throwaway code.
+
+> **Retrospective on 2a/2b (2026-08-14).** Both slices were planned around GPU work that turned out
+> to be unnecessary — two new render targets + a pipeline + a `two_group` callback mode for 2a, a
+> third scene target for 2b. Both estimates came from the same wrong premise: that a compare pane is
+> *the composite*. Once each pane is a single layer, 2a is one extra `LoadOp::Load` pass and 2b is
+> zero new GPU code. **The expensive question was a UX question, not a rendering one** — worth
+> settling what the panes actually show before designing how to render them.
 
 ### Phase 4 / R4 — collapse to one model  ← **RESUME HERE (handoff below)**
 
@@ -310,14 +334,17 @@ bottom timeline tracks. R4 finishes the collapse:
   classic `viewer.ui` A/B path is only reachable with an **empty** stack, which no longer happens via
   the UI (open/drop always add a layer). It is *retained, not deleted* — the render-retire step below
   revives compare modes as `Arrangement`s and **then** the `_b`/`comp_*` deletion removes it.
-- **RESUME AT — render-retire (Phase 3), Slice 2b.** Side-by-Side is back in the comp path (Slice 2a,
-  above) and the histogram is ported; **Wipe + Diff are what remain** before Slice 3. They do *not*
-  ride on 2a's overlay pass — see the 2b bullet for why (2-input shader draws vs. side A living in
-  `scene_view`). THEN Slice 3: delete `emit_mode_draws` / `gpu_textures_b` / `pick_b` /
-  `render_program.rs` / the `_b`/`comp_*` duplication + the `CompareMode`→`configure` shim, and drop
-  the `#[allow(dead_code)]` on `open_file` / `update_base_layer`. Persistence (`Vec<LayerPersist>`,
-  path + name/blend/opacity/enabled/solo/aov/trim; NEVER `#[serde(flatten)]`) is independent —
-  landable any time.
+- **RESUME AT — render-retire (Phase 3), Slice 3.** **All four arrangements are back in the comp
+  path** (Stacked / Side-by-Side / Wipe / Diff, Slices 2a+2b) and the readout / EXR Info / histogram
+  are ported, so nothing user-visible is left on the A/B path. Slice 3: delete `emit_mode_draws` /
+  `gpu_textures_b` / `pick_b` / `render_program.rs` (keep `Arrangement`) / the `_b`/`comp_*`
+  duplication + the `CompareMode`→`configure` shim, and drop the `#[allow(dead_code)]` on
+  `open_file` / `update_base_layer`. Grep each deleted symbol for hidden readers first.
+  **Carry over from 2b:** the Diff controls (`diff_multiplier`/`diff_metric`/`diff_floor`) and the
+  wipe angle / line-opacity sliders currently exist *only* in the A/B compare toolbar, so they must
+  be re-homed into `draw_comp_layer_bar` rather than deleted with it. Persistence
+  (`Vec<LayerPersist>`, path + name/blend/opacity/enabled/solo/aov/trim; NEVER `#[serde(flatten)]`)
+  is independent — landable any time.
 - **Readout fast-follows:** the floating cursor tooltip (`viewer.rs` `Window::new("Pixel Tooltip")` —
   factor its swatch/HSVL block out and reuse); expose the aperture combo (1 / 3×3 / 9×9) in comp mode.
 - **Non-blocking follow-ups:** reuse A's T2 ring in `ensure_base_frame`; a `.cube` LUT in the OCIO-off
@@ -493,6 +520,18 @@ groundwork the final collapse (**R4**) sits on. All in `src/app.rs` + the GPU re
   layer and renames the status row). `Normalize Size` surfaced beside the `Compare:` combo. New pure
   tests: `pick_comp_side`, `comp_side_b_draw`; `side_by_side_layout` is no longer dead code.
 
+- **Wipe + Diff in the comp path** (render-retire Slice 2b) — completes the compare set, so the A/B
+  path has nothing user-visible left. Both are **single 2-input draws** (pane A as `tex_a`, pane B as
+  `tex_b`, one shared rect, `is_wipe_mode` / `is_diff` doing the work in `fs_main`), which needed
+  **no new GPU code at all** — the layer-vs-layer model from 2a had already removed the read/write
+  hazard this slice was budgeted for. Wipe rides the accumulate path as a single draw and stays
+  colour-managed; Diff keeps the A/B opt-out (immediate `ExrCallback`, empty `ocio_draws`, existing
+  early return). `wipe_line_endpoints` extracted pure and shared with the A/B path so they can't
+  drift; `handle_wipe_interaction` reused. Because Wipe overlays both layers in one rect, the readout
+  splits on the line via the new pure `wipe_side_at` (mirroring `fs_main` exactly) behind a single
+  `comp_hover_side`, fed by `ExrViewer::last_wipe`. Follow-up: the Diff + wipe sliders still live
+  only in the A/B toolbar, so Slice 3 must re-home rather than delete them.
+
 ## Execution checklist — Phase 1  *(complete; kept for reference — resume point is Phase 4 / R4 below)*
 
 Symbols are stable; line numbers drift (grep the name). Keep A/B pinned to
@@ -560,10 +599,11 @@ Phase 2 section above for the slice-by-slice breakdown.
 renders standalone in any colour mode, drives the transport, includes the base plate, and the panel
 is the Chaos-Player bottom timeline tracks. See the "Render foundation" progress-log block above.
 
-**Resume next → render-retire (Phase 3) Slice 2b, then the `_b`/`comp_*` deletion.** Open/drop = add a
-layer, the comp-path pixel readout, the histogram, and **comp Side-by-Side** (Slice 2a) have landed;
-see the **R4 handoff** above for the concrete resume steps and sequencing. In short: bring **Wipe +
-Diff** into the comp path (they need their own mechanism, not 2a's overlay pass), then delete the
-`_b`/`comp_*` duplication and drop the `#[allow(dead_code)]` on `open_file` / `update_base_layer`.
+**Resume next → render-retire (Phase 3) Slice 3, the `_b`/`comp_*` deletion.** Open/drop = add a
+layer, the comp-path pixel readout, EXR Info, the histogram, and **all four compare arrangements**
+(Slices 2a+2b) have landed, so nothing user-visible remains on the A/B path; see the **R4 handoff**
+above for the concrete resume steps. In short: delete `emit_mode_draws` / `render_program.rs` /
+`CompareMode` / the `_b`/`comp_*` duplication and drop the `#[allow(dead_code)]` on `open_file` /
+`update_base_layer` — re-homing the Diff + wipe sliders into the comp bar rather than deleting them.
 Layer persistence (`Vec<LayerPersist>`) is independent. Readout fast-follows: the floating cursor
 tooltip + the aperture combo in comp mode.
