@@ -2,9 +2,11 @@
 
 > Status: **in progress** (updated 2026-08). Phases 1–2 + the R-series are done; the R4 collapse is
 > underway — open/drop = add a layer, the comp-path readout / EXR Info / histogram, and **all four
-> compare arrangements** (render-retire Slices 2a+2b) have landed, so nothing user-visible is left on
-> the A/B path. Next: **Slice 3, the A/B retire**. Resume point and concrete next steps: the **R4
-> handoff** section below. Supersedes the ad-hoc PR-C/PR-D framing.
+> compare arrangements** (render-retire Slices 2a+2b) have landed. Next: **Slice 3, rescoped after an
+> audit** — the A/B path is already unreachable, so the deletion is cheap, but the viewport chrome
+> that went dead with it (exposure/gamma above all) is restored first, in sub-slices 3a–3h. Resume
+> point and concrete next steps: the **R4 handoff** section below. Supersedes the ad-hoc PR-C/PR-D
+> framing.
 > Builds on the shipped additive Layers panel (epic #99, PR-B) and the layer model spine
 > (`src/layer.rs`, #103). See `layer-model.md` for the model itself.
 
@@ -153,11 +155,11 @@ accumulate ping-pong renders in any colour mode (**R1/R2**), threads the live fr
   `sample_comp_readout` + the pure `top_sample_source` / `comp_hover_pixel` helpers; the status-bar
   row reuses `draw_nuke_status_line`). Samples the **top layer's raw source pixels** (the A/B
   analogue), not the composited GPU result. The **histogram** has since landed too.
-- **[PARTLY DONE]** keep `Arrangement` as the viewport axis; lift Wipe / Side-by-Side / Diff geometry
-  out of the A/B-only `emit_mode_draws` arms into arrangement-generic code (#104). **This is where the
-  compare modes come back** for the comp path. **Side-by-Side is done** (Slice 2a below — and *not*
-  by making `emit_mode_draws` generic; the comp path grew its own geometry and the A/B arm stays put
-  until Slice 3 deletes it). Wipe + Diff remain (Slice 2b).
+- **[DONE]** keep `Arrangement` as the viewport axis; lift Wipe / Side-by-Side / Diff geometry out of
+  the A/B-only `emit_mode_draws` arms into arrangement-generic code (#104). **This is where the
+  compare modes came back** for the comp path — all four, via Slices 2a+2b below, and *not* by making
+  `emit_mode_draws` generic: the comp path grew its own geometry (`comp_pane_layout`) and the A/B arms
+  stay put until Slice 3h deletes them.
 
 > **CORRECTION (2026-08-14):** the first two TODO bullets above are **stale**. `Arrangement` already
 > exists as a real enum (`render_program.rs`, `Stacked | Wipe{position} | SideBySide | Diff`) and is
@@ -281,13 +283,104 @@ non-accumulate 2-input pass reintroduced.
     angle / line-opacity sliders still live only in the A/B compare toolbar — the comp bar exposes
     neither, so comp Diff runs on defaults. Surface them in `draw_comp_layer_bar` (or fold that
     toolbar in) with the Slice 3 retire.
-- **Slice 3 — retire the A/B path.** Delete `emit_mode_draws`, `gpu_textures_b`, `pick_b`,
-  `render_program.rs` (keep/relocate only `Arrangement`, or fold into `layer::Layout`), `CompareMode`,
-  the `configure` shim, and the `_b`/`comp_*` duplication; route `draw_central_canvas` through the
-  comp path only (migrate the Contact-Sheet `viewer.ui` shim). `open_file` → **deleted**;
-  `update_base_layer` → **revived** (live base-plate infra, drop the `#[allow(dead_code)]`). Grep each
-  deleted symbol for hidden readers (status bar / EXR Info / histogram were re-homed into the comp
-  path). Persistence (`Vec<LayerPersist>`, never `#[serde(flatten)]`) is an independent fast-follow.
+- **Slice 3 — retire the A/B path.** ~~Delete `emit_mode_draws`, `gpu_textures_b`, `pick_b`,
+  `render_program.rs`, `CompareMode`, the `configure` shim, and the `_b`/`comp_*` duplication; route
+  `draw_central_canvas` through the comp path only (migrate the Contact-Sheet `viewer.ui` shim).~~
+  **RESCOPED (2026-08-14) after a full audit — see "Slice 3, rescoped" below.** The deletion itself is
+  nearly free because the A/B path is *already unreachable at runtime*; the real work is restoring the
+  viewport chrome the R4 collapse silently dropped with it.
+
+#### Slice 3, rescoped — restore first, then delete  (audited + locked 2026-08-14)
+
+**The finding that reframes this slice.** `ExrApp::open_file` has **zero callers**: since the R4
+collapse (`03ec2cf`) every open/drop routes through `open_layer` → `add_comp_source`, which never sets
+`self.exr_data`. Slot A is therefore permanently `None`, so `ExrViewer::ui` — which hosts nearly all
+the viewport chrome — never runs. Its two guards (`show_contact_sheet && exr_data.is_some()`, and
+`comp_stack.is_empty() && loaded_file.is_some()`) can no longer be satisfied through the UI.
+
+So the following are **already dead on this branch**, not "will break when deleted":
+
+| Already unreachable | Note |
+|---|---|
+| **Exposure / gamma / sRGB** | No widget, no hotkey (`primary_row` + `handle_hotkeys` are both `ui`-only). `draw_comp_composite` still *reads* `self.exposure`/`self.gamma`, so they are frozen at whatever persisted. **The severe one.** |
+| **Background + gradient-editor windows** | View ▸ "Viewport Background…" (`app.rs`) only sets the flag; the window bodies are drawn from `ExrViewer::ui`. Already a dead menu click. |
+| **Annotations (#45)** | `handle_annotation_input` / `draw_annotations` / `annotation_text_popup` are in the legacy branch only; `src/annotation.rs` is orphaned. `handle_canvas_interaction` still checks `anno_tool`, so a tool you cannot select would suppress comp pan. |
+| **Contact Sheet** | Gate never true. `draw_contact_sheet` itself is A/B-forked but needs **no viewport** — only `&ExrData` + a layer index + `ThumbnailTone` + the thumbnail cache. |
+| **Blink compare** | Toggle, `Space`, `blink_interval`, and the `apply_blink_mode` driver. |
+| **F11 fullscreen / `Esc`** | `viewer.fullscreen` is still *read* by `app.rs` to hide the menu bar + side panel, so the plumbing is half-alive; only the handler is gone. |
+| **Diff gain / metric / floor / colormap, wipe line opacity** | Comp Diff + Wipe consume all of these with no UI. Wipe centre/angle survive via the drag handle. |
+| **Proxy first-paint, sample aperture, Pixel Tooltip, PAR override, overscan opacity, display-window + bbox overlays, format readout** | All `ui`-only. Overscan is additionally a no-op in comp (`overscan_factor` hardcoded `1.0`). |
+
+**Decision (user, 2026-08-14): restore first, then delete** — the app is never more broken than it is
+now, and each restore is independently verifiable. **All of the above are restored**, none dropped.
+
+Sub-slices, each its own CI-green commit:
+
+- **3a — Tone + sampling controls.** `exposure`, `gamma`, `srgb`, the `⟲` reset, `sample_aperture`,
+  and the `pixel_aspect_override` "custom factor" into `draw_comp_layer_bar` (a `Display ▾` menu keeps
+  the bar short). Re-home the `E` / `Shift+G` hotkeys onto the comp-reachable
+  `handle_channel_hotkeys` (already called from `draw_comp_central`). **Also fix here:**
+  `draw_comp_composite` sets `last_image_rect` raw while the legacy path clamped it via
+  `snapshot::active_area_rect` — so a zoomed comp snapshot can crop past the canvas into the panels.
+  Wire `active_area_rect` into the comp path or it goes dead and locks the bug in.
+- **3b — App-owned floating windows.** Move `gradient_editor_window` + `background_window` out of
+  `ExrViewer::ui` so `ExrApp` draws them unconditionally. Fixes the already-dead View-menu item and
+  removes two `ui` dependencies.
+- **3c — Compare parameters.** The `mode_param_row` analogue for the comp bar, shown per
+  `Arrangement`: Diff gain / metric / floor / colormap (+ the legend and `Edit gradient…` hook), and
+  wipe Centre X/Y / Angle / **Line Opacity** (a persisted `0.0` currently makes the comp wipe line
+  invisible with no way back).
+- **3d — Annotations into the comp path.** `handle_annotation_input` + `draw_annotations` +
+  `annotation_text_popup` + `annotation_toolbar` + the `Esc`-cancel. Un-orphans `src/annotation.rs`
+  and resolves the `anno_tool`-suppresses-pan trap.
+- **3e — Contact Sheet independence.** Drop the `is_a`/`_b` fork and the `compare_mode` dispatch
+  (`viewer.rs` ~2620/2640/2653); drive **one sheet per comp source**, clicking a cell selecting that
+  layer's AOV (`CompSource.aov`) instead of writing `compare_mode`. It must carry
+  `sync_texture_caches` (the only thing sizing `thumbnails`/`gpu_thumbnails` — `draw_contact_sheet`
+  indexes them unguarded and will panic without it), and `drain_thumb_frees` +
+  `invalidate_thumbnails_on_ocio_change` must keep running every frame once `ui` stops doing it.
+  Re-point the app-driven invalidations (`settle_to_full`, the swap paths) at comp sources. This is
+  what retires the `viewer.ui` shim in `draw_central_canvas`.
+- **3f — Global hotkeys.** `F11` fullscreen + `Esc` re-homed to an app-level handler (`1` / `2` /
+  `Space` die with A/B — `Space` is playback's in comp). Update the Help window, which still
+  advertises them.
+- **3g — Blink as an `Arrangement`.** Reframe `apply_blink_mode`'s `compare_mode` override as
+  `Arrangement::Blink`: one draw alternating pane A / pane B on `blink_interval`, reusing the same
+  two-pane resolution (`comp_layer_draw` × 2) that Side-by-Side and Wipe already use. Needs a repaint
+  request on the interval.
+- **3h — The deletion** (the mechanical bulk, now safe). Delete `emit_mode_draws`, `draw_canvas_gpu`,
+  `ExrViewer::ui`'s legacy `else` branch (and then `ui` itself), `gpu_textures`/`gpu_textures_b` +
+  `pick_b`, `ExrViewer::layer_stack`/`layer_ids`/`render_program()`, all of `render_program.rs`
+  (dropping `mod render_program;` from `lib.rs`), `CompareMode` + `has_mode_params` + `primary_row` +
+  `mode_param_row`, the `_b` state (`exr_data_b`, `swap_b_frame`, `sync_b_to_a`, `request_b_frame`,
+  `map_b_frame`/`map_b_frame_offset`, `B_SOURCE`, `b()`/`b_mut()`, `histogram_b`,
+  `last_sampled_val_b`, the `thumbnails_b`/`invalidate_reference_*` family), and `open_file` /
+  `update_base_layer` / `unload` (keeping `remove_base_layer` + `reset_viewer_session`, which are
+  live).
+  - **`Arrangement` survives** — move it to `src/layer.rs` beside its model twin `layer::Layout`. 20
+    live comp-path references (`viewer.rs` `comp_pane_layout` + `draw_comp_composite`; `app.rs`
+    `comp_arrangement`, the `Compare:` combo, `draw_comp_central`).
+  - **Three live readers that must not be left dangling:** `build_frame_uniforms` reads
+    `compare_mode` for `is_wipe_mode` (comp overrides it right after — make it a constant `0`);
+    `invalidate_active_viewport` (`gpu_textures.fill(None)`) is called from `swap_image_arc` on every
+    A frame swap and would become a silent no-op — delete the call site too; `sync_b_to_a` is called
+    from `request_sequence_frame` + `settle_to_full`, both on the live playback chokepoint.
+  - **Tests: ~27 to delete or rewrite.** All 10 in `render_program.rs`; in `viewer.rs` `gui_tests`
+    delete the compare/blink/`has_mode_params`/`render_program` tests and rewrite the three that call
+    `viewer.ui` (`ui_renders_all_compare_modes…`, and the two contact-sheet ones, re-pointed at 3e's
+    entry point) — **keep** `comp_pane_layout_splits_only_in_side_by_side` (retarget the
+    `Arrangement` import) and `channel_hotkeys_work_via_comp_entry_point`; in `app.rs` delete the
+    B-reference/lockstep tests plus the `deliver_b_frame` / `arm_b_sequence` helpers; in
+    `playback.rs` the two `map_b_frame*` tests.
+
+**Verification per sub-slice:** `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D
+warnings` (default **and** `--no-default-features`, the CI config), `cargo test --all-targets`, plus a
+manual smoke of the specific control restored. 3h additionally needs a full pass over every
+arrangement + playback, since it touches the shared decode path.
+
+**CHANGELOG:** 3a–3g are user-visible *fixes* for regressions introduced by the R4 collapse on this
+branch. If the branch ships as one release they need no separate entries; if any of it has already
+shipped, they are `### Fixed` items.
 
 **Order:** 2a **[DONE]** → 2b **[DONE]** → 3 (Slice 1 dropped). Each slice CI-green (default +
 `system-ocio`), no throwaway code.
@@ -334,17 +427,17 @@ bottom timeline tracks. R4 finishes the collapse:
   classic `viewer.ui` A/B path is only reachable with an **empty** stack, which no longer happens via
   the UI (open/drop always add a layer). It is *retained, not deleted* — the render-retire step below
   revives compare modes as `Arrangement`s and **then** the `_b`/`comp_*` deletion removes it.
-- **RESUME AT — render-retire (Phase 3), Slice 3.** **All four arrangements are back in the comp
-  path** (Stacked / Side-by-Side / Wipe / Diff, Slices 2a+2b) and the readout / EXR Info / histogram
-  are ported, so nothing user-visible is left on the A/B path. Slice 3: delete `emit_mode_draws` /
-  `gpu_textures_b` / `pick_b` / `render_program.rs` (keep `Arrangement`) / the `_b`/`comp_*`
-  duplication + the `CompareMode`→`configure` shim, and drop the `#[allow(dead_code)]` on
-  `open_file` / `update_base_layer`. Grep each deleted symbol for hidden readers first.
-  **Carry over from 2b:** the Diff controls (`diff_multiplier`/`diff_metric`/`diff_floor`) and the
-  wipe angle / line-opacity sliders currently exist *only* in the A/B compare toolbar, so they must
-  be re-homed into `draw_comp_layer_bar` rather than deleted with it. Persistence
-  (`Vec<LayerPersist>`, path + name/blend/opacity/enabled/solo/aov/trim; NEVER `#[serde(flatten)]`)
-  is independent — landable any time.
+- **RESUME AT — render-retire (Phase 3), Slice 3a.** All four arrangements are back in the comp path
+  (Slices 2a+2b) and the readout / EXR Info / histogram are ported. **Slice 3 was audited and
+  rescoped** — see "Slice 3, rescoped" above for the full sub-slice plan and the audit table. The
+  short version: `open_file` has no callers, so `ExrViewer::ui` is already unreachable and a large
+  amount of viewport chrome (**exposure / gamma / sRGB** above all, plus the background + gradient
+  windows, annotations, the Contact Sheet, blink, F11/Esc, and the diff/wipe parameters) is *already
+  dead on this branch*. Order: **3a** tone controls (+ the `active_area_rect` snapshot-crop fix) →
+  **3b** app-owned windows → **3c** compare params → **3d** annotations → **3e** Contact Sheet
+  independence (retires the `viewer.ui` shim) → **3f** F11/Esc → **3g** blink as an `Arrangement` →
+  **3h** the deletion. Persistence (`Vec<LayerPersist>`, path + name/blend/opacity/enabled/solo/aov/
+  trim; NEVER `#[serde(flatten)]`) is independent — landable any time.
 - **Readout fast-follows:** the floating cursor tooltip (`viewer.rs` `Window::new("Pixel Tooltip")` —
   factor its swatch/HSVL block out and reuse); expose the aperture combo (1 / 3×3 / 9×9) in comp mode.
 - **Non-blocking follow-ups:** reuse A's T2 ring in `ensure_base_frame`; a `.cube` LUT in the OCIO-off
@@ -599,11 +692,12 @@ Phase 2 section above for the slice-by-slice breakdown.
 renders standalone in any colour mode, drives the transport, includes the base plate, and the panel
 is the Chaos-Player bottom timeline tracks. See the "Render foundation" progress-log block above.
 
-**Resume next → render-retire (Phase 3) Slice 3, the `_b`/`comp_*` deletion.** Open/drop = add a
-layer, the comp-path pixel readout, EXR Info, the histogram, and **all four compare arrangements**
-(Slices 2a+2b) have landed, so nothing user-visible remains on the A/B path; see the **R4 handoff**
-above for the concrete resume steps. In short: delete `emit_mode_draws` / `render_program.rs` /
-`CompareMode` / the `_b`/`comp_*` duplication and drop the `#[allow(dead_code)]` on `open_file` /
-`update_base_layer` — re-homing the Diff + wipe sliders into the comp bar rather than deleting them.
+**Resume next → render-retire (Phase 3) Slice 3a.** Open/drop = add a layer, the comp-path pixel
+readout, EXR Info, the histogram, and **all four compare arrangements** (Slices 2a+2b) have landed.
+Slice 3 has been **audited and rescoped**: because `open_file` has no callers, `ExrViewer::ui` is
+already unreachable, so the A/B deletion is nearly free — but a large amount of viewport chrome
+(exposure/gamma/sRGB, the background + gradient windows, annotations, the Contact Sheet, blink,
+F11/Esc, the diff/wipe parameters) went dead with it and must be **restored first**. See "Slice 3,
+rescoped" for the audit table and the 3a–3h sub-slice order.
 Layer persistence (`Vec<LayerPersist>`) is independent. Readout fast-follows: the floating cursor
 tooltip + the aperture combo in comp mode.
