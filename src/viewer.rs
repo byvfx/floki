@@ -3350,12 +3350,14 @@ impl ExrViewer {
     /// rect (per-layer placement is the follow-up, #102/#104), so a differently-
     /// sized layer is stretched to fit for now.
     ///
-    /// Requires OCIO active (the ping-pong lives on the OCIO path) + a GPU; the
-    /// caller ([`crate::app::ExrApp::draw_comp_central`]) gates on both and shows a
-    /// fallback message otherwise. A no-op when `draws` is empty. Global tone
-    /// (exposure / gamma / channel isolation / background) comes from the shared
-    /// viewer fields, so it applies to the composite exactly as to a single image;
-    /// per-composite tone controls land with the row controls (PR-B.4).
+    /// Renders in **any** colour mode (#99 R2): OCIO on → the OCIO transform; OCIO
+    /// off → the sRGB display-encode pass (`use_display_encode`), so it no longer
+    /// requires OCIO active. Requires a GPU; the caller
+    /// ([`crate::app::ExrApp::draw_comp_central`]) gates on that (and a non-empty
+    /// stack) and shows a fallback message otherwise. A no-op when `draws` is empty.
+    /// Global tone (exposure / gamma / channel isolation / background) comes from the
+    /// shared viewer fields, so it applies to the composite exactly as to a single
+    /// image; per-composite tone controls land with the row controls (PR-B.4).
     pub(crate) fn draw_comp_composite(
         &mut self,
         ui: &mut egui::Ui,
