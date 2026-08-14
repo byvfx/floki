@@ -155,6 +155,52 @@ accumulate ping-pong renders in any colour mode (**R1/R2**), threads the live fr
   of the A/B-only `emit_mode_draws` arms into arrangement-generic code (#104). **This is where the
   compare modes come back** for the comp path.
 
+> **CORRECTION (2026-08-14):** the first two TODO bullets above are **stale**. `Arrangement` already
+> exists as a real enum (`render_program.rs`, `Stacked | Wipe{position} | SideBySide | Diff`) and is
+> the live dispatch key in `emit_mode_draws`, and the comp path already resolves at the **live frame**
+> (`composite_at(current_frame)`). So the end state **deletes** `render_program.rs` wholesale (its
+> `resolve`/`configure`/`ProgramInput`/`new_ab_stack`/… all die), rather than threading a live frame
+> into `resolve`. See the concrete sliced plan below.
+
+#### Render-retire — concrete sliced plan  (locked 2026-08-14)
+
+Two render paths exist: the **A/B path** (`draw_canvas_gpu` → `render_program::resolve` →
+`emit_mode_draws`, ≤2 inputs via positional `gpu_textures`/`gpu_textures_b` + `pick_b`, geometry
+hardcoded per-arm) and the **comp path** (`draw_comp_central` → `draw_comp_composite`, N-layer
+accumulate at the live frame from `comp_sources`, but only ever `Stacked`). Retire the A/B path.
+
+**Key architectural fact:** Wipe and Diff in the A/B path are **single-pass 2-input shader draws**
+(`tex_a`+`tex_b`, `is_wipe_mode`/`is_diff` uniforms), **not** accumulate draws; Diff opts out of OCIO
+(display-space heat map). SideBySide is two independent placed draws. The comp renderer today has
+**only** the accumulate path — so compare modes are not a trivial addition; Wipe/Diff need the
+non-accumulate 2-input pass reintroduced.
+
+- **Slice 1 — texture-map unification** (behavior-preserving, A/B pinned). Replace
+  `gpu_textures`/`gpu_textures_b` + `pick_b` with a `SourceId`-keyed bind lookup
+  (`gpu_binds: BTreeMap<SourceId, Vec<Option<Arc<BindGroup>>>>`, A/B pinned to the reserved ids).
+  Intermediate `bind_of(input)` helper first (pure indirection), then swap the storage. Touches
+  `sync_texture_caches`, the populate block, the `.fill(None)` clears, every `emit_mode_draws` arm.
+  Zero visible change; covered by existing `render_program` tests + one new headless equivalence test.
+- **Slice 2 — Arrangements in the comp path.** **UX model (locked): compose vs current layer** — A =
+  the full composite, B = the `active_comp_layer` (the timeline-selected "current" layer); zero new
+  selection UI. New `ExrApp::comp_arrangement: Arrangement` (default `Stacked`) surfaced in
+  `draw_comp_layer_bar`. Geometry helpers extracted **pure + unit-tested** (`side_by_side_layout`,
+  `wipe_line_endpoints`), same pattern as `comp_hover_pixel`. Sub-slices: **2a SideBySide** (fits the
+  accumulate model — two draw-groups at disjoint rects, ship first); **2b Wipe + Diff** (needs the
+  non-accumulate 2-input pass — first cut restricts each side to a single texture, base-vs-current;
+  full N-vs-N via offscreen-per-side is a fast-follow). `draw_comp_composite`'s hardwired
+  `force_accumulate=true` / `is_wipe_mode=0` become arrangement-dependent; fold `comp_arrangement` +
+  current-layer id into `render_sig`.
+- **Slice 3 — retire the A/B path.** Delete `emit_mode_draws`, `gpu_textures_b`, `pick_b`,
+  `render_program.rs` (keep/relocate only `Arrangement`, or fold into `layer::Layout`), `CompareMode`,
+  the `configure` shim, and the `_b`/`comp_*` duplication; route `draw_central_canvas` through the
+  comp path only (migrate the Contact-Sheet `viewer.ui` shim). `open_file` → **deleted**;
+  `update_base_layer` → **revived** (live base-plate infra, drop the `#[allow(dead_code)]`). Grep each
+  deleted symbol for hidden readers (status bar / EXR Info / histogram were re-homed into the comp
+  path). Persistence (`Vec<LayerPersist>`, never `#[serde(flatten)]`) is an independent fast-follow.
+
+**Order:** 1 → 2a → 2b → 3. Each slice CI-green (default + `system-ocio`), no throwaway code.
+
 ### Phase 4 / R4 — collapse to one model  ← **RESUME HERE (handoff below)**
 
 The R-series has already delivered the pieces R4 stands on: the base plate is a real layer (R3),
