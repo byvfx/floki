@@ -348,6 +348,16 @@ groundwork the final collapse (**R4**) sits on. All in `src/app.rs` + the GPU re
   with no extra term). `base_par` is the bottom drawable layer's header PAR, threaded through
   `draw_comp_central`. An **Unsqueeze** checkbox is surfaced in `draw_comp_layer_bar` for anamorphic
   layers, since the comp path doesn't draw the classic Display ▾ menu.
+- **Histogram + Color Sampler + swatch sampling in the comp path** — completes the inspection trilogy
+  (readout ✓ / EXR Info ✓ / histogram ✓). `calculate_histogram`'s bin math is extracted to
+  `histogram_bins`; a new `calculate_histogram_for(exr_data, layer_idx, disc)` is the comp entry point
+  (clears B). The histogram cache key gains a **source discriminator** (`(disc, layer_idx, log)`;
+  classic uses `HIST_DISC_CLASSIC`, comp passes its `SourceId`) so switching the current layer/AOV
+  recomputes. `draw_side_panel` resolves a per-mode panel source (classic slot-A, or the current comp
+  layer's `CompSource` at its AOV) so Color Sampler + Histogram render in comp mode. Shift+Click swatch
+  sampling — which lived in `viewer::ui` — is ported into `sample_comp_readout` (checks `shift` only,
+  so Shift+Ctrl+Click works). New **View ▸ Info panel** toggle (`show_side_panel`) shows/hides the left
+  panel.
 
 ## Execution checklist — Phase 1  *(complete; kept for reference — resume point is Phase 4 / R4 below)*
 

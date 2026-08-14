@@ -738,11 +738,14 @@ pub struct ExrViewer {
     pub swatches: Vec<[f32; 4]>,
     pub histogram: Option<[u32; 256]>,
     pub histogram_b: Option<[u32; 256]>,
-    /// Cache key for the computed bins: `(active_layer, log_histogram)`. The bins
-    /// depend on both, so keying on the layer alone left stale bins when the log
-    /// toggle flipped. Image-B load/unload is invalidated explicitly via
+    /// Cache key for the computed bins: `(disc, layer_idx, log_histogram)`. The
+    /// bins depend on all three, so keying on the layer alone left stale bins when
+    /// the log toggle flipped. `disc` is a source discriminator so switching which
+    /// image the histogram reflects (classic A vs a comp layer's source, #99 R4)
+    /// invalidates it — classic uses [`Self::HIST_DISC_CLASSIC`], comp passes its
+    /// `SourceId`. Image-B load/unload is invalidated explicitly via
     /// [`ExrViewer::invalidate_histogram`] since B identity isn't in the key.
-    histogram_key: Option<(usize, bool)>,
+    histogram_key: Option<(u64, usize, bool)>,
     pub log_histogram: bool,
 
     // View transform
@@ -4375,73 +4378,99 @@ impl ExrViewer {
         Some(ctx.load_texture("exr_proxy", color_image, egui::TextureOptions::LINEAR))
     }
 
+    /// Source discriminator for the classic A/B histogram cache key — distinct from
+    /// any comp `SourceId` (which pass their own id), so switching between the
+    /// classic path and a comp layer always invalidates the bins.
+    pub const HIST_DISC_CLASSIC: u64 = u64::MAX;
+
+    /// Compute the 256-bin luminance histogram of `data`'s logical layer `layer_idx`
+    /// (`None` if that layer has no resolvable RGB). Parallelized per-row: each
+    /// thread accumulates its own `[u32; 256]`, then reduce by summing — for a 4K
+    /// layer this is ~8M iterations, a noticeable single-threaded stall on every
+    /// layer / log-scale change. Shared by the classic A/B and comp-layer entry
+    /// points below.
+    fn histogram_bins(data: &ExrData, layer_idx: usize, log_histogram: bool) -> Option<[u32; 256]> {
+        let (layer, r_chan, g_chan, b_chan, _) = data.logical_channels(layer_idx)?;
+        let width = layer.size.0;
+        let height = layer.size.1;
+
+        // Hoist F32 slices (common case) for direct indexing.
+        let r_s = sample_channel_f32(r_chan);
+        let g_s = sample_channel_f32(g_chan);
+        let b_s = sample_channel_f32(b_chan);
+
+        let bins = (0..height)
+            .into_par_iter()
+            .map(|y| {
+                let mut local = [0u32; 256];
+                for x in 0..width {
+                    let r = pixel_val(r_s, r_chan, x, y, width);
+                    let g = pixel_val(g_s, g_chan, x, y, width);
+                    let b = pixel_val(b_s, b_chan, x, y, width);
+
+                    let lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+
+                    let bin = if log_histogram {
+                        let ev = if lum <= 0.0 {
+                            -10.0
+                        } else {
+                            lum.log2().clamp(-10.0, 10.0)
+                        };
+                        ((ev + 10.0) / 20.0 * 255.0) as usize
+                    } else {
+                        (lum.clamp(0.0, 1.0) * 255.0) as usize
+                    };
+
+                    if bin < 256 {
+                        local[bin] += 1;
+                    }
+                }
+                local
+            })
+            .reduce(
+                || [0u32; 256],
+                |mut a, b| {
+                    for i in 0..256 {
+                        a[i] += b[i];
+                    }
+                    a
+                },
+            );
+        Some(bins)
+    }
+
+    /// Comp-path histogram (#99 R4): the current layer's source at `layer_idx`
+    /// (its AOV), keyed by `disc` (its `SourceId`) so switching layers/AOVs
+    /// recomputes. No B in comp mode, so `histogram_b` is cleared. Mirrors
+    /// [`Self::calculate_histogram`]'s cache gate.
+    pub fn calculate_histogram_for(&mut self, exr_data: &ExrData, layer_idx: usize, disc: u64) {
+        let key = (disc, layer_idx, self.log_histogram);
+        if self.histogram_key == Some(key) {
+            return;
+        }
+        self.histogram = Self::histogram_bins(exr_data, layer_idx, self.log_histogram);
+        self.histogram_b = None;
+        self.histogram_key = Some(key);
+    }
+
     pub fn calculate_histogram(&mut self, exr_data: &ExrData, exr_data_b: Option<&ExrData>) {
-        let key = (self.active_layer, self.log_histogram);
+        let key = (
+            Self::HIST_DISC_CLASSIC,
+            self.active_layer,
+            self.log_histogram,
+        );
         if self.histogram_key == Some(key) {
             return;
         }
 
         let log_histogram = self.log_histogram;
-        let calc_bins = |data: &ExrData, layer_idx: usize| -> Option<[u32; 256]> {
-            let (layer, r_chan, g_chan, b_chan, _) = data.logical_channels(layer_idx)?;
-            let width = layer.size.0;
-            let height = layer.size.1;
-
-            // Hoist F32 slices (common case) for direct indexing.
-            let r_s = sample_channel_f32(r_chan);
-            let g_s = sample_channel_f32(g_chan);
-            let b_s = sample_channel_f32(b_chan);
-
-            // Parallelize per-row: each thread accumulates its own [u32; 256]
-            // bins, then reduce by summing. For a 4K layer this is ~8M
-            // iterations — single-threaded was a noticeable stall on every
-            // layer/log-scale change.
-            let bins = (0..height)
-                .into_par_iter()
-                .map(|y| {
-                    let mut local = [0u32; 256];
-                    for x in 0..width {
-                        let r = pixel_val(r_s, r_chan, x, y, width);
-                        let g = pixel_val(g_s, g_chan, x, y, width);
-                        let b = pixel_val(b_s, b_chan, x, y, width);
-
-                        let lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-
-                        let bin = if log_histogram {
-                            let ev = if lum <= 0.0 {
-                                -10.0
-                            } else {
-                                lum.log2().clamp(-10.0, 10.0)
-                            };
-                            ((ev + 10.0) / 20.0 * 255.0) as usize
-                        } else {
-                            (lum.clamp(0.0, 1.0) * 255.0) as usize
-                        };
-
-                        if bin < 256 {
-                            local[bin] += 1;
-                        }
-                    }
-                    local
-                })
-                .reduce(
-                    || [0u32; 256],
-                    |mut a, b| {
-                        for i in 0..256 {
-                            a[i] += b[i];
-                        }
-                        a
-                    },
-                );
-            Some(bins)
-        };
-
-        self.histogram = calc_bins(exr_data, self.active_layer);
+        self.histogram = Self::histogram_bins(exr_data, self.active_layer, log_histogram);
         self.histogram_b = exr_data_b.and_then(|d| {
-            calc_bins(
+            Self::histogram_bins(
                 d,
                 self.active_layer
                     .min(d.logical_layers.len().saturating_sub(1)),
+                log_histogram,
             )
         });
         self.histogram_key = Some(key);

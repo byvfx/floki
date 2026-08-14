@@ -672,6 +672,11 @@ pub struct ExrApp {
     /// out); still menu-toggleable.
     #[serde(skip)]
     show_layers_panel: bool,
+    /// Whether the left **Info** side panel (EXR Info / Color Sampler / Histogram)
+    /// is shown. On by default; menu-toggleable via View ▸ Info panel. Transient
+    /// like `show_layers_panel` — resets to shown each session.
+    #[serde(skip)]
+    show_side_panel: bool,
     /// An in-progress timeline clip-bar drag (#99), or `None`. Purely transient
     /// interaction state — the edit it produces lands in the layer's `Trim.offset`.
     #[serde(skip)]
@@ -895,6 +900,7 @@ impl Default for ExrApp {
             show_help: false,
             show_settings: false,
             show_layers_panel: true,
+            show_side_panel: true,
             track_drag: None,
             comp_drives_transport: false,
             comp_stack: crate::layer::LayerStack::new(),
@@ -4231,6 +4237,11 @@ impl ExrApp {
                                  sources as layers with per-layer blend / opacity / \
                                  visibility, and drag a layer's clip to retime it (#99)",
                             );
+                        ui.checkbox(&mut self.show_side_panel, "Info panel")
+                            .on_hover_text(
+                                "Left panel: EXR Info, Color Sampler, and Histogram for \
+                                 the current layer",
+                            );
                         if ui.button("Viewport Background...").clicked() {
                             self.viewer.show_background_window = true;
                             ui.close();
@@ -5282,7 +5293,7 @@ impl ExrApp {
     }
 
     fn draw_side_panel(&mut self, ui: &mut egui::Ui) {
-        if !self.viewer.fullscreen {
+        if !self.viewer.fullscreen && self.show_side_panel {
             egui::Panel::left("side_panel")
                 .resizable(true)
                 .min_size(200.0)
@@ -5516,165 +5527,210 @@ impl ExrApp {
                             });
                         }
 
-                        if let Some(_path) = &self.loaded_file {
-                            if let Some(exr_data) = &self.exr_data {
-                                ui.separator();
-                                ui.heading("Color Sampler");
+                        // Color Sampler + Histogram source (#99 R4): the classic
+                        // slot-A image, or — in comp mode — the current layer's source
+                        // at its AOV. Owned Arc clones so the block can call the &mut
+                        // viewer histogram methods without holding a borrow of `self`.
+                        // Tuple = (data, layer/AOV idx, source discriminator, B data).
+                        type HistPanel = (
+                            std::sync::Arc<ExrData>,
+                            usize,
+                            u64,
+                            Option<std::sync::Arc<ExrData>>,
+                        );
+                        let panel_hist: Option<HistPanel> = if self.loaded_file.is_some()
+                            && let Some(a) = &self.exr_data
+                        {
+                            Some((
+                                a.clone(),
+                                self.viewer.active_layer,
+                                crate::viewer::ExrViewer::HIST_DISC_CLASSIC,
+                                self.exr_data_b.clone(),
+                            ))
+                        } else if let Some(id) = self.active_comp_layer() {
+                            match self.comp_stack.get(id).map(|l| &l.source) {
+                                Some(crate::layer::LayerSource::Image { source, aov }) => self
+                                    .comp_sources
+                                    .get(source)
+                                    .map(|cs| (cs.exr_data.clone(), *aov, source.0, None)),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
 
-                                if !self.viewer.swatches.is_empty() {
-                                    ui.horizontal(|ui| {
-                                        ui.label(format!("{} saved", self.viewer.swatches.len()));
-                                        if ui.button("Clear All").clicked() {
-                                            self.viewer.swatches.clear();
+                        if let Some((exr_data, hist_layer, hist_disc, exr_data_b)) = &panel_hist {
+                            ui.separator();
+                            ui.heading("Color Sampler");
+
+                            if !self.viewer.swatches.is_empty() {
+                                ui.horizontal(|ui| {
+                                    ui.label(format!("{} saved", self.viewer.swatches.len()));
+                                    if ui.button("Clear All").clicked() {
+                                        self.viewer.swatches.clear();
+                                    }
+                                });
+                                ui.add_space(5.0);
+
+                                egui::ScrollArea::vertical()
+                                    .id_salt("swatches_scroll")
+                                    .show(ui, |ui| {
+                                        let mut to_remove = None;
+                                        let exp_mult = crate::render_math::exposure_to_multiplier(
+                                            self.viewer.exposure,
+                                        );
+                                        for (i, swatch) in self.viewer.swatches.iter().enumerate() {
+                                            ui.horizontal(|ui| {
+                                                let [r, g, b, _a] = *swatch;
+
+                                                // Preview color patch using current sRGB mode and exposure/gamma
+                                                let mut disp_r = r * exp_mult;
+                                                let mut disp_g = g * exp_mult;
+                                                let mut disp_b = b * exp_mult;
+
+                                                if self.viewer.gamma != 1.0 {
+                                                    disp_r = crate::render_math::apply_gamma(
+                                                        disp_r,
+                                                        self.viewer.gamma,
+                                                    );
+                                                    disp_g = crate::render_math::apply_gamma(
+                                                        disp_g,
+                                                        self.viewer.gamma,
+                                                    );
+                                                    disp_b = crate::render_math::apply_gamma(
+                                                        disp_b,
+                                                        self.viewer.gamma,
+                                                    );
+                                                }
+
+                                                if self.viewer.srgb {
+                                                    disp_r =
+                                                        crate::render_math::linear_to_srgb(disp_r);
+                                                    disp_g =
+                                                        crate::render_math::linear_to_srgb(disp_g);
+                                                    disp_b =
+                                                        crate::render_math::linear_to_srgb(disp_b);
+                                                }
+
+                                                let r_u8 = (disp_r.clamp(0.0, 1.0) * 255.0) as u8;
+                                                let g_u8 = (disp_g.clamp(0.0, 1.0) * 255.0) as u8;
+                                                let b_u8 = (disp_b.clamp(0.0, 1.0) * 255.0) as u8;
+
+                                                let color =
+                                                    egui::Color32::from_rgb(r_u8, g_u8, b_u8);
+                                                let (rect, _resp) = ui.allocate_exact_size(
+                                                    egui::vec2(20.0, 20.0),
+                                                    egui::Sense::hover(),
+                                                );
+                                                ui.painter().rect_filled(rect, 2.0, color);
+
+                                                // Display values
+                                                ui.vertical(|ui| {
+                                                    ui.label(format!(
+                                                        "Float: {r:.4}, {g:.4}, {b:.4}"
+                                                    ));
+                                                    ui.label(format!(
+                                                        "8-bit: {r_u8}, {g_u8}, {b_u8}"
+                                                    ));
+                                                    // HSV mapping
+                                                    let max = r.max(g).max(b);
+                                                    let min = r.min(g).min(b);
+                                                    let c = max - min;
+                                                    let h = if c == 0.0 {
+                                                        0.0
+                                                    } else if max == r {
+                                                        60.0 * (((g - b) / c) % 6.0)
+                                                    } else if max == g {
+                                                        60.0 * (((b - r) / c) + 2.0)
+                                                    } else {
+                                                        60.0 * (((r - g) / c) + 4.0)
+                                                    };
+                                                    let h = if h < 0.0 { h + 360.0 } else { h };
+                                                    let s = if max == 0.0 { 0.0 } else { c / max };
+                                                    let v = max;
+                                                    ui.label(format!(
+                                                        "HSV: {h:.1}°, {s:.2}, {v:.2}"
+                                                    ));
+                                                });
+
+                                                if ui.button("X").clicked() {
+                                                    to_remove = Some(i);
+                                                }
+                                            });
+                                            ui.separator();
+                                        }
+                                        if let Some(i) = to_remove {
+                                            self.viewer.swatches.remove(i);
                                         }
                                     });
-                                    ui.add_space(5.0);
+                            } else {
+                                ui.label("Shift+Click on the image to save a swatch.");
+                            }
 
-                                    egui::ScrollArea::vertical()
-                                        .id_salt("swatches_scroll")
-                                        .show(ui, |ui| {
-                                            let mut to_remove = None;
-                                            let exp_mult =
-                                                crate::render_math::exposure_to_multiplier(
-                                                    self.viewer.exposure,
-                                                );
-                                            for (i, swatch) in
-                                                self.viewer.swatches.iter().enumerate()
-                                            {
-                                                ui.horizontal(|ui| {
-                                                    let [r, g, b, _a] = *swatch;
+                            ui.separator();
+                            ui.heading("Histogram");
+                            ui.horizontal(|ui| {
+                                // The histogram cache key includes log_histogram,
+                                // so flipping this auto-invalidates — no manual reset.
+                                ui.checkbox(
+                                    &mut self.viewer.log_histogram,
+                                    "Log Scale (-10 to +10 EV)",
+                                );
+                            });
 
-                                                    // Preview color patch using current sRGB mode and exposure/gamma
-                                                    let mut disp_r = r * exp_mult;
-                                                    let mut disp_g = g * exp_mult;
-                                                    let mut disp_b = b * exp_mult;
-
-                                                    if self.viewer.gamma != 1.0 {
-                                                        disp_r = crate::render_math::apply_gamma(
-                                                            disp_r,
-                                                            self.viewer.gamma,
-                                                        );
-                                                        disp_g = crate::render_math::apply_gamma(
-                                                            disp_g,
-                                                            self.viewer.gamma,
-                                                        );
-                                                        disp_b = crate::render_math::apply_gamma(
-                                                            disp_b,
-                                                            self.viewer.gamma,
-                                                        );
-                                                    }
-
-                                                    if self.viewer.srgb {
-                                                        disp_r = crate::render_math::linear_to_srgb(
-                                                            disp_r,
-                                                        );
-                                                        disp_g = crate::render_math::linear_to_srgb(
-                                                            disp_g,
-                                                        );
-                                                        disp_b = crate::render_math::linear_to_srgb(
-                                                            disp_b,
-                                                        );
-                                                    }
-
-                                                    let r_u8 =
-                                                        (disp_r.clamp(0.0, 1.0) * 255.0) as u8;
-                                                    let g_u8 =
-                                                        (disp_g.clamp(0.0, 1.0) * 255.0) as u8;
-                                                    let b_u8 =
-                                                        (disp_b.clamp(0.0, 1.0) * 255.0) as u8;
-
-                                                    let color =
-                                                        egui::Color32::from_rgb(r_u8, g_u8, b_u8);
-                                                    let (rect, _resp) = ui.allocate_exact_size(
-                                                        egui::vec2(20.0, 20.0),
-                                                        egui::Sense::hover(),
-                                                    );
-                                                    ui.painter().rect_filled(rect, 2.0, color);
-
-                                                    // Display values
-                                                    ui.vertical(|ui| {
-                                                        ui.label(format!(
-                                                            "Float: {r:.4}, {g:.4}, {b:.4}"
-                                                        ));
-                                                        ui.label(format!(
-                                                            "8-bit: {r_u8}, {g_u8}, {b_u8}"
-                                                        ));
-                                                        // HSV mapping
-                                                        let max = r.max(g).max(b);
-                                                        let min = r.min(g).min(b);
-                                                        let c = max - min;
-                                                        let h = if c == 0.0 {
-                                                            0.0
-                                                        } else if max == r {
-                                                            60.0 * (((g - b) / c) % 6.0)
-                                                        } else if max == g {
-                                                            60.0 * (((b - r) / c) + 2.0)
-                                                        } else {
-                                                            60.0 * (((r - g) / c) + 4.0)
-                                                        };
-                                                        let h = if h < 0.0 { h + 360.0 } else { h };
-                                                        let s =
-                                                            if max == 0.0 { 0.0 } else { c / max };
-                                                        let v = max;
-                                                        ui.label(format!(
-                                                            "HSV: {h:.1}°, {s:.2}, {v:.2}"
-                                                        ));
-                                                    });
-
-                                                    if ui.button("X").clicked() {
-                                                        to_remove = Some(i);
-                                                    }
-                                                });
-                                                ui.separator();
-                                            }
-                                            if let Some(i) = to_remove {
-                                                self.viewer.swatches.remove(i);
-                                            }
-                                        });
-                                } else {
-                                    ui.label("Shift+Click on the image to save a swatch.");
-                                }
-
-                                ui.separator();
-                                ui.heading("Histogram");
-                                ui.horizontal(|ui| {
-                                    // The histogram cache key includes log_histogram,
-                                    // so flipping this auto-invalidates — no manual reset.
-                                    ui.checkbox(
-                                        &mut self.viewer.log_histogram,
-                                        "Log Scale (-10 to +10 EV)",
-                                    );
-                                });
-
-                                // Recomputing full-res bins on every frame swap
-                                // would block the UI thread at playback rate and
-                                // contend with decode for the rayon pool (#141).
-                                // INV-SAMPLE already suppresses the pixel readout
-                                // while playing/pending — mirror it: hold the last
-                                // computed bins and recompute once on settle (the
-                                // swap invalidated the key).
-                                if !self.playback.sampling_suppressed() {
+                            // Recomputing full-res bins on every frame swap
+                            // would block the UI thread at playback rate and
+                            // contend with decode for the rayon pool (#141).
+                            // INV-SAMPLE already suppresses the pixel readout
+                            // while playing/pending — mirror it: hold the last
+                            // computed bins and recompute once on settle (the
+                            // swap invalidated the key).
+                            if !self.playback.sampling_suppressed() {
+                                if *hist_disc == crate::viewer::ExrViewer::HIST_DISC_CLASSIC {
                                     self.viewer
-                                        .calculate_histogram(exr_data, self.exr_data_b.as_deref());
+                                        .calculate_histogram(exr_data, exr_data_b.as_deref());
+                                } else {
+                                    self.viewer.calculate_histogram_for(
+                                        exr_data,
+                                        *hist_layer,
+                                        *hist_disc,
+                                    );
+                                }
+                            }
+
+                            if let Some(bins) = &self.viewer.histogram {
+                                let (rect, _resp) = ui.allocate_exact_size(
+                                    egui::vec2(ui.available_width(), 80.0),
+                                    egui::Sense::hover(),
+                                );
+                                let mut max_val = *bins.iter().max().unwrap_or(&1) as f32;
+                                if let Some(bins_b) = &self.viewer.histogram_b {
+                                    max_val =
+                                        max_val.max(*bins_b.iter().max().unwrap_or(&1) as f32);
+                                }
+                                let max_val = max_val.max(1.0);
+
+                                // Up to 512 bars (256 bins × A/B); reserve to avoid reallocation.
+                                let mut shapes = Vec::with_capacity(512);
+                                let bar_width = rect.width() / 256.0;
+
+                                for (i, &count) in bins.iter().enumerate() {
+                                    let h = (count as f32 / max_val).powf(0.5) * rect.height();
+                                    let x = rect.min.x + i as f32 * bar_width;
+                                    let y = rect.max.y - h;
+
+                                    shapes.push(egui::Shape::rect_filled(
+                                        egui::Rect::from_min_max(
+                                            egui::pos2(x, y),
+                                            egui::pos2(x + bar_width.max(1.0), rect.max.y),
+                                        ),
+                                        0.0,
+                                        egui::Color32::from_white_alpha(150), // White for A
+                                    ));
                                 }
 
-                                if let Some(bins) = &self.viewer.histogram {
-                                    let (rect, _resp) = ui.allocate_exact_size(
-                                        egui::vec2(ui.available_width(), 80.0),
-                                        egui::Sense::hover(),
-                                    );
-                                    let mut max_val = *bins.iter().max().unwrap_or(&1) as f32;
-                                    if let Some(bins_b) = &self.viewer.histogram_b {
-                                        max_val =
-                                            max_val.max(*bins_b.iter().max().unwrap_or(&1) as f32);
-                                    }
-                                    let max_val = max_val.max(1.0);
-
-                                    // Up to 512 bars (256 bins × A/B); reserve to avoid reallocation.
-                                    let mut shapes = Vec::with_capacity(512);
-                                    let bar_width = rect.width() / 256.0;
-
-                                    for (i, &count) in bins.iter().enumerate() {
+                                if let Some(bins_b) = &self.viewer.histogram_b {
+                                    for (i, &count) in bins_b.iter().enumerate() {
                                         let h = (count as f32 / max_val).powf(0.5) * rect.height();
                                         let x = rect.min.x + i as f32 * bar_width;
                                         let y = rect.max.y - h;
@@ -5685,31 +5741,11 @@ impl ExrApp {
                                                 egui::pos2(x + bar_width.max(1.0), rect.max.y),
                                             ),
                                             0.0,
-                                            egui::Color32::from_white_alpha(150), // White for A
+                                            egui::Color32::from_rgba_unmultiplied(255, 50, 50, 150), // Red for B
                                         ));
                                     }
-
-                                    if let Some(bins_b) = &self.viewer.histogram_b {
-                                        for (i, &count) in bins_b.iter().enumerate() {
-                                            let h =
-                                                (count as f32 / max_val).powf(0.5) * rect.height();
-                                            let x = rect.min.x + i as f32 * bar_width;
-                                            let y = rect.max.y - h;
-
-                                            shapes.push(egui::Shape::rect_filled(
-                                                egui::Rect::from_min_max(
-                                                    egui::pos2(x, y),
-                                                    egui::pos2(x + bar_width.max(1.0), rect.max.y),
-                                                ),
-                                                0.0,
-                                                egui::Color32::from_rgba_unmultiplied(
-                                                    255, 50, 50, 150,
-                                                ), // Red for B
-                                            ));
-                                        }
-                                    }
-                                    ui.painter().extend(shapes);
                                 }
+                                ui.painter().extend(shapes);
                             }
                         } else {
                             ui.label("No file loaded.");
@@ -6855,6 +6891,15 @@ impl ExrApp {
             Some((x, y, v)) => {
                 self.viewer.last_hover_pos_img = Some((x, y));
                 self.viewer.last_sampled_val_a = v;
+                // Shift+Click saves the sampled pixel as a persistent swatch — the
+                // comp-path analogue of the classic sampler (#99 R4), which lived in
+                // `viewer.ui` and so never fired here. `v` is the raw source value
+                // under the cursor; checks `shift` only, so Shift+Ctrl+Click works too.
+                if let Some(rgba) = v
+                    && ui.input(|i| i.modifiers.shift && i.pointer.primary_clicked())
+                {
+                    self.viewer.swatches.push(rgba);
+                }
             }
             None => {
                 self.viewer.last_hover_pos_img = None;
@@ -7310,6 +7355,32 @@ mod tests {
             app.active_comp_layer(),
             Some(top),
             "falls back to the top of the stack"
+        );
+    }
+
+    #[test]
+    fn comp_histogram_entry_point_computes_bins_and_clears_b() {
+        // The comp-path histogram (#99 R4) computes the current layer's bins keyed
+        // by its SourceId, and — unlike the classic A/B path — never populates B.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("layer.exr");
+        write_rgba_exr(&f);
+        let data = std::sync::Arc::new(ExrData::load(&f).unwrap());
+
+        let mut v = crate::viewer::ExrViewer::default();
+        // Seed a stale B histogram to prove the comp path clears it.
+        v.histogram_b = Some([1u32; 256]);
+        v.calculate_histogram_for(&data, 0, 2);
+
+        let bins = v.histogram.expect("comp bins computed");
+        assert_eq!(
+            bins.iter().sum::<u32>(),
+            4,
+            "every pixel of the 2×2 fixture lands in exactly one bin"
+        );
+        assert!(
+            v.histogram_b.is_none(),
+            "comp mode has no reference image — B bins cleared"
         );
     }
 
