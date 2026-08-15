@@ -6463,11 +6463,32 @@ impl ExrApp {
                                 }
                             }
                         });
-                    // Only Side-by-Side lays the panes out separately; Wipe and Diff
-                    // overlay both layers in one rect, where normalizing is meaningless.
-                    if arr == Arrangement::SideBySide {
-                        ui.checkbox(&mut self.viewer.normalize_side_by_side, "Normalize Size")
-                            .on_hover_text("Match the compare layer's height to pane A's");
+                    // Per-arrangement parameters (#99 Slice 3c). These lived in the
+                    // classic `mode_param_row` — a second toolbar row that slid in — but
+                    // the comp bar is one row, so they go behind a menu. Shared with
+                    // that row via `wipe_params_ui` / `diff_params_ui`.
+                    match arr {
+                        // Only Side-by-Side lays the panes out separately; Wipe and Diff
+                        // overlay both layers in one rect, where normalizing is
+                        // meaningless.
+                        Arrangement::SideBySide => {
+                            ui.checkbox(&mut self.viewer.normalize_side_by_side, "Normalize Size")
+                                .on_hover_text("Match the compare layer's height to pane A's");
+                        }
+                        Arrangement::Wipe { .. } => {
+                            ui.menu_button("Wipe ▾", |ui| self.viewer.wipe_params_ui(ui))
+                                .response
+                                .on_hover_text(
+                                    "Split centre, angle, and divider opacity \
+                                     (or drag the on-image handle / scroll to rotate)",
+                                );
+                        }
+                        Arrangement::Diff => {
+                            ui.menu_button("Diff ▾", |ui| self.viewer.diff_params_ui(ui))
+                                .response
+                                .on_hover_text("Gain, colormap, metric, and noise floor");
+                        }
+                        Arrangement::Stacked => {}
                     }
                 }
             }

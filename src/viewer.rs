@@ -1586,6 +1586,83 @@ impl ExrViewer {
     /// (clipped/animated) by [`Self::animated_mode_param_row`]. Kept in lockstep
     /// with [`Self::has_mode_params`]: every arm that draws here must report
     /// `true` there, and vice versa.
+    /// The Wipe parameters: split centre, angle, and the divider-line opacity.
+    /// `pub(crate)` and shared with the comp viewport bar (#99 Slice 3c) so the two
+    /// entry points can't drift — the comp path is the only *reachable* one now.
+    /// `wipe_line_opacity` in particular has no other control, so a persisted `0.0`
+    /// would otherwise leave the comp wipe line invisible with no way back.
+    pub(crate) fn wipe_params_ui(&mut self, ui: &mut egui::Ui) {
+        // Each slider gets a left-side `ui.label(...)` for a consistent row; the two
+        // centre sliders are named so the wipe-centre handle is self-describing.
+        ui.label("Center X");
+        ui.add(egui::Slider::new(&mut self.wipe_center[0], 0.0..=1.0));
+        ui.label("Center Y");
+        ui.add(egui::Slider::new(&mut self.wipe_center[1], 0.0..=1.0));
+        ui.label("Angle °");
+        ui.add(egui::Slider::new(&mut self.wipe_angle, -180.0..=180.0));
+        ui.label("Line Opacity");
+        ui.add(egui::Slider::new(&mut self.wipe_line_opacity, 0.0..=1.0));
+    }
+
+    /// The Diff parameters: gain, colormap, metric, noise floor, the legend, and the
+    /// gradient-editor hook. `pub(crate)` and shared with the comp viewport bar
+    /// (#99 Slice 3c); comp Diff consumes all of these and had no UI for any of them.
+    pub(crate) fn diff_params_ui(&mut self, ui: &mut egui::Ui) {
+        ui.add(egui::Slider::new(&mut self.diff_multiplier, 0.0..=100.0).text("Diff Gain"));
+        ui.separator();
+
+        ui.label("Colormap");
+        let mut pick: Option<Colormap> = None;
+        egui::ComboBox::from_id_salt("diff_colormap_select")
+            .selected_text(self.prefs.diff_colormap.label())
+            .show_ui(ui, |ui| {
+                for cm in Colormap::PRESETS {
+                    if ui
+                        .selectable_label(self.prefs.diff_colormap == cm, cm.label())
+                        .clicked()
+                    {
+                        pick = Some(cm);
+                    }
+                }
+                if !self.prefs.custom_gradients.is_empty() {
+                    ui.separator();
+                    for (name, g) in &self.prefs.custom_gradients {
+                        let selected =
+                            matches!(&self.prefs.diff_colormap, Colormap::Custom(cur) if cur == g);
+                        if ui.selectable_label(selected, name).clicked() {
+                            pick = Some(Colormap::Custom(g.clone()));
+                        }
+                    }
+                }
+            });
+        if let Some(cm) = pick {
+            self.prefs.diff_colormap = cm;
+        }
+
+        ui.label("Metric");
+        egui::ComboBox::from_id_salt("diff_metric_select")
+            .selected_text(self.prefs.diff_metric.label())
+            .show_ui(ui, |ui| {
+                for m in DiffMetric::ALL {
+                    ui.selectable_value(&mut self.prefs.diff_metric, m, m.label());
+                }
+            });
+
+        ui.label("Floor");
+        ui.add(egui::Slider::new(&mut self.prefs.diff_floor, 0.0..=0.25));
+
+        // Legend / scale bar. Per-channel RGB has no colormap, so skip it.
+        if self.prefs.diff_metric != DiffMetric::PerChannelRGB {
+            self.diff_legend(ui);
+        }
+
+        if ui.button("Edit gradient…").clicked() {
+            self.editing_gradient = self.prefs.diff_colormap.gradient();
+            self.gradient_editor_target = GradientTarget::DiffColormap;
+            self.gradient_editor_open = true;
+        }
+    }
+
     fn mode_param_row(&mut self, ui: &mut egui::Ui) {
         // While blinking, `compare_mode` toggles A/B each frame, so key off
         // `blink_state` and expose the blink-speed control instead.
@@ -1595,73 +1672,8 @@ impl ExrViewer {
             return;
         }
         match self.compare_mode {
-            CompareMode::Wipe => {
-                // Each slider gets a left-side `ui.label(...)` (matching the
-                // `Blend:` style below) for a consistent row; the two center
-                // sliders are named so the wipe-center handle is self-describing.
-                ui.label("Center X");
-                ui.add(egui::Slider::new(&mut self.wipe_center[0], 0.0..=1.0));
-                ui.label("Center Y");
-                ui.add(egui::Slider::new(&mut self.wipe_center[1], 0.0..=1.0));
-                ui.label("Angle °");
-                ui.add(egui::Slider::new(&mut self.wipe_angle, -180.0..=180.0));
-                ui.label("Line Opacity");
-                ui.add(egui::Slider::new(&mut self.wipe_line_opacity, 0.0..=1.0));
-            }
-            CompareMode::DiffMatte => {
-                ui.add(egui::Slider::new(&mut self.diff_multiplier, 0.0..=100.0).text("Diff Gain"));
-                ui.separator();
-
-                ui.label("Colormap");
-                let mut pick: Option<Colormap> = None;
-                egui::ComboBox::from_id_salt("diff_colormap_select")
-                    .selected_text(self.prefs.diff_colormap.label())
-                    .show_ui(ui, |ui| {
-                        for cm in Colormap::PRESETS {
-                            if ui
-                                .selectable_label(self.prefs.diff_colormap == cm, cm.label())
-                                .clicked()
-                            {
-                                pick = Some(cm);
-                            }
-                        }
-                        if !self.prefs.custom_gradients.is_empty() {
-                            ui.separator();
-                            for (name, g) in &self.prefs.custom_gradients {
-                                let selected = matches!(&self.prefs.diff_colormap, Colormap::Custom(cur) if cur == g);
-                                if ui.selectable_label(selected, name).clicked() {
-                                    pick = Some(Colormap::Custom(g.clone()));
-                                }
-                            }
-                        }
-                    });
-                if let Some(cm) = pick {
-                    self.prefs.diff_colormap = cm;
-                }
-
-                ui.label("Metric");
-                egui::ComboBox::from_id_salt("diff_metric_select")
-                    .selected_text(self.prefs.diff_metric.label())
-                    .show_ui(ui, |ui| {
-                        for m in DiffMetric::ALL {
-                            ui.selectable_value(&mut self.prefs.diff_metric, m, m.label());
-                        }
-                    });
-
-                ui.label("Floor");
-                ui.add(egui::Slider::new(&mut self.prefs.diff_floor, 0.0..=0.25));
-
-                // Legend / scale bar. Per-channel RGB has no colormap, so skip it.
-                if self.prefs.diff_metric != DiffMetric::PerChannelRGB {
-                    self.diff_legend(ui);
-                }
-
-                if ui.button("Edit gradient…").clicked() {
-                    self.editing_gradient = self.prefs.diff_colormap.gradient();
-                    self.gradient_editor_target = GradientTarget::DiffColormap;
-                    self.gradient_editor_open = true;
-                }
-            }
+            CompareMode::Wipe => self.wipe_params_ui(ui),
+            CompareMode::DiffMatte => self.diff_params_ui(ui),
             CompareMode::SideBySide => {
                 ui.checkbox(&mut self.normalize_side_by_side, "Normalize Size");
             }
