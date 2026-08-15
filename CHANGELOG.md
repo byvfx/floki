@@ -5,7 +5,7 @@ All notable changes to Floki are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.12.0] - 2026-08-15
 
 The layer-stack wave (#99). Floki's viewer was built around two hardcoded image
 slots, A and B. It is now built around one **layer stack**: you add as many layers
@@ -636,7 +636,11 @@ Initial release.
 - Advanced metadata header inspector.
 - Cross-platform GitHub Actions builds (Linux, Windows, macOS).
 
-[Unreleased]: https://github.com/byvfx/floki/compare/v1.9.0...HEAD
+[Unreleased]: https://github.com/byvfx/floki/compare/v1.12.0...HEAD
+[1.12.0]: https://github.com/byvfx/floki/compare/v1.11.0...v1.12.0
+[1.11.0]: https://github.com/byvfx/floki/compare/v1.10.2...v1.11.0
+[1.10.2]: https://github.com/byvfx/floki/compare/v1.10.0...v1.10.2
+[1.10.0]: https://github.com/byvfx/floki/compare/v1.9.3...v1.10.0
 [1.9.3]: https://github.com/byvfx/floki/compare/v1.9.2...v1.9.3
 [1.9.2]: https://github.com/byvfx/floki/compare/v1.9.1...v1.9.2
 [1.9.1]: https://github.com/byvfx/floki/compare/v1.9.0...v1.9.1
