@@ -220,6 +220,10 @@ struct CompSource {
     // composite ping-pong / row controls in PR-B.3–B.4 — hence the item-level
     // `#[allow(dead_code)]`s (the sanctioned "landed ahead of its consumer" pattern,
     // #153), not a struct-wide allow that would also mask accidental dead fields.
+    /// The file this source decoded from — the one thing persistence needs to
+    /// rebuild the layer next session (#99 PR-B.5). The layer's `name` is only the
+    /// file *name*, so it can't reopen the file on its own.
+    path: std::path::PathBuf,
     /// Full decode, kept for pixel sampling, AOV metadata, and re-uploads (an AOV
     /// switch in PR-B.4 rebuilds the texture from this without touching disk).
     #[allow(dead_code)]
@@ -245,6 +249,60 @@ struct CompSource {
     /// first per-frame build. `draw_comp_central` rebuilds from the T1 cache when
     /// the resolved source frame moves off this.
     cur_frame: Option<u32>,
+}
+
+/// One comp layer, flattened for persistence (#99 PR-B.5). Written at `save()` from
+/// `comp_stack` + `comp_sources`, replayed by [`ExrApp::restore_comp_layers`] on the
+/// next launch.
+///
+/// **Flat fields, not the model types.** `LayerStack`/`Layer`/`Trim` are deliberately
+/// not `Serialize`: the model is pure and free to change shape, and `LayerId`/`SourceId`
+/// are session-scoped (re-allocated on load, so a persisted id would be a lie). This
+/// struct is the versioned boundary between the two — every field has a serde default,
+/// so an `app.ron` written by an older build still loads.
+///
+/// **Never `#[serde(flatten)]` this into `ExrApp`** — a flattened map swallows unknown
+/// keys and has repeatedly wiped `app.ron` on this project.
+#[derive(Clone, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct LayerPersist {
+    /// The source file. Re-decoded on load; a layer whose file has moved or been
+    /// deleted is skipped (not an error — the rest of the stack still restores).
+    path: std::path::PathBuf,
+    /// The layer's display name. Usually the file name, but the user may have
+    /// renamed it, so persist it rather than re-deriving.
+    name: String,
+    /// Which AOV / logical layer of the source is shown.
+    aov: usize,
+    blend: crate::viewer::BlendMode,
+    opacity: f32,
+    enabled: bool,
+    solo: bool,
+    /// `Trim`, flattened — see the struct note on why the model type isn't used.
+    trim_in: u32,
+    trim_out: u32,
+    trim_offset: i64,
+}
+
+/// Hand-written rather than derived, because `#[serde(default)]` fills **missing**
+/// fields from here: a derived `Default` would give `opacity: 0.0` / `enabled: false`,
+/// so an `app.ron` from a build that predates either field would restore a stack of
+/// invisible layers. These match [`crate::layer::LayerStack::push_image`]'s defaults.
+impl Default for LayerPersist {
+    fn default() -> Self {
+        Self {
+            path: std::path::PathBuf::new(),
+            name: String::new(),
+            aov: 0,
+            blend: crate::viewer::BlendMode::default(),
+            opacity: 1.0,
+            enabled: true,
+            solo: false,
+            trim_in: 0,
+            trim_out: u32::MAX,
+            trim_offset: 0,
+        }
+    }
 }
 
 /// serde default for `proxy_cache_gb` (#165): the on-disk proxy-cache size budget
@@ -493,6 +551,13 @@ pub struct ExrApp {
     /// schema-versioned migration is tracked separately in #65.
     #[serde(default)]
     persisted_prefs: crate::viewer::ViewerPrefs,
+
+    /// The comp stack, flattened for persistence (#99 PR-B.5). Mirrored from
+    /// `comp_stack` + `comp_sources` in [`eframe::App::save`] — the same persist-time
+    /// bridge `persisted_prefs` uses — and replayed by [`Self::restore_comp_layers`]
+    /// on the next launch. Nested, **never `#[serde(flatten)]`** (see the note above).
+    #[serde(default)]
+    persisted_layers: Vec<LayerPersist>,
 
     /// Snapshot to clipboard (issue #19): when true, each snapshot also writes a
     /// timestamped PNG to `~/.floki/snapshots/`. The clipboard copy always happens.
@@ -880,6 +945,7 @@ impl Default for ExrApp {
             recent_files: Vec::new(),
             theme: ThemeChoice::default(),
             persisted_prefs: crate::viewer::ViewerPrefs::default(),
+            persisted_layers: Vec::new(),
             save_snapshots: false,
             t2_enabled: true,
             beauty_preview: true,
@@ -976,6 +1042,13 @@ impl ExrApp {
         // (#151). From here on `self.viewer.prefs` is the single source of truth;
         // `persisted_prefs` stays dormant until `save()` re-mirrors it.
         app.viewer.prefs = std::mem::take(&mut app.persisted_prefs);
+
+        // Rebuild the comp stack from the persisted layer list (#99 PR-B.5). Deferred
+        // until after the prefs move (so a restored layer's decode sees the right
+        // settings) but before the GPU/OCIO wiring below — `add_comp_source` decodes
+        // synchronously and only builds textures when `gpu_resources` is set, which
+        // `draw_comp_central`'s `ensure_comp_*` then does on the first frame anyway.
+        app.restore_comp_layers();
 
         // Wire the repaint handle before anything can spawn the decode worker,
         // so the worker can wake the UI when a result lands (#137).
@@ -3314,6 +3387,9 @@ impl eframe::App for ExrApp {
         // whole-app serialize below persists them. Done here, at persist time only,
         // instead of the old per-frame round-trip around `viewer.ui`.
         self.persisted_prefs = self.viewer.prefs.clone();
+        // Same persist-time bridge for the comp stack (#99 PR-B.5): flatten the live
+        // layers + their source paths into the serde-able list.
+        self.persisted_layers = self.comp_layers_persist();
         eframe::set_value(storage, eframe::APP_KEY, self);
     }
 
@@ -5342,7 +5418,7 @@ impl ExrApp {
     /// whose texture is built lazily each paint from the live A frame
     /// ([`Self::ensure_base_frame`]). Caller ensures a file is open.
     fn add_base_layer(&mut self) {
-        let Some(path) = self.loaded_file.as_ref() else {
+        let Some(path) = self.loaded_file.clone() else {
             return;
         };
         let name = path
@@ -5369,6 +5445,7 @@ impl ExrApp {
         self.comp_sources.insert(
             Self::A_SOURCE,
             CompSource {
+                path,
                 exr_data,
                 size,
                 aov,
@@ -5438,6 +5515,89 @@ impl ExrApp {
     /// When this is the *first* comp source and a file is open as slot A, the
     /// opened image is pushed first as the bottom **base track** (#99 R3) so the
     /// plate composites underneath the added layers.
+    /// Flatten the live comp stack into the persistable list (#99 PR-B.5), bottom→top
+    /// so a replay rebuilds the same order. The **base plate is skipped**: it is
+    /// `A_SOURCE`, owned by the slot-A open path rather than the panel, and
+    /// `add_comp_source` re-promotes it on its own. A layer whose source is missing
+    /// (never possible today, but cheap to tolerate) is skipped rather than persisted
+    /// with an empty path that would fail to restore.
+    fn comp_layers_persist(&self) -> Vec<LayerPersist> {
+        self.comp_stack
+            .iter()
+            .filter_map(|l| {
+                let crate::layer::LayerSource::Image { source, aov } = &l.source else {
+                    return None; // adjustment layers (#102) carry no file
+                };
+                if *source == Self::A_SOURCE {
+                    return None;
+                }
+                let cs = self.comp_sources.get(source)?;
+                Some(LayerPersist {
+                    path: cs.path.clone(),
+                    name: l.name.clone(),
+                    aov: *aov,
+                    blend: l.blend,
+                    opacity: l.opacity,
+                    enabled: l.enabled,
+                    solo: l.solo,
+                    trim_in: l.trim.in_point,
+                    trim_out: l.trim.out_point,
+                    trim_offset: l.trim.offset,
+                })
+            })
+            .collect()
+    }
+
+    /// Rebuild the comp stack from the persisted list (#99 PR-B.5) — called once at
+    /// startup, after storage is read.
+    ///
+    /// Each entry is replayed through [`Self::add_comp_source`], so restore takes the
+    /// *same* path as a normal open: sequence detection, follower registration,
+    /// transport entry, and the layer cap all behave identically. The per-layer state
+    /// the model owns (`aov` / blend / opacity / enabled / solo / trim) is then applied
+    /// on top, since `add_comp_source` always adds at defaults.
+    ///
+    /// A file that has moved or been deleted is **skipped silently** — the rest of the
+    /// stack still restores, and a startup error box for a stale session would be
+    /// noise. `add_comp_source` sets `error_msg` on a failed decode, so that is cleared
+    /// afterwards for the same reason.
+    fn restore_comp_layers(&mut self) {
+        let saved = std::mem::take(&mut self.persisted_layers);
+        if saved.is_empty() {
+            return;
+        }
+        for entry in saved {
+            if !entry.path.is_file() {
+                continue;
+            }
+            self.add_comp_source(entry.path);
+            // `add_comp_source` pushes on top and selects it, so the just-added layer
+            // is the last one; a rejected add (cap / decode failure) leaves the stack
+            // unchanged and there is nothing to configure.
+            let Some(id) = self.comp_stack.iter().last().map(|l| l.id) else {
+                continue;
+            };
+            let Some(layer) = self.comp_stack.get_mut(id) else {
+                continue;
+            };
+            if let crate::layer::LayerSource::Image { aov, .. } = &mut layer.source {
+                *aov = entry.aov;
+            }
+            layer.name = entry.name;
+            layer.blend = entry.blend;
+            layer.opacity = entry.opacity;
+            layer.enabled = entry.enabled;
+            layer.solo = entry.solo;
+            layer.trim = crate::layer::Trim {
+                in_point: entry.trim_in,
+                out_point: entry.trim_out,
+                offset: entry.trim_offset,
+            };
+        }
+        // A skipped/failed entry must not greet the user with a stale error box.
+        self.error_msg = None;
+    }
+
     fn add_comp_source(&mut self, path: std::path::PathBuf) {
         if self.comp_stack.len() >= COMP_LAYER_CAP {
             // Report rather than silently drop — a multi-file drop past the cap
@@ -5550,6 +5710,7 @@ impl ExrApp {
         self.comp_sources.insert(
             source,
             CompSource {
+                path,
                 exr_data,
                 size,
                 aov,
@@ -7818,6 +7979,146 @@ mod tests {
             restored.viewer.prefs, expected,
             "viewer prefs survive the save/load persistence bridge"
         );
+    }
+
+    #[test]
+    fn comp_layers_persist_and_restore_through_ron_storage() {
+        // #99 PR-B.5: the comp stack survives a restart. Exercises the real bridge —
+        // `save()` flattens, eframe's RON codec round-trips, `restore_comp_layers`
+        // replays through `add_comp_source` — not just a serde round-trip.
+        #[derive(Default)]
+        struct MemStorage(std::collections::HashMap<String, String>);
+        impl eframe::Storage for MemStorage {
+            fn get_string(&self, key: &str) -> Option<String> {
+                self.0.get(key).cloned()
+            }
+            fn set_string(&mut self, key: &str, value: String) {
+                self.0.insert(key.to_owned(), value);
+            }
+            fn flush(&mut self) {}
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let f0 = dir.path().join("one.exr");
+        let f1 = dir.path().join("two.exr");
+        write_rgba_exr(&f0);
+        write_rgba_exr(&f1);
+
+        let mut app = ExrApp::default();
+        app.add_comp_source(f0.clone());
+        app.add_comp_source(f1.clone());
+        assert_eq!(app.comp_stack.len(), 2, "two layers added");
+
+        // Give the top layer non-default per-layer state, so the assertions below
+        // prove the *state* round-trips and not just the paths.
+        let top = app.comp_stack.iter().last().map(|l| l.id).unwrap();
+        {
+            let l = app.comp_stack.get_mut(top).unwrap();
+            l.blend = crate::viewer::BlendMode::Screen;
+            l.opacity = 0.25;
+            l.solo = true;
+            l.name = "renamed".to_string();
+            l.trim = crate::layer::Trim {
+                in_point: 3,
+                out_point: 9,
+                offset: -2,
+            };
+        }
+
+        let mut storage = MemStorage::default();
+        eframe::App::save(&mut app, &mut storage);
+
+        let mut restored: ExrApp = eframe::get_value(&storage, eframe::APP_KEY)
+            .expect("app state round-trips through eframe's RON codec");
+        assert_eq!(
+            restored.comp_stack.len(),
+            0,
+            "the stack itself is runtime-only — it arrives empty and is replayed"
+        );
+        restored.restore_comp_layers();
+
+        assert_eq!(restored.comp_stack.len(), 2, "both layers restored");
+        let names: Vec<_> = restored.comp_stack.iter().map(|l| l.name.clone()).collect();
+        assert_eq!(
+            names,
+            vec!["one.exr".to_string(), "renamed".to_string()],
+            "restored bottom→top in the saved order, keeping the renamed layer"
+        );
+
+        let t = restored.comp_stack.iter().last().unwrap();
+        assert_eq!(t.blend, crate::viewer::BlendMode::Screen, "blend restored");
+        assert!((t.opacity - 0.25).abs() < f32::EPSILON, "opacity restored");
+        assert!(t.solo, "solo restored");
+        assert_eq!(t.trim.in_point, 3);
+        assert_eq!(t.trim.out_point, 9);
+        assert_eq!(t.trim.offset, -2, "per-layer time offset restored");
+
+        // Each restored layer decoded into its own source — no aliasing, and none
+        // landing on the base-plate slot.
+        let sources: Vec<_> = restored
+            .comp_stack
+            .iter()
+            .filter_map(|l| match &l.source {
+                crate::layer::LayerSource::Image { source, .. } => Some(*source),
+                crate::layer::LayerSource::Adjustment => None,
+            })
+            .collect();
+        assert_eq!(sources.len(), 2);
+        assert_ne!(sources[0], sources[1], "distinct sources");
+        assert!(
+            sources.iter().all(|s| *s != ExrApp::A_SOURCE),
+            "restored layers never alias the base-plate slot"
+        );
+        assert!(restored.error_msg.is_none(), "a clean restore is silent");
+    }
+
+    #[test]
+    fn restore_skips_layers_whose_file_is_gone() {
+        // A stale session must not fail wholesale, nor greet the user with an error
+        // box: the missing layer is dropped and the rest of the stack restores.
+        let dir = tempfile::tempdir().unwrap();
+        let present = dir.path().join("here.exr");
+        write_rgba_exr(&present);
+
+        let mut app = ExrApp {
+            persisted_layers: vec![
+                LayerPersist {
+                    path: dir.path().join("deleted.exr"),
+                    name: "deleted.exr".into(),
+                    ..Default::default()
+                },
+                LayerPersist {
+                    path: present.clone(),
+                    name: "here.exr".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        app.restore_comp_layers();
+
+        assert_eq!(app.comp_stack.len(), 1, "only the present file restored");
+        assert_eq!(app.comp_stack.iter().next().unwrap().name, "here.exr");
+        assert!(
+            app.error_msg.is_none(),
+            "a missing file is not an error box"
+        );
+        assert!(
+            app.persisted_layers.is_empty(),
+            "the replayed list is consumed, so a later save re-derives it from the stack"
+        );
+    }
+
+    #[test]
+    fn layer_persist_defaults_keep_a_layer_visible() {
+        // `#[serde(default)]` fills MISSING fields from `Default`, so an app.ron
+        // written before a field existed must not restore an invisible layer — a
+        // derived Default would give opacity 0.0 / enabled false.
+        let d = LayerPersist::default();
+        assert!((d.opacity - 1.0).abs() < f32::EPSILON, "fully opaque");
+        assert!(d.enabled, "enabled");
+        assert!(!d.solo);
+        assert_eq!(d.trim_out, u32::MAX, "spans all frames");
     }
 
     #[test]
