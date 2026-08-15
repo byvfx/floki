@@ -28,10 +28,8 @@ impl From<ThemeChoice> for egui::ThemePreference {
 /// [`ExrApp::open_file`]'s worker and applied in [`ExrApp::apply_load_result`].
 /// A stale result from a superseded request is discarded; which field is the
 /// supersession key depends on the request kind: a **seq-frame** by `epoch`
-/// (#57), a **slot-A explicit open** by `open_gen` (#109), and a **slot-B
-/// open** by `path` (its `b.loaded_file` is never rewritten by playback).
+/// (#57) and an explicit open by `open_gen` (#109).
 struct LoadResult {
-    path: PathBuf,
     /// Which source this decode is for (#99 unification): the A/B compare slots are
     /// `ExrApp::{A,B}_SOURCE` (`SourceId` 0/1). For an explicit open it selects
     /// B-open vs A-open (path/generation supersession); for a **seq frame**
@@ -63,6 +61,153 @@ fn default_proxy_size() -> usize {
 /// bounded on 8 GB (see the roadmap); the panel disables Add at this many layers.
 const COMP_LAYER_CAP: usize = 6;
 
+/// First `SourceId` the Layers panel allocates for its sources (#99 Phase 2).
+/// `SourceId(0)` is the base-plate slot ([`ExrApp::A_SOURCE`]) and `SourceId(1)`
+/// was the old locked-step B follower (deleted in Slice 3h.2), so comp sources
+/// start at 2 and never alias either in the shared T1 cache / T2 rings /
+/// `followers` map once they decode as sequence followers.
+const COMP_SOURCE_BASE: u64 = 2;
+
+/// Width of the timeline panel's track gutter (#99): the fixed-width left column
+/// holding a layer's visibility / solo / name / menu. Everything right of it is
+/// the shared time axis, so the frame ruler and every clip bar map frames to the
+/// same x.
+const TIMELINE_GUTTER_W: f32 = 220.0;
+
+/// Height of one row in the timeline panel (#99) — the ruler and each layer track.
+const TIMELINE_ROW_H: f32 = 22.0;
+
+/// Cache-fill strip colors (#172), shared by the ruler's bar and the per-track
+/// strips (#99): proxy/beauty-resident frames in a dim green, full-res on top in a
+/// brighter green — so a range that's only proxy-cached (it sharpens to full on
+/// pause) reads differently from a fully-cached one.
+const CACHE_PROXY_FILL: egui::Color32 = egui::Color32::from_rgb(52, 104, 72);
+const CACHE_FULL_FILL: egui::Color32 = egui::Color32::from_rgb(64, 168, 96);
+
+/// Frame ↔ x mapping for the timeline panel (#99). Built per row from that row's
+/// axis rect (every row allocates identically, so they all agree) and shared by
+/// the ruler and the layer clip bars, which is what makes a bar line up with the
+/// frame numbers above it. `f64` throughout: frame numbers on long sequences
+/// exceed f32-exact range, and the mapping has to stay monotonic.
+#[derive(Clone, Copy, Debug)]
+struct TimeAxis {
+    left: f32,
+    width: f32,
+    lo: u32,
+    hi: u32,
+}
+
+impl TimeAxis {
+    fn new(rect: egui::Rect, lo: u32, hi: u32) -> Self {
+        Self {
+            left: rect.left(),
+            width: rect.width(),
+            lo,
+            hi,
+        }
+    }
+
+    /// Frames spanned; `0` for a single-frame sequence (which maps to the center).
+    fn span(self) -> f64 {
+        f64::from(self.hi.saturating_sub(self.lo))
+    }
+
+    /// x of a global frame. Frames outside `[lo, hi]` clamp to the axis edges, so
+    /// a layer offset off the end of the timeline shows as a bar against the edge
+    /// rather than painting outside the panel.
+    fn x_of(self, frame: i64) -> f32 {
+        let span = self.span();
+        let t = if span == 0.0 {
+            0.5
+        } else {
+            (((frame - i64::from(self.lo)) as f64) / span) as f32
+        };
+        self.left + t.clamp(0.0, 1.0) * self.width
+    }
+
+    /// x of the *left edge of a frame's slot*, for strips where each frame owns an
+    /// equal-width cell over `lo..=hi` inclusive (the cache-fill bars) rather than
+    /// sitting on a tick.
+    fn slot_x(self, frame: i64) -> f32 {
+        let nslots = self.span() + 1.0;
+        let t = (((frame - i64::from(self.lo)) as f64) / nslots) as f32;
+        self.left + t.clamp(0.0, 1.0) * self.width
+    }
+
+    /// The global frame under `x` (clamped to the axis).
+    fn frame_at(self, x: f32) -> i64 {
+        let t = f64::from((x - self.left) / self.width.max(1.0)).clamp(0.0, 1.0);
+        i64::from(self.lo) + (t * self.span()).round() as i64
+    }
+}
+
+/// Coalesce a sorted frame set into contiguous runs, handing each `[start, end]`
+/// to `run` (#146): with a large RAM budget the ring holds thousands of frames,
+/// and painting one rect per frame tessellated thousands of shapes per repaint.
+/// Shared by the ruler's cache-fill bar and the per-track strips.
+fn for_each_frame_run(frames: &mut [u32], mut run: impl FnMut(u32, u32)) {
+    frames.sort_unstable();
+    let mut i = 0;
+    while i < frames.len() {
+        let start = frames[i];
+        let mut end = start;
+        while i + 1 < frames.len() && frames[i + 1] == end + 1 {
+            i += 1;
+            end = frames[i];
+        }
+        i += 1;
+        run(start, end);
+    }
+}
+
+/// Allocate one full-width timeline row and split it into `(gutter, axis)`.
+/// Allocating the row in a single call — rather than as two adjacent widgets —
+/// is what keeps the axis x-origin identical on every row: egui inserts
+/// `item_spacing` between separate allocations, which would stagger the rows.
+fn alloc_timeline_row(ui: &mut egui::Ui, axis_w: f32, h: f32) -> (egui::Rect, egui::Rect) {
+    let (row, _) = ui.allocate_exact_size(
+        egui::vec2(TIMELINE_GUTTER_W + axis_w, h),
+        egui::Sense::hover(),
+    );
+    let split = row.left() + TIMELINE_GUTTER_W;
+    (
+        egui::Rect::from_min_max(row.min, egui::pos2(split, row.bottom())),
+        egui::Rect::from_min_max(egui::pos2(split, row.top()), row.max),
+    )
+}
+
+/// A layer clip bar's span on the *global* timeline, from its source-space trim.
+/// `source = global + offset`, so `global = source - offset`. Returns `None` when
+/// the layer falls entirely outside `[lo, hi]` (it is blank across the whole
+/// visible timeline).
+fn track_span(trim: crate::layer::Trim, lo: u32, hi: u32) -> Option<(i64, i64)> {
+    let g_lo = i64::from(trim.in_point).saturating_sub(trim.offset);
+    let g_hi = i64::from(trim.out_point).saturating_sub(trim.offset);
+    if g_hi < i64::from(lo) || g_lo > i64::from(hi) {
+        return None;
+    }
+    Some((g_lo, g_hi))
+}
+
+/// The layer offset a clip drag lands on (#99): the bar is anchored to the frame
+/// the pointer grabbed, so the result is a function of the pointer's *absolute*
+/// position rather than an accumulation of per-event deltas (which drifts).
+/// Dragging right moves the layer later on the global timeline, which *decreases*
+/// the offset (`global = source - offset`).
+fn offset_after_drag(start_offset: i64, grab: i64, now: i64) -> i64 {
+    start_offset - (now - grab)
+}
+
+/// An in-progress clip-bar drag (#99). Holds the frame the pointer grabbed and
+/// the layer's offset at grab time, so every drag event re-derives the offset
+/// from scratch (see [`offset_after_drag`]).
+#[derive(Clone, Copy, Debug)]
+struct TrackDrag {
+    id: crate::layer::LayerId,
+    grab: i64,
+    start_offset: i64,
+}
+
 /// A decoded Layers-panel source (#99 PR-B.2): its pixels plus the GPU texture the
 /// composite ping-pong (PR-B.3) binds as a layer. One per `SourceId`, held in
 /// [`ExrApp::comp_sources`]. The `texture` handle is kept purely to own the VRAM
@@ -75,6 +220,10 @@ struct CompSource {
     // composite ping-pong / row controls in PR-B.3–B.4 — hence the item-level
     // `#[allow(dead_code)]`s (the sanctioned "landed ahead of its consumer" pattern,
     // #153), not a struct-wide allow that would also mask accidental dead fields.
+    /// The file this source decoded from — the one thing persistence needs to
+    /// rebuild the layer next session (#99 PR-B.5). The layer's `name` is only the
+    /// file *name*, so it can't reopen the file on its own.
+    path: std::path::PathBuf,
     /// Full decode, kept for pixel sampling, AOV metadata, and re-uploads (an AOV
     /// switch in PR-B.4 rebuilds the texture from this without touching disk).
     #[allow(dead_code)]
@@ -95,6 +244,65 @@ struct CompSource {
     /// Owns the texture's VRAM; not read directly (the bind group holds the view).
     #[allow(dead_code)]
     texture: Option<eframe::egui_wgpu::wgpu::Texture>,
+    /// The sequence frame `texture`/`bind_group` currently hold, for a **sequence**
+    /// source (#99 Phase 2). `None` for a still (one fixed texture) or before the
+    /// first per-frame build. `draw_comp_central` rebuilds from the T1 cache when
+    /// the resolved source frame moves off this.
+    cur_frame: Option<u32>,
+}
+
+/// One comp layer, flattened for persistence (#99 PR-B.5). Written at `save()` from
+/// `comp_stack` + `comp_sources`, replayed by [`ExrApp::restore_comp_layers`] on the
+/// next launch.
+///
+/// **Flat fields, not the model types.** `LayerStack`/`Layer`/`Trim` are deliberately
+/// not `Serialize`: the model is pure and free to change shape, and `LayerId`/`SourceId`
+/// are session-scoped (re-allocated on load, so a persisted id would be a lie). This
+/// struct is the versioned boundary between the two — every field has a serde default,
+/// so an `app.ron` written by an older build still loads.
+///
+/// **Never `#[serde(flatten)]` this into `ExrApp`** — a flattened map swallows unknown
+/// keys and has repeatedly wiped `app.ron` on this project.
+#[derive(Clone, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct LayerPersist {
+    /// The source file. Re-decoded on load; a layer whose file has moved or been
+    /// deleted is skipped (not an error — the rest of the stack still restores).
+    path: std::path::PathBuf,
+    /// The layer's display name. Usually the file name, but the user may have
+    /// renamed it, so persist it rather than re-deriving.
+    name: String,
+    /// Which AOV / logical layer of the source is shown.
+    aov: usize,
+    blend: crate::viewer::BlendMode,
+    opacity: f32,
+    enabled: bool,
+    solo: bool,
+    /// `Trim`, flattened — see the struct note on why the model type isn't used.
+    trim_in: u32,
+    trim_out: u32,
+    trim_offset: i64,
+}
+
+/// Hand-written rather than derived, because `#[serde(default)]` fills **missing**
+/// fields from here: a derived `Default` would give `opacity: 0.0` / `enabled: false`,
+/// so an `app.ron` from a build that predates either field would restore a stack of
+/// invisible layers. These match [`crate::layer::LayerStack::push_image`]'s defaults.
+impl Default for LayerPersist {
+    fn default() -> Self {
+        Self {
+            path: std::path::PathBuf::new(),
+            name: String::new(),
+            aov: 0,
+            blend: crate::viewer::BlendMode::default(),
+            opacity: 1.0,
+            enabled: true,
+            solo: false,
+            trim_in: 0,
+            trim_out: u32::MAX,
+            trim_offset: 0,
+        }
+    }
 }
 
 /// serde default for `proxy_cache_gb` (#165): the on-disk proxy-cache size budget
@@ -148,12 +356,7 @@ struct LoadJob {
 /// slot-A load first sends a `Proxy` (a fast low-res first paint, #33) when one
 /// is available, then always sends `Loaded` with the full decode.
 enum LoadMsg {
-    Proxy {
-        path: PathBuf,
-        proxy: crate::proxy::ProxyImage,
-    },
-    // Boxed: `LoadResult` holds a full `ExrData` inline, dwarfing the `Proxy`
-    // variant (`large_enum_variant`).
+    /// Boxed: `LoadResult` holds a full `ExrData` inline.
     Loaded(Box<LoadResult>),
 }
 
@@ -198,15 +401,10 @@ const OCIO_BAKE_LUT_SIZE: u32 = 65;
 /// as the old defaulted `*_b`.
 #[derive(Default)]
 struct SourceState {
-    /// The follower's opened path — path-keyed explicit-open supersession.
-    loaded_file: Option<PathBuf>,
     /// The follower's detected sequence (`None` → a lone image that holds).
     sequence: Option<crate::sequence::Sequence>,
     /// The follower's current frame (position-aligned to the global playhead).
     current_frame: u32,
-    /// User A/B frame offset (#166): the follower shows its aligned frame + this,
-    /// clamped to its range. Runtime, footage-specific; resets to 0 each session.
-    offset: i32,
     /// The follower frame the transport is awaiting (`None` when resident).
     pending: Option<u32>,
     /// Follower seq frames submitted-but-not-returned — a separate set from the
@@ -236,8 +434,6 @@ pub struct ExrApp {
     // (often 600 MB+) pixel buffers. See docs/playback/memory-contract.md.
     #[serde(skip)]
     exr_data: Option<std::sync::Arc<ExrData>>,
-    #[serde(skip)]
-    exr_data_b: Option<std::sync::Arc<ExrData>>,
     #[serde(skip)]
     error_msg: Option<String>,
     #[serde(skip)]
@@ -277,11 +473,8 @@ pub struct ExrApp {
     inflight: std::collections::HashSet<u32>,
 
     /// Per-`SourceId` follower decode+playback state (#99 unification). Each
-    /// non-primary source is a *slaved* function of the master playhead. Today the
-    /// map holds exactly one entry — the locked-step **B** follower at
-    /// [`Self::B_SOURCE`] — seeded in `Default` and reset (never removed) by open /
-    /// unload, so [`Self::b`]/[`Self::b_mut`] always resolve.
-    /// Phase 2 inserts the comp stack's N sources here so their playheads,
+    /// non-primary source is a *slaved* function of the master playhead. Holds the
+    /// comp stack's sequence sources so their playheads,
     /// in-flight sets, and per-source budget shares are tracked uniformly. The
     /// primary (Slot A) still lives in the top-level `inflight` / `loading_a` and
     /// on `playback`. `BTreeMap` gives a deterministic pump/eviction order by id.
@@ -353,6 +546,13 @@ pub struct ExrApp {
     /// schema-versioned migration is tracked separately in #65.
     #[serde(default)]
     persisted_prefs: crate::viewer::ViewerPrefs,
+
+    /// The comp stack, flattened for persistence (#99 PR-B.5). Mirrored from
+    /// `comp_stack` + `comp_sources` in [`eframe::App::save`] — the same persist-time
+    /// bridge `persisted_prefs` uses — and replayed by [`Self::restore_comp_layers`]
+    /// on the next launch. Nested, **never `#[serde(flatten)]`** (see the note above).
+    #[serde(default)]
+    persisted_layers: Vec<LayerPersist>,
 
     /// Snapshot to clipboard (issue #19): when true, each snapshot also writes a
     /// timestamped PNG to `~/.floki/snapshots/`. The clipboard copy always happens.
@@ -515,9 +715,28 @@ pub struct ExrApp {
     show_help: bool,
     #[serde(skip)]
     show_settings: bool,
-    /// Whether the additive **Layers** panel is shown (#99 PR-B). Menu-toggled.
+    /// Whether the **Layers** panel is shown (#99). On by default now that the
+    /// layer stack is becoming the primary model (the A/B compare is on its way
+    /// out); still menu-toggleable.
     #[serde(skip)]
     show_layers_panel: bool,
+    /// Whether the left **Info** side panel (EXR Info / Color Sampler / Histogram)
+    /// is shown. On by default; menu-toggleable via View ▸ Info panel. Transient
+    /// like `show_layers_panel` — resets to shown each session.
+    #[serde(skip)]
+    show_side_panel: bool,
+    /// An in-progress timeline clip-bar drag (#99), or `None`. Purely transient
+    /// interaction state — the edit it produces lands in the layer's `Trim.offset`.
+    #[serde(skip)]
+    track_drag: Option<TrackDrag>,
+    /// The comp stack drives the global transport (#99 R4-lite): set when the first
+    /// added comp *sequence* establishes the playhead (there's no slot-A open), so
+    /// the timeline + playback keys light up. While set, the slot-A decode path is
+    /// bypassed (`request_sequence_frame` / `next_want` / the budget split) so the
+    /// clock-driving sequence isn't also decoded as the primary. A real slot-A open
+    /// reclaims the transport (clears this).
+    #[serde(skip)]
+    comp_drives_transport: bool,
     /// The Layers panel's composite stack: a viewer-independent N-layer stack the
     /// panel edits and (PR-B.3) composites via the PR-A accumulate ping-pong,
     /// separate from the A/B compare stack so the compare modes stay untouched.
@@ -525,8 +744,10 @@ pub struct ExrApp {
     /// this field (`LayerStack` isn't `Serialize`, and ids are re-allocated on load).
     #[serde(skip)]
     comp_stack: crate::layer::LayerStack,
-    /// Monotonic allocator for the panel's `SourceId`s (#99 PR-B). Never reused, so
-    /// a removed-then-added source can't alias a stale decode/texture (PR-B.2).
+    /// Monotonic allocator for the panel's `SourceId`s (#99 PR-B). Starts at
+    /// [`COMP_SOURCE_BASE`] (2) so comp sources never alias the A/B slots (0/1);
+    /// never reused, so a removed-then-added source can't alias a stale
+    /// decode/texture (PR-B.2).
     #[serde(skip)]
     comp_next_source: u64,
     /// Decoded pixels + GPU texture for each Layers-panel source, keyed by the
@@ -540,6 +761,45 @@ pub struct ExrApp {
     /// [`Self::remove_comp_layer`].
     #[serde(skip)]
     comp_sources: std::collections::HashMap<crate::layer::SourceId, CompSource>,
+
+    /// The topmost drawable comp layer under the cursor — `(source, aov)` — for the
+    /// status-bar pixel readout (#99 R4). Set each frame by [`Self::draw_comp_central`]
+    /// and read the next frame by [`Self::draw_status_bar`] (which runs first — the same
+    /// one-frame lag the A/B readout has). Runtime-only.
+    #[serde(skip)]
+    comp_readout: Option<(crate::layer::SourceId, usize)>,
+
+    /// Which layer fills the compare pane (side B) in a non-`Stacked` arrangement
+    /// (#99 Slice 2a) — Nuke's second viewer input, chosen explicitly via the `vs:`
+    /// picker rather than tied to the "current" layer. `None` = use the default from
+    /// [`default_compare_b`] (the topmost layer that isn't current), so the two panes
+    /// differ out of the box instead of side B duplicating the top of the composite.
+    /// Runtime-only.
+    #[serde(skip)]
+    compare_b_layer: Option<crate::layer::LayerId>,
+
+    /// The compare layer's `(source, aov)` — side B of a Side-by-Side (#99 Slice 2a).
+    /// When the cursor is over that pane, [`Self::sample_comp_readout`] promotes this
+    /// into `comp_readout` so the status-bar row names and samples the pane actually
+    /// under the cursor. `None` outside Side-by-Side. Runtime-only.
+    #[serde(skip)]
+    comp_readout_b: Option<(crate::layer::SourceId, usize)>,
+
+    /// The comp layer the viewer's AOV / channel controls + EXR Info act on —
+    /// Nuke's "current" layer (#99 R4 follow-up). Set to the newest layer on
+    /// open/add and by clicking a layer in the viewport bar or a timeline track;
+    /// resolved (with a top-of-stack fallback for a stale/empty selection) by
+    /// [`Self::active_comp_layer`]. Runtime-only.
+    #[serde(skip)]
+    selected_comp_layer: Option<crate::layer::LayerId>,
+
+    /// Viewport arrangement for the comp path (#99 render-retire, Slice 2): how the
+    /// composite is presented against the **current layer** (`active_comp_layer`).
+    /// `Stacked` = the plain composite; `SideBySide`/`Wipe`/`Diff` compare the
+    /// composite (side A) against the current layer (side B). The comp-path analogue
+    /// of the A/B `compare_mode`. Runtime-only.
+    #[serde(skip)]
+    comp_arrangement: crate::layer::Arrangement,
 
     /// App-owned GPU core (#54): the single home for the persistent `GpuState`
     /// and the OCIO pass publisher. `None` in the CPU-only path (no wgpu
@@ -654,7 +914,6 @@ impl Default for ExrApp {
             loaded_file: None,
             open_gen_a: 0,
             exr_data: None,
-            exr_data_b: None,
             error_msg: None,
             viewer: ExrViewer::default(),
             playback: crate::playback::Playback::default(),
@@ -666,7 +925,7 @@ impl Default for ExrApp {
             frame_bytes: None,
             proxy_bytes: None,
             inflight: std::collections::HashSet::new(),
-            followers: std::iter::once((Self::B_SOURCE, SourceState::default())).collect(),
+            followers: std::collections::BTreeMap::new(),
             epoch_signal: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             show_playback_debug: false,
             show_playback_hud: false,
@@ -681,6 +940,7 @@ impl Default for ExrApp {
             recent_files: Vec::new(),
             theme: ThemeChoice::default(),
             persisted_prefs: crate::viewer::ViewerPrefs::default(),
+            persisted_layers: Vec::new(),
             save_snapshots: false,
             t2_enabled: true,
             beauty_preview: true,
@@ -711,10 +971,18 @@ impl Default for ExrApp {
             resource_monitor: crate::resource_monitor::ResourceMonitor::default(),
             show_help: false,
             show_settings: false,
-            show_layers_panel: false,
+            show_layers_panel: true,
+            show_side_panel: true,
+            track_drag: None,
+            comp_drives_transport: false,
             comp_stack: crate::layer::LayerStack::new(),
-            comp_next_source: 0,
+            comp_next_source: COMP_SOURCE_BASE,
             comp_sources: std::collections::HashMap::new(),
+            comp_readout: None,
+            comp_readout_b: None,
+            compare_b_layer: None,
+            selected_comp_layer: None,
+            comp_arrangement: crate::layer::Arrangement::Stacked,
             gpu_resources: None,
             ocio_path: String::new(),
             lut_path: String::new(),
@@ -769,6 +1037,13 @@ impl ExrApp {
         // (#151). From here on `self.viewer.prefs` is the single source of truth;
         // `persisted_prefs` stays dormant until `save()` re-mirrors it.
         app.viewer.prefs = std::mem::take(&mut app.persisted_prefs);
+
+        // Rebuild the comp stack from the persisted layer list (#99 PR-B.5). Deferred
+        // until after the prefs move (so a restored layer's decode sees the right
+        // settings) but before the GPU/OCIO wiring below — `add_comp_source` decodes
+        // synchronously and only builds textures when `gpu_resources` is set, which
+        // `draw_comp_central`'s `ensure_comp_*` then does on the first frame anyway.
+        app.restore_comp_layers();
 
         // Wire the repaint handle before anything can spawn the decode worker,
         // so the worker can wake the UI when a result lands (#137).
@@ -1041,7 +1316,27 @@ impl ExrApp {
     /// playing (#146). The outcome arrives over `snapshot_rx`.
     fn finish_snapshot(&mut self, image: &egui::ColorImage, pixels_per_point: f32) {
         // Crop to the active image area (#52), falling back to the full canvas.
-        let Some(rect) = self.viewer.last_image_rect.or(self.viewer.last_canvas_rect) else {
+        //
+        // The clamp to the canvas happens here rather than at the `last_image_rect`
+        // write site (#99 Slice 3a): the comp path reuses that rect for the cursor→
+        // pixel readout (`comp_hover_pixel` normalizes across it), so storing a
+        // canvas-clipped rect would skew the readout whenever the image is zoomed
+        // past the viewport. The legacy path clamped on write and had separate hover
+        // geometry; doing it here keeps both consumers correct. Two panes span the
+        // canvas, so Side-by-Side takes the whole canvas.
+        let Some(rect) = self
+            .viewer
+            .last_image_rect
+            .zip(self.viewer.last_canvas_rect)
+            .map(|(img, canvas)| {
+                crate::snapshot::active_area_rect(
+                    canvas,
+                    img,
+                    self.viewer.last_image_rect_b.is_some(),
+                )
+            })
+            .or(self.viewer.last_canvas_rect)
+        else {
             return;
         };
         let cropped = crate::snapshot::crop_to_rect(image, rect, pixels_per_point);
@@ -1144,46 +1439,57 @@ impl ExrApp {
         self.viewer.invalidate_tone();
     }
 
-    /// Begin loading an EXR into slot A or B. The decode runs on a worker thread
-    /// so the UI stays responsive on large files; the result is delivered over
-    /// `load_rx` and applied in [`Self::apply_load_result`]. Records the path
-    /// up-front and raises the matching `loading_*` flag (which drives the
-    /// spinner and keeps repaints flowing).
-    fn open_file(&mut self, path: PathBuf, is_b: bool) {
-        if !is_b {
-            self.recent_files.retain(|p| p != &path);
-            self.recent_files.insert(0, path.clone());
-            self.recent_files.truncate(10);
-            self.loaded_file = Some(path.clone());
-            // New slot-A open: bump the generation so any in-flight open's result
-            // is superseded, even though playback may have rewritten `loaded_file`
-            // to a frame path in the meantime (#109).
-            self.open_gen_a += 1;
-            self.loading_a = true;
-            // An explicit slot-A open (re)evaluates sequence mode: opening one
-            // frame of a numbered sequence enables playback over its siblings; a
-            // lone image leaves single-image behavior unchanged (#7).
-            self.detect_sequence(&path);
-        } else {
-            self.b_mut().loaded_file = Some(path.clone());
-            self.b_mut().loading = true;
+    /// Arm slot-A sequence playback from `path` — **test fixture only** (#99
+    /// Slice 3h.2). Production arms the transport through `add_comp_source`, which
+    /// uses `sequence::detect_from_file` + `playback.enter` directly; this survived
+    /// its production caller (`open_file`) because ~45 playback tests use it to set
+    /// up a sequence before exercising advance / loop / scrub / cache / pump — all
+    /// of which are live. Rewriting those onto `add_comp_source` is a test-refactor
+    /// worth doing separately, not deletion fallout.
+    /// Drops the frame cache — it is keyed by frame number, which a different
+    /// sequence reuses.
+    #[cfg(test)]
+    fn detect_sequence(&mut self, path: &std::path::Path) {
+        self.frame_cache.clear();
+        self.frame_bytes = None;
+        // Reset the debug-overlay counters so each opened sequence's soak run
+        // starts clean (#100).
+        self.dbg_evictions = 0;
+        self.dbg_dropped_epoch = 0;
+        // A different sequence reuses frame numbers, so drop the T2 GPU ring too
+        // (and reset the on-screen frame; the first show re-sets it).
+        self.viewer.clear_t2(Self::A_SOURCE);
+        self.viewer.set_t2_frame(Self::A_SOURCE, None);
+        // Drop any prior sequence's in-flight frames (a different sequence reuses
+        // frame numbers); `enter`/`clear` bump the epoch so their results are
+        // dropped. `loading_a` is left to the caller.
+        self.inflight.clear();
+        // A new sequence resets the precache fill latch (#56, step 4).
+        self.precache_filled = false;
+        // A new sequence (or a lone image) invalidates the watch baseline; the
+        // next poll re-baselines against the freshly-opened group.
+        self.watch_sigs.clear();
+        self.last_watch_poll = None;
+        match crate::sequence::detect_from_file(path) {
+            Some(seq) => {
+                let start = seq.number_of(path).unwrap_or(seq.range.0);
+                self.playback.enter(seq, start);
+            }
+            None => self.playback.clear(),
         }
-        self.error_msg = None;
+    }
 
-        self.submit_job(LoadJob {
-            path,
-            source: if is_b { Self::B_SOURCE } else { Self::A_SOURCE },
-            seq_frame: false,
-            frame: 0,
-            epoch: self.playback.epoch,
-            // Only slot-A opens supersede by generation; B is path-keyed, so its
-            // job carries no meaningful generation.
-            open_gen: if is_b { 0 } else { self.open_gen_a },
-            // An explicit open always decodes in full (it seeds the session and
-            // the T1 RAM budget; AOVs must be present).
-            beauty_only: false,
-            proxy_target: None,
-        });
+    /// Bring a file into the stack as a new layer — the unified open/drop entry
+    /// (#99 R4). Records recent files, ensures the Layers panel is visible, then
+    /// decodes + adds the layer via [`Self::add_comp_source`] (a synchronous
+    /// decode: it promotes slot A to a base track on the first add, drives the
+    /// transport for the first sequence, and caps at [`COMP_LAYER_CAP`]).
+    fn open_layer(&mut self, path: PathBuf) {
+        self.recent_files.retain(|p| p != &path);
+        self.recent_files.insert(0, path.clone());
+        self.recent_files.truncate(10);
+        self.show_layers_panel = true;
+        self.add_comp_source(path);
     }
 
     /// Send a decode job to the worker, **respawning it if it has died** (#…).
@@ -1250,24 +1556,6 @@ impl ExrApp {
                     {
                         continue;
                     }
-                    // Slot-A first-paint proxy (#33): a fast low-res read so the
-                    // image appears before the full decode lands. Skipped for
-                    // slot B (a reference) and for playback frames (#7), which
-                    // swap straight to full-res. `from_exr_fast_read` returns None
-                    // for small / tiled / deep files anyway.
-                    if job.source == Self::A_SOURCE
-                        && !job.seq_frame
-                        && let Some(proxy) = crate::proxy::ProxyImage::from_exr_fast_read(
-                            &job.path,
-                            crate::proxy::PROXY_TARGET_BLOCKS,
-                        )
-                    {
-                        let _ = result_tx.send(LoadMsg::Proxy {
-                            path: job.path.clone(),
-                            proxy,
-                        });
-                        wake_ui();
-                    }
                     // Decode mode while the playhead moves, cheapest first (#94/#56):
                     // - a **scrub proxy** (downsampled, tiny + fast) when requested,
                     //   falling back to beauty/full if the fast read isn't available;
@@ -1310,7 +1598,6 @@ impl ExrApp {
                         None => ExrData::load(&job.path),
                     };
                     let _ = result_tx.send(LoadMsg::Loaded(Box::new(LoadResult {
-                        path: job.path,
                         source: job.source,
                         seq_frame: job.seq_frame,
                         frame: job.frame,
@@ -1335,90 +1622,17 @@ impl ExrApp {
     }
 
     // --- Image-sequence playback (#7) ----------------------------------------
-
-    /// Evaluate sequence mode for a freshly opened slot-A `path`: enter playback
-    /// over the detected siblings (placing the playhead on the opened frame), or
-    /// clear playback for a lone image. Either way the frame cache is dropped —
-    /// it is keyed by frame number, which a different sequence reuses.
-    fn detect_sequence(&mut self, path: &std::path::Path) {
-        self.frame_cache.clear();
-        self.frame_bytes = None;
-        // Reset the debug-overlay counters so each opened sequence's soak run
-        // starts clean (#100).
-        self.dbg_evictions = 0;
-        self.dbg_dropped_epoch = 0;
-        // A different sequence reuses frame numbers, so drop the T2 GPU ring too
-        // (and reset the on-screen frame; the first show re-sets it).
-        self.viewer.clear_t2(Self::A_SOURCE);
-        self.viewer.set_t2_frame(Self::A_SOURCE, None);
-        // Drop any prior sequence's in-flight frames (a different sequence reuses
-        // frame numbers); `enter`/`clear` bump the epoch so their results are
-        // dropped. `loading_a` is left to `open_file`, which owns this open.
-        self.inflight.clear();
-        // A new sequence resets the precache fill latch (#56, step 4).
-        self.precache_filled = false;
-        // A new sequence (or a lone image) invalidates the watch baseline; the
-        // next poll re-baselines against the freshly-opened group.
-        self.watch_sigs.clear();
-        self.last_watch_poll = None;
-        // A new A session drops any locked-step B (a lone reference is meaningless
-        // on its own, #98); the B result-apply path re-detects if a B is reopened.
-        self.clear_b_sequence();
-        match crate::sequence::detect_from_file(path) {
-            Some(seq) => {
-                let start = seq.number_of(path).unwrap_or(seq.range.0);
-                self.playback.enter(seq, start);
-            }
-            None => self.playback.clear(),
-        }
-    }
-
-    /// Drop all locked-step B state (#98): the B sequence, its playhead, awaited
-    /// and in-flight frames, and every B-source (`B_SOURCE`) ring entry. After
-    /// this, B is a lone static reference again (or absent).
-    fn clear_b_sequence(&mut self) {
-        let b = self.b_mut();
-        b.sequence = None;
-        b.current_frame = 0;
-        b.offset = 0;
-        b.pending = None;
-        b.loading = false;
-        b.inflight.clear();
-        self.frame_cache.clear_slot(Self::B_SOURCE);
-        // Drop the B T2 GPU ring too (#166): its frame keys belong to the sequence
-        // being cleared; the next B show re-sets the on-screen frame.
-        self.viewer.clear_t2(Self::B_SOURCE);
-        self.viewer.set_t2_frame(Self::B_SOURCE, None);
-    }
-
-    /// Arm locked-step B (#98) if the just-opened B file is part of an image
-    /// sequence: store `b.sequence`, seed `b.current_frame` + the B-source ring
-    /// with the opened frame, and re-align to A on the next playhead move. A lone
-    /// image leaves `sequence_b = None`, so B stays the static reference it was.
-    fn detect_sequence_b(&mut self, path: &std::path::Path) {
-        self.clear_b_sequence();
-        let Some(seq) = crate::sequence::detect_from_file(path) else {
-            return;
-        };
-        let bf = seq.number_of(path).unwrap_or(seq.range.0);
-        self.b_mut().current_frame = bf;
-        // The opened B frame is on screen; mark it for the B ring so its pump
-        // protects it from eviction (#166) even before the first locked-step swap.
-        self.viewer.set_t2_frame(Self::B_SOURCE, Some(bf));
-        // Seed the ring with the opened B frame (mirror the A open, #56) so it's an
-        // instant hit and the first locked-step advance has a cached neighbour.
-        if let Some(arc) = self.exr_data_b.clone() {
-            self.frame_cache.insert(Self::B_SOURCE, bf, arc);
-        }
-        self.b_mut().sequence = Some(seq);
-    }
-
-    /// Move the playhead to `frame` and display it. A resident frame (#56) shows
-    /// instantly from the T1 ring; a miss is marked pending and decoded by
-    /// [`Self::pump_decode`]. A hole (no file) holds the previous frame — nothing
-    /// is requested, so playback never stalls.
     fn request_sequence_frame(&mut self, frame: u32) {
         self.error_msg = None;
+        // Comp stack drives the transport (#99 R4-lite): no slot-A sequence, so skip
+        // the slot-A request entirely and just advance the comp followers to the new
+        // playhead. (`self.playback.frame_path` points at the clock-driving comp
+        // sequence, but decoding it as A_SOURCE would double-decode + steal priority.)
+        if self.comp_drives_transport {
+            self.sync_comp_followers();
+            self.pump_decode();
+            return;
+        }
         let Some(path) = self.playback.frame_path(frame).map(Path::to_path_buf) else {
             // Hole: keep showing the last real frame; prefetch may still run.
             self.playback.pending = None;
@@ -1440,7 +1654,7 @@ impl ExrApp {
                 && (data.beauty_only || data.proxy);
             self.loading_a = false;
             self.viewer.set_t2_frame(Self::A_SOURCE, Some(frame)); // bind this frame's T2 texture
-            self.swap_image_arc(data, false);
+            self.swap_image_arc(data);
             if needs_full {
                 self.playback.pending = Some(frame);
             } else {
@@ -1453,68 +1667,60 @@ impl ExrApp {
             // want-list puts the playhead first, so it beats any prefetch).
             self.playback.pending = Some(frame);
         }
-        // Locked-step B follows A here — this is the single chokepoint every A
-        // playhead move funnels through (advance / step / scrub / drop-frames /
-        // render-watch), so B never falls out of step (#98). No-op without a B
-        // sequence. Ordered after A's own request so `pump_decode` sees A's want
-        // first (A-playhead priority).
-        self.sync_b_to_a();
+        // Comp-panel sequence layers (#99 Phase 2) also follow the shared playhead —
+        // each maps the global frame through its `Trim` and requests it, so the pump
+        // decodes it alongside the primary. No-op with no comp sequence layers.
+        self.sync_comp_followers();
         self.pump_decode();
     }
 
-    /// Locked-step A/B (#98): drive B's playhead from A's. B is a *slaved*,
-    /// position-aligned function of A (no clock of its own), so whenever A's
-    /// playhead moves, recompute B's frame and request it. No-op when B isn't a
-    /// sequence (a lone-image B just holds, as before).
-    fn sync_b_to_a(&mut self) {
-        let Some(range) = self.b().sequence.as_ref().map(|s| s.range) else {
-            return;
-        };
-        // B follows A by position, plus the user's A/B offset (#166), clamped to
-        // B's range so the nudge can never point outside the compared sequence.
-        let b_frame = crate::playback::map_b_frame_offset(
-            self.playback.current_frame,
-            self.playback.in_point,
-            range,
-            self.b().offset,
-        );
-        self.b_mut().current_frame = b_frame;
-        self.request_b_frame(b_frame);
+    /// Advance each comp-panel **sequence** layer to its `Trim`-mapped source frame
+    /// for the current global playhead and request it (#99 Phase 2) — the comp
+    /// for the current global playhead and request it (#99 Phase 2). A layer whose trim does not cover the
+    /// current global frame is blank (holds its last frame); a still (no follower)
+    /// is skipped. No-op with no comp sequence layers.
+    fn sync_comp_followers(&mut self) {
+        let global = self.playback.current_frame;
+        // Snapshot (source, source_frame) for each in-range sequence layer before
+        // mutating followers / requesting (avoids aliasing the `comp_stack` borrow).
+        let wants: Vec<(crate::layer::SourceId, u32)> = self
+            .comp_stack
+            .iter()
+            .filter_map(|l| match &l.source {
+                crate::layer::LayerSource::Image { source, .. }
+                    if self.followers.contains_key(source) =>
+                {
+                    l.trim.source_frame(global).map(|sf| (*source, sf))
+                }
+                _ => None,
+            })
+            .collect();
+        for (source, sf) in wants {
+            if let Some(st) = self.followers.get_mut(&source) {
+                st.current_frame = sf;
+            }
+            self.request_comp_frame(source, sf);
+        }
     }
 
-    /// The slot-B counterpart of [`Self::request_sequence_frame`] (#98): show B's
-    /// frame from the T1 ring if resident (upgrading a beauty copy to full on
-    /// settle), else mark it awaited for the pump. `b.loaded_file` is *not*
-    /// rewritten — B seq frames supersede by the shared epoch (like A), so the
-    /// B-open path keeps its stable path-key.
-    fn request_b_frame(&mut self, frame: u32) {
-        // B is slaved to A, so it can move to a new frame while a previous B
-        // decode is still awaited — the old `b.loading` is now stale, and its
-        // frame (if it lands) won't match `b.current_frame`, so nothing else would
-        // clear it. Reset it on every B move: `submit_seq` re-sets it if this frame
-        // is submitted, and `apply_load_result` clears it when B's current frame
-        // lands. Without this, mapping B onto a hole (or advancing past an in-flight
-        // B frame) latches `b.loading` and gates `pump_decode` forever (freeze).
-        self.b_mut().loading = false;
+    /// Request a comp source's `frame` for the pump (#99 Phase 2) — the comp
+    /// counterpart of [`Self::request_b_frame`]. A comp follower has no display slot
+    /// (`draw_comp_central` binds it from the T1 cache), so this only clears the
+    /// stale wait state and marks the frame awaited when it isn't already resident.
+    fn request_comp_frame(&mut self, source: crate::layer::SourceId, frame: u32) {
+        let resident = self.frame_cache.contains(source, frame);
         let is_hole = self
-            .b()
-            .sequence
-            .as_ref()
+            .followers
+            .get(&source)
+            .and_then(|st| st.sequence.as_ref())
             .is_none_or(|s| s.path_for(frame).is_none());
-        if is_hole {
-            // Hole in B: hold the last real B frame; A drives on.
-            self.b_mut().pending = None;
-            self.pump_decode();
-            return;
-        }
-        if let Some(data) = self.frame_cache.get(Self::B_SOURCE, frame) {
-            let needs_full = !self.playback.is_playing()
-                && !self.scrub_active
-                && (data.beauty_only || data.proxy);
-            self.swap_b_frame(data);
-            self.b_mut().pending = if needs_full { Some(frame) } else { None };
-        } else {
-            self.b_mut().pending = Some(frame);
+        if let Some(st) = self.followers.get_mut(&source) {
+            st.loading = false;
+            st.pending = if is_hole || resident {
+                None
+            } else {
+                Some(frame)
+            };
         }
         self.pump_decode();
     }
@@ -1531,25 +1737,6 @@ impl ExrApp {
     /// The source id of the **primary** compare slot (A) — `SourceId(0)`. The
     /// master clock's source; keys A's T1 cache + T2 ring (#99).
     const A_SOURCE: crate::layer::SourceId = crate::layer::SourceId(0);
-    /// The source id of the locked-step **B** follower — `SourceId(1)`. Held as a
-    /// const so the sole `followers` entry (and its cache / T2 slot) has one name
-    /// while the app is still A/B-pinned; Phase 2 inserts comp sources under their
-    /// own ids.
-    const B_SOURCE: crate::layer::SourceId = crate::layer::SourceId(1);
-
-    /// The locked-step **B** follower's decode+playback state (#99). Always present
-    /// (seeded in `Default`, only reset — never removed — by open/unload), so both
-    /// accessors resolve unconditionally.
-    fn b(&self) -> &SourceState {
-        self.followers
-            .get(&Self::B_SOURCE)
-            .expect("B follower entry is seeded in Default and never removed")
-    }
-    fn b_mut(&mut self) -> &mut SourceState {
-        self.followers
-            .get_mut(&Self::B_SOURCE)
-            .expect("B follower entry is seeded in Default and never removed")
-    }
 
     /// The *active* followers — those with a detected sequence (the N-source
     /// generalization of "B is playing"). A lone-image / absent follower holds a
@@ -1560,9 +1747,12 @@ impl ExrApp {
 
     /// Resident source count for the per-source budget splits (#99): the primary
     /// (Slot A) plus every active follower. Replaces the hardcoded `/2` A+B split
-    /// so N playing sources each get their fair T1/decode-ahead share.
+    /// so N playing sources each get their fair T1/decode-ahead share. The primary
+    /// isn't counted when the comp stack drives the transport (#99 R4-lite) — it
+    /// doesn't decode then — so the followers get the whole budget. Floored at 1.
     fn n_active_sources(&self) -> usize {
-        1 + self.active_followers().count()
+        let primary = usize::from(!self.comp_drives_transport);
+        (primary + self.active_followers().count()).max(1)
     }
 
     /// The protected on-screen playheads for T1 eviction (#99 unification): the
@@ -1874,6 +2064,12 @@ impl ExrApp {
     /// scheduler in its own frame space (its range as in/out, its playhead), with
     /// the master direction / loop.
     fn next_want(&self, source: crate::layer::SourceId, depth: usize) -> Option<u32> {
+        // No primary (slot-A) decode when the comp stack drives the transport
+        // (#99 R4-lite): `playback` holds a comp sequence for the clock, but that
+        // sequence decodes as its own follower, not as A_SOURCE.
+        if source == Self::A_SOURCE && self.comp_drives_transport {
+            return None;
+        }
         // Split the window RV-style (#169): ~25% reserved behind the playhead,
         // the rest ahead — so forward window + behind reservation together never
         // over-ask the ring (the #57 back-pressure contract holds for the sum).
@@ -1999,62 +2195,6 @@ impl ExrApp {
         }
     }
 
-    /// Pre-upload **slot-B** T2 GPU textures (#166, #98 Phase 2) ahead of B's
-    /// playhead in locked-step compare, so a compared sequence binds an
-    /// already-uploaded texture each frame instead of re-packing + re-uploading on
-    /// the UI thread — the per-frame B upload that made B stutter while A stayed
-    /// smooth. Mirrors [`Self::pump_t2`] in B's own frame space; no-op unless B is
-    /// a sequence with a non-zero B ring cap. Only touches frames already resident
-    /// in B's (`B_SOURCE`) T1 cache (never decodes). UI-thread only.
-    fn pump_t2_b(&mut self) {
-        let Some(range) = self.b().sequence.as_ref().map(|s| s.range) else {
-            return;
-        };
-        if !self.playback.is_active() || self.viewer.t2_cap(Self::B_SOURCE) == 0 {
-            return;
-        }
-        // Full B ring on an unmoved B playhead: every slot is built for this frame.
-        if self.viewer.t2_len(Self::B_SOURCE) >= self.viewer.t2_cap(Self::B_SOURCE)
-            && self.last_t2_pump_b == Some(self.b().current_frame)
-        {
-            return;
-        }
-        let Some(gpu) = self.gpu_resources.as_ref() else {
-            return;
-        };
-        let depth = self.viewer.t2_cap(Self::B_SOURCE).saturating_sub(1);
-        // B's want-list in B's own frame space (its range as in/out, its playhead),
-        // sharing A's direction/loop — the same shape `next_want`/`warm_ahead` use
-        // for B (cf. `want_list_for`). Forward-only (no read-behind), like the A ring.
-        let wants = crate::scheduler::want_list(
-            self.b().current_frame,
-            range.0,
-            range.1,
-            self.playback.direction,
-            self.playback.loop_mode,
-            &std::collections::HashSet::new(),
-            depth,
-            0,
-        );
-        self.last_t2_pump_b = Some(self.b().current_frame);
-        const PUMP_BUDGET: std::time::Duration = std::time::Duration::from_millis(4);
-        let start = std::time::Instant::now();
-        let mut built = 0;
-        for w in std::iter::once(self.b().current_frame).chain(wants) {
-            if built > 0 && start.elapsed() >= PUMP_BUDGET {
-                break;
-            }
-            if let Some(arc) = self.frame_cache.peek(Self::B_SOURCE, w)
-                && self.viewer.prebuild_t2(Self::B_SOURCE, gpu, &arc, w)
-            {
-                built += 1;
-            }
-        }
-    }
-
-    /// Supersede every in-flight sequence decode: bump the epoch (so late results
-    /// are dropped on arrival) and forget the in-flight set / awaited playhead.
-    /// Called on every seek / scrub / direction change (#57).
     fn invalidate_inflight(&mut self) {
         self.playback.bump_epoch();
         // Publish the new epoch so the worker skips the jobs this just superseded
@@ -2066,7 +2206,7 @@ impl ExrApp {
         self.playback.pending = None;
         // Every follower (#98/#99) is superseded by the same epoch; clear each's
         // seq state too so a dropped decode can't leave a `loading` latched (gating
-        // the pump). `sync_b_to_a` re-requests B's new frame right after.
+        // the pump). `sync_comp_followers` re-requests their new frames right after.
         for st in self.followers.values_mut() {
             st.inflight.clear();
             st.pending = None;
@@ -2173,37 +2313,20 @@ impl ExrApp {
             .frame_cache
             .peek(Self::A_SOURCE, a_frame)
             .is_some_and(|d| !d.beauty_only && !d.proxy);
-        // Locked-step B (#98): its settled frame must be full-resident too so
-        // compare-mode sampling/AOV on B is correct. A hole holds the previous B
-        // frame — nothing to fetch, so treat it as settled.
-        let b_full = match self.b().sequence.as_ref() {
-            None => true,
-            Some(s) => {
-                let bf = self.b().current_frame;
-                s.path_for(bf).is_none()
-                    || self
-                        .frame_cache
-                        .peek(Self::B_SOURCE, bf)
-                        .is_some_and(|d| !d.beauty_only && !d.proxy)
-            }
-        };
         if a_full {
             // A is full-res and displayed; no A decode will land to trigger it,
             // so refresh the contact sheet now (frozen during play, #144).
             self.viewer.invalidate_active_thumbnails();
         }
-        if a_full && b_full {
+        if a_full {
             return;
         }
-        // Supersede in-flight beauty prefetch, then re-request each not-yet-full
-        // playhead at full fidelity (`request_*` upgrades a beauty ring hit; #7).
+        // Supersede in-flight beauty prefetch, then re-request the playhead at full
+        // fidelity (`request_*` upgrades a beauty ring hit; #7). Already-full frames
+        // need nothing — the slot-B re-sync that used to run in that case went with
+        // the locked-step B path (#99 Slice 3h.2).
         self.invalidate_inflight();
-        if a_full {
-            // A needs no re-decode; `request_sequence_frame` (which would sync B)
-            // is skipped, so upgrade/re-sync B directly.
-            self.sync_b_to_a();
-        } else {
-            // Re-decodes A at full fidelity and syncs B via the chokepoint.
+        if !a_full {
             self.request_sequence_frame(a_frame);
         }
     }
@@ -2618,7 +2741,6 @@ impl ExrApp {
             })
         };
         let t2_on = self.t2_enabled && self.playback.is_active();
-        let b_active = t2_on && self.b().sequence.is_some();
         let avail = crate::budget::vram_available(&sample);
         // Split the pool in *bytes* (not frame counts) across the active sources
         // (#99) so each derives its own count from its own resolution when they
@@ -2634,27 +2756,6 @@ impl ExrApp {
             .flatten();
         self.viewer
             .set_t2_cap(Self::A_SOURCE, cap_from(a_avail, a_dims));
-
-        // B ring: same per-source share, sized from B's own dims at the B layer
-        // (active layer clamped to B's layer count). Disabled unless B is a live
-        // sequence.
-        let b_dims = b_active
-            .then(|| {
-                self.exr_data_b.as_ref().and_then(|d| {
-                    let layer_b = self
-                        .viewer
-                        .active_layer
-                        .min(d.logical_layers.len().saturating_sub(1));
-                    d.logical_size(layer_b)
-                })
-            })
-            .flatten();
-        let t2_cap_b = if b_active {
-            cap_from(per_source, b_dims)
-        } else {
-            0
-        };
-        self.viewer.set_t2_cap(Self::B_SOURCE, t2_cap_b);
     }
 
     /// The ctx-free, synchronous core of the render-watch: re-scan the group,
@@ -2809,10 +2910,6 @@ impl ExrApp {
     /// results (a newer open of a different file superseded this one) by checking
     /// the result path against the currently-requested path for its slot.
     fn apply_load_result(&mut self, res: LoadResult) {
-        // The explicit-open routing below (the non-seq path) still forks A vs B;
-        // derive it from the result's source. Seq-frame routing keys on
-        // `res.source` directly (#99 P1.4c).
-        let is_b = res.source == Self::B_SOURCE;
         // Playback frame (#7): supersession is by **epoch** (#57), not path —
         // sequences recur the same paths under loop/ping-pong/scrub-back, so a
         // stale frame could otherwise be mistaken for the current one. Apply as a
@@ -2886,16 +2983,21 @@ impl ExrApp {
                             self.loading_a = false;
                             self.playback.pending = None;
                             self.viewer.set_t2_frame(Self::A_SOURCE, Some(res.frame));
-                            self.swap_image_arc(arc, false);
+                            self.swap_image_arc(arc);
                             self.playback.note_shown(std::time::Instant::now());
                         }
                     } else if res.frame == self.source_playhead(res.source) {
-                        // Follower show — the locked-step B display slot for now.
+                        // The awaited follower frame landed (already in the T1 cache,
+                        // inserted above). Clear its wait state. A comp follower has
+                        // no display slot — `draw_comp_central` binds it from the
+                        // cache — so just nudge a repaint so the new frame paints.
                         if let Some(st) = self.followers.get_mut(&res.source) {
                             st.loading = false;
                             st.pending = None;
                         }
-                        self.swap_b_frame(arc);
+                        if let Some(ctx) = &self.repaint_ctx {
+                            ctx.request_repaint();
+                        }
                     }
                     self.error_msg = None;
                 }
@@ -2921,56 +3023,24 @@ impl ExrApp {
             return;
         }
 
-        // Supersession for an explicit open. Slot B is path-keyed (its
-        // `b.loaded_file` is only set by an explicit B open / unload, never by
-        // playback). Slot A is **generation**-keyed (#109): `loaded_file` is
-        // rewritten to the current frame's path during playback, so a path check
-        // could drop a still-current open's result — and dropping it here returns
-        // before clearing `loading_a`, permanently gating `pump_decode`. The
-        // generation is bumped only by a later open or an unload.
-        let superseded = if is_b {
-            self.b().loaded_file.as_ref() != Some(&res.path)
-        } else {
-            res.open_gen != self.open_gen_a
-        };
-        if superseded {
+        // Supersession for an explicit open. The primary slot is
+        // **generation**-keyed (#109): `loaded_file` is rewritten to the current
+        // frame's path during playback, so a path check could drop a still-current
+        // open's result — and dropping it here returns before clearing `loading_a`,
+        // permanently gating `pump_decode`. The generation is bumped only by a
+        // later open or an unload.
+        if res.open_gen != self.open_gen_a {
             return;
         }
-
-        if is_b {
-            self.b_mut().loading = false;
-        } else {
-            self.loading_a = false;
-        }
+        self.loading_a = false;
 
         match res.result {
             Ok(data) => {
-                if is_b {
-                    // B is a reference slot, not a new session: swap the pixel
-                    // source while preserving the viewer's session state.
-                    self.swap_image_data(data, true);
-                    // Locked-step A/B (#98): if this B open is part of a sequence,
-                    // arm B so it advances with A. A lone image just holds.
-                    self.detect_sequence_b(&res.path);
-                } else {
-                    // An explicit open of a new A starts a fresh session: drop the
-                    // reference (meaningless on its own) in both paths below.
-                    self.exr_data_b = None; // Reset B when A changes
-                    self.b_mut().loaded_file = None;
-                    self.clear_b_sequence(); // and any locked-step B (#98)
-                    self.b_mut().loading = false; // A discards any in-flight B load
-                    if self.viewer.has_proxy() {
-                        // A proxy painted first and already established the fresh
-                        // view (and the user may have panned/zoomed it); swap to
-                        // full-res preserving that view so the handoff is
-                        // continuous. swap_image_data clears the proxy.
-                        self.swap_image_data(data, false);
-                    } else {
-                        // No proxy: the full decode is this image's first paint —
-                        // reset the viewer so it fits the new image.
-                        self.exr_data = Some(std::sync::Arc::new(data));
-                        self.reset_viewer_session();
-                    }
+                {
+                    // The full decode is this image's first paint — reset the
+                    // viewer so it fits the new image.
+                    self.exr_data = Some(std::sync::Arc::new(data));
+                    self.reset_viewer_session();
                     // If this open started a sequence, seed the T1 ring with the
                     // opened frame so a scrub-back to it is an instant hit (#56).
                     if self.playback.is_active()
@@ -2987,69 +3057,30 @@ impl ExrApp {
                 self.error_msg = None;
             }
             Err(e) => {
-                if !is_b {
-                    self.exr_data = None;
-                }
+                self.exr_data = None;
                 self.error_msg = Some(e);
             }
         }
     }
 
-    /// Replace the pixel source for slot A or B **without** resetting viewer
-    /// session state (zoom, pan, compare mode, channel mode, annotations,
-    /// swatches, tone/OCIO/LUT controls). This is the per-frame path for
-    /// image-sequence playback (#7): a new frame lands but the user's view is
-    /// preserved.
-    ///
-    /// Invalidates only image-derived caches (textures, histogram, sampled
-    /// values) and clamps `active_layer` to the new image's layer count. The
-    /// *other* slot (e.g. a fixed reference B while A plays a sequence) is left
-    /// untouched - swapping A does not drop B, unlike an explicit open.
-    ///
-    /// Contrast [`Self::reset_viewer_session`], used for an explicit open / new
-    /// session, which drops B and resets the entire viewer.
-    fn swap_image_data(&mut self, data: ExrData, is_b: bool) {
-        self.swap_image_arc(std::sync::Arc::new(data), is_b);
-    }
-
     /// As [`Self::swap_image_data`], but takes an already-`Arc`'d image so a
     /// playback cache hit (#56) can show a resident frame without cloning its
     /// pixel buffers — the same `Arc` is held by the T1 ring and the active slot.
-    fn swap_image_arc(&mut self, data: std::sync::Arc<ExrData>, is_b: bool) {
+    fn swap_image_arc(&mut self, data: std::sync::Arc<ExrData>) {
         // Same Arc as already displayed (scrub-return, settle onto the shown
         // frame): the pixels are identical, so skip the invalidations — on a T2
         // miss they'd force a full re-pack + re-upload of the same data (#146).
-        let same = if is_b {
-            self.exr_data_b
-                .as_ref()
-                .is_some_and(|cur| std::sync::Arc::ptr_eq(cur, &data))
-        } else {
-            self.exr_data
-                .as_ref()
-                .is_some_and(|cur| std::sync::Arc::ptr_eq(cur, &data))
-        };
+        let same = self
+            .exr_data
+            .as_ref()
+            .is_some_and(|cur| std::sync::Arc::ptr_eq(cur, &data));
         if same {
             self.error_msg = None;
             return;
         }
-        if is_b {
-            self.exr_data_b = Some(data);
-            // The texture caches only rebuild on a layer-count change, so a new B
-            // with the same layer count would keep showing the previous image.
-            // Force the reference textures (and the B-dependent diff/composite)
-            // to regenerate from the new data.
-            self.viewer.invalidate_reference_textures();
-            // B isn't part of the histogram cache key - refresh it so the
-            // B histogram appears without waiting for a layer change.
-            self.viewer.invalidate_histogram();
-            self.viewer.last_sampled_val_b = None;
-        } else {
+        {
             let layer_count = data.logical_layers.len();
             self.exr_data = Some(data);
-            // The full-res A decode has landed: drop the slot-A first-paint proxy
-            // (#58). The viewer's zoom/pan session state is preserved so the
-            // handoff from proxy to full-res is visually continuous.
-            self.viewer.clear_proxy();
             // Clamp the active layer to the new image's last valid index. A
             // sequence normally has identical structure frame-to-frame, but guard
             // against a frame with fewer layers so the per-layer texture index
@@ -3073,32 +3104,6 @@ impl ExrApp {
         self.error_msg = None;
     }
 
-    /// Swap slot B to a new locked-step playback frame (#98) — the per-frame B
-    /// counterpart of `swap_image_arc(_, is_b=true)`, without the reference-*open*
-    /// semantics. Rebuilds only B's viewport bind groups (so the compare draws
-    /// show the new B frame); B thumbnails stay frozen while the transport is busy
-    /// and refresh on settle (mirror the A #144/#151 split). No histogram reset —
-    /// it's suppressed during play anyway (#141). Skips a same-`Arc` swap so a
-    /// settle onto the shown frame doesn't force a needless B re-pack.
-    fn swap_b_frame(&mut self, data: std::sync::Arc<ExrData>) {
-        if self
-            .exr_data_b
-            .as_ref()
-            .is_some_and(|cur| std::sync::Arc::ptr_eq(cur, &data))
-        {
-            return;
-        }
-        self.exr_data_b = Some(data);
-        // The B ring binds this frame's pre-built texture (#166); tell it which B
-        // frame is on screen (mirrors A's `set_t2_frame`).
-        let bf = self.b().current_frame;
-        self.viewer.set_t2_frame(Self::B_SOURCE, Some(bf));
-        self.viewer.invalidate_reference_viewport();
-        if !self.thumbs_suppressed() {
-            self.viewer.invalidate_reference_thumbnails();
-        }
-    }
-
     /// Reset the entire viewer to defaults - the "new session" path for an
     /// explicit open / new sequence. Drops zoom, pan, compare mode, channel
     /// mode, annotations, swatches, and tone/OCIO/LUT view state. The caller is
@@ -3116,177 +3121,54 @@ impl ExrApp {
         self.viewer.prefs = prefs;
     }
 
-    /// Apply a worker-produced first-paint proxy (#33) to slot A. Dropped if the
-    /// open was superseded (a newer open of a different file) or the full-res
-    /// decode already landed — in both cases a late proxy would be a regression.
-    fn apply_proxy(&mut self, ctx: &egui::Context, path: &Path, proxy: crate::proxy::ProxyImage) {
-        if self.loaded_file.as_deref() != Some(path) || self.exr_data.is_some() {
-            return;
-        }
-        self.set_proxy(ctx, proxy);
-    }
-
-    /// Set the slot-A first-paint proxy (#58/#33): upload a low-res
-    /// [`ProxyImage`] so the viewport shows the image immediately while the
-    /// full-res decode is still in flight. Called from [`Self::apply_proxy`] when
-    /// the worker's fast low-res read (#33) arrives; the full decode later calls
-    /// [`Self::swap_image_data`], which clears the proxy. No-op if the slot-A
-    /// full image is already loaded.
-    fn set_proxy(&mut self, ctx: &egui::Context, proxy: crate::proxy::ProxyImage) {
-        if self.exr_data.is_some() {
-            // Full-res already landed; a late proxy would be a step backwards.
-            return;
-        }
-        if !self.viewer.has_proxy() {
-            // First proxy for this open: establish the fresh-session view so the
-            // proxy fits-to-view and doesn't inherit the previous image's
-            // zoom/pan. Gated on has_proxy so a progressive proxy update (#33)
-            // doesn't wipe the user's interaction. The full-res handoff
-            // (apply_load_result) then preserves whatever view the user adjusts.
-            self.reset_viewer_session();
-        }
-        // The viewer keeps its background across the reset above (#151), so the
-        // proxy already renders with the persisted background — no re-sync needed.
-        self.viewer.set_proxy(ctx, proxy);
-        ctx.request_repaint();
-    }
-
-    /// Explicitly release a loaded image and its resources without restarting.
-    /// Unloading A also drops B (a reference is meaningless on its own) and
-    /// resets the viewer, dropping every `Arc<BindGroup>` GPU handle. Unloading
-    /// B only clears B; the viewer's `textures_b`/`gpu_textures_b` are freed on
-    /// the next `viewer.ui` pass when its layer count falls to zero.
-    fn unload(&mut self, is_b: bool) {
-        if is_b {
-            self.exr_data_b = None;
-            self.b_mut().loaded_file = None;
-            // Drop any in-flight B load so a late decode can't resurrect B and
-            // `b.loading` doesn't stick (the path-supersession guard in
-            // `apply_load_result` returns before clearing it). #117.
-            self.b_mut().loading = false;
-            self.clear_b_sequence(); // and any locked-step B state (#98)
-            // B-only compare modes are meaningless without B.
-            self.viewer.compare_mode = crate::viewer::CompareMode::SingleA;
-            self.viewer.blink_state = false;
-            // Drop B's histogram (not part of the cache key).
-            self.viewer.invalidate_histogram();
-        } else {
-            self.exr_data = None;
-            self.loaded_file = None;
-            self.exr_data_b = None;
-            self.b_mut().loaded_file = None;
-            // Supersede any in-flight slot-A open so its late result can't
-            // resurrect the released image (#109 / #117).
-            self.open_gen_a += 1;
-            // Tear down the app-owned playback + decode state too. Without this the
-            // T1 ring keeps every decoded frame resident (the memory leak) and the
-            // decode-ahead pump keeps re-issuing `LoadJob`s for the now-unloaded
-            // sequence — a late sequence-frame result (guarded by epoch, not path)
-            // could even resurrect the image. Mirrors the load-side reset in
-            // `detect_sequence`; `playback.clear()` bumps the epoch so any in-flight
-            // decode is dropped on arrival. #117.
-            self.frame_cache.clear();
-            self.frame_bytes = None;
-            self.inflight.clear();
-            self.watch_sigs.clear();
-            self.last_watch_poll = None;
-            self.loading_a = false;
-            self.b_mut().loading = false;
-            self.clear_b_sequence(); // locked-step B goes with A (#98)
-            self.playback.clear();
-            self.reset_viewer_session();
-        }
-        self.error_msg = None;
-    }
-
-    /// floki's own resident image footprint in bytes: the decoded pixel buffers it
-    /// holds — slot A (or, for a sequence, the resident T1 frames) plus slot B.
-    /// Shown in the status bar beside process RSS. Unlike RSS — which the allocator
-    /// keeps mapped after a free, so it doesn't budge on unload — this drops
-    /// immediately when an image is released, reflecting what floki actually holds
-    /// (#117).
     fn tracked_image_bytes(&self) -> u64 {
         // For a sequence the active frame is one of the resident T1 frames (a
         // shared `Arc`), so the cache already accounts for slot A — don't also add
         // `exr_data`, which would double-count it.
-        let a = if self.playback.is_active() {
+        if self.playback.is_active() {
             self.frame_bytes
                 .map_or(0, |b| self.frame_cache.len() as u64 * b as u64)
         } else {
             self.exr_data
                 .as_ref()
                 .map_or(0, |d| d.approx_bytes() as u64)
-        };
-        let b = self
-            .exr_data_b
-            .as_ref()
-            .map_or(0, |d| d.approx_bytes() as u64);
-        a + b
+        }
     }
 
-    /// Load EXR files dragged onto the window. While files are dragged over the
-    /// window a left/right split overlay is drawn; on drop a single file routes
-    /// by position (right half → reference Image B) and multiple files load
-    /// first → A, second → B with the rest ignored. Non-EXR drops are ignored.
+    /// Load EXR files dragged onto the window as new layers (#99 R4). While files
+    /// are dragged over the window a single "Drop to add layer" overlay is drawn;
+    /// on drop every `.exr` is added to the stack via [`Self::open_layer`], in
+    /// drop order (up to the layer cap). Non-EXR drops are ignored.
     fn handle_drag_and_drop(&mut self, ctx: &egui::Context) {
-        // Hover preview while files are dragged in (before release). The cursor
-        // position updates during the drag, so highlight the half it's currently
-        // over — the half that will receive the drop — to make A vs B obvious.
-        if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+        // Hover preview while files are dragged in (before release). Dropping is
+        // no longer position-dependent — the whole window is one drop target.
+        let hovered = ctx.input(|i| i.raw.hovered_files.len());
+        if hovered > 0 {
             let screen = ctx.content_rect();
-            let cx = screen.center().x;
-            // The OS cursor moves during the drag even though winit delivers no
-            // events, so query it directly (see `live_dropped_right`).
-            let target_b = live_dropped_right(ctx).unwrap_or(false);
-
             let painter = ctx.layer_painter(egui::LayerId::new(
                 egui::Order::Foreground,
                 egui::Id::new("dnd_overlay"),
             ));
-            let left = egui::Rect::from_min_max(screen.min, egui::pos2(cx, screen.max.y));
-            let right = egui::Rect::from_min_max(egui::pos2(cx, screen.min.y), screen.max);
-            let active = if target_b { right } else { left };
-
-            // Dim the whole window, then brighten the active half so it reads as
-            // the live drop target.
             painter.rect_filled(screen, 0.0, egui::Color32::from_black_alpha(150));
-            painter.rect_filled(
-                active,
-                0.0,
-                egui::Color32::from_rgba_unmultiplied(40, 90, 160, 70),
-            );
             painter.rect_stroke(
-                active,
+                screen,
                 0.0,
                 egui::Stroke::new(3.0_f32, egui::Color32::from_rgb(90, 160, 240)),
                 egui::StrokeKind::Inside,
             );
-            painter.line_segment(
-                [
-                    egui::pos2(cx, screen.top()),
-                    egui::pos2(cx, screen.bottom()),
-                ],
-                (2.0, egui::Color32::from_white_alpha(180)),
-            );
-
-            let font = egui::FontId::proportional(28.0);
-            let bright = egui::Color32::WHITE;
-            let dim = egui::Color32::from_white_alpha(110);
+            let label = if hovered > 1 {
+                format!("Drop to add {hovered} layers")
+            } else {
+                "Drop to add layer".to_string()
+            };
             painter.text(
-                egui::pos2(screen.left() + screen.width() * 0.25, screen.center().y),
+                screen.center(),
                 egui::Align2::CENTER_CENTER,
-                "Drop for A",
-                font.clone(),
-                if target_b { dim } else { bright },
+                label,
+                egui::FontId::proportional(28.0),
+                egui::Color32::WHITE,
             );
-            painter.text(
-                egui::pos2(screen.left() + screen.width() * 0.75, screen.center().y),
-                egui::Align2::CENTER_CENTER,
-                "Drop for B (reference)",
-                font,
-                if target_b { bright } else { dim },
-            );
-            // Keep repainting so the highlight tracks the cursor smoothly.
+            // Keep repainting so the overlay shows promptly during the drag.
             ctx.request_repaint();
         }
 
@@ -3300,68 +3182,10 @@ impl ExrApp {
             .filter_map(|f| f.path)
             .filter(|p| is_exr_path(p))
             .collect();
-        let dropped_right = live_dropped_right(ctx).unwrap_or(false);
-        for (path, is_b) in route_dropped_exrs(&exr_paths, dropped_right) {
-            self.open_file(path, is_b);
+        for path in exr_paths {
+            self.open_layer(path);
         }
     }
-}
-
-/// Global OS cursor position in SCREEN-SPACE POINTS — the same space as
-/// `ViewportInfo::inner_rect` — queried directly from the OS rather than via
-/// winit events. During an external file drag winit delivers no cursor-move
-/// events, so egui's pointer is stale, but the OS cursor itself keeps moving.
-/// `None` on unsupported platforms.
-///
-/// Note the per-platform coordinate space: macOS `CGEvent` locations are already
-/// in points (global display space), whereas Windows `GetCursorPos` returns
-/// physical pixels, so only the Windows path divides by `pixels_per_point`.
-fn global_cursor_pos_points(pixels_per_point: f32) -> Option<egui::Pos2> {
-    #[cfg(target_os = "windows")]
-    {
-        use windows::Win32::Foundation::POINT;
-        use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
-        let mut p = POINT::default();
-        // SAFETY: `GetCursorPos` writes a valid POINT; we pass a live pointer to it.
-        unsafe { GetCursorPos(&mut p).ok()? };
-        Some(egui::pos2(
-            p.x as f32 / pixels_per_point,
-            p.y as f32 / pixels_per_point,
-        ))
-    }
-    #[cfg(target_os = "macos")]
-    {
-        use core_graphics::event::CGEvent;
-        use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
-        // A null-ish event created from a session source carries the *current*
-        // cursor location (the documented `CGEventCreate(NULL)` idiom). Already
-        // in screen-space points, so `pixels_per_point` is not needed here.
-        let _ = pixels_per_point;
-        let src = CGEventSource::new(CGEventSourceStateID::CombinedSessionState).ok()?;
-        let loc = CGEvent::new(src).ok()?.location();
-        Some(egui::pos2(loc.x as f32, loc.y as f32))
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        let _ = pixels_per_point;
-        None
-    }
-}
-
-/// Whether `cursor_points` (screen-space points) is in the right half of
-/// `window_rect` (also screen-space points) — i.e. the drop targets Image B.
-/// Only X matters, so the cross-platform Y-origin difference is irrelevant.
-/// Pure / testable.
-fn cursor_targets_right(cursor_points: egui::Pos2, window_rect: egui::Rect) -> bool {
-    cursor_points.x >= window_rect.center().x
-}
-
-/// Live drop-target side this frame from the OS cursor + window rect, or `None`
-/// if either is unavailable (caller defaults to A / left).
-fn live_dropped_right(ctx: &egui::Context) -> Option<bool> {
-    let rect = ctx.input(|i| i.viewport().inner_rect)?;
-    let cursor = global_cursor_pos_points(ctx.pixels_per_point())?;
-    Some(cursor_targets_right(cursor, rect))
 }
 
 /// True if `path` has a (case-insensitive) `.exr` extension.
@@ -3371,15 +3195,103 @@ fn is_exr_path(path: &std::path::Path) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("exr"))
 }
 
-/// Map dropped EXR paths to `(path, is_b)` load requests. A single file routes
-/// by drop position (`dropped_right` → Image B); multiple files load first → A,
-/// second → B, and any extras are ignored.
-fn route_dropped_exrs(paths: &[PathBuf], dropped_right: bool) -> Vec<(PathBuf, bool)> {
-    match paths {
-        [] => Vec::new(),
-        [single] => vec![(single.clone(), dropped_right)],
-        [a, b, ..] => vec![(a.clone(), false), (b.clone(), true)],
+/// The topmost drawable layer in a resolved composite — the last `Step::Draw`
+/// whose source is drawable (per `drawable`) → `(source, aov)`. This is the layer
+/// the comp-path pixel readout samples (top-of-stack under the cursor); `None` when
+/// nothing drawable is present. Mirrors `draw_comp_central`'s draw-list skip rule,
+/// factored out pure (`drawable` is the caller's `comp_sources` texture check).
+fn top_sample_source(
+    steps: &[crate::layer::Step],
+    drawable: impl Fn(crate::layer::SourceId) -> bool,
+) -> Option<(crate::layer::SourceId, usize)> {
+    steps.iter().rev().find_map(|step| match step {
+        crate::layer::Step::Draw(d) if drawable(d.source) => Some((d.source, d.aov)),
+        _ => None,
+    })
+}
+
+/// How many characters of a layer's file name the comp viewport bar's pickers show
+/// before eliding. Two of them share that row with every other control.
+const COMP_BAR_NAME_CHARS: usize = 24;
+
+/// Shorten a label to at most `max` characters, eliding the middle with `…` (#99
+/// Slice 3d follow-up). EXR layer names are full file names — often 50+ characters
+/// like `ESTU0001_gloomWatcher_v001.karmarendersettings.1001.exr` — and two of them
+/// sit in the comp viewport bar, which pushed the controls to its right off-screen
+/// even maximized. Keeping both ends preserves the distinguishing parts (the shot
+/// prefix and the version/frame suffix), which a plain truncation would lose. Callers
+/// pair it with a hover tooltip carrying the full name. Pure.
+fn elide_middle(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max || max < 3 {
+        return s.to_string();
     }
+    // Split the budget around the ellipsis, biasing the tail (version/frame) when odd.
+    let keep = max - 1;
+    let head = keep / 2 + keep % 2;
+    let tail = keep - head;
+    let chars: Vec<char> = s.chars().collect();
+    let mut out: String = chars[..head].iter().collect();
+    out.push('…');
+    out.extend(&chars[n - tail..]);
+    out
+}
+
+/// The default compare pane (side B) for a stack whose layers are `ids` **bottom→top**
+/// and whose current layer is `current` (#99 Slice 2a). Picks the topmost layer that
+/// *isn't* the current one, so the two panes differ without the user choosing anything
+/// — side A is the whole composite, so defaulting B to the current layer (which is
+/// itself top-of-stack by default) would make the compare look redundant. Falls back to
+/// the only layer when there is just one, and `None` for an empty stack. Pure.
+fn default_compare_b(
+    ids: &[crate::layer::LayerId],
+    current: Option<crate::layer::LayerId>,
+) -> Option<crate::layer::LayerId> {
+    ids.iter()
+        .rev()
+        .find(|id| Some(**id) != current)
+        .or_else(|| ids.last())
+        .copied()
+}
+
+/// One named layer's draw in a resolved composite — the `Step::Draw` carrying `layer`,
+/// if that layer is both present at this frame (`composite_at` drops hidden / soloed-out
+/// / trimmed-blank layers) and drawable (per `drawable`). Resolves **both** panes of a
+/// comp Side-by-Side (#99 Slice 2a), which shows two individual layers rather than the
+/// composite; `None` for either pane means the compare can't be drawn and the caller
+/// falls back to `Stacked`. Pure.
+fn comp_layer_draw(
+    steps: &[crate::layer::Step],
+    layer: Option<crate::layer::LayerId>,
+    drawable: impl Fn(crate::layer::SourceId) -> bool,
+) -> Option<&crate::layer::Draw> {
+    let layer = layer?;
+    steps.iter().find_map(|step| match step {
+        crate::layer::Step::Draw(d) if d.id == layer && drawable(d.source) => Some(d),
+        _ => None,
+    })
+}
+
+/// Map a screen position over the composite `image_rect` to a source pixel of a
+/// layer sized `size`. Normalized (fraction across the rect × source size) so a
+/// layer whose size differs from the base still maps correctly under the
+/// stretch-to-base display. `None` outside `[0, 1)` on either axis, or for a
+/// zero-sized / zero-area rect. Pure / testable.
+fn comp_hover_pixel(
+    pos: egui::Pos2,
+    image_rect: egui::Rect,
+    size: (usize, usize),
+) -> Option<(usize, usize)> {
+    let (w, h) = size;
+    if w == 0 || h == 0 || image_rect.width() <= 0.0 || image_rect.height() <= 0.0 {
+        return None;
+    }
+    let u = (pos.x - image_rect.min.x) / image_rect.width();
+    let v = (pos.y - image_rect.min.y) / image_rect.height();
+    if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
+        return None;
+    }
+    Some(((u * w as f32) as usize, (v * h as f32) as usize))
 }
 
 impl eframe::App for ExrApp {
@@ -3388,6 +3300,9 @@ impl eframe::App for ExrApp {
         // whole-app serialize below persists them. Done here, at persist time only,
         // instead of the old per-frame round-trip around `viewer.ui`.
         self.persisted_prefs = self.viewer.prefs.clone();
+        // Same persist-time bridge for the comp stack (#99 PR-B.5): flatten the live
+        // layers + their source paths into the serde-able list.
+        self.persisted_layers = self.comp_layers_persist();
         eframe::set_value(storage, eframe::APP_KEY, self);
     }
 
@@ -3422,22 +3337,26 @@ impl eframe::App for ExrApp {
         self.draw_help_window(ui.ctx());
         self.draw_tools_window(ui.ctx());
         self.draw_color_management_window(ui.ctx());
+        // Viewer-owned windows, driven from here rather than from `ExrViewer::ui`
+        // (#99 Slice 3b): `ui` has been unreachable since the R4 collapse, which left
+        // View ▸ "Viewport Background…" setting a flag whose window nothing drew. Both
+        // early-return unless their flag is set.
+        self.viewer.background_window(ui.ctx());
+        self.viewer.gradient_editor_window(ui.ctx());
         self.draw_playback_debug(ui.ctx());
         self.draw_playback_hud(ui.ctx());
         self.draw_menu_bar(ui);
         self.draw_status_bar(ui);
-        // Transport bar sits just above the status bar (added after it, so it
-        // stacks above); a no-op panel unless a sequence is loaded.
-        self.draw_transport_bar(ui);
+        // The merged bottom timeline panel (#99, Chaos-Player layout): transport
+        // controls, the frame ruler, and the layer tracks — one panel so the bars
+        // share the ruler's x axis. Added after the status bar, so it sits just
+        // above it. A no-op unless a sequence is loaded or the tracks are shown.
+        self.draw_timeline_panel(ui);
         self.draw_side_panel(ui);
-        self.draw_layers_panel(ui);
         self.draw_central_canvas(ui);
         // Pre-upload T2 GPU textures ahead of the playhead (#56). After the canvas
         // so the on-screen frame's texture exists; self-gates when T2 is off.
         self.pump_t2();
-        // ...and the slot-B ring in locked-step compare (#166); self-gates unless
-        // B is a sequence with a non-zero B ring cap.
-        self.pump_t2_b();
     }
 }
 
@@ -3459,7 +3378,6 @@ impl ExrApp {
         }
         for msg in msgs {
             match msg {
-                LoadMsg::Proxy { path, proxy } => self.apply_proxy(ctx, &path, proxy),
                 LoadMsg::Loaded(res) => self.apply_load_result(*res),
             }
         }
@@ -3616,16 +3534,15 @@ impl ExrApp {
                 .open(&mut self.show_help)
                 .show(ctx, |ui| {
                     ui.heading("Keyboard Shortcuts");
-                    ui.label("1 - View Image A");
-                    ui.label("2 - View Image B (when reference loaded)");
-                    ui.label("Space - Toggle Blink comparison (when reference loaded)");
                     ui.label("R / G / B / A - Isolate specific channel");
                     ui.label("C - Return to full color composite");
                     ui.label("F - Frame image to fit the window");
+                    ui.label("T - Toggle the contact sheet for the current layer");
                     ui.label("F11 - Toggle full-screen (ESC or F11 to exit)");
+                    ui.label("ESC - Cancel an in-progress annotation, else exit full-screen");
                     ui.label("E - Reset exposure to 0.0");
                     ui.label("Shift+G - Reset gamma to 1.0");
-                    ui.label("(or right-click the Exposure / Gamma labels to reset)");
+                    ui.label("(or right-click the EV / γ boxes to reset)");
 
                     ui.add_space(5.0);
                     ui.heading("Mouse Controls");
@@ -3635,7 +3552,7 @@ impl ExrApp {
 
                     ui.add_space(10.0);
                     ui.heading("Features");
-                    ui.label("• Dual Contact Sheets: Enable 'Contact Sheet' and use Compare Modes (A, B, A|B) to view side-by-side contact sheets.");
+                    ui.label("• Contact Sheet: View ▸ Contact Sheet shows every pass of the current layer as a grid; click one to switch the layer to it.");
                     ui.label("• Metadata Explorer: When two images are loaded, EXR Info automatically displays metadata and layers for both Image A and Image B.");
                     ui.label("• Variable Sampling: Pick 1px / 3×3 / 9×9 to average the pixel readout over an aperture.");
                     ui.label("• Compositing: Load Image B, choose 'Comp', and pick a blend mode (Over / Under / Add / Multiply / Screen).");
@@ -3949,20 +3866,11 @@ impl ExrApp {
                                 .add_filter("EXR Image", &["exr"])
                                 .pick_file()
                             {
-                                self.open_file(path, false);
+                                self.open_layer(path);
                             }
                             ui.close();
                         }
-                        if ui.button("Open Reference (Image B)...").clicked() {
-                            if let Some(path) = FileDialog::new()
-                                .add_filter("EXR Image", &["exr"])
-                                .pick_file()
-                            {
-                                self.open_file(path, true);
-                            }
-                            ui.close();
-                        }
-                        ui.menu_button("Open Recent A", |ui| {
+                        ui.menu_button("Open Recent", |ui| {
                             if self.recent_files.is_empty() {
                                 ui.label("No recent files");
                             } else {
@@ -3978,43 +3886,9 @@ impl ExrApp {
                                     }
                                 }
                                 if let Some(path) = clicked_path {
-                                    self.open_file(path, false);
+                                    self.open_layer(path);
                                     ui.close();
                                 }
-                            }
-                        });
-                        ui.menu_button("Open Recent B", |ui| {
-                            if self.recent_files.is_empty() {
-                                ui.label("No recent files");
-                            } else {
-                                let mut clicked_path = None;
-                                for path in &self.recent_files {
-                                    if ui
-                                        .button(
-                                            path.file_name().unwrap_or_default().to_string_lossy(),
-                                        )
-                                        .clicked()
-                                    {
-                                        clicked_path = Some(path.clone());
-                                    }
-                                }
-                                if let Some(path) = clicked_path {
-                                    self.open_file(path, true);
-                                    ui.close();
-                                }
-                            }
-                        });
-                        ui.separator();
-                        ui.add_enabled_ui(self.exr_data.is_some(), |ui| {
-                            if ui.button("Close Image A").clicked() {
-                                self.unload(false);
-                                ui.close();
-                            }
-                        });
-                        ui.add_enabled_ui(self.exr_data_b.is_some(), |ui| {
-                            if ui.button("Close Image B").clicked() {
-                                self.unload(true);
-                                ui.close();
                             }
                         });
                         ui.separator();
@@ -4025,10 +3899,16 @@ impl ExrApp {
 
                     ui.menu_button("View", |ui| {
                         ui.checkbox(&mut self.viewer.show_contact_sheet, "Contact Sheet");
-                        ui.checkbox(&mut self.show_layers_panel, "Layers")
+                        ui.checkbox(&mut self.show_layers_panel, "Layer tracks")
                             .on_hover_text(
-                                "Compositing layer stack: stack N sources as layers with \
-                                 per-layer blend / opacity / visibility (#99)",
+                                "Compositing layer stack as timeline tracks: stack N \
+                                 sources as layers with per-layer blend / opacity / \
+                                 visibility, and drag a layer's clip to retime it (#99)",
+                            );
+                        ui.checkbox(&mut self.show_side_panel, "Info panel")
+                            .on_hover_text(
+                                "Left panel: EXR Info, Color Sampler, and Histogram for \
+                                 the current layer",
                             );
                         if ui.button("Viewport Background...").clicked() {
                             self.viewer.show_background_window = true;
@@ -4096,6 +3976,10 @@ impl ExrApp {
         // window when Image B is loaded) is added first, it expands the parent UI's
         // bottom edge past the window and the bottom panel anchors off-screen.
         egui::Panel::bottom("status_bar").show_inside(ui, |ui| {
+            // Channel isolation now lives in the comp viewport's top control bar
+            // (`draw_comp_layer_bar`, #99 R4) and the classic viewer's own control
+            // row, so the bottom-bar quick toggle (#192) was retired to avoid a
+            // duplicate "Channel:" row.
             if let Some(status) = &self.snapshot_status {
                 ui.label(egui::RichText::new(status).weak());
             }
@@ -4280,23 +4164,33 @@ impl ExrApp {
                     layer_name_a,
                 );
 
-                if let Some(exr_b) = &self.exr_data_b {
-                    let ll_b = exr_b.logical_layers.get(
-                        self.viewer
-                            .active_layer
-                            .min(exr_b.logical_layers.len().saturating_sub(1)),
-                    );
-                    let phys_idx_b = ll_b.map(|l| l.physical_index).unwrap_or(0);
-                    let layer_name_b = ll_b.map(|l| l.name.as_str()).unwrap_or("");
-
+                // Comp-path readout (#99 R4): the topmost layer under the cursor.
+                // In comp mode `exr_data` is None, so the row above renders nothing
+                // and this is the sole readout row.
+                if let Some((src, aov)) = self.comp_readout
+                    && let Some(cs) = self.comp_sources.get(&src)
+                {
+                    let ll = cs.exr_data.logical_layers.get(aov);
+                    let phys_idx = ll.map(|l| l.physical_index).unwrap_or(0);
+                    let layer_name = ll.map(|l| l.name.as_str()).unwrap_or("");
+                    // Row label = the comp layer's name (which of N is on top).
+                    let prefix = self
+                        .comp_stack
+                        .iter()
+                        .find(|l| {
+                            matches!(l.source,
+                                crate::layer::LayerSource::Image { source, .. } if source == src)
+                        })
+                        .map(|l| l.name.as_str())
+                        .unwrap_or("Layer");
                     draw_nuke_status_line(
                         ui,
-                        "B",
-                        Some(exr_b),
+                        prefix,
+                        Some(cs.exr_data.as_ref()),
                         self.viewer.last_hover_pos_img,
-                        self.viewer.last_sampled_val_b,
-                        phys_idx_b,
-                        layer_name_b,
+                        self.viewer.last_sampled_val_a,
+                        phys_idx,
+                        layer_name,
                     );
                 }
             });
@@ -4368,8 +4262,6 @@ impl ExrApp {
         let t1_cap = self.frame_cache_cap;
         let t2_len = self.viewer.t2_len(Self::A_SOURCE);
         let t2_cap = self.viewer.t2_cap(Self::A_SOURCE);
-        let t2_len_b = self.viewer.t2_len(Self::B_SOURCE);
-        let t2_cap_b = self.viewer.t2_cap(Self::B_SOURCE);
         let frame_bytes = self.frame_bytes;
         let proxy_state = (self.proxy_enabled, self.proxy_size, self.proxy_bytes);
         let mut inflight: Vec<u32> = self.inflight.iter().copied().collect();
@@ -4447,16 +4339,6 @@ impl ExrApp {
                         ui.label(t2);
                         ui.end_row();
 
-                        // Slot-B T2 ring (#166) — only meaningful in locked-step
-                        // compare; shows "off" otherwise.
-                        ui.label("T2-B (GPU)");
-                        let t2b = if t2_cap_b == 0 {
-                            "off".to_string()
-                        } else {
-                            format!("{t2_len_b} / {t2_cap_b} frames")
-                        };
-                        ui.label(t2b);
-                        ui.end_row();
 
                         ui.label("worker");
                         let pend = pending.map_or_else(|| "—".to_string(), |f| f.to_string());
@@ -4514,374 +4396,389 @@ impl ExrApp {
         self.show_playback_debug = open;
     }
 
-    /// Transport controls for image-sequence playback (#7). A no-op unless a
-    /// sequence is loaded. Scrubber + play/pause/stop/step/jump + reverse +
-    /// loop-mode + editable target fps and measured fps.
-    fn draw_transport_bar(&mut self, ui: &mut egui::Ui) {
-        use crate::playback::{Direction, LoopMode, Pacing};
-        if !self.playback.is_active() {
+    /// The merged bottom **timeline panel** (#99, Chaos-Player layout): transport
+    /// controls, the frame ruler, and one track per composite layer — all sharing a
+    /// single x axis, so a layer's clip bar lines up with the frame numbers above
+    /// it. Replaces the separate transport and Layers panels (aligning bars to a
+    /// ruler in a *different* panel would mean matching gutter widths by hand).
+    ///
+    /// Each section self-gates: the controls and ruler need an active transport,
+    /// the tracks need the Layers toggle. With neither, the panel doesn't show.
+    fn draw_timeline_panel(&mut self, ui: &mut egui::Ui) {
+        let transport = self.playback.is_active();
+        if self.viewer.fullscreen || (!transport && !self.show_layers_panel) {
             return;
         }
-        egui::Panel::bottom("transport_bar").show_inside(ui, |ui| {
-            ui.horizontal(|ui| {
-                let (lo, hi) = (self.playback.in_point, self.playback.out_point);
-                let playing = self.playback.is_playing();
+        egui::Panel::bottom("timeline_panel")
+            .resizable(true)
+            .show_inside(ui, |ui| {
+                // One axis width for every row in the panel, measured before any
+                // row is added (`available_width` is horizontal, so it's stable
+                // down the vertical layout).
+                let axis_w = (ui.available_width() - TIMELINE_GUTTER_W).max(64.0);
+                // The visible frame range comes from the driving sequence. `None`
+                // (stills-only stack, no transport) ⇒ no axis: tracks render
+                // gutter-only, as the old flat list did.
+                let range = self.playback.full_range();
 
-                if ui.button("|<").on_hover_text("Jump to in").clicked() {
-                    self.playback_scrub_to(lo);
+                if transport {
+                    self.draw_transport_controls(ui);
+                    self.draw_ruler_row(ui, axis_w, range);
                 }
-                if ui.button("<").on_hover_text("Step back (←)").clicked() {
-                    self.playback_step(-1);
+                if self.show_layers_panel {
+                    self.draw_layer_tracks(ui, axis_w, range);
                 }
-                if ui
-                    .button(if playing { "Pause" } else { "Play" })
-                    .on_hover_text("Play/Pause (Space)")
-                    .clicked()
-                {
-                    self.playback_toggle();
-                }
-                if ui
-                    .button("Stop")
-                    .on_hover_text("Stop (halt in place; |< rewinds to in)")
-                    .clicked()
-                {
-                    self.playback_stop();
-                }
-                if ui.button(">").on_hover_text("Step forward (→)").clicked() {
-                    self.playback_step(1);
-                }
-                if ui.button(">|").on_hover_text("Jump to out").clicked() {
-                    self.playback_scrub_to(hi);
-                }
+            });
+    }
 
-                ui.separator();
+    /// The frame-ruler row of the timeline panel: the frame readout in the gutter,
+    /// the scrubbable timeline over the shared axis.
+    fn draw_ruler_row(&mut self, ui: &mut egui::Ui, axis_w: f32, range: Option<(u32, u32)>) {
+        let (gutter, axis_rect) = alloc_timeline_row(ui, axis_w, TIMELINE_ROW_H);
+        let cur = self.playback.current_frame;
+        let (in_pt, out_pt) = (self.playback.in_point, self.playback.out_point);
+        // A hole holds the previous frame; flag it so the readout isn't mistaken
+        // for a decoded frame.
+        let hole = self.playback.frame_path(cur).is_none();
+        let mut g = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(gutter)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        g.set_clip_rect(gutter);
+        g.label(format!("{cur}  [{in_pt}–{out_pt}]"));
+        if hole {
+            g.label(egui::RichText::new("(hole)").weak());
+        }
+        if let Some((lo, hi)) = range {
+            self.draw_timeline(ui, axis_rect, lo, hi);
+        }
+    }
 
-                let mut reverse = self.playback.direction == Direction::Reverse;
-                if ui
-                    .toggle_value(&mut reverse, "Rev")
-                    .on_hover_text("Reverse play direction")
-                    .changed()
-                {
-                    self.playback.direction = if reverse {
-                        Direction::Reverse
-                    } else {
-                        Direction::Forward
-                    };
-                    // Direction change invalidates prefetch (it ran the other way).
-                    self.invalidate_inflight();
-                }
+    /// Transport controls for image-sequence playback (#7): play/pause/stop/step/
+    /// jump + reverse + loop-mode + pacing + in/out trim + editable target fps and
+    /// measured fps + the decode/cache toggles. The top row of the timeline panel
+    /// (#99); the caller gates on an active transport.
+    fn draw_transport_controls(&mut self, ui: &mut egui::Ui) {
+        use crate::playback::{Direction, LoopMode, Pacing};
+        ui.horizontal(|ui| {
+            let (lo, hi) = (self.playback.in_point, self.playback.out_point);
+            let playing = self.playback.is_playing();
 
-                let loop_label = match self.playback.loop_mode {
-                    LoopMode::Once => "Once",
-                    LoopMode::Loop => "Loop",
-                    LoopMode::PingPong => "Ping-Pong",
+            if ui.button("|<").on_hover_text("Jump to in").clicked() {
+                self.playback_scrub_to(lo);
+            }
+            if ui.button("<").on_hover_text("Step back (←)").clicked() {
+                self.playback_step(-1);
+            }
+            if ui
+                .button(if playing { "Pause" } else { "Play" })
+                .on_hover_text("Play/Pause (Space)")
+                .clicked()
+            {
+                self.playback_toggle();
+            }
+            if ui
+                .button("Stop")
+                .on_hover_text("Stop (halt in place; |< rewinds to in)")
+                .clicked()
+            {
+                self.playback_stop();
+            }
+            if ui.button(">").on_hover_text("Step forward (→)").clicked() {
+                self.playback_step(1);
+            }
+            if ui.button(">|").on_hover_text("Jump to out").clicked() {
+                self.playback_scrub_to(hi);
+            }
+
+            ui.separator();
+
+            let mut reverse = self.playback.direction == Direction::Reverse;
+            if ui
+                .toggle_value(&mut reverse, "Rev")
+                .on_hover_text("Reverse play direction")
+                .changed()
+            {
+                self.playback.direction = if reverse {
+                    Direction::Reverse
+                } else {
+                    Direction::Forward
                 };
-                if ui
-                    .button(loop_label)
-                    .on_hover_text("Cycle loop mode")
-                    .clicked()
-                {
-                    self.playback.loop_mode = match self.playback.loop_mode {
-                        LoopMode::Once => LoopMode::Loop,
-                        LoopMode::Loop => LoopMode::PingPong,
-                        LoopMode::PingPong => LoopMode::Once,
-                    };
-                }
+                // Direction change invalidates prefetch (it ran the other way).
+                self.invalidate_inflight();
+            }
 
-                // Pacing toggle (#7): stutter plays every frame; drop-frames holds
-                // wall-clock rate and skips. Wired through to `tick_playback`.
-                let drop = self.playback.pacing == Pacing::DropFrames;
-                let pacing_label = if drop { "Drop" } else { "Stutter" };
-                if ui
-                    .button(pacing_label)
-                    .on_hover_text(
-                        "Pacing when decode can't keep up. Stutter: play every \
+            let loop_label = match self.playback.loop_mode {
+                LoopMode::Once => "Once",
+                LoopMode::Loop => "Loop",
+                LoopMode::PingPong => "Ping-Pong",
+            };
+            if ui
+                .button(loop_label)
+                .on_hover_text("Cycle loop mode")
+                .clicked()
+            {
+                self.playback.loop_mode = match self.playback.loop_mode {
+                    LoopMode::Once => LoopMode::Loop,
+                    LoopMode::Loop => LoopMode::PingPong,
+                    LoopMode::PingPong => LoopMode::Once,
+                };
+            }
+
+            // Pacing toggle (#7): stutter plays every frame; drop-frames holds
+            // wall-clock rate and skips. Wired through to `tick_playback`.
+            let drop = self.playback.pacing == Pacing::DropFrames;
+            let pacing_label = if drop { "Drop" } else { "Stutter" };
+            if ui
+                .button(pacing_label)
+                .on_hover_text(
+                    "Pacing when decode can't keep up. Stutter: play every \
                          frame, fps drops. Drop: hold wall-clock rate, skip frames.",
-                    )
-                    .clicked()
-                {
-                    self.playback.pacing = if drop {
-                        Pacing::Stutter
-                    } else {
-                        Pacing::DropFrames
-                    };
-                }
-
-                ui.separator();
-
-                // In/out trim (#7). Set to the playhead; Reset restores the full
-                // sequence span.
-                if ui
-                    .button("Set In")
-                    .on_hover_text("Trim in point to the playhead (I)")
-                    .clicked()
-                {
-                    self.playback_set_in();
-                }
-                if ui
-                    .button("Set Out")
-                    .on_hover_text("Trim out point to the playhead (O)")
-                    .clicked()
-                {
-                    self.playback_set_out();
-                }
-                if ui
-                    .button("Reset")
-                    .on_hover_text("Reset trim to the full range")
-                    .clicked()
-                {
-                    self.playback_reset_trim();
-                }
-
-                ui.separator();
-
-                ui.add(
-                    egui::DragValue::new(&mut self.playback.fps_target)
-                        .range(1.0..=120.0)
-                        .speed(0.25)
-                        .suffix(" fps"),
                 )
-                .on_hover_text("Target fps");
-                ui.label(
-                    egui::RichText::new(format!("{:.1} actual", self.playback.measured_fps)).weak(),
-                );
+                .clicked()
+            {
+                self.playback.pacing = if drop {
+                    Pacing::Stutter
+                } else {
+                    Pacing::DropFrames
+                };
+            }
 
-                ui.separator();
+            ui.separator();
 
-                // T2 GPU pre-upload kill-switch (#56). Off → the lazy per-swap
-                // path (decode-ahead still smooths via the T1 ring).
-                if ui
-                    .checkbox(&mut self.t2_enabled, "GPU cache")
-                    .on_hover_text(
-                        "Pre-upload upcoming frames to GPU textures for smoother \
+            // In/out trim (#7). Set to the playhead; Reset restores the full
+            // sequence span.
+            if ui
+                .button("Set In")
+                .on_hover_text("Trim in point to the playhead (I)")
+                .clicked()
+            {
+                self.playback_set_in();
+            }
+            if ui
+                .button("Set Out")
+                .on_hover_text("Trim out point to the playhead (O)")
+                .clicked()
+            {
+                self.playback_set_out();
+            }
+            if ui
+                .button("Reset")
+                .on_hover_text("Reset trim to the full range")
+                .clicked()
+            {
+                self.playback_reset_trim();
+            }
+
+            ui.separator();
+
+            ui.add(
+                egui::DragValue::new(&mut self.playback.fps_target)
+                    .range(1.0..=120.0)
+                    .speed(0.25)
+                    .suffix(" fps"),
+            )
+            .on_hover_text("Target fps");
+            ui.label(
+                egui::RichText::new(format!("{:.1} actual", self.playback.measured_fps)).weak(),
+            );
+
+            ui.separator();
+
+            // T2 GPU pre-upload kill-switch (#56). Off → the lazy per-swap
+            // path (decode-ahead still smooths via the T1 ring).
+            if ui
+                .checkbox(&mut self.t2_enabled, "GPU cache")
+                .on_hover_text(
+                    "Pre-upload upcoming frames to GPU textures for smoother \
                          playback. Turn off if you see VRAM pressure.",
-                    )
-                    .changed()
-                    && !self.t2_enabled
-                {
-                    self.viewer.clear_t2(Self::A_SOURCE);
-                }
+                )
+                .changed()
+                && !self.t2_enabled
+            {
+                self.viewer.clear_t2(Self::A_SOURCE);
+            }
 
-                // A/B frame offset (#166): nudge the compared (B) sequence relative
-                // to A. Only shown when B is a locked-step sequence.
-                if self.b().sequence.is_some() {
-                    ui.separator();
-                    ui.label("A/B offset");
-                    let mut off = self.b().offset;
-                    if ui
-                        .add(
-                            egui::DragValue::new(&mut off)
-                                .range(-9999..=9999)
-                                .speed(0.1)
-                                .suffix(" f"),
-                        )
-                        .on_hover_text(
-                            "Frame offset of the compared (B) sequence relative to A: \
-                             nudge B ahead (+) or behind (−) to line up takes that \
-                             start on different frames. Clamped to B's range.",
-                        )
-                        .changed()
-                    {
-                        self.b_mut().offset = off;
-                        // Re-align B to the new offset immediately.
-                        self.sync_b_to_a();
-                    }
-                }
+            ui.separator();
 
-                ui.separator();
-
-                // Beauty-only playback decode kill-switch (#56, step 3). On → the
-                // ring decodes just the beauty/first layer while moving (faster
-                // decode, smaller frames for multi-part AOV EXRs); the settled
-                // frame is always re-decoded in full. Off → always decode all AOVs.
-                if ui
-                    .checkbox(&mut self.beauty_preview, "Beauty preview")
-                    .on_hover_text(
-                        "While playing, decode only the beauty/first layer for a \
+            // Beauty-only playback decode kill-switch (#56, step 3). On → the
+            // ring decodes just the beauty/first layer while moving (faster
+            // decode, smaller frames for multi-part AOV EXRs); the settled
+            // frame is always re-decoded in full. Off → always decode all AOVs.
+            if ui
+                .checkbox(&mut self.beauty_preview, "Beauty preview")
+                .on_hover_text(
+                    "While playing, decode only the beauty/first layer for a \
                          faster, lighter cache; the paused frame is always full. \
                          Turn off if a file's first layer isn't its beauty.",
-                    )
-                    .changed()
-                {
-                    // Switching modes makes the cached ring (now the wrong decode
-                    // mode) stale; drop it so frames re-decode under the new mode.
-                    self.frame_cache.clear();
-                    self.invalidate_inflight();
-                    self.request_sequence_frame(self.playback.current_frame);
-                }
+                )
+                .changed()
+            {
+                // Switching modes makes the cached ring (now the wrong decode
+                // mode) stale; drop it so frames re-decode under the new mode.
+                self.frame_cache.clear();
+                self.invalidate_inflight();
+                self.request_sequence_frame(self.playback.current_frame);
+            }
 
-                ui.separator();
+            ui.separator();
 
-                // Scrub-proxy kill-switch + size (#94). On → while moving, decode a
-                // tiny downsampled proxy so heavy footage plays and far more frames
-                // fit RAM; the paused frame is always re-decoded full-res. Self-gates
-                // to a full decode on small/tiled/deep files.
-                let proxy_changed = ui
-                    .checkbox(&mut self.proxy_enabled, "Scrub proxy")
-                    .on_hover_text(
-                        "While playing/scrubbing, decode a small downsampled proxy so \
+            // Scrub-proxy kill-switch + size (#94). On → while moving, decode a
+            // tiny downsampled proxy so heavy footage plays and far more frames
+            // fit RAM; the paused frame is always re-decoded full-res. Self-gates
+            // to a full decode on small/tiled/deep files.
+            let proxy_changed = ui
+                .checkbox(&mut self.proxy_enabled, "Scrub proxy")
+                .on_hover_text(
+                    "While playing/scrubbing, decode a small downsampled proxy so \
                          heavy footage plays smoothly and far more frames fit in RAM; \
                          the paused frame sharpens to full res. Great for slow or \
                          networked media.",
+                )
+                .changed();
+            let size_changed = self.proxy_enabled
+                && ui
+                    .add(
+                        egui::DragValue::new(&mut self.proxy_size)
+                            .range(256..=4096)
+                            .speed(16.0)
+                            .suffix(" px"),
                     )
-                    .changed();
-                let size_changed = self.proxy_enabled
-                    && ui
-                        .add(
-                            egui::DragValue::new(&mut self.proxy_size)
-                                .range(256..=4096)
-                                .speed(16.0)
-                                .suffix(" px"),
-                        )
-                        .on_hover_text(
-                            "Proxy size — the downsampled long-side resolution: higher \
+                    .on_hover_text(
+                        "Proxy size — the downsampled long-side resolution: higher \
                              = sharper but larger + fewer frames cached. The frame is \
                              decoded full (correct geometry) then box-filtered to this \
                              size on the way into the cache.",
-                        )
-                        .changed();
-                if proxy_changed || size_changed {
-                    // The cached ring is now the wrong decode mode/size — drop it so
-                    // frames re-decode (mirrors the Beauty-preview toggle). Also
-                    // forget the measured proxy byte-size so a new size re-measures
-                    // it (otherwise a larger proxy is budgeted at the old, smaller
-                    // size until restart).
-                    self.frame_cache.clear();
-                    self.proxy_bytes = None;
-                    self.invalidate_inflight();
-                    self.request_sequence_frame(self.playback.current_frame);
-                }
+                    )
+                    .changed();
+            if proxy_changed || size_changed {
+                // The cached ring is now the wrong decode mode/size — drop it so
+                // frames re-decode (mirrors the Beauty-preview toggle). Also
+                // forget the measured proxy byte-size so a new size re-measures
+                // it (otherwise a larger proxy is budgeted at the old, smaller
+                // size until restart).
+                self.frame_cache.clear();
+                self.proxy_bytes = None;
+                self.invalidate_inflight();
+                self.request_sequence_frame(self.playback.current_frame);
+            }
 
-                ui.separator();
+            ui.separator();
 
-                // On-disk proxy cache (#165). On → persist scrub proxies to
-                // ~/.floki/proxy-cache so a repeat pass / later session loads them
-                // instead of re-decoding; LRU-bounded by the GB budget beside it.
-                let disk_changed = ui
-                    .checkbox(&mut self.proxy_disk_cache, "Disk cache")
-                    .on_hover_text(
-                        "Persist scrub proxies to disk (~/.floki/proxy-cache) so a \
+            // On-disk proxy cache (#165). On → persist scrub proxies to
+            // ~/.floki/proxy-cache so a repeat pass / later session loads them
+            // instead of re-decoding; LRU-bounded by the GB budget beside it.
+            let disk_changed = ui
+                .checkbox(&mut self.proxy_disk_cache, "Disk cache")
+                .on_hover_text(
+                    "Persist scrub proxies to disk (~/.floki/proxy-cache) so a \
                          repeat pass or a later session loads them instantly instead \
                          of re-decoding — auto-invalidated when a frame is re-rendered. \
                          Huge for networked media and repeated review (dailies, shot \
                          iteration).",
+                )
+                .changed();
+            let budget_changed = self.proxy_disk_cache
+                && ui
+                    .add(
+                        egui::DragValue::new(&mut self.proxy_cache_gb)
+                            .range(1.0..=200.0)
+                            .speed(1.0)
+                            .suffix(" GB"),
                     )
-                    .changed();
-                let budget_changed = self.proxy_disk_cache
-                    && ui
-                        .add(
-                            egui::DragValue::new(&mut self.proxy_cache_gb)
-                                .range(1.0..=200.0)
-                                .speed(1.0)
-                                .suffix(" GB"),
-                        )
-                        .on_hover_text(
-                            "On-disk proxy-cache size budget in GB (gibibytes, 1024³ — \
+                    .on_hover_text(
+                        "On-disk proxy-cache size budget in GB (gibibytes, 1024³ — \
                              same unit as the RAM budget). A ceiling, not a reservation: \
                              the least-recently-used proxies are evicted first once it \
                              fills.",
-                        )
-                        .changed();
-                if disk_changed || budget_changed {
-                    self.proxy_cache.configure(
-                        self.proxy_disk_cache,
-                        crate::proxy_cache::gib_to_bytes(self.proxy_cache_gb),
-                    );
-                }
-                if self.proxy_disk_cache
-                    && ui
-                        .button("Clear")
-                        .on_hover_text("Delete all cached proxies from ~/.floki/proxy-cache.")
-                        .clicked()
-                {
-                    self.proxy_cache.clear();
-                }
+                    )
+                    .changed();
+            if disk_changed || budget_changed {
+                self.proxy_cache.configure(
+                    self.proxy_disk_cache,
+                    crate::proxy_cache::gib_to_bytes(self.proxy_cache_gb),
+                );
+            }
+            if self.proxy_disk_cache
+                && ui
+                    .button("Clear")
+                    .on_hover_text("Delete all cached proxies from ~/.floki/proxy-cache.")
+                    .clicked()
+            {
+                self.proxy_cache.clear();
+            }
 
-                ui.separator();
+            ui.separator();
 
-                // Eager precache kill-switch (#56, step 4). On → fill the whole
-                // in/out range into the ring up front (bounded by RAM); the
-                // cache-fill bar under the scrubber shows how much is resident. On
-                // by default (#165): scrub proxies keep the footprint small and the
-                // disk cache makes a repeat fill cheap, so warming the range is cheap.
-                if ui
-                    .checkbox(&mut self.precache, "Precache")
-                    .on_hover_text(
-                        "Cache the whole in/out range up front so it plays and \
+            // Eager precache kill-switch (#56, step 4). On → fill the whole
+            // in/out range into the ring up front (bounded by RAM); the
+            // cache-fill bar under the scrubber shows how much is resident. On
+            // by default (#165): scrub proxies keep the footprint small and the
+            // disk cache makes a repeat fill cheap, so warming the range is cheap.
+            if ui
+                .checkbox(&mut self.precache, "Precache")
+                .on_hover_text(
+                    "Cache the whole in/out range up front so it plays and \
                          loops with no decoding. Fills to the RAM budget; the bar \
                          under the scrubber shows the cached span. Cheap with scrub \
                          proxies + the disk cache on, so it's on by default.",
-                    )
-                    .changed()
-                    && self.precache
-                {
-                    // Kick the fill immediately; the chain self-sustains from
-                    // `apply_load_result` as each frame lands.
-                    self.precache_filled = false;
-                    self.pump_decode();
-                    ui.ctx().request_repaint();
-                }
-
-                ui.separator();
-
-                // User-assigned RAM budget for the T1 ring (#56). 0 = Auto (size
-                // from free RAM). A ceiling only — capped by the auto figure so it
-                // can't OOM; lets you bound RAM on a shared box or dogfood eviction.
-                ui.label("RAM");
-                ui.add(
-                    egui::DragValue::new(&mut self.ram_budget_gb)
-                        .range(0.0..=256.0)
-                        .speed(0.25)
-                        .custom_formatter(|n, _| {
-                            if n < f64::from(RAM_BUDGET_AUTO_BELOW_GB) {
-                                "Auto".to_string()
-                            } else {
-                                format!("{n:.1} GB")
-                            }
-                        }),
                 )
-                .on_hover_text(
-                    "Cap the RAM the frame cache may use (0 = Auto, sized from free \
+                .changed()
+                && self.precache
+            {
+                // Kick the fill immediately; the chain self-sustains from
+                // `apply_load_result` as each frame lands.
+                self.precache_filled = false;
+                self.pump_decode();
+                ui.ctx().request_repaint();
+            }
+
+            ui.separator();
+
+            // User-assigned RAM budget for the T1 ring (#56). 0 = Auto (size
+            // from free RAM). A ceiling only — capped by the auto figure so it
+            // can't OOM; lets you bound RAM on a shared box or dogfood eviction.
+            ui.label("RAM");
+            ui.add(
+                egui::DragValue::new(&mut self.ram_budget_gb)
+                    .range(0.0..=256.0)
+                    .speed(0.25)
+                    .custom_formatter(|n, _| {
+                        if n < f64::from(RAM_BUDGET_AUTO_BELOW_GB) {
+                            "Auto".to_string()
+                        } else {
+                            format!("{n:.1} GB")
+                        }
+                    }),
+            )
+            .on_hover_text(
+                "Cap the RAM the frame cache may use (0 = Auto, sized from free \
                      RAM). A ceiling only — it can't exceed what's free. Lower it to \
                      bound RAM on a shared box, or to dogfood the eviction paths.",
-                );
+            );
 
-                ui.separator();
+            ui.separator();
 
-                // Render-watch (#101): pick up frames as a render writes them.
-                if ui
-                    .checkbox(&mut self.watch_enabled, "Watch")
-                    .on_hover_text(
-                        "Watch the sequence folder and load frames as a render \
+            // Render-watch (#101): pick up frames as a render writes them.
+            if ui
+                .checkbox(&mut self.watch_enabled, "Watch")
+                .on_hover_text(
+                    "Watch the sequence folder and load frames as a render \
                          writes them (new frames extend the range; re-rendered \
                          frames refresh).",
-                    )
-                    .changed()
-                {
-                    // (Re)baseline on the next poll so existing frames aren't
-                    // mistaken for newly-arrived ones.
-                    self.watch_sigs.clear();
-                    self.last_watch_poll = None;
-                }
-                if self.watch_enabled {
-                    ui.checkbox(&mut self.watch_follow, "Follow")
-                        .on_hover_text("Park the playhead on the newest frame as it arrives.");
-                }
-            });
-
-            // Timeline row: full-width span with the trimmed region + holes drawn
-            // distinctly, plus the frame readout.
-            ui.horizontal(|ui| {
-                let cur = self.playback.current_frame;
-                let (in_pt, out_pt) = (self.playback.in_point, self.playback.out_point);
-                ui.label(format!("{cur}  [{in_pt}–{out_pt}]"));
-                // A hole holds the previous frame; flag it so the readout isn't
-                // mistaken for a decoded frame.
-                if self.playback.frame_path(cur).is_none() {
-                    ui.label(egui::RichText::new("(hole)").weak());
-                }
-                self.draw_timeline(ui);
-            });
+                )
+                .changed()
+            {
+                // (Re)baseline on the next poll so existing frames aren't
+                // mistaken for newly-arrived ones.
+                self.watch_sigs.clear();
+                self.last_watch_poll = None;
+            }
+            if self.watch_enabled {
+                ui.checkbox(&mut self.watch_follow, "Follow")
+                    .on_hover_text("Park the playhead on the newest frame as it arrives.");
+            }
         });
     }
 
@@ -4889,31 +4786,23 @@ impl ExrApp {
     /// `[in, out]` region is highlighted, holes are marked distinctly, the in/out
     /// edges and playhead are drawn as vertical ticks. Click or drag scrubs to the
     /// frame under the cursor (a P0 seek, clamped to the trim).
-    fn draw_timeline(&mut self, ui: &mut egui::Ui) {
-        let Some((lo, hi)) = self.playback.full_range() else {
-            return;
-        };
+    ///
+    /// `rect` is the row's axis area, already allocated by the caller (#99) so the
+    /// ruler and every layer clip bar below it share one frame↔x mapping.
+    fn draw_timeline(&mut self, ui: &mut egui::Ui, rect: egui::Rect, lo: u32, hi: u32) {
+        let axis = TimeAxis::new(rect, lo, hi);
         let (in_pt, out_pt) = (self.playback.in_point, self.playback.out_point);
         let cur = self.playback.current_frame;
-        let span = hi.saturating_sub(lo); // 0 for a single-frame sequence
 
-        let width = ui.available_width().max(64.0);
-        let (rect, resp) =
-            ui.allocate_exact_size(egui::vec2(width, 22.0), egui::Sense::click_and_drag());
+        let resp = ui.interact(
+            rect,
+            ui.id().with("timeline_ruler"),
+            egui::Sense::click_and_drag(),
+        );
         if ui.is_rect_visible(rect) {
             let painter = ui.painter_at(rect);
             let visuals = ui.visuals();
-            // Map a frame number to an x inside `rect` (single-frame → center).
-            let x_of = |f: u32| {
-                // f64 throughout so the mapping stays monotonic for long
-                // sequences (frame offsets can exceed u16/f32-exact ranges).
-                let t = if span == 0 {
-                    0.5
-                } else {
-                    (f64::from(f.saturating_sub(lo)) / f64::from(span)) as f32
-                };
-                rect.left() + t.clamp(0.0, 1.0) * rect.width()
-            };
+            let x_of = |f: u32| axis.x_of(i64::from(f));
 
             // Track background.
             painter.rect_filled(rect, 3.0, visuals.extreme_bg_color);
@@ -4933,34 +4822,17 @@ impl ExrApp {
             // sort is far cheaper. The gap to a full green bar is the part of
             // the range that doesn't fit the RAM budget (or hasn't decoded yet).
             let strip_top = rect.bottom() - 4.0;
-            let nslots = f64::from(span) + 1.0; // frames lo..=hi inclusive
-            let slot_x = |f: u32| {
-                rect.left() + ((f64::from(f.saturating_sub(lo)) / nslots) as f32) * rect.width()
-            };
-            // Two-tone (#172): proxy/beauty-resident frames in a dim green, full-res
-            // on top in a brighter green — so a range that's only proxy-cached (it
-            // sharpens to full on pause) reads differently from a fully-cached one.
-            let proxy_fill = egui::Color32::from_rgb(52, 104, 72);
-            let full_fill = egui::Color32::from_rgb(64, 168, 96);
-            // Coalesce a sorted frame set into contiguous runs and paint each as one
-            // rect (#146 — one shape per frame tessellated thousands per repaint).
             let paint_runs = |frames: &mut Vec<u32>, color: egui::Color32| {
-                frames.sort_unstable();
-                let mut i = 0;
-                while i < frames.len() {
-                    let start = frames[i];
-                    let mut end = start;
-                    while i + 1 < frames.len() && frames[i + 1] == end + 1 {
-                        i += 1;
-                        end = frames[i];
-                    }
-                    i += 1;
+                for_each_frame_run(frames, |start, end| {
                     let seg = egui::Rect::from_min_max(
-                        egui::pos2(slot_x(start), strip_top),
-                        egui::pos2(slot_x(end + 1).min(rect.right()), rect.bottom()),
+                        egui::pos2(axis.slot_x(i64::from(start)), strip_top),
+                        egui::pos2(
+                            axis.slot_x(i64::from(end) + 1).min(rect.right()),
+                            rect.bottom(),
+                        ),
                     );
                     painter.rect_filled(seg, 0.0, color);
-                }
+                });
             };
             // only the trimmed range is the precache target
             let in_range = |f: u32| f >= in_pt && f <= out_pt;
@@ -4969,13 +4841,13 @@ impl ExrApp {
                 .resident_frames(Self::A_SOURCE)
                 .filter(|&f| in_range(f))
                 .collect();
-            paint_runs(&mut resident, proxy_fill);
+            paint_runs(&mut resident, CACHE_PROXY_FILL);
             let mut full: Vec<u32> = self
                 .frame_cache
                 .resident_full_frames(Self::A_SOURCE)
                 .filter(|&f| in_range(f))
                 .collect();
-            paint_runs(&mut full, full_fill);
+            paint_runs(&mut full, CACHE_FULL_FILL);
             // Holes: distinct vertical marks across the full span.
             if let Some(seq) = self.playback.sequence.as_ref() {
                 let hole_color = egui::Color32::from_rgb(206, 92, 60);
@@ -5021,9 +4893,8 @@ impl ExrApp {
         if (resp.clicked() || resp.dragged())
             && let Some(pos) = resp.interact_pointer_pos()
         {
-            let t = f64::from((pos.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
-            let frame = lo + (t * f64::from(span)).round() as u32;
-            self.playback_scrub_to(frame);
+            // `frame_at` clamps to `[lo, hi]`, so the cast is always in range.
+            self.playback_scrub_to(axis.frame_at(pos.x).max(0) as u32);
         }
         if resp.drag_stopped() {
             self.scrub_active = false;
@@ -5032,7 +4903,7 @@ impl ExrApp {
     }
 
     fn draw_side_panel(&mut self, ui: &mut egui::Ui) {
-        if !self.viewer.fullscreen {
+        if !self.viewer.fullscreen && self.show_side_panel {
             egui::Panel::left("side_panel")
                 .resizable(true)
                 .min_size(200.0)
@@ -5047,31 +4918,80 @@ impl ExrApp {
                             ui.separator();
                         }
 
-                        let mut files_to_show = vec![];
+                        // (section label, display filename, decoded data, comp layer
+                        // id). `comp_layer` is `Some` for a layer-stack source — its
+                        // pass list drives that layer's AOV; `None` for the classic
+                        // A/B slots, whose pass list drives `viewer.active_layer`.
+                        // Owned `Arc` clones (cheap) so nothing borrows `self` across
+                        // the render loop (which mutates `self` on a pass click).
+                        type InfoEntry = (
+                            String,
+                            String,
+                            std::sync::Arc<ExrData>,
+                            Option<crate::layer::LayerId>,
+                        );
+                        let mut files_to_show: Vec<InfoEntry> = vec![];
                         if let (Some(path), Some(data)) = (&self.loaded_file, &self.exr_data) {
-                            files_to_show.push(("Image A", path, data));
+                            files_to_show.push((
+                                "Image A".to_string(),
+                                path.file_name()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                                    .into_owned(),
+                                data.clone(),
+                                None,
+                            ));
                         }
-                        if let (Some(path), Some(data)) = (
-                            &self.followers[&Self::B_SOURCE].loaded_file,
-                            &self.exr_data_b,
-                        ) {
-                            files_to_show.push(("Image B", path, data));
+                        // Comp / layer-stack path (#99 R4): `exr_data` is None, so show
+                        // the current layer's source metadata first (Nuke-style), then
+                        // the rest of the stack top→bottom.
+                        if files_to_show.is_empty() {
+                            let cur = self.active_comp_layer();
+                            let ids: Vec<crate::layer::LayerId> = {
+                                let mut v: Vec<_> =
+                                    self.comp_stack.iter().rev().map(|l| l.id).collect();
+                                if let Some(c) = cur {
+                                    v.retain(|&id| id != c);
+                                    v.insert(0, c);
+                                }
+                                v
+                            };
+                            for id in ids {
+                                let Some(l) = self.comp_stack.get(id) else {
+                                    continue;
+                                };
+                                let source = match &l.source {
+                                    crate::layer::LayerSource::Image { source, .. } => {
+                                        Some(*source)
+                                    }
+                                    crate::layer::LayerSource::Adjustment => None,
+                                };
+                                if let Some(cs) = source.and_then(|s| self.comp_sources.get(&s)) {
+                                    let label = if cur == Some(id) {
+                                        "Current Layer"
+                                    } else {
+                                        "Layer"
+                                    };
+                                    files_to_show.push((
+                                        label.to_string(),
+                                        l.name.clone(),
+                                        cs.exr_data.clone(),
+                                        Some(id),
+                                    ));
+                                }
+                            }
                         }
 
                         if !files_to_show.is_empty() {
                             egui::ScrollArea::vertical().show(ui, |ui| {
-                                for (idx, (label, path, exr_data)) in
+                                for (idx, (label, name, exr_data, comp_layer)) in
                                     files_to_show.iter().enumerate()
                                 {
                                     if idx > 0 {
                                         ui.separator();
                                         ui.add_space(10.0);
                                     }
-                                    ui.heading(format!(
-                                        "{}: {}",
-                                        label,
-                                        path.file_name().unwrap_or_default().to_string_lossy()
-                                    ));
+                                    ui.heading(format!("{label}: {name}"));
                                     ui.add_space(5.0);
 
                                     egui::CollapsingHeader::new("Image Metadata")
@@ -5120,11 +5040,40 @@ impl ExrApp {
                                     ui.separator();
                                     ui.heading("Layers");
 
+                                    // Which pass is active for this entry, and where a
+                                    // click retargets it: a comp layer drives its own
+                                    // AOV (`LayerSource::Image.aov`); the classic A/B
+                                    // slots drive the shared `viewer.active_layer`.
+                                    let active_pass = match comp_layer {
+                                        Some(id) => self
+                                            .comp_stack
+                                            .get(*id)
+                                            .and_then(|l| match &l.source {
+                                                crate::layer::LayerSource::Image {
+                                                    aov, ..
+                                                } => Some(*aov),
+                                                crate::layer::LayerSource::Adjustment => None,
+                                            })
+                                            .unwrap_or(0),
+                                        None => self.viewer.active_layer,
+                                    };
                                     for (i, ll) in exr_data.logical_layers.iter().enumerate() {
-                                        let is_selected = self.viewer.active_layer == i;
+                                        let is_selected = active_pass == i;
 
                                         if ui.selectable_label(is_selected, &ll.name).clicked() {
-                                            self.viewer.active_layer = i;
+                                            match comp_layer {
+                                                Some(id) => {
+                                                    if let Some(l) = self.comp_stack.get_mut(*id)
+                                                        && let crate::layer::LayerSource::Image {
+                                                            aov,
+                                                            ..
+                                                        } = &mut l.source
+                                                    {
+                                                        *aov = i;
+                                                    }
+                                                }
+                                                None => self.viewer.active_layer = i,
+                                            }
                                         }
 
                                         if is_selected
@@ -5174,206 +5123,295 @@ impl ExrApp {
                             });
                         }
 
-                        if let Some(_path) = &self.loaded_file {
-                            if let Some(exr_data) = &self.exr_data {
-                                ui.separator();
-                                ui.heading("Color Sampler");
+                        // Color Sampler + Histogram source (#99 R4): the current
+                        // layer's source at its AOV. Owned Arc clones so the block can
+                        // call the &mut viewer histogram methods without holding a
+                        // borrow of `self`. Tuple = (data, AOV idx, source discriminator).
+                        type HistPanel = (std::sync::Arc<ExrData>, usize, u64);
+                        let panel_hist: Option<HistPanel> =
+                            if let Some(id) = self.active_comp_layer() {
+                                match self.comp_stack.get(id).map(|l| &l.source) {
+                                    Some(crate::layer::LayerSource::Image { source, aov }) => self
+                                        .comp_sources
+                                        .get(source)
+                                        .map(|cs| (cs.exr_data.clone(), *aov, source.0)),
+                                    _ => None,
+                                }
+                            } else {
+                                None
+                            };
 
-                                if !self.viewer.swatches.is_empty() {
-                                    ui.horizontal(|ui| {
-                                        ui.label(format!("{} saved", self.viewer.swatches.len()));
-                                        if ui.button("Clear All").clicked() {
-                                            self.viewer.swatches.clear();
+                        if let Some((exr_data, hist_layer, hist_disc)) = &panel_hist {
+                            ui.separator();
+                            ui.heading("Color Sampler");
+
+                            if !self.viewer.swatches.is_empty() {
+                                ui.horizontal(|ui| {
+                                    ui.label(format!("{} saved", self.viewer.swatches.len()));
+                                    if ui.button("Clear All").clicked() {
+                                        self.viewer.swatches.clear();
+                                    }
+                                });
+                                ui.add_space(5.0);
+
+                                egui::ScrollArea::vertical()
+                                    .id_salt("swatches_scroll")
+                                    .show(ui, |ui| {
+                                        let mut to_remove = None;
+                                        let exp_mult = crate::render_math::exposure_to_multiplier(
+                                            self.viewer.exposure,
+                                        );
+                                        for (i, swatch) in self.viewer.swatches.iter().enumerate() {
+                                            ui.horizontal(|ui| {
+                                                let [r, g, b, _a] = *swatch;
+
+                                                // Preview color patch using current sRGB mode and exposure/gamma
+                                                let mut disp_r = r * exp_mult;
+                                                let mut disp_g = g * exp_mult;
+                                                let mut disp_b = b * exp_mult;
+
+                                                if self.viewer.gamma != 1.0 {
+                                                    disp_r = crate::render_math::apply_gamma(
+                                                        disp_r,
+                                                        self.viewer.gamma,
+                                                    );
+                                                    disp_g = crate::render_math::apply_gamma(
+                                                        disp_g,
+                                                        self.viewer.gamma,
+                                                    );
+                                                    disp_b = crate::render_math::apply_gamma(
+                                                        disp_b,
+                                                        self.viewer.gamma,
+                                                    );
+                                                }
+
+                                                if self.viewer.srgb {
+                                                    disp_r =
+                                                        crate::render_math::linear_to_srgb(disp_r);
+                                                    disp_g =
+                                                        crate::render_math::linear_to_srgb(disp_g);
+                                                    disp_b =
+                                                        crate::render_math::linear_to_srgb(disp_b);
+                                                }
+
+                                                let r_u8 = (disp_r.clamp(0.0, 1.0) * 255.0) as u8;
+                                                let g_u8 = (disp_g.clamp(0.0, 1.0) * 255.0) as u8;
+                                                let b_u8 = (disp_b.clamp(0.0, 1.0) * 255.0) as u8;
+
+                                                let color =
+                                                    egui::Color32::from_rgb(r_u8, g_u8, b_u8);
+                                                let (rect, _resp) = ui.allocate_exact_size(
+                                                    egui::vec2(20.0, 20.0),
+                                                    egui::Sense::hover(),
+                                                );
+                                                ui.painter().rect_filled(rect, 2.0, color);
+
+                                                // Display values
+                                                ui.vertical(|ui| {
+                                                    ui.label(format!(
+                                                        "Float: {r:.4}, {g:.4}, {b:.4}"
+                                                    ));
+                                                    ui.label(format!(
+                                                        "8-bit: {r_u8}, {g_u8}, {b_u8}"
+                                                    ));
+                                                    // HSV mapping
+                                                    let max = r.max(g).max(b);
+                                                    let min = r.min(g).min(b);
+                                                    let c = max - min;
+                                                    let h = if c == 0.0 {
+                                                        0.0
+                                                    } else if max == r {
+                                                        60.0 * (((g - b) / c) % 6.0)
+                                                    } else if max == g {
+                                                        60.0 * (((b - r) / c) + 2.0)
+                                                    } else {
+                                                        60.0 * (((r - g) / c) + 4.0)
+                                                    };
+                                                    let h = if h < 0.0 { h + 360.0 } else { h };
+                                                    let s = if max == 0.0 { 0.0 } else { c / max };
+                                                    let v = max;
+                                                    ui.label(format!(
+                                                        "HSV: {h:.1}°, {s:.2}, {v:.2}"
+                                                    ));
+                                                });
+
+                                                if ui.button("X").clicked() {
+                                                    to_remove = Some(i);
+                                                }
+                                            });
+                                            ui.separator();
+                                        }
+                                        if let Some(i) = to_remove {
+                                            self.viewer.swatches.remove(i);
                                         }
                                     });
-                                    ui.add_space(5.0);
+                            } else {
+                                ui.label("Shift+Click on the image to save a swatch.");
+                            }
 
-                                    egui::ScrollArea::vertical()
-                                        .id_salt("swatches_scroll")
-                                        .show(ui, |ui| {
-                                            let mut to_remove = None;
-                                            let exp_mult =
-                                                crate::render_math::exposure_to_multiplier(
-                                                    self.viewer.exposure,
-                                                );
-                                            for (i, swatch) in
-                                                self.viewer.swatches.iter().enumerate()
-                                            {
-                                                ui.horizontal(|ui| {
-                                                    let [r, g, b, _a] = *swatch;
+                            ui.separator();
+                            ui.heading("Histogram");
+                            ui.horizontal(|ui| {
+                                // The histogram cache key includes log_histogram,
+                                // so flipping this auto-invalidates — no manual reset.
+                                ui.checkbox(
+                                    &mut self.viewer.log_histogram,
+                                    "Log Scale (-10 to +10 EV)",
+                                );
+                            });
 
-                                                    // Preview color patch using current sRGB mode and exposure/gamma
-                                                    let mut disp_r = r * exp_mult;
-                                                    let mut disp_g = g * exp_mult;
-                                                    let mut disp_b = b * exp_mult;
+                            // Recomputing full-res bins on every frame swap
+                            // would block the UI thread at playback rate and
+                            // contend with decode for the rayon pool (#141).
+                            // INV-SAMPLE already suppresses the pixel readout
+                            // while playing/pending — mirror it: hold the last
+                            // computed bins and recompute once on settle (the
+                            // swap invalidated the key).
+                            if !self.playback.sampling_suppressed() {
+                                self.viewer.calculate_histogram_for(
+                                    exr_data,
+                                    *hist_layer,
+                                    *hist_disc,
+                                );
+                            }
 
-                                                    if self.viewer.gamma != 1.0 {
-                                                        disp_r = crate::render_math::apply_gamma(
-                                                            disp_r,
-                                                            self.viewer.gamma,
-                                                        );
-                                                        disp_g = crate::render_math::apply_gamma(
-                                                            disp_g,
-                                                            self.viewer.gamma,
-                                                        );
-                                                        disp_b = crate::render_math::apply_gamma(
-                                                            disp_b,
-                                                            self.viewer.gamma,
-                                                        );
-                                                    }
+                            if let Some(bins) = &self.viewer.histogram {
+                                let (rect, _resp) = ui.allocate_exact_size(
+                                    egui::vec2(ui.available_width(), 80.0),
+                                    egui::Sense::hover(),
+                                );
+                                let max_val = (*bins.iter().max().unwrap_or(&1) as f32).max(1.0);
 
-                                                    if self.viewer.srgb {
-                                                        disp_r = crate::render_math::linear_to_srgb(
-                                                            disp_r,
-                                                        );
-                                                        disp_g = crate::render_math::linear_to_srgb(
-                                                            disp_g,
-                                                        );
-                                                        disp_b = crate::render_math::linear_to_srgb(
-                                                            disp_b,
-                                                        );
-                                                    }
+                                // 256 bins; reserve to avoid reallocation.
+                                let mut shapes = Vec::with_capacity(256);
+                                let bar_width = rect.width() / 256.0;
 
-                                                    let r_u8 =
-                                                        (disp_r.clamp(0.0, 1.0) * 255.0) as u8;
-                                                    let g_u8 =
-                                                        (disp_g.clamp(0.0, 1.0) * 255.0) as u8;
-                                                    let b_u8 =
-                                                        (disp_b.clamp(0.0, 1.0) * 255.0) as u8;
+                                for (i, &count) in bins.iter().enumerate() {
+                                    let h = (count as f32 / max_val).powf(0.5) * rect.height();
+                                    let x = rect.min.x + i as f32 * bar_width;
+                                    let y = rect.max.y - h;
 
-                                                    let color =
-                                                        egui::Color32::from_rgb(r_u8, g_u8, b_u8);
-                                                    let (rect, _resp) = ui.allocate_exact_size(
-                                                        egui::vec2(20.0, 20.0),
-                                                        egui::Sense::hover(),
-                                                    );
-                                                    ui.painter().rect_filled(rect, 2.0, color);
-
-                                                    // Display values
-                                                    ui.vertical(|ui| {
-                                                        ui.label(format!(
-                                                            "Float: {r:.4}, {g:.4}, {b:.4}"
-                                                        ));
-                                                        ui.label(format!(
-                                                            "8-bit: {r_u8}, {g_u8}, {b_u8}"
-                                                        ));
-                                                        // HSV mapping
-                                                        let max = r.max(g).max(b);
-                                                        let min = r.min(g).min(b);
-                                                        let c = max - min;
-                                                        let h = if c == 0.0 {
-                                                            0.0
-                                                        } else if max == r {
-                                                            60.0 * (((g - b) / c) % 6.0)
-                                                        } else if max == g {
-                                                            60.0 * (((b - r) / c) + 2.0)
-                                                        } else {
-                                                            60.0 * (((r - g) / c) + 4.0)
-                                                        };
-                                                        let h = if h < 0.0 { h + 360.0 } else { h };
-                                                        let s =
-                                                            if max == 0.0 { 0.0 } else { c / max };
-                                                        let v = max;
-                                                        ui.label(format!(
-                                                            "HSV: {h:.1}°, {s:.2}, {v:.2}"
-                                                        ));
-                                                    });
-
-                                                    if ui.button("X").clicked() {
-                                                        to_remove = Some(i);
-                                                    }
-                                                });
-                                                ui.separator();
-                                            }
-                                            if let Some(i) = to_remove {
-                                                self.viewer.swatches.remove(i);
-                                            }
-                                        });
-                                } else {
-                                    ui.label("Shift+Click on the image to save a swatch.");
+                                    shapes.push(egui::Shape::rect_filled(
+                                        egui::Rect::from_min_max(
+                                            egui::pos2(x, y),
+                                            egui::pos2(x + bar_width.max(1.0), rect.max.y),
+                                        ),
+                                        0.0,
+                                        egui::Color32::from_white_alpha(150), // White for A
+                                    ));
                                 }
-
-                                ui.separator();
-                                ui.heading("Histogram");
-                                ui.horizontal(|ui| {
-                                    // The histogram cache key includes log_histogram,
-                                    // so flipping this auto-invalidates — no manual reset.
-                                    ui.checkbox(
-                                        &mut self.viewer.log_histogram,
-                                        "Log Scale (-10 to +10 EV)",
-                                    );
-                                });
-
-                                // Recomputing full-res bins on every frame swap
-                                // would block the UI thread at playback rate and
-                                // contend with decode for the rayon pool (#141).
-                                // INV-SAMPLE already suppresses the pixel readout
-                                // while playing/pending — mirror it: hold the last
-                                // computed bins and recompute once on settle (the
-                                // swap invalidated the key).
-                                if !self.playback.sampling_suppressed() {
-                                    self.viewer
-                                        .calculate_histogram(exr_data, self.exr_data_b.as_deref());
-                                }
-
-                                if let Some(bins) = &self.viewer.histogram {
-                                    let (rect, _resp) = ui.allocate_exact_size(
-                                        egui::vec2(ui.available_width(), 80.0),
-                                        egui::Sense::hover(),
-                                    );
-                                    let mut max_val = *bins.iter().max().unwrap_or(&1) as f32;
-                                    if let Some(bins_b) = &self.viewer.histogram_b {
-                                        max_val =
-                                            max_val.max(*bins_b.iter().max().unwrap_or(&1) as f32);
-                                    }
-                                    let max_val = max_val.max(1.0);
-
-                                    // Up to 512 bars (256 bins × A/B); reserve to avoid reallocation.
-                                    let mut shapes = Vec::with_capacity(512);
-                                    let bar_width = rect.width() / 256.0;
-
-                                    for (i, &count) in bins.iter().enumerate() {
-                                        let h = (count as f32 / max_val).powf(0.5) * rect.height();
-                                        let x = rect.min.x + i as f32 * bar_width;
-                                        let y = rect.max.y - h;
-
-                                        shapes.push(egui::Shape::rect_filled(
-                                            egui::Rect::from_min_max(
-                                                egui::pos2(x, y),
-                                                egui::pos2(x + bar_width.max(1.0), rect.max.y),
-                                            ),
-                                            0.0,
-                                            egui::Color32::from_white_alpha(150), // White for A
-                                        ));
-                                    }
-
-                                    if let Some(bins_b) = &self.viewer.histogram_b {
-                                        for (i, &count) in bins_b.iter().enumerate() {
-                                            let h =
-                                                (count as f32 / max_val).powf(0.5) * rect.height();
-                                            let x = rect.min.x + i as f32 * bar_width;
-                                            let y = rect.max.y - h;
-
-                                            shapes.push(egui::Shape::rect_filled(
-                                                egui::Rect::from_min_max(
-                                                    egui::pos2(x, y),
-                                                    egui::pos2(x + bar_width.max(1.0), rect.max.y),
-                                                ),
-                                                0.0,
-                                                egui::Color32::from_rgba_unmultiplied(
-                                                    255, 50, 50, 150,
-                                                ), // Red for B
-                                            ));
-                                        }
-                                    }
-                                    ui.painter().extend(shapes);
-                                }
+                                ui.painter().extend(shapes);
                             }
                         } else {
                             ui.label("No file loaded.");
                         }
                     });
                 });
+        }
+    }
+
+    /// The `LayerId` of the slot-A **base track** (#99 R3), if the composite holds
+    /// one. The base is the sole layer referencing [`Self::A_SOURCE`] — the opened
+    /// image, rendered as the bottom of the stack while compositing.
+    fn base_layer_id(&self) -> Option<crate::layer::LayerId> {
+        self.comp_stack.iter().find_map(|l| match l.source {
+            crate::layer::LayerSource::Image { source, .. } if source == Self::A_SOURCE => {
+                Some(l.id)
+            }
+            _ => None,
+        })
+    }
+
+    /// Push the opened image (slot A) as the **bottom track** of the composite
+    /// (#99 R3), so once you add a comp layer the base plate is *in* the stack
+    /// rather than vanishing. A real `LayerSource::Image { source: A_SOURCE }`
+    /// layer: `draw_comp_composite` binds it like any other, and it shows as a
+    /// (non-removable, clock-pinned) track. Registers a `CompSource` at `A_SOURCE`
+    /// whose texture is built lazily each paint from the live A frame
+    /// ([`Self::ensure_base_frame`]). Caller ensures a file is open.
+    fn add_base_layer(&mut self) {
+        let Some(path) = self.loaded_file.clone() else {
+            return;
+        };
+        let name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "base".to_string());
+        let Some(exr_data) = self.exr_data.clone() else {
+            return;
+        };
+        // A's range drives the clock at offset 0 (source frame == global frame); a
+        // lone still spans all frames.
+        let trim = match self.playback.full_range() {
+            Some((lo, hi)) => crate::layer::Trim {
+                in_point: lo,
+                out_point: hi,
+                offset: 0,
+            },
+            None => crate::layer::Trim::full(0, u32::MAX),
+        };
+        let aov = self.viewer.active_layer;
+        let id = self.comp_stack.push_image(name, Self::A_SOURCE, aov, trim);
+        self.comp_stack.move_to(id, 0); // bottom of the stack
+        let size = exr_data.logical_size(aov).unwrap_or((0, 0));
+        self.comp_sources.insert(
+            Self::A_SOURCE,
+            CompSource {
+                path,
+                exr_data,
+                size,
+                aov,
+                bind_group: None,
+                texture: None,
+                cur_frame: None,
+            },
+        );
+    }
+
+    /// Re-point the base track at a freshly-opened slot A (#99 R3): its name +
+    /// range, and force a texture rebuild next paint (the new image may reuse the
+    /// old frame number, which would otherwise skip the rebuild). No-op if there is
+    /// no base track. Called from `open_file`, after `detect_sequence` has set the
+    /// new range.
+    ///
+    /// Reached only from the legacy [`Self::open_file`], now unreachable via the
+    /// unified open/drop flow (#99 R4) — kept for the compare path until
+    /// render-retire (Phase 3).
+    #[allow(dead_code)]
+    fn update_base_layer(&mut self, path: &std::path::Path) {
+        let Some(id) = self.base_layer_id() else {
+            return;
+        };
+        let name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "base".to_string());
+        let trim = match self.playback.full_range() {
+            Some((lo, hi)) => crate::layer::Trim {
+                in_point: lo,
+                out_point: hi,
+                offset: 0,
+            },
+            None => crate::layer::Trim::full(0, u32::MAX),
+        };
+        if let Some(l) = self.comp_stack.get_mut(id) {
+            l.name = name;
+            l.trim = trim;
+        }
+        if let Some(cs) = self.comp_sources.get_mut(&Self::A_SOURCE) {
+            cs.cur_frame = None;
+        }
+    }
+
+    /// Remove the slot-A base track + its comp source (#99 R3), if present. Unlike
+    /// a comp source, `A_SOURCE` is A's *own* transport cache / T2 ring, not a
+    /// follower — so this drops only the model layer + the `comp_sources` entry and
+    /// must NEVER `clear_slot`/touch `followers` for it. Called when the last comp
+    /// source is removed and when A is unloaded.
+    fn remove_base_layer(&mut self) {
+        if let Some(id) = self.base_layer_id() {
+            self.comp_stack.remove(id);
+            self.comp_sources.remove(&Self::A_SOURCE);
         }
     }
 
@@ -5385,8 +5423,100 @@ impl ExrApp {
     /// can bind it. On a decode error nothing is added; the error surfaces in the
     /// status bar. Headless (no `gpu_resources`) still registers the model layer +
     /// pixels, just without a texture.
+    ///
+    /// When this is the *first* comp source and a file is open as slot A, the
+    /// opened image is pushed first as the bottom **base track** (#99 R3) so the
+    /// plate composites underneath the added layers.
+    /// Flatten the live comp stack into the persistable list (#99 PR-B.5), bottom→top
+    /// so a replay rebuilds the same order. The **base plate is skipped**: it is
+    /// `A_SOURCE`, owned by the slot-A open path rather than the panel, and
+    /// `add_comp_source` re-promotes it on its own. A layer whose source is missing
+    /// (never possible today, but cheap to tolerate) is skipped rather than persisted
+    /// with an empty path that would fail to restore.
+    fn comp_layers_persist(&self) -> Vec<LayerPersist> {
+        self.comp_stack
+            .iter()
+            .filter_map(|l| {
+                let crate::layer::LayerSource::Image { source, aov } = &l.source else {
+                    return None; // adjustment layers (#102) carry no file
+                };
+                if *source == Self::A_SOURCE {
+                    return None;
+                }
+                let cs = self.comp_sources.get(source)?;
+                Some(LayerPersist {
+                    path: cs.path.clone(),
+                    name: l.name.clone(),
+                    aov: *aov,
+                    blend: l.blend,
+                    opacity: l.opacity,
+                    enabled: l.enabled,
+                    solo: l.solo,
+                    trim_in: l.trim.in_point,
+                    trim_out: l.trim.out_point,
+                    trim_offset: l.trim.offset,
+                })
+            })
+            .collect()
+    }
+
+    /// Rebuild the comp stack from the persisted list (#99 PR-B.5) — called once at
+    /// startup, after storage is read.
+    ///
+    /// Each entry is replayed through [`Self::add_comp_source`], so restore takes the
+    /// *same* path as a normal open: sequence detection, follower registration,
+    /// transport entry, and the layer cap all behave identically. The per-layer state
+    /// the model owns (`aov` / blend / opacity / enabled / solo / trim) is then applied
+    /// on top, since `add_comp_source` always adds at defaults.
+    ///
+    /// A file that has moved or been deleted is **skipped silently** — the rest of the
+    /// stack still restores, and a startup error box for a stale session would be
+    /// noise. `add_comp_source` sets `error_msg` on a failed decode, so that is cleared
+    /// afterwards for the same reason.
+    fn restore_comp_layers(&mut self) {
+        let saved = std::mem::take(&mut self.persisted_layers);
+        if saved.is_empty() {
+            return;
+        }
+        for entry in saved {
+            if !entry.path.is_file() {
+                continue;
+            }
+            self.add_comp_source(entry.path);
+            // `add_comp_source` pushes on top and selects it, so the just-added layer
+            // is the last one; a rejected add (cap / decode failure) leaves the stack
+            // unchanged and there is nothing to configure.
+            let Some(id) = self.comp_stack.iter().last().map(|l| l.id) else {
+                continue;
+            };
+            let Some(layer) = self.comp_stack.get_mut(id) else {
+                continue;
+            };
+            if let crate::layer::LayerSource::Image { aov, .. } = &mut layer.source {
+                *aov = entry.aov;
+            }
+            layer.name = entry.name;
+            layer.blend = entry.blend;
+            layer.opacity = entry.opacity;
+            layer.enabled = entry.enabled;
+            layer.solo = entry.solo;
+            layer.trim = crate::layer::Trim {
+                in_point: entry.trim_in,
+                out_point: entry.trim_out,
+                offset: entry.trim_offset,
+            };
+        }
+        // A skipped/failed entry must not greet the user with a stale error box.
+        self.error_msg = None;
+    }
+
     fn add_comp_source(&mut self, path: std::path::PathBuf) {
         if self.comp_stack.len() >= COMP_LAYER_CAP {
+            // Report rather than silently drop — a multi-file drop past the cap
+            // otherwise reads as if every file landed (#99 R4, no-silent-caps).
+            self.error_msg = Some(format!(
+                "Layer limit reached ({COMP_LAYER_CAP}) — remove a layer to add more."
+            ));
             return;
         }
         // Decode first: a failed load must leave the stack untouched (no dangling
@@ -5413,10 +5543,55 @@ impl ExrApp {
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "layer".to_string());
+
+        // Detect whether the file is part of an image sequence (#99 Phase 2). A
+        // sequence source becomes a decoding **follower** on the shared playhead,
+        // and its layer's `Trim` spans the sequence range (blank outside it); a
+        // lone still keeps the all-frames trim and its single decoded texture.
+        let sequence = crate::sequence::detect_from_file(&path);
+        // The opened frame of the sequence (its "current" frame).
+        let cf = sequence
+            .as_ref()
+            .map(|seq| seq.number_of(&path).unwrap_or(seq.range.0));
+        // The first comp sequence with no transport loaded drives the global clock
+        // (#99 R4-lite): enter it so the timeline + playback keys light up (mirrors
+        // opening a slot-A sequence). A base plate already active keeps its clock;
+        // added comp layers then align to it.
+        if let (Some(seq), Some(cf)) = (&sequence, cf)
+            && !self.playback.is_active()
+        {
+            self.playback.enter(seq.clone(), cf);
+            self.comp_drives_transport = true;
+        }
+        let trim = match (&sequence, cf) {
+            // Align the opened frame to the current playhead so the just-added layer
+            // is visible *immediately*: `offset = cf - global` makes
+            // `source_frame(global) == cf` right now, then it plays 1:1 with the
+            // transport and is blank outside `[lo, hi]`. Without a base plate the
+            // playhead is 0, so this shows the opened frame instead of dropping the
+            // layer as out-of-range (the bug where an added sequence went blank).
+            (Some(seq), Some(cf)) => crate::layer::Trim {
+                in_point: seq.range.0,
+                out_point: seq.range.1,
+                offset: i64::from(cf) - i64::from(self.playback.current_frame),
+            },
+            // A lone still spans all frames.
+            _ => crate::layer::Trim::full(0, u32::MAX),
+        };
+
+        // The first comp source, with a plate open as slot A, promotes that plate
+        // to the bottom base track first (#99 R3) — so it's beneath the layer we're
+        // about to add. `comp_drives_transport` (no slot A) has no plate to add.
+        if self.comp_stack.is_empty() && self.loaded_file.is_some() && self.exr_data.is_some() {
+            self.add_base_layer();
+        }
+
         let source = crate::layer::SourceId(self.comp_next_source);
         self.comp_next_source += 1;
-        self.comp_stack
-            .push_image(name, source, 0, crate::layer::Trim::full(0, u32::MAX));
+        let layer_id = self.comp_stack.push_image(name, source, 0, trim);
+        // A freshly added layer becomes the "current" layer the viewport bar's AOV /
+        // channel controls + EXR Info act on (Nuke-style, #99 R4 follow-up).
+        self.selected_comp_layer = Some(layer_id);
 
         // Build the GPU texture for AOV 0 (matching `push_image`'s aov). Absent a
         // GPU device (headless / CPU-only) the source is stored pixels-only.
@@ -5427,14 +5602,33 @@ impl ExrApp {
                 .map_or((None, None), |(t, bg)| (Some(t), Some(bg))),
             None => (None, None),
         };
+
+        // A sequence source: register a follower so the shared decode pump / T1
+        // cache / eviction treat it like the A/B slots, and seed the cache with the
+        // opened frame (its full decode) for an instant first hit — mirrors
+        // `detect_sequence`. Stills register no follower (nothing to play).
+        if let (Some(seq), Some(cf)) = (sequence, cf) {
+            self.frame_cache.insert(source, cf, exr_data.clone());
+            self.followers.insert(
+                source,
+                SourceState {
+                    sequence: Some(seq),
+                    current_frame: cf,
+                    ..Default::default()
+                },
+            );
+        }
+
         self.comp_sources.insert(
             source,
             CompSource {
+                path,
                 exr_data,
                 size,
                 aov,
                 bind_group,
                 texture,
+                cur_frame: None,
             },
         );
     }
@@ -5473,6 +5667,77 @@ impl ExrApp {
         }
     }
 
+    /// Rebuild a **sequence** comp source's texture to hold `(source_frame, aov)`
+    /// from the T1-cached frame (#99 Phase 2), when the playhead or AOV moved off
+    /// what it currently holds. No-op if already current, headless, the frame isn't
+    /// resident (the last-built frame is held), or the build fails. This is what
+    /// makes an added comp layer *play*: each paint, `draw_comp_central` resolves
+    /// the layer's source frame and rebinds the decoded pixels for it.
+    fn ensure_comp_frame(&mut self, source: crate::layer::SourceId, source_frame: u32, aov: usize) {
+        let Some(cs) = self.comp_sources.get(&source) else {
+            return;
+        };
+        if cs.cur_frame == Some(source_frame) && cs.aov == aov {
+            return;
+        }
+        // Hold the current texture until the frame is actually resident in T1.
+        let Some(arc) = self.frame_cache.peek(source, source_frame) else {
+            return;
+        };
+        let Some(gpu) = self.gpu_resources.as_ref() else {
+            return;
+        };
+        let Some((texture, bind_group)) =
+            crate::viewer::ExrViewer::build_source_texture(gpu, &arc, aov)
+        else {
+            return;
+        };
+        let size = arc.logical_size(aov).unwrap_or((0, 0));
+        if let Some(cs) = self.comp_sources.get_mut(&source) {
+            cs.texture = Some(texture);
+            cs.bind_group = Some(bind_group);
+            cs.aov = aov;
+            cs.size = size;
+            cs.cur_frame = Some(source_frame);
+        }
+    }
+
+    /// Bring the slot-A **base track**'s texture current for the on-screen frame
+    /// (#99 R3) — the base-plate analogue of [`Self::ensure_comp_frame`]. Slot A is
+    /// the master transport, not a follower, so its pixels come straight from the
+    /// live `self.exr_data` (already swapped to each frame by the decode path)
+    /// rather than the T1 cache. Rebuilds only when the playhead or AOV moved off
+    /// what the texture holds; a still keeps `current_frame == 0` and builds once.
+    /// No-op headless or if the build fails (the last texture is held).
+    fn ensure_base_frame(&mut self, aov: usize) {
+        let cur = self.playback.current_frame;
+        let Some(cs) = self.comp_sources.get(&Self::A_SOURCE) else {
+            return;
+        };
+        if cs.cur_frame == Some(cur) && cs.aov == aov {
+            return;
+        }
+        let Some(data) = self.exr_data.clone() else {
+            return;
+        };
+        let Some(gpu) = self.gpu_resources.as_ref() else {
+            return;
+        };
+        let Some((texture, bind_group)) =
+            crate::viewer::ExrViewer::build_source_texture(gpu, &data, aov)
+        else {
+            return;
+        };
+        let size = data.logical_size(aov).unwrap_or((0, 0));
+        if let Some(cs) = self.comp_sources.get_mut(&Self::A_SOURCE) {
+            cs.texture = Some(texture);
+            cs.bind_group = Some(bind_group);
+            cs.aov = aov;
+            cs.size = size;
+            cs.cur_frame = Some(cur);
+        }
+    }
+
     /// Remove a Layers-panel layer and free its source's pixels/VRAM once no other
     /// layer references it (#99 PR-B.2). A source can be shared by several layers
     /// (e.g. back-to-beauty AOVs of one file), so its [`CompSource`] is dropped
@@ -5485,6 +5750,10 @@ impl ExrApp {
             crate::layer::LayerSource::Adjustment => None,
         });
         self.comp_stack.remove(id);
+        // Drop a stale selection so `active_comp_layer` falls back to the top layer.
+        if self.selected_comp_layer == Some(id) {
+            self.selected_comp_layer = None;
+        }
         // GC the source if the removed layer was its last reference.
         if let Some(source) = source
             && !self.comp_stack.iter().any(|l| {
@@ -5492,233 +5761,851 @@ impl ExrApp {
             })
         {
             self.comp_sources.remove(&source);
+            // A sequence comp source is also a decode follower (#99 Phase 2): drop
+            // its follower state and every cached frame so a removed-then-re-added
+            // source can't hit a stale follower / cache entry. No-op for a still
+            // (no follower registered).
+            self.followers.remove(&source);
+            self.frame_cache.clear_slot(source);
+        }
+        // Removing the last comp source leaves only the slot-A base track (#99 R3);
+        // drop it too so the composite empties and the classic viewer takes back
+        // over (readout / histogram / compare modes). `remove_base_layer` is careful
+        // not to touch A's real cache / transport.
+        if self.comp_stack.len() == 1 && self.base_layer_id().is_some() {
+            self.remove_base_layer();
+        }
+        // If the comp stack drove the transport and its last sequence is gone,
+        // release the clock (#99 R4-lite) so the timeline doesn't outlive its
+        // source.
+        if self.comp_drives_transport && self.active_followers().next().is_none() {
+            self.playback.clear();
+            self.comp_drives_transport = false;
         }
     }
 
-    /// The additive **Layers** panel (#99 PR-B): a right dock listing the panel's
-    /// composite stack top-to-bottom, with Add / remove. Per-layer blend / opacity /
-    /// visibility / solo / AOV controls and reorder land in PR-B.4; rendering the
-    /// stack via the accumulate ping-pong lands in PR-B.3.
-    fn draw_layers_panel(&mut self, ui: &mut egui::Ui) {
-        if !self.show_layers_panel || self.viewer.fullscreen {
-            return;
+    /// The comp layer the viewport bar's AOV / channel controls + EXR Info operate
+    /// on — Nuke's "current" layer. Prefers the explicit
+    /// [`Self::selected_comp_layer`]; when unset or stale (its layer was removed),
+    /// falls back to the **topmost** layer so there is always a current layer while
+    /// the stack is non-empty. `None` only for an empty stack.
+    fn active_comp_layer(&self) -> Option<crate::layer::LayerId> {
+        if let Some(id) = self.selected_comp_layer
+            && self.comp_stack.get(id).is_some()
+        {
+            return Some(id);
         }
-        egui::Panel::right("layers_panel")
-            .resizable(true)
-            .min_size(220.0)
-            .show_inside(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.heading("Layers");
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{}/{}",
-                            self.comp_stack.len(),
-                            COMP_LAYER_CAP
-                        ))
-                        .weak(),
-                    );
-                });
-                ui.separator();
+        // `iter()` is bottom→top, so the last layer is the top of the stack.
+        self.comp_stack.iter().last().map(|l| l.id)
+    }
 
-                let at_cap = self.comp_stack.len() >= COMP_LAYER_CAP;
-                ui.add_enabled_ui(!at_cap, |ui| {
-                    if ui
-                        .button("➕  Add source…")
-                        .on_disabled_hover_text("Layer cap reached")
-                        .clicked()
-                        && let Some(path) = FileDialog::new()
-                            .add_filter("EXR Image", &["exr"])
-                            .pick_file()
-                    {
-                        self.add_comp_source(path);
-                    }
-                });
-                ui.separator();
+    /// The layer filling the compare pane (side B) — Nuke's second viewer input
+    /// (#99 Slice 2a). Prefers the explicit [`Self::compare_b_layer`]; when unset or
+    /// stale (its layer was removed) falls back to [`default_compare_b`], which avoids
+    /// the current layer so the panes differ by default. `None` only for an empty stack.
+    fn compare_b(&self) -> Option<crate::layer::LayerId> {
+        if let Some(id) = self.compare_b_layer
+            && self.comp_stack.get(id).is_some()
+        {
+            return Some(id);
+        }
+        let ids: Vec<_> = self.comp_stack.iter().map(|l| l.id).collect();
+        default_compare_b(&ids, self.active_comp_layer())
+    }
 
-                if self.comp_stack.is_empty() {
-                    ui.weak("No layers yet. Add a source to begin.");
-                    return;
-                }
-
-                // Per-row controls (#99 PR-B.4): visibility / solo / blend / reorder /
-                // remove. Snapshot each row's id + display state up front (bottom→top)
-                // so the widgets can mutate `comp_stack` without aliasing an `iter()`
-                // borrow; the index `i` in this Vec is the layer's stack index (0 =
-                // bottom). Deferred edits (reorder / remove restructure the stack) are
-                // recorded and applied once after the loop.
-                struct Row {
-                    id: crate::layer::LayerId,
-                    name: String,
-                    enabled: bool,
-                    solo: bool,
-                    blend: crate::viewer::BlendMode,
-                    opacity: f32,
-                    /// Current AOV index + the source's AOV names, for the per-row AOV
-                    /// picker (#99 PR-B.4.3). Empty / single-entry ⇒ no picker shown.
-                    aov: usize,
-                    aov_names: Vec<String>,
-                }
-                let rows: Vec<Row> = self
-                    .comp_stack
+    /// Nuke-style "current layer" control bar for the comp viewport (#99 R4
+    /// follow-up): a layer picker (which of the stack is current), that layer's
+    /// AOV / pass pulldown, and R/G/B/A channel isolation — the classic
+    /// single-image control row, restored for the layer-stack path so you can load
+    /// a layer and look through its AOVs / channels. Reuses the per-track AOV combo
+    /// (`aov_names`) + [`crate::viewer::ExrViewer::set_channel_mode`].
+    fn draw_comp_layer_bar(&mut self, ui: &mut egui::Ui) {
+        let Some(layer_id) = self.active_comp_layer() else {
+            return;
+        };
+        // Snapshot the current layer's source + AOV + the whole stack's names up
+        // front, so the combo closures below only mutate simple fields (no aliasing
+        // borrow of `self.comp_stack` while a picker is open).
+        let (source, aov) = match self.comp_stack.get(layer_id).map(|l| &l.source) {
+            Some(crate::layer::LayerSource::Image { source, aov }) => (Some(*source), *aov),
+            _ => (None, 0),
+        };
+        // Top→bottom for the picker, matching the stack's visual order.
+        let layer_list: Vec<(crate::layer::LayerId, String)> = self
+            .comp_stack
+            .iter()
+            .rev()
+            .map(|l| (l.id, l.name.clone()))
+            .collect();
+        let cur_name = self
+            .comp_stack
+            .get(layer_id)
+            .map(|l| l.name.clone())
+            .unwrap_or_else(|| "—".to_string());
+        let aov_names: Vec<String> = source
+            .and_then(|s| self.comp_sources.get(&s))
+            .map(|cs| {
+                cs.exr_data
+                    .logical_layers
                     .iter()
-                    .map(|l| {
-                        let (source, aov) = match &l.source {
-                            crate::layer::LayerSource::Image { source, aov } => {
-                                (Some(*source), *aov)
-                            }
-                            crate::layer::LayerSource::Adjustment => (None, 0),
-                        };
-                        let aov_names = source
-                            .and_then(|s| self.comp_sources.get(&s))
-                            .map(|cs| {
-                                cs.exr_data
-                                    .logical_layers
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(i, ll)| {
-                                        if ll.name.is_empty() {
-                                            format!("layer {i}")
-                                        } else {
-                                            ll.name.clone()
-                                        }
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        Row {
-                            id: l.id,
-                            name: l.name.clone(),
-                            enabled: l.enabled,
-                            solo: l.solo,
-                            blend: l.blend,
-                            opacity: l.opacity,
-                            aov,
-                            aov_names,
+                    .enumerate()
+                    .map(|(i, ll)| {
+                        if ll.name.is_empty() {
+                            format!("layer {i}")
+                        } else {
+                            ll.name.clone()
                         }
                     })
-                    .collect();
-                let count = rows.len();
-                let solo_active = self.comp_stack.solo_active();
-                let mut remove: Option<crate::layer::LayerId> = None;
-                let mut reorder: Option<(crate::layer::LayerId, usize)> = None;
+                    .collect()
+            })
+            .unwrap_or_default();
+        // The current layer's header pixel aspect, to gate the anamorphic toggle
+        // below (#194) — only worth showing for non-square-pixel footage.
+        let cur_par = source
+            .and_then(|s| self.comp_sources.get(&s))
+            .map(|cs| cs.exr_data.image.attributes.pixel_aspect)
+            .unwrap_or(1.0);
 
-                // Display top-of-stack first: iterate high stack index → low.
-                for (i, row) in rows.iter().enumerate().rev() {
-                    ui.horizontal(|ui| {
-                        // Visibility. Dimmed (but not disabled) while a solo is active,
-                        // since solo overrides `enabled` in the composite.
-                        let mut enabled = row.enabled;
+        // Wrapped, so a long layer name pushes the trailing controls onto a second line
+        // instead of clipping them off the right edge.
+        ui.horizontal_wrapped(|ui| {
+            // Which layer is current (Nuke's input selector). Only worth showing
+            // with more than one layer to choose from.
+            if layer_list.len() > 1 {
+                ui.label("Layer:");
+                egui::ComboBox::from_id_salt("comp_current_layer")
+                    .selected_text(elide_middle(&cur_name, COMP_BAR_NAME_CHARS))
+                    .show_ui(ui, |ui| {
+                        for (id, nm) in &layer_list {
+                            if ui.selectable_label(*id == layer_id, nm).clicked() {
+                                self.selected_comp_layer = Some(*id);
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text(&cur_name);
+                ui.separator();
+            }
+
+            // The current layer's AOV / pass pulldown (multi-pass EXRs only).
+            if aov_names.len() > 1 {
+                ui.label("Pass:");
+                let mut new_aov = aov.min(aov_names.len() - 1);
+                egui::ComboBox::from_id_salt("comp_current_aov")
+                    .selected_text(aov_names[new_aov].clone())
+                    .width(150.0)
+                    .show_ui(ui, |ui| {
+                        for (idx, nm) in aov_names.iter().enumerate() {
+                            ui.selectable_value(&mut new_aov, idx, nm);
+                        }
+                    });
+                if new_aov != aov
+                    && let Some(l) = self.comp_stack.get_mut(layer_id)
+                    && let crate::layer::LayerSource::Image { aov: a, .. } = &mut l.source
+                {
+                    *a = new_aov;
+                }
+                ui.separator();
+            }
+
+            // Contact Sheet, beside the pass control because that is what it is — a
+            // visual pass-picker for the current layer. Always available (single or
+            // multi load), unlike the `Pass:` combo, which needs a multi-pass source.
+            // Only shows the *current* layer's passes, so it follows the `Layer:`
+            // selection; the View-menu item and `T` toggle the same flag.
+            ui.toggle_value(&mut self.viewer.show_contact_sheet, "▦ Sheet")
+                .on_hover_text("Contact sheet of the current layer's passes (T)");
+            ui.separator();
+
+            // Tone controls (#99 Slice 3a). These lived only in the classic viewer's
+            // `primary_row`, which the R4 collapse made unreachable — yet
+            // `draw_comp_composite` still applies `exposure` / `gamma` / `srgb` to the
+            // composite, so they were frozen at whatever persisted. Same widgets and
+            // same right-click-to-reset behaviour as the row they replace.
+            let exp = ui
+                .add(
+                    egui::DragValue::new(&mut self.viewer.exposure)
+                        .speed(0.01)
+                        .range(-5.0..=5.0)
+                        .prefix("EV ")
+                        .fixed_decimals(2),
+                )
+                .on_hover_text("Drag to adjust • right-click resets to 0.0 (key: E)");
+            if exp.changed() {
+                self.viewer.invalidate_tone();
+            }
+            if exp.secondary_clicked() {
+                self.viewer.reset_exposure();
+            }
+            let gam = ui
+                .add(
+                    egui::DragValue::new(&mut self.viewer.gamma)
+                        .speed(0.01)
+                        .range(0.1..=5.0)
+                        .prefix("γ ")
+                        .fixed_decimals(2),
+                )
+                .on_hover_text("Drag to adjust • right-click resets to 1.0 (key: Shift+G)");
+            if gam.changed() {
+                self.viewer.invalidate_tone();
+            }
+            if gam.secondary_clicked() {
+                self.viewer.reset_gamma();
+            }
+            if ui
+                .button("⟲")
+                .on_hover_text("Reset exposure (0.0) & gamma (1.0)")
+                .clicked()
+            {
+                self.viewer.reset_exposure();
+                self.viewer.reset_gamma();
+            }
+            if ui.checkbox(&mut self.viewer.srgb, "sRGB").changed() {
+                self.viewer.invalidate_tone();
+            }
+            ui.separator();
+
+            // Channel isolation — the same C/R/G/B/A the classic top row had; the
+            // composite honors `channel_mode` on its top layer.
+            ui.label("Channel:");
+            use crate::viewer::ChannelMode;
+            let mut mode = self.viewer.channel_mode;
+            ui.selectable_value(&mut mode, ChannelMode::RGB, "RGB")
+                .on_hover_text("Show all channels (C)");
+            ui.selectable_value(&mut mode, ChannelMode::R, "R");
+            ui.selectable_value(&mut mode, ChannelMode::G, "G");
+            ui.selectable_value(&mut mode, ChannelMode::B, "B");
+            ui.selectable_value(&mut mode, ChannelMode::A, "A");
+            self.viewer.set_channel_mode(mode);
+
+            // Compare arrangement (#99 render-retire, Slice 2): how the composite
+            // (side A) is presented against the current layer (side B). Only
+            // meaningful with ≥2 layers. Wipe/Diff arrive in Slice 2b.
+            if layer_list.len() > 1 {
+                ui.separator();
+                ui.label("Compare:");
+                use crate::layer::Arrangement;
+                let mut arr = self.comp_arrangement;
+                egui::ComboBox::from_id_salt("comp_arrangement")
+                    .selected_text(match arr {
+                        Arrangement::Stacked => "Stacked",
+                        Arrangement::SideBySide => "Side by Side",
+                        Arrangement::Wipe { .. } => "Wipe",
+                        Arrangement::Diff => "Diff",
+                        Arrangement::Blink => "Blink",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut arr, Arrangement::Stacked, "Stacked");
+                        ui.selectable_value(&mut arr, Arrangement::SideBySide, "Side by Side");
+                        // Wipe carries a position, but the live geometry comes from the
+                        // viewer's `wipe_center` / `wipe_angle` (dragged on the handle),
+                        // so this literal is just the selector value.
                         if ui
-                            .checkbox(&mut enabled, "")
-                            .on_hover_text("Visible")
+                            .selectable_label(matches!(arr, Arrangement::Wipe { .. }), "Wipe")
+                            .clicked()
+                        {
+                            arr = Arrangement::Wipe { position: 0.5 };
+                        }
+                        ui.selectable_value(&mut arr, Arrangement::Diff, "Diff");
+                        ui.selectable_value(&mut arr, Arrangement::Blink, "Blink");
+                    });
+                self.comp_arrangement = arr;
+
+                if arr != Arrangement::Stacked {
+                    // Which layer fills the compare pane — Nuke's second viewer input.
+                    // Side A is always the whole composite; this picks what it is shown
+                    // against, independent of the "current" layer above.
+                    let cmp_b = self.compare_b();
+                    let cmp_b_name = cmp_b
+                        .and_then(|id| self.comp_stack.get(id))
+                        .map(|l| l.name.clone())
+                        .unwrap_or_else(|| "—".to_string());
+                    ui.label("vs:");
+                    egui::ComboBox::from_id_salt("comp_compare_b")
+                        .selected_text(elide_middle(&cmp_b_name, COMP_BAR_NAME_CHARS))
+                        .show_ui(ui, |ui| {
+                            for (id, nm) in &layer_list {
+                                if ui.selectable_label(Some(*id) == cmp_b, nm).clicked() {
+                                    self.compare_b_layer = Some(*id);
+                                }
+                            }
+                        })
+                        .response
+                        .on_hover_text(&cmp_b_name);
+                    // Per-arrangement parameters (#99 Slice 3c). These lived in the
+                    // classic `mode_param_row` — a second toolbar row that slid in — but
+                    // the comp bar is one row, so they go behind a menu. Shared with
+                    // that row via `wipe_params_ui` / `diff_params_ui`.
+                    match arr {
+                        // Only Side-by-Side lays the panes out separately; Wipe and Diff
+                        // overlay both layers in one rect, where normalizing is
+                        // meaningless.
+                        Arrangement::SideBySide => {
+                            ui.checkbox(&mut self.viewer.normalize_side_by_side, "Normalize Size")
+                                .on_hover_text("Match the compare layer's height to pane A's");
+                        }
+                        Arrangement::Wipe { .. } => {
+                            ui.menu_button("Wipe ▾", |ui| self.viewer.wipe_params_ui(ui))
+                                .response
+                                .on_hover_text(
+                                    "Split centre, angle, and divider opacity \
+                                     (or drag the on-image handle / scroll to rotate)",
+                                );
+                        }
+                        Arrangement::Diff => {
+                            ui.menu_button("Diff ▾", |ui| self.viewer.diff_params_ui(ui))
+                                .response
+                                .on_hover_text("Gain, colormap, metric, and noise floor");
+                        }
+                        Arrangement::Blink => {
+                            ui.label("Speed");
+                            ui.add(
+                                egui::Slider::new(&mut self.viewer.blink_interval, 0.05..=5.0)
+                                    .suffix("s"),
+                            )
+                            .on_hover_text("How long each pane is shown before flipping");
+                        }
+                        Arrangement::Stacked => {}
+                    }
+                }
+            }
+
+            // Annotations (#45 / #99 Slice 3d). Hiding the bar also drops the active
+            // tool, so a hidden bar can never leave a tool armed — which would suppress
+            // canvas pan (`handle_canvas_interaction` checks `anno_tool`).
+            ui.separator();
+            if ui
+                .toggle_value(&mut self.viewer.show_annotation_bar, "✎ Annotate")
+                .on_hover_text("Draw arrows / boxes / freehand / text over the image")
+                .changed()
+                && !self.viewer.show_annotation_bar
+            {
+                self.viewer.anno_tool = crate::annotation::AnnotationTool::None;
+            }
+
+            // The rarely-touched controls, behind a menu as the classic row had them
+            // (#99 Slice 3a). The standalone Unsqueeze checkbox (#194) folds in here.
+            ui.separator();
+            ui.menu_button("Display ▾", |ui| {
+                // Readout aperture. `sample_pixel` (shared with the comp readout) has
+                // always honored this; only its control was unreachable.
+                ui.label("Sample:");
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.viewer.sample_aperture, 1, "1px");
+                    ui.selectable_value(&mut self.viewer.sample_aperture, 3, "3×3");
+                    ui.selectable_value(&mut self.viewer.sample_aperture, 9, "9×9");
+                });
+                ui.checkbox(&mut self.viewer.show_tooltip, "Show Pixel Tooltip")
+                    .on_hover_text("Float the sampled value next to the cursor");
+
+                ui.separator();
+                // Anamorphic unsqueeze (#179 / #194): the master toggle persists via
+                // `ViewerPrefs`; the optional custom factor overrides the header PAR.
+                ui.checkbox(
+                    &mut self.viewer.prefs.anamorphic_unsqueeze,
+                    "Unsqueeze anamorphic",
+                )
+                .on_hover_text(
+                    "Stretch non-square-pixel (anamorphic) footage to its display aspect",
+                );
+                let unsqueeze = self.viewer.prefs.anamorphic_unsqueeze;
+                ui.add_enabled_ui(unsqueeze, |ui| {
+                    let mut custom = self.viewer.pixel_aspect_override.is_some();
+                    if ui
+                        .checkbox(&mut custom, "Custom factor")
+                        .on_hover_text("Override the header pixel aspect ratio")
+                        .changed()
+                    {
+                        // Seed from the current layer's header PAR, or a common 2×
+                        // squeeze when the header is square/absent.
+                        let seed = if cur_par > 0.0 && (cur_par - 1.0).abs() > f32::EPSILON {
+                            cur_par
+                        } else {
+                            2.0
+                        };
+                        self.viewer.pixel_aspect_override = custom.then_some(seed);
+                    }
+                    if let Some(factor) = self.viewer.pixel_aspect_override.as_mut() {
+                        ui.add(egui::DragValue::new(factor).speed(0.01).range(0.1..=4.0));
+                    } else {
+                        ui.label(format!("Header PAR: {cur_par}"));
+                    }
+                });
+            });
+        });
+        // The annotation tool row, on its own line below the bar so the main row keeps
+        // its width (the classic UI gave it a separate toolbar row too).
+        if self.viewer.show_annotation_bar {
+            self.viewer.annotation_toolbar(ui);
+        }
+        ui.separator();
+    }
+
+    /// The **layer tracks** section of the timeline panel (#99, Chaos-Player
+    /// layout): one row per composite layer, top-of-stack first. The gutter holds
+    /// visibility / solo / name plus a `⋮` menu with the rest of the layer's
+    /// controls; right of it the layer's clip bar sits on the panel's shared time
+    /// axis, showing its `[in, out] + offset` span and draggable to retime it.
+    ///
+    /// `range` is the visible global frame range, or `None` when no transport is
+    /// loaded (a stills-only stack) — the rows are then gutter-only, as the old
+    /// flat list was.
+    fn draw_layer_tracks(&mut self, ui: &mut egui::Ui, axis_w: f32, range: Option<(u32, u32)>) {
+        ui.horizontal(|ui| {
+            ui.heading("Layers");
+            ui.label(
+                egui::RichText::new(format!("{}/{}", self.comp_stack.len(), COMP_LAYER_CAP)).weak(),
+            );
+            let at_cap = self.comp_stack.len() >= COMP_LAYER_CAP;
+            ui.add_enabled_ui(!at_cap, |ui| {
+                if ui
+                    .button("➕  Add source…")
+                    .on_disabled_hover_text("Layer cap reached")
+                    .clicked()
+                    && let Some(path) = FileDialog::new()
+                        .add_filter("EXR Image", &["exr"])
+                        .pick_file()
+                {
+                    self.open_layer(path);
+                }
+            });
+        });
+        ui.separator();
+
+        if self.comp_stack.is_empty() {
+            ui.weak("No layers yet. Add a source to begin.");
+            return;
+        }
+        {
+            // Per-row controls (#99 PR-B.4): visibility / solo / blend / reorder /
+            // remove. Snapshot each row's id + display state up front (bottom→top)
+            // so the widgets can mutate `comp_stack` without aliasing an `iter()`
+            // borrow; the index `i` in this Vec is the layer's stack index (0 =
+            // bottom). Deferred edits (reorder / remove restructure the stack) are
+            // recorded and applied once after the loop.
+            struct Row {
+                id: crate::layer::LayerId,
+                name: String,
+                enabled: bool,
+                solo: bool,
+                blend: crate::viewer::BlendMode,
+                opacity: f32,
+                /// Current AOV index + the source's AOV names, for the per-row AOV
+                /// picker (#99 PR-B.4.3). Empty / single-entry ⇒ no picker shown.
+                aov: usize,
+                aov_names: Vec<String>,
+                /// This layer's time mapping + whether it's a sequence (#99): the
+                /// clip bar's span comes from the trim, and only a sequence layer is
+                /// retimeable (a still spans all frames, so an offset is a no-op).
+                trim: crate::layer::Trim,
+                is_sequence: bool,
+                /// The slot-A base track (#99 R3): the opened plate as the bottom
+                /// layer. Clock-pinned (no retime) and non-removable via the panel.
+                is_base: bool,
+                /// The layer's pixel source, for the per-track cache-fill strip.
+                source: Option<crate::layer::SourceId>,
+            }
+            let rows: Vec<Row> = self
+                .comp_stack
+                .iter()
+                .map(|l| {
+                    let (source, aov) = match &l.source {
+                        crate::layer::LayerSource::Image { source, aov } => (Some(*source), *aov),
+                        crate::layer::LayerSource::Adjustment => (None, 0),
+                    };
+                    // The base track is slot A itself (the master transport), not a
+                    // decode follower, so its sequence-ness comes from the transport;
+                    // a comp source's comes from its follower registration.
+                    let is_base = source == Some(Self::A_SOURCE);
+                    let is_sequence = if is_base {
+                        self.playback.sequence.is_some()
+                    } else {
+                        source.is_some_and(|s| self.followers.contains_key(&s))
+                    };
+                    let aov_names = source
+                        .and_then(|s| self.comp_sources.get(&s))
+                        .map(|cs| {
+                            cs.exr_data
+                                .logical_layers
+                                .iter()
+                                .enumerate()
+                                .map(|(i, ll)| {
+                                    if ll.name.is_empty() {
+                                        format!("layer {i}")
+                                    } else {
+                                        ll.name.clone()
+                                    }
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    Row {
+                        id: l.id,
+                        name: l.name.clone(),
+                        enabled: l.enabled,
+                        solo: l.solo,
+                        blend: l.blend,
+                        opacity: l.opacity,
+                        aov,
+                        aov_names,
+                        trim: l.trim,
+                        is_sequence,
+                        is_base,
+                        source,
+                    }
+                })
+                .collect();
+            let count = rows.len();
+            let solo_active = self.comp_stack.solo_active();
+            let mut remove: Option<crate::layer::LayerId> = None;
+            let mut reorder: Option<(crate::layer::LayerId, usize)> = None;
+            // A time-offset edit re-maps a layer's source frame, so re-request the
+            // comp followers after the loop (the pump fetches the newly-needed frame).
+            let mut offset_changed = false;
+
+            // Vertical extent of the track lanes, for the playhead drawn across
+            // all of them once the rows are laid out.
+            let mut lanes: Option<egui::Rect> = None;
+
+            // Display top-of-stack first: iterate high stack index → low.
+            for (i, row) in rows.iter().enumerate().rev() {
+                let (gutter, lane) = alloc_timeline_row(ui, axis_w, TIMELINE_ROW_H);
+                lanes = Some(lanes.map_or(lane, |r: egui::Rect| r.union(lane)));
+                // Whether this layer reaches the composite at all (disabled, or
+                // hidden by a solo elsewhere) — greys both the name and the bar.
+                let renders = if solo_active { row.solo } else { row.enabled };
+                // A layer can be slid in time only if it's a sequence AND not the
+                // base track (#99 R3): the base is the master clock, pinned at
+                // offset 0 — retiming it would desync everything below.
+                let retimeable = row.is_sequence && !row.is_base;
+
+                // ── Gutter: visibility / solo / name / the ⋮ menu ──────────────
+                let mut g = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(gutter)
+                        .layout(egui::Layout::right_to_left(egui::Align::Center)),
+                );
+                g.set_clip_rect(gutter);
+                // The ⋮ menu holds every control that doesn't earn permanent
+                // gutter space; laid out right-to-left so it pins to the gutter's
+                // right edge and the name gets whatever is left.
+                g.menu_button("⋮", |ui| {
+                    // Blend (unused for the bottom layer, which is a plain copy —
+                    // the base of the composite has nothing beneath it).
+                    ui.add_enabled_ui(i > 0, |ui| {
+                        let mut blend = row.blend;
+                        egui::ComboBox::from_id_salt((row.id, "blend"))
+                            .selected_text(blend.label())
+                            .width(110.0)
+                            .show_ui(ui, |ui| {
+                                for mode in crate::viewer::BlendMode::ALL {
+                                    ui.selectable_value(&mut blend, mode, mode.label());
+                                }
+                            });
+                        if blend != row.blend
+                            && let Some(l) = self.comp_stack.get_mut(row.id)
+                        {
+                            l.blend = blend;
+                        }
+                    });
+                    // Opacity 0–100% (applies to every layer, including the bottom
+                    // — the shader premultiplies its color by this).
+                    ui.horizontal(|ui| {
+                        ui.label("Opacity");
+                        let mut opacity = row.opacity;
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut opacity)
+                                    .range(0.0..=1.0)
+                                    .speed(0.01)
+                                    .fixed_decimals(2),
+                            )
                             .changed()
                             && let Some(l) = self.comp_stack.get_mut(row.id)
                         {
-                            l.enabled = enabled;
+                            l.opacity = opacity;
                         }
-                        // Solo: isolate this layer (any solo hides non-soloed layers).
-                        if ui
-                            .selectable_label(row.solo, "S")
-                            .on_hover_text("Solo")
-                            .clicked()
+                    });
+                    // AOV picker: which logical layer (pass) of the source to show.
+                    // Only for multi-layer EXRs — a single-beauty source has nothing
+                    // to choose. Changing it rebuilds the source texture next frame
+                    // (`ensure_comp_aov`).
+                    if row.aov_names.len() > 1 {
+                        let mut aov = row.aov.min(row.aov_names.len() - 1);
+                        egui::ComboBox::from_id_salt((row.id, "aov"))
+                            .selected_text(row.aov_names[aov].clone())
+                            .width(110.0)
+                            .show_ui(ui, |ui| {
+                                for (idx, nm) in row.aov_names.iter().enumerate() {
+                                    ui.selectable_value(&mut aov, idx, nm);
+                                }
+                            });
+                        if aov != row.aov
                             && let Some(l) = self.comp_stack.get_mut(row.id)
+                            && let crate::layer::LayerSource::Image { aov: a, .. } = &mut l.source
                         {
-                            l.solo = !row.solo;
+                            *a = aov;
                         }
-
-                        // Name, greyed when it won't render (disabled, or hidden by a
-                        // solo elsewhere).
-                        let renders = if solo_active { row.solo } else { row.enabled };
-                        ui.add(egui::Label::new(if renders {
-                            egui::RichText::new(&row.name)
-                        } else {
-                            egui::RichText::new(&row.name).weak()
-                        }));
-
-                        // Right-aligned per-row controls: remove, reorder, blend.
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("✕").on_hover_text("Remove layer").clicked() {
-                                remove = Some(row.id);
-                            }
-                            // ⬆ moves toward the top of the composite (higher index);
-                            // ⬇ toward the bottom. Disabled at the ends.
-                            ui.add_enabled_ui(i + 1 < count, |ui| {
-                                if ui.small_button("⬆").on_hover_text("Move up").clicked() {
-                                    reorder = Some((row.id, i + 1));
-                                }
-                            });
-                            ui.add_enabled_ui(i > 0, |ui| {
-                                if ui.small_button("⬇").on_hover_text("Move down").clicked() {
-                                    reorder = Some((row.id, i - 1));
-                                }
-                            });
-                            // Opacity 0–100% (applies to every layer, including the
-                            // bottom — the shader premultiplies its color by this).
-                            let mut opacity = row.opacity;
+                    }
+                    // Precise time offset, for typing an exact value where dragging
+                    // the clip bar is the coarse gesture. Omitted where retiming is a
+                    // no-op or forbidden: a still (all frames) or the base track (the
+                    // clock, pinned at 0).
+                    if retimeable {
+                        ui.horizontal(|ui| {
+                            ui.label("Offset");
+                            let mut offset = row.trim.offset;
                             if ui
-                                .add(
-                                    egui::DragValue::new(&mut opacity)
-                                        .range(0.0..=1.0)
-                                        .speed(0.01)
-                                        .fixed_decimals(2),
-                                )
-                                .on_hover_text("Opacity")
+                                .add(egui::DragValue::new(&mut offset).speed(0.25).suffix(" f"))
+                                .on_hover_text("Slide this layer along the timeline")
                                 .changed()
                                 && let Some(l) = self.comp_stack.get_mut(row.id)
                             {
-                                l.opacity = opacity;
-                            }
-                            // Blend (unused for the bottom layer, which is a plain
-                            // copy — the base of the composite has nothing beneath it).
-                            ui.add_enabled_ui(i > 0, |ui| {
-                                let mut blend = row.blend;
-                                egui::ComboBox::from_id_salt((row.id, "blend"))
-                                    .selected_text(blend.label())
-                                    .width(90.0)
-                                    .show_ui(ui, |ui| {
-                                        for mode in crate::viewer::BlendMode::ALL {
-                                            ui.selectable_value(&mut blend, mode, mode.label());
-                                        }
-                                    });
-                                if blend != row.blend
-                                    && let Some(l) = self.comp_stack.get_mut(row.id)
-                                {
-                                    l.blend = blend;
-                                }
-                            });
-                            // AOV picker: which logical layer (pass) of the source to
-                            // show. Only for multi-layer EXRs — a single-beauty source
-                            // has nothing to choose. Changing it rebuilds the source
-                            // texture next frame (`ensure_comp_aov`).
-                            if row.aov_names.len() > 1 {
-                                let mut aov = row.aov.min(row.aov_names.len() - 1);
-                                egui::ComboBox::from_id_salt((row.id, "aov"))
-                                    .selected_text(row.aov_names[aov].clone())
-                                    .width(90.0)
-                                    .show_ui(ui, |ui| {
-                                        for (idx, nm) in row.aov_names.iter().enumerate() {
-                                            ui.selectable_value(&mut aov, idx, nm);
-                                        }
-                                    });
-                                if aov != row.aov
-                                    && let Some(l) = self.comp_stack.get_mut(row.id)
-                                    && let crate::layer::LayerSource::Image { aov: a, .. } =
-                                        &mut l.source
-                                {
-                                    *a = aov;
-                                }
+                                l.trim.offset = offset;
+                                offset_changed = true;
                             }
                         });
+                    }
+                    ui.separator();
+                    // ⬆ moves toward the top of the composite (higher index); ⬇
+                    // toward the bottom. Disabled at the ends.
+                    ui.add_enabled_ui(i + 1 < count, |ui| {
+                        if ui.button("⬆  Move up").clicked() {
+                            reorder = Some((row.id, i + 1));
+                            ui.close();
+                        }
                     });
+                    ui.add_enabled_ui(i > 0, |ui| {
+                        if ui.button("⬇  Move down").clicked() {
+                            reorder = Some((row.id, i - 1));
+                            ui.close();
+                        }
+                    });
+                    // The base track (the opened plate) isn't removed here — its
+                    // close path is revived in the render-retire step (#99 R3); the
+                    // File ▸ Close Image A menu that closed it was removed in R4.
+                    if !row.is_base && ui.button("✕  Remove layer").clicked() {
+                        remove = Some(row.id);
+                        ui.close();
+                    }
+                });
+                // The remaining gutter width, left-to-right: visibility, solo, name.
+                g.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    // Visibility. Dimmed (but not disabled) while a solo is active,
+                    // since solo overrides `enabled` in the composite.
+                    let mut enabled = row.enabled;
+                    if ui
+                        .checkbox(&mut enabled, "")
+                        .on_hover_text("Visible")
+                        .changed()
+                        && let Some(l) = self.comp_stack.get_mut(row.id)
+                    {
+                        l.enabled = enabled;
+                    }
+                    // Solo: isolate this layer (any solo hides non-soloed layers).
+                    if ui
+                        .selectable_label(row.solo, "S")
+                        .on_hover_text("Solo")
+                        .clicked()
+                        && let Some(l) = self.comp_stack.get_mut(row.id)
+                    {
+                        l.solo = !row.solo;
+                    }
+                    // Name, greyed when it won't render. Truncated rather than
+                    // wrapped: the gutter is a fixed width shared with every row.
+                    // Clicking it makes this the "current" layer the viewport bar's
+                    // AOV / channel controls + EXR Info act on (#99 R4); the current
+                    // layer's name is bold.
+                    let is_current = self.selected_comp_layer == Some(row.id);
+                    let mut text = if renders {
+                        egui::RichText::new(&row.name)
+                    } else {
+                        egui::RichText::new(&row.name).weak()
+                    };
+                    if is_current {
+                        text = text.strong();
+                    }
+                    if ui
+                        .add(
+                            egui::Label::new(text)
+                                .truncate()
+                                .sense(egui::Sense::click()),
+                        )
+                        .on_hover_text("Click to make this the current layer")
+                        .clicked()
+                    {
+                        self.selected_comp_layer = Some(row.id);
+                    }
+                });
+                drop(g);
+
+                // ── Clip bar on the shared time axis ──────────────────────────
+                let Some((lo, hi)) = range else { continue };
+                let axis = TimeAxis::new(lane, lo, hi);
+                let painter = ui.painter_at(lane);
+                let visuals = ui.visuals();
+                let lane_bg = lane.shrink2(egui::vec2(0.0, 2.0));
+                painter.rect_filled(lane_bg, 2.0, visuals.extreme_bg_color);
+
+                let Some((g_lo, g_hi)) = track_span(row.trim, lo, hi) else {
+                    // The layer is blank across the whole visible timeline. Mark
+                    // the edge it ran off so it isn't silently missing.
+                    let ran_off_the_start = i64::from(row.trim.out_point)
+                        .saturating_sub(row.trim.offset)
+                        < i64::from(lo);
+                    let x = if ran_off_the_start {
+                        lane.left() + 1.5
+                    } else {
+                        lane.right() - 1.5
+                    };
+                    painter.line_segment(
+                        [
+                            egui::pos2(x, lane_bg.top()),
+                            egui::pos2(x, lane_bg.bottom()),
+                        ],
+                        egui::Stroke::new(3.0_f32, visuals.warn_fg_color),
+                    );
+                    continue;
+                };
+
+                // Clip extents use slot mapping (each frame owns an equal cell)
+                // so a one-frame layer still has visible width; `max` keeps a
+                // clip clamped to a sliver of the axis from vanishing entirely.
+                let (x0, x1) = (axis.slot_x(g_lo), axis.slot_x(g_hi + 1));
+                let bar = egui::Rect::from_min_max(
+                    egui::pos2(x0, lane_bg.top()),
+                    egui::pos2(x1.max(x0 + 3.0).min(lane.right()), lane_bg.bottom()),
+                );
+                let fill = if renders {
+                    visuals.selection.bg_fill
+                } else {
+                    visuals.selection.bg_fill.gamma_multiply(0.35)
+                };
+                painter.rect_filled(bar, 2.0, fill);
+
+                // Per-track cache-fill strip (#99): which of *this* layer's frames
+                // are resident, in its own place on the global timeline. The T1
+                // cache is `SourceId`-keyed, so this is the same two-tone readout
+                // the ruler gives slot A — per layer. Source frames map to global
+                // by `global = source - offset`, so a contiguous source run stays
+                // contiguous. Sequence layers only (a still has no ring); the base
+                // track reads slot A's own `frame_cache` (#99 R3).
+                if row.is_sequence
+                    && let Some(src) = row.source
+                {
+                    let strip_top = bar.bottom() - 3.0;
+                    let clip = ui.painter_at(bar);
+                    let to_global = |f: u32| {
+                        let g = i64::from(f).saturating_sub(row.trim.offset);
+                        (g >= i64::from(lo) && g <= i64::from(hi)).then_some(g as u32)
+                    };
+                    let paint_runs = |frames: &mut Vec<u32>, color: egui::Color32| {
+                        for_each_frame_run(frames, |start, end| {
+                            let seg = egui::Rect::from_min_max(
+                                egui::pos2(axis.slot_x(i64::from(start)), strip_top),
+                                egui::pos2(
+                                    axis.slot_x(i64::from(end) + 1).min(bar.right()),
+                                    bar.bottom(),
+                                ),
+                            );
+                            clip.rect_filled(seg, 0.0, color);
+                        });
+                    };
+                    let mut resident: Vec<u32> = self
+                        .frame_cache
+                        .resident_frames(src)
+                        .filter_map(to_global)
+                        .collect();
+                    paint_runs(&mut resident, CACHE_PROXY_FILL);
+                    let mut full: Vec<u32> = self
+                        .frame_cache
+                        .resident_full_frames(src)
+                        .filter_map(to_global)
+                        .collect();
+                    paint_runs(&mut full, CACHE_FULL_FILL);
                 }
-                // Apply the structural edits after the loop (each restructures the Vec).
-                if let Some((id, to)) = reorder {
-                    self.comp_stack.move_to(id, to);
+
+                // ── Drag the clip to retime the layer ─────────────────────────
+                // Only a retimeable clip drags; a still or the base track is hover-
+                // only (offset is a no-op / forbidden).
+                let resp = ui.interact(
+                    bar,
+                    ui.id().with(("track", row.id)),
+                    if retimeable {
+                        egui::Sense::click_and_drag()
+                    } else {
+                        egui::Sense::hover()
+                    },
+                );
+                let resp = resp.on_hover_text(format!(
+                    "{}\nframes {g_lo}–{g_hi}   offset {} f{}",
+                    row.name,
+                    row.trim.offset,
+                    if retimeable {
+                        "\ndrag to slide this layer along the timeline"
+                    } else if row.is_base {
+                        "\nbase plate — pinned to the transport"
+                    } else {
+                        ""
+                    }
+                ));
+                if retimeable {
+                    if resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                    }
+                    if resp.drag_started()
+                        && let Some(p) = resp.interact_pointer_pos()
+                    {
+                        self.track_drag = Some(TrackDrag {
+                            id: row.id,
+                            grab: axis.frame_at(p.x),
+                            start_offset: row.trim.offset,
+                        });
+                    }
+                    if resp.dragged()
+                        && let Some(p) = resp.interact_pointer_pos()
+                        && let Some(d) = self.track_drag
+                        && d.id == row.id
+                    {
+                        let offset = offset_after_drag(d.start_offset, d.grab, axis.frame_at(p.x));
+                        if let Some(l) = self.comp_stack.get_mut(row.id)
+                            && l.trim.offset != offset
+                        {
+                            l.trim.offset = offset;
+                            offset_changed = true;
+                        }
+                    }
+                    if resp.drag_stopped() {
+                        self.track_drag = None;
+                        // Settle: the pump fetches whatever the final offset needs.
+                        offset_changed = true;
+                    }
                 }
-                if let Some(id) = remove {
-                    self.remove_comp_layer(id);
-                }
-            });
+            }
+
+            // Playhead across every lane (drawn last, on top of the bars) so the
+            // tracks read as one timeline with the ruler above them.
+            if let (Some(lanes), Some((lo, hi))) = (lanes, range) {
+                let x = TimeAxis::new(lanes, lo, hi).x_of(i64::from(self.playback.current_frame));
+                ui.painter().line_segment(
+                    [egui::pos2(x, lanes.top()), egui::pos2(x, lanes.bottom())],
+                    egui::Stroke::new(1.5_f32, ui.visuals().strong_text_color()),
+                );
+            }
+
+            // Apply the structural edits after the loop (each restructures the Vec).
+            if let Some((id, to)) = reorder {
+                self.comp_stack.move_to(id, to);
+            }
+            if let Some(id) = remove {
+                self.remove_comp_layer(id);
+            }
+            // A time-offset edit changed a layer's mapping — re-request each comp
+            // follower's newly-needed frame so the pump fetches it (#99).
+            if offset_changed {
+                self.sync_comp_followers();
+            }
+        }
     }
 
     /// Render the Layers-panel composite in the central canvas (#99 PR-B.3):
@@ -5729,6 +6616,12 @@ impl ExrApp {
     /// non-OCIO composite is a follow-up. Assumes the panel is shown with a
     /// non-empty stack (the caller gates on that).
     fn draw_comp_central(&mut self, ui: &mut egui::Ui) {
+        // Nuke-style current-layer control bar at the top of the viewport (#99 R4
+        // follow-up): pick the current layer, page through its AOVs/passes, and
+        // isolate channels — the classic single-image control row, restored for the
+        // layer-stack path. Drawn before the composite so it sits above it.
+        self.draw_comp_layer_bar(ui);
+
         // Mirror the per-frame viewer state the slot-A path sets before `viewer.ui`,
         // so the composite honors the same tone / OCIO / LUT settings.
         self.viewer.enable_lut = self.enable_lut && self.lut_bg.is_some();
@@ -5737,15 +6630,26 @@ impl ExrApp {
         self.viewer.ocio_active = self.ocio_enabled && self.ocio_ready;
         self.viewer.ocio_render_gen = self.ocio_render_gen;
 
-        // Resolve the model → concrete draws at the shared global playhead (stills
-        // sit at frame 0 via `Trim::full`; per-source sequence frames arrive w/ PR-C).
+        // Resolve the model → concrete draws at the shared global playhead. A still
+        // spans all frames (`Trim::full`) and binds its one texture; a sequence layer
+        // (#99 Phase 2) resolves its `source_frame` here and is dropped by
+        // `composite_at` outside its trim (blank there).
         let steps = self.comp_stack.composite_at(self.playback.current_frame);
 
-        // Rebuild any source texture whose layer switched AOV since it was last built
-        // (#99 PR-B.4.3), so the draw below binds the requested pass.
+        // Bring each source's texture current for what its draw wants: a sequence
+        // layer rebinds its resolved source frame from the T1 cache (this is what
+        // makes it *play*); a still just tracks AOV switches (#99 PR-B.4.3). Done
+        // before the draw list so the bind below is up to date.
         for step in &steps {
             if let crate::layer::Step::Draw(d) = step {
-                self.ensure_comp_aov(d.source, d.aov);
+                if d.source == Self::A_SOURCE {
+                    // The slot-A base track (#99 R3): pixels from the live A frame.
+                    self.ensure_base_frame(d.aov);
+                } else if self.followers.contains_key(&d.source) {
+                    self.ensure_comp_frame(d.source, d.source_frame, d.aov);
+                } else {
+                    self.ensure_comp_aov(d.source, d.aov);
+                }
             }
         }
 
@@ -5754,6 +6658,9 @@ impl ExrApp {
         // layer defines the shared canvas size.
         let mut draws: Vec<crate::viewer::CompDraw> = Vec::new();
         let mut base_size = (0usize, 0usize);
+        // The bottom drawable layer defines the canvas, so its header pixel aspect
+        // drives the anamorphic unsqueeze for the whole composite (#194 / #179).
+        let mut base_par = 1.0_f32;
         for step in &steps {
             let crate::layer::Step::Draw(d) = step else {
                 continue; // Adjustment layers (#102) don't render yet.
@@ -5766,6 +6673,7 @@ impl ExrApp {
             };
             if draws.is_empty() {
                 base_size = cs.size;
+                base_par = cs.exr_data.image.attributes.pixel_aspect;
             }
             draws.push(crate::viewer::CompDraw {
                 bind_group,
@@ -5774,18 +6682,113 @@ impl ExrApp {
             });
         }
 
-        if self.viewer.ocio_active
-            && !draws.is_empty()
+        // Pixel readout (#99 R4) targets the topmost drawable layer under the cursor
+        // — the honest analogue of the A/B path, which samples raw source pixels, not
+        // the composited result. Record it independent of hover (so the status-bar
+        // row persists) and clone its pixels (cheap Arc) so the sample below doesn't
+        // borrow `self` across the GPU draw.
+        let top = top_sample_source(&steps, |s| {
+            self.comp_sources
+                .get(&s)
+                .is_some_and(|c| c.bind_group.is_some())
+        });
+        let top_exr =
+            top.and_then(|(s, aov)| self.comp_sources.get(&s).map(|c| (c.exr_data.clone(), aov)));
+
+        // A compare arrangement (#99 Slice 2a) shows the **two layers themselves**, not
+        // the composite: pane A is the `Layer:` (current) layer, pane B the `vs:` one,
+        // each drawn alone. Comparing a layer against a composite that already contains
+        // it just showed the same content twice. Both must be drawable at this frame
+        // (not hidden / soloed out / trimmed blank / textureless) or we fall back to
+        // `Stacked` — better the plain composite than an empty pane.
+        let drawable = |s: crate::layer::SourceId| {
+            self.comp_sources
+                .get(&s)
+                .is_some_and(|c| c.bind_group.is_some())
+        };
+        let compare = self.comp_arrangement != crate::layer::Arrangement::Stacked;
+        let side_a_draw = compare
+            .then(|| comp_layer_draw(&steps, self.active_comp_layer(), drawable))
+            .flatten();
+        let side_b_draw = compare
+            .then(|| comp_layer_draw(&steps, self.compare_b(), drawable))
+            .flatten()
+            // Both panes or neither: a compare with only one resolvable side is a
+            // fallback to `Stacked`, not a half-drawn split.
+            .filter(|_| side_a_draw.is_some());
+        let side_b = side_b_draw.and_then(|d| {
+            let cs = self.comp_sources.get(&d.source)?;
+            Some(crate::viewer::CompSideB {
+                draw: crate::viewer::CompDraw {
+                    bind_group: cs.bind_group.clone()?,
+                    blend: d.blend,
+                    opacity: d.opacity,
+                },
+                tex_size: egui::vec2(cs.size.0.max(1) as f32, cs.size.1.max(1) as f32),
+                par: cs.exr_data.image.attributes.pixel_aspect,
+            })
+        });
+        // The compare layer's own pixels, for the per-pane readout.
+        self.comp_readout_b = side_b_draw.map(|d| (d.source, d.aov));
+        let side_b_exr = side_b_draw.and_then(|d| {
+            self.comp_sources
+                .get(&d.source)
+                .map(|c| (c.exr_data.clone(), d.aov))
+        });
+
+        // With the compare live, pane A is the current layer *alone*, so replace the
+        // composite draw list with that one layer (and take the canvas size / PAR from
+        // it). Side B is already a lone placed draw, so both panes are single layers.
+        let arrangement = match (side_a_draw, side_b.is_some()) {
+            (Some(a), true) => {
+                if let Some(cs) = self.comp_sources.get(&a.source)
+                    && let Some(bind_group) = cs.bind_group.clone()
+                {
+                    draws = vec![crate::viewer::CompDraw {
+                        bind_group,
+                        blend: a.blend,
+                        opacity: a.opacity,
+                    }];
+                    base_size = cs.size;
+                    base_par = cs.exr_data.image.attributes.pixel_aspect;
+                }
+                self.comp_arrangement
+            }
+            _ => crate::layer::Arrangement::Stacked,
+        };
+        // Pane A's readout follows pane A: the current layer in compare mode, the
+        // composite's topmost drawable layer otherwise.
+        let (top, top_exr) = match (side_a_draw, arrangement) {
+            (Some(a), arr) if arr != crate::layer::Arrangement::Stacked => (
+                Some((a.source, a.aov)),
+                self.comp_sources
+                    .get(&a.source)
+                    .map(|c| (c.exr_data.clone(), a.aov)),
+            ),
+            _ => (top, top_exr),
+        };
+        self.comp_readout = top;
+
+        // The composite renders in any color mode (#99 R2): OCIO on → the OCIO
+        // display transform; OCIO off → the sRGB display-encode pass. Only a GPU
+        // and a drawable layer are required.
+        if !draws.is_empty()
             && let Some(gpu) = self.gpu_resources.as_ref()
         {
             let lut = self.lut_bg.clone();
-            self.viewer
-                .draw_comp_composite(ui, base_size, &draws, gpu, lut);
+            self.viewer.draw_comp_composite(
+                ui,
+                base_size,
+                base_par,
+                &draws,
+                arrangement,
+                side_b,
+                gpu,
+                lut,
+            );
         } else {
             let msg = if self.gpu_resources.is_none() {
                 "No GPU: the compositing viewport is unavailable."
-            } else if !self.viewer.ocio_active {
-                "Enable OCIO (Color Management) to view the layer composite."
             } else {
                 "Add a source to the Layers panel to begin."
             };
@@ -5793,69 +6796,190 @@ impl ExrApp {
                 ui.label(msg);
             });
         }
+
+        // Sample after the draw so `last_image_rect` is this frame's, and after the
+        // `gpu_resources` borrow above is released. Unconditional: no drawable / no
+        // hover / suppressed clears the readout (status bar then shows `x=--`).
+        self.sample_comp_readout(ui, top_exr, side_b_exr);
+    }
+
+    /// Populate the pixel-readout fields (`last_hover_pos_img` / `last_sampled_val_a`)
+    /// from the cursor over the composite (#99 R4). `top` is the topmost drawable
+    /// layer's pixels + aov; `side_b` is the current layer's, sampled instead when the
+    /// cursor is over the Side-by-Side compare pane (#99 Slice 2a) so each pane reports
+    /// its *own* values. Clears the readout when playback suppresses sampling, the
+    /// pointer is off the image, or there is no drawable layer.
+    fn sample_comp_readout(
+        &mut self,
+        ui: &egui::Ui,
+        top: Option<(std::sync::Arc<ExrData>, usize)>,
+        side_b: Option<(std::sync::Arc<ExrData>, usize)>,
+    ) {
+        let suppressed = self.playback.sampling_suppressed();
+        let hover = if suppressed {
+            None
+        } else {
+            ui.input(|i| i.pointer.hover_pos())
+        };
+        // Resolve which pane the cursor is over, then sample that pane's own source
+        // against its own rect. Outside Side-by-Side `last_image_rect_b` is `None`, so
+        // this collapses to the single-composite case.
+        let rect_a = self.viewer.last_image_rect;
+        let rect_b = self.viewer.last_image_rect_b;
+        let wipe = self.viewer.last_wipe;
+        let blink_b = self.viewer.last_blink_b;
+        let picked = hover
+            .zip(rect_a)
+            .and_then(|(pos, ir)| crate::viewer::comp_hover_side(pos, ir, rect_b, wipe, blink_b));
+        // Name the status-bar row after the pane actually sampled, not always the
+        // composite's top layer.
+        if picked == Some(crate::viewer::CompSide::B)
+            && let Some(b) = self.comp_readout_b
+        {
+            self.comp_readout = Some(b);
+        }
+        let side = match picked {
+            Some(crate::viewer::CompSide::A) => rect_a.map(|ir| (ir, &top)),
+            // Side-by-Side gives pane B its own rect; Wipe overlays both layers in
+            // pane A's rect, so B is sampled against that one.
+            Some(crate::viewer::CompSide::B) => rect_b.or(rect_a).map(|ir| (ir, &side_b)),
+            None => None,
+        };
+        let sampled = match (side, hover) {
+            (Some((ir, Some((exr, aov)))), Some(pos)) => {
+                let size = exr.logical_size(*aov).unwrap_or((0, 0));
+                comp_hover_pixel(pos, ir, size)
+                    .map(|(x, y)| (x, y, self.viewer.sample_pixel(exr, *aov, x, y)))
+            }
+            _ => None,
+        };
+        match sampled {
+            Some((x, y, v)) => {
+                self.viewer.last_hover_pos_img = Some((x, y));
+                self.viewer.last_sampled_val_a = v;
+                // The floating cursor tooltip (#99 Slice 3d): another casualty of the
+                // R4 collapse — it lived in `viewer.ui`'s `handle_pixel_sampling`.
+                // Reuses that window verbatim via `pixel_tooltip_window`, with no B
+                // value: the comp readout samples whichever single pane the cursor is
+                // over, so a two-value A/B block would be meaningless here.
+                if self.viewer.show_tooltip
+                    && let Some(pos) = hover
+                {
+                    crate::viewer::pixel_tooltip_window(ui.ctx(), pos, x, y, v, None);
+                }
+                // Shift+Click saves the sampled pixel as a persistent swatch — the
+                // comp-path analogue of the classic sampler (#99 R4), which lived in
+                // `viewer.ui` and so never fired here. `v` is the raw source value
+                // under the cursor; checks `shift` only, so Shift+Ctrl+Click works too.
+                if let Some(rgba) = v
+                    && ui.input(|i| i.modifiers.shift && i.pointer.primary_clicked())
+                {
+                    self.viewer.swatches.push(rgba);
+                }
+            }
+            None => {
+                self.viewer.last_hover_pos_img = None;
+                self.viewer.last_sampled_val_a = None;
+            }
+        }
+    }
+
+    /// a grid of that source's AOVs/passes, where clicking one points the layer's
+    /// `aov` at it — the comp analogue of the classic sheet's "select this layer".
+    /// Returns `false` when there is nothing to show, so the caller falls through to
+    /// the composite rather than rendering a blank viewport.
+    ///
+    /// Owns the per-frame thumbnail housekeeping that `ExrViewer::ui` used to run:
+    /// `sync_texture_caches` (which sizes the caches the sheet indexes **unguarded**),
+    /// the deferred GPU-id drain, and the OCIO-change invalidation.
+    fn draw_comp_contact_sheet(&mut self, ui: &mut egui::Ui) -> bool {
+        let Some(layer_id) = self.active_comp_layer() else {
+            return false;
+        };
+        let Some(crate::layer::LayerSource::Image { source, .. }) =
+            self.comp_stack.get(layer_id).map(|l| l.source.clone())
+        else {
+            return false;
+        };
+        let Some(exr) = self.comp_sources.get(&source).map(|cs| cs.exr_data.clone()) else {
+            return false;
+        };
+
+        // The per-frame app→viewer state the sheet's tone snapshot reads.
+        self.viewer.enable_lut = self.enable_lut && self.lut_bg.is_some();
+        self.viewer.lut_domain_min = self.lut_domain_min;
+        self.viewer.lut_domain_max = self.lut_domain_max;
+        self.viewer.ocio_active = self.ocio_enabled && self.ocio_ready;
+        self.viewer.ocio_render_gen = self.ocio_render_gen;
+        self.viewer.suppress_sampling = self.playback.sampling_suppressed();
+
+        self.viewer.invalidate_thumbnails_on_ocio_change();
+        self.viewer.drain_thumb_frees(self.gpu_resources.as_ref());
+        self.viewer.sync_texture_caches(exr.logical_layers.len());
+
+        // Header: which source is on show, and an explicit way out. The sheet replaces
+        // the whole viewport (the comp bar that hosts the toggle isn't drawn), so
+        // without this the only exits are clicking a cell or finding the View menu.
+        let name = self
+            .comp_stack
+            .get(layer_id)
+            .map(|l| l.name.clone())
+            .unwrap_or_default();
+        ui.horizontal(|ui| {
+            ui.heading(&name);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button("✕ Close")
+                    .on_hover_text("Back to the composite")
+                    .clicked()
+                {
+                    self.viewer.show_contact_sheet = false;
+                }
+            });
+        });
+        ui.separator();
+
+        let lut = self.lut_bg.clone();
+        let picked =
+            self.viewer
+                .draw_contact_sheet(ui, &exr, self.gpu_resources.as_ref(), lut.as_ref());
+
+        // Point the current layer at the chosen AOV, the comp-model equivalent of the
+        // classic sheet's `active_layer` write.
+        if let Some(aov) = picked
+            && let Some(l) = self.comp_stack.get_mut(layer_id)
+            && let crate::layer::LayerSource::Image { aov: a, .. } = &mut l.source
+        {
+            *a = aov;
+        }
+        true
     }
 
     fn draw_central_canvas(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default().show_inside(ui, |ui| {
-            // The Layers-panel composite takes over the viewport when the panel is
-            // active with sources (#99 PR-B.3), separate from the A/B path below
-            // (which is untouched — the compare modes are unaffected).
-            if self.show_layers_panel && !self.comp_stack.is_empty() {
+            // Viewer shortcuts run here, *before* the branch, so they work on the
+            // contact-sheet path too — otherwise `T` could open the sheet but never
+            // close it, and F11 / Esc would die at its edge. Exactly one call site:
+            // servicing them in both branches would toggle each key twice per press.
+            self.viewer.handle_channel_hotkeys(ui);
+
+            // The comp stack IS the viewport (#99 Slice 3h): the unified open/drop flow
+            // adds every file to it, so this is the only path. The `show_layers_panel`
+            // toggle hides only the timeline *tracks* (see `draw_timeline_panel`), not
+            // the composite, so toggling it off shows the composite full-screen.
+            //
+            // Contact Sheet (#191) is a single-source, per-layer/pass grid over the
+            // current layer, so it takes priority over the composite.
+            if self.viewer.show_contact_sheet && self.draw_comp_contact_sheet(ui) {
+                return;
+            }
+            if !self.comp_stack.is_empty() {
                 self.draw_comp_central(ui);
                 return;
             }
-            if self.loaded_file.is_some() {
-                if let Some(data) = &self.exr_data {
-                    self.viewer.enable_lut = self.enable_lut && self.lut_bg.is_some();
-                    self.viewer.lut_domain_min = self.lut_domain_min;
-                    self.viewer.lut_domain_max = self.lut_domain_max;
-                    self.viewer.ocio_active = self.ocio_enabled && self.ocio_ready;
-                    self.viewer.ocio_render_gen = self.ocio_render_gen;
-                    // INV-SAMPLE (#7): suppress the pixel readout while a sequence
-                    // is advancing or a seek's frame is still in flight.
-                    self.viewer.suppress_sampling = self.playback.sampling_suppressed();
-                    // Diff controls, custom gradients, and background + presets are
-                    // single-owned by the viewer now (#151): the UI mutates them in
-                    // place and `save()` persists them straight from the viewer — no
-                    // per-frame push/read-back or `mem::take` shuffle.
-                    self.viewer.ui(
-                        ui,
-                        data,
-                        self.exr_data_b.as_deref(),
-                        self.gpu_resources.as_ref(),
-                        self.lut_bg.clone(),
-                    );
-                } else if self.loading_a {
-                    // A requested but its decode hasn't landed yet (no prior image
-                    // to keep showing). If a low-res first-paint proxy (#58) is
-                    // available, render it; otherwise show a spinner.
-                    if self.viewer.has_proxy() {
-                        // Hydrate the same per-frame viewer state the full `ui`
-                        // path uses, so the proxy renders with the user's tone /
-                        // LUT / OCIO-toggled settings (OCIO itself isn't applied
-                        // to the proxy — see `set_proxy`'s OCIO note).
-                        self.viewer.enable_lut = false; // proxy is a pre-baked CPU texture
-                        self.viewer.draw_proxy(ui);
-                    } else {
-                        let name = self
-                            .loaded_file
-                            .as_ref()
-                            .and_then(|p| p.file_name())
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_default();
-                        ui.centered_and_justified(|ui| {
-                            ui.horizontal(|ui| {
-                                ui.spinner();
-                                ui.label(format!("Loading {name}…"));
-                            });
-                        });
-                    }
-                }
-            } else {
-                ui.centered_and_justified(|ui| {
-                    ui.label("Open an EXR file to begin.");
-                });
-            }
+            ui.centered_and_justified(|ui| {
+                ui.label("Open an EXR file to begin.");
+            });
         });
     }
 }
@@ -5915,6 +7039,170 @@ mod tests {
             .expect("write multi-pass exr fixture");
     }
 
+    // --- Timeline panel: the shared frame↔x axis (#99) -----------------------
+    // The ruler and every layer clip bar map frames through one `TimeAxis`, so
+    // these are the guarantees that make a bar line up with the ruler above it.
+
+    fn axis(lo: u32, hi: u32) -> TimeAxis {
+        TimeAxis::new(
+            egui::Rect::from_min_size(egui::pos2(100.0, 0.0), egui::vec2(200.0, 22.0)),
+            lo,
+            hi,
+        )
+    }
+
+    #[test]
+    fn time_axis_maps_the_range_across_the_rect_and_clamps_outside_it() {
+        let a = axis(1000, 1100);
+        assert!((a.x_of(1000) - 100.0).abs() < 0.01, "lo at the left edge");
+        assert!((a.x_of(1100) - 300.0).abs() < 0.01, "hi at the right edge");
+        assert!(
+            (a.x_of(1050) - 200.0).abs() < 0.01,
+            "midpoint at the center"
+        );
+        // A layer dragged off either end must paint against the edge, never
+        // outside the panel.
+        assert!((a.x_of(500) - 100.0).abs() < 0.01, "before lo clamps left");
+        assert!((a.x_of(9999) - 300.0).abs() < 0.01, "after hi clamps right");
+        // A single-frame sequence has no span to divide by: it sits centered.
+        assert!((axis(7, 7).x_of(7) - 200.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn time_axis_frame_at_round_trips_x_of() {
+        let a = axis(1000, 1100);
+        for f in [1000, 1001, 1037, 1099, 1100] {
+            assert_eq!(a.frame_at(a.x_of(f)), f, "round trip at {f}");
+        }
+        // Scrubbing past either end lands on the end frame, not out of range —
+        // `draw_timeline` casts the result to `u32` on that guarantee.
+        assert_eq!(a.frame_at(-500.0), 1000);
+        assert_eq!(a.frame_at(9999.0), 1100);
+    }
+
+    #[test]
+    fn slot_x_gives_the_last_frame_a_real_cell() {
+        // Cache-fill strips and clip bars give each frame an equal cell over
+        // `lo..=hi` *inclusive*, so a one-frame clip still has visible width and
+        // frame `hi`'s cell reaches the right edge.
+        let a = axis(0, 3); // 4 frames ⇒ 4 cells of 50 px
+        assert!((a.slot_x(0) - 100.0).abs() < 0.01);
+        assert!((a.slot_x(1) - 150.0).abs() < 0.01);
+        assert!((a.slot_x(3) - 250.0).abs() < 0.01);
+        assert!(
+            (a.slot_x(4) - 300.0).abs() < 0.01,
+            "hi's cell ends at the edge"
+        );
+    }
+
+    // --- Timeline panel: clip spans + drag arithmetic (#99) ------------------
+
+    #[test]
+    fn track_span_maps_the_trim_into_global_frames() {
+        use crate::layer::Trim;
+        // `source = global + offset`, so the bar sits at `source - offset`.
+        let t = Trim {
+            in_point: 10,
+            out_point: 20,
+            offset: 0,
+        };
+        assert_eq!(track_span(t, 0, 100), Some((10, 20)));
+        // A positive offset makes the layer *lead* the playhead, so its clip
+        // moves earlier on the global timeline; a negative one moves it later.
+        assert_eq!(track_span(Trim { offset: 5, ..t }, 0, 100), Some((5, 15)));
+        assert_eq!(track_span(Trim { offset: -5, ..t }, 0, 100), Some((15, 25)));
+        // Partly visible still draws (the bar clamps at the edge)...
+        assert_eq!(track_span(t, 15, 100), Some((10, 20)));
+        // ...but a layer entirely off the visible timeline has no bar at all.
+        assert_eq!(track_span(t, 50, 100), None, "ends before the range");
+        assert_eq!(track_span(t, 0, 5), None, "starts after the range");
+    }
+
+    #[test]
+    fn track_span_handles_a_stills_all_frames_trim() {
+        // A still is `Trim::full(0, u32::MAX)`: its bar spans the whole timeline
+        // and the i64 arithmetic must not overflow at the u32 ceiling.
+        let t = crate::layer::Trim::full(0, u32::MAX);
+        let (lo, hi) = track_span(t, 1000, 1100).expect("a still is always visible");
+        assert!(lo <= 1000 && hi >= 1100);
+    }
+
+    #[test]
+    fn dragging_a_clip_right_moves_it_later_on_the_timeline() {
+        // Grab frame 20 on a layer at offset 0 and drop it on frame 30: the clip
+        // moved 10 frames later, so the offset drops by 10 (`global = source -
+        // offset`). Dragging back left is the exact inverse.
+        assert_eq!(offset_after_drag(0, 20, 30), -10);
+        assert_eq!(offset_after_drag(0, 20, 10), 10);
+        // Re-deriving from the grab frame (rather than accumulating per-event
+        // deltas) means a jittery drag that returns to where it started restores
+        // the original offset exactly — no drift.
+        let start = 7;
+        for now in [20, 25, 31, 24, 20] {
+            let landed = offset_after_drag(start, 20, now);
+            assert_eq!(landed, start - (now - 20));
+        }
+        assert_eq!(offset_after_drag(start, 20, 20), start);
+    }
+
+    // --- Timeline panel: layout (#99) ----------------------------------------
+
+    #[test]
+    fn timeline_panel_lays_out_tracks_for_sequence_and_still_layers() {
+        use egui_kittest::Harness;
+        let dir = tempfile::tempdir().unwrap();
+        // The two track shapes the panel has to lay out: a comp *sequence* (two
+        // numbered frames ⇒ `detect_from_file` finds a range, so the layer gets a
+        // real `[in, out]` clip) and a lone *still* (`Trim::full`, spanning the
+        // whole axis).
+        let s1 = dir.path().join("seq.0001.exr");
+        let s2 = dir.path().join("seq.0002.exr");
+        let still = dir.path().join("still.exr");
+        for p in [&s1, &s2, &still] {
+            write_rgba_exr(p);
+        }
+
+        let mut app = ExrApp::default();
+        app.add_comp_source(s1);
+        app.add_comp_source(still);
+        assert_eq!(app.comp_stack.len(), 2);
+        assert!(
+            app.playback.is_active(),
+            "the first comp sequence takes the clock (#99 R4-lite), so the panel \
+             draws its transport + ruler as well as the tracks"
+        );
+
+        let mut h = Harness::new_ui_state(|ui, app: &mut ExrApp| app.draw_timeline_panel(ui), app);
+        h.run_steps(1);
+        let app = std::mem::take(h.state_mut());
+        // Laying out the tracks must not disturb the model.
+        assert_eq!(app.comp_stack.len(), 2, "drawing is not an edit");
+    }
+
+    #[test]
+    fn timeline_panel_draws_gutter_only_tracks_without_a_transport() {
+        // A stills-only stack has no sequence, so `full_range()` is `None` and
+        // there is no time axis to place clips on. The rows must still lay out
+        // (gutter-only, as the old flat list did) rather than panicking on a
+        // missing range.
+        use egui_kittest::Harness;
+        let dir = tempfile::tempdir().unwrap();
+        let still = dir.path().join("still.exr");
+        write_rgba_exr(&still);
+
+        let mut app = ExrApp::default();
+        app.add_comp_source(still);
+        assert!(
+            !app.playback.is_active(),
+            "a still establishes no transport"
+        );
+        assert!(app.playback.full_range().is_none());
+
+        let mut h = Harness::new_ui_state(|ui, app: &mut ExrApp| app.draw_timeline_panel(ui), app);
+        h.run_steps(1);
+        assert_eq!(h.state().comp_stack.len(), 1);
+    }
+
     // --- Layers panel: decode-on-add (#99 PR-B.2) ----------------------------
     // Headless (no `gpu_resources`): the model layer + decoded pixels register,
     // but no GPU texture is built. The composite-render half is on-device (PR-B.3).
@@ -5928,14 +7216,23 @@ mod tests {
         let mut app = ExrApp::default();
         app.add_comp_source(f);
 
-        // One model layer, at AOV 0, referencing source id 0.
+        // One model layer, at AOV 0, referencing the first comp source id
+        // (COMP_SOURCE_BASE = 2; ids 0/1 are reserved for the A/B compare slots).
         assert_eq!(app.comp_stack.len(), 1, "layer registered");
-        assert_eq!(app.comp_next_source, 1, "SourceId allocator advanced");
+        assert_eq!(
+            app.comp_next_source,
+            COMP_SOURCE_BASE + 1,
+            "SourceId allocator advanced"
+        );
         let layer = app.comp_stack.iter().next().unwrap();
         let crate::layer::LayerSource::Image { source, aov } = layer.source else {
             panic!("expected an image layer");
         };
-        assert_eq!((source, aov), (crate::layer::SourceId(0), 0));
+        assert_eq!((source, aov), (crate::layer::SourceId(COMP_SOURCE_BASE), 0));
+        assert!(
+            source != ExrApp::A_SOURCE,
+            "comp source must not alias the base-plate slot"
+        );
 
         // The decoded pixels are stored keyed by that source; no GPU texture
         // headless, but the model + size are populated.
@@ -5957,7 +7254,10 @@ mod tests {
         app.add_comp_source(std::path::PathBuf::from("/nonexistent/does-not-exist.exr"));
         assert!(app.comp_stack.is_empty(), "no layer on decode failure");
         assert!(app.comp_sources.is_empty(), "no source stored");
-        assert_eq!(app.comp_next_source, 0, "SourceId not consumed");
+        assert_eq!(
+            app.comp_next_source, COMP_SOURCE_BASE,
+            "SourceId not consumed"
+        );
         assert!(app.error_msg.is_some(), "error surfaced to the status bar");
     }
 
@@ -5970,7 +7270,7 @@ mod tests {
         let mut app = ExrApp::default();
         app.add_comp_source(f);
         let id = app.comp_stack.iter().next().unwrap().id;
-        let source = crate::layer::SourceId(0);
+        let source = crate::layer::SourceId(COMP_SOURCE_BASE);
         assert!(app.comp_sources.contains_key(&source));
 
         app.remove_comp_layer(id);
@@ -5980,7 +7280,308 @@ mod tests {
             "orphaned source freed"
         );
         // Ids are never reused, so a re-add can't alias the freed source.
-        assert_eq!(app.comp_next_source, 1, "allocator not rewound");
+        assert_eq!(
+            app.comp_next_source,
+            COMP_SOURCE_BASE + 1,
+            "allocator not rewound"
+        );
+    }
+
+    #[test]
+    fn active_comp_layer_tracks_selection_with_a_top_fallback() {
+        // The Nuke-style "current layer" (#99 R4): adding a layer selects it; an
+        // explicit selection wins; removing the selected layer falls back to the
+        // top of the stack; an empty stack has no current layer.
+        let dir = tempfile::tempdir().unwrap();
+        let (f0, f1) = (dir.path().join("a.exr"), dir.path().join("b.exr"));
+        write_rgba_exr(&f0);
+        write_rgba_exr(&f1);
+
+        let mut app = ExrApp::default();
+        assert_eq!(
+            app.active_comp_layer(),
+            None,
+            "empty stack → no current layer"
+        );
+
+        app.add_comp_source(f0);
+        let bottom = app.comp_stack.iter().next().unwrap().id;
+        assert_eq!(
+            app.selected_comp_layer,
+            Some(bottom),
+            "adding a layer selects it"
+        );
+
+        app.add_comp_source(f1);
+        // `iter()` is bottom→top, so the second add is the top (last) layer.
+        let top = app.comp_stack.iter().last().unwrap().id;
+        assert_eq!(
+            app.active_comp_layer(),
+            Some(top),
+            "the newest layer is current"
+        );
+
+        // An explicit selection of the bottom layer wins over the top fallback.
+        app.selected_comp_layer = Some(bottom);
+        assert_eq!(app.active_comp_layer(), Some(bottom));
+
+        // Removing the selected layer drops the selection; the resolver then
+        // falls back to the topmost remaining layer.
+        app.remove_comp_layer(bottom);
+        assert_eq!(app.selected_comp_layer, None, "stale selection cleared");
+        assert_eq!(
+            app.active_comp_layer(),
+            Some(top),
+            "falls back to the top of the stack"
+        );
+    }
+
+    #[test]
+    fn comp_histogram_entry_point_computes_bins() {
+        // The comp-path histogram (#99 R4) computes the current layer's bins keyed
+        // by its SourceId, and — unlike the classic A/B path — never populates B.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("layer.exr");
+        write_rgba_exr(&f);
+        let data = std::sync::Arc::new(ExrData::load(&f).unwrap());
+
+        let mut v = crate::viewer::ExrViewer::default();
+        v.calculate_histogram_for(&data, 0, 2);
+
+        let bins = v.histogram.expect("comp bins computed");
+        assert_eq!(
+            bins.iter().sum::<u32>(),
+            4,
+            "every pixel of the 2×2 fixture lands in exactly one bin"
+        );
+    }
+
+    #[test]
+    fn add_comp_source_registers_a_sequence_follower() {
+        // A numbered file is detected as a sequence: the comp source becomes a
+        // decode follower on the shared playhead (#99 Phase 2), its layer's Trim
+        // spans the sequence range, and the opened frame is seeded into the T1
+        // cache under the comp source id — never the A/B slots.
+        let (_dir, paths) = write_sequence(5);
+        let mut app = ExrApp::default();
+        app.add_comp_source(paths[0].clone());
+
+        let source = crate::layer::SourceId(COMP_SOURCE_BASE);
+        let layer = app.comp_stack.iter().next().unwrap();
+        assert_eq!(
+            (layer.trim.in_point, layer.trim.out_point),
+            (1, 5),
+            "trim spans the detected sequence range, not the still's all-frames trim"
+        );
+
+        let f = app
+            .followers
+            .get(&source)
+            .expect("sequence source registered as a follower");
+        assert!(
+            f.sequence.is_some(),
+            "follower carries the detected sequence"
+        );
+        assert_eq!(
+            f.current_frame, 1,
+            "follower opens on the sequence's frame 1"
+        );
+
+        assert!(
+            app.frame_cache.contains(source, 1),
+            "opened frame seeded under the comp source id"
+        );
+        assert!(
+            !app.frame_cache.contains(ExrApp::A_SOURCE, 1),
+            "comp frame must not land in the base-plate slot"
+        );
+    }
+
+    #[test]
+    fn add_comp_source_still_registers_no_follower() {
+        // A lone (unnumbered) file stays a still: no follower, nothing to play.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("still.exr");
+        write_rgba_exr(&f);
+        let mut app = ExrApp::default();
+        app.add_comp_source(f);
+
+        let source = crate::layer::SourceId(COMP_SOURCE_BASE);
+        assert!(
+            !app.followers.contains_key(&source),
+            "a still registers no decode follower"
+        );
+        assert!(
+            app.comp_sources.contains_key(&source),
+            "the still source is still stored (its single texture)"
+        );
+    }
+
+    // --- R3: slot A joins the composite as the bottom base track (#99) --------
+
+    /// Open a still as slot A directly (headless: `open_file` is async), then add a
+    /// comp source. Returns the app with A + one comp layer.
+    fn app_with_open_a_still() -> (tempfile::TempDir, ExrApp) {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("plate.exr");
+        let comp = dir.path().join("over.exr");
+        write_rgba_exr(&a);
+        write_rgba_exr(&comp);
+        let mut app = ExrApp {
+            loaded_file: Some(a.clone()),
+            exr_data: Some(std::sync::Arc::new(ExrData::load(&a).unwrap())),
+            ..Default::default()
+        };
+        app.add_comp_source(comp);
+        (dir, app)
+    }
+
+    #[test]
+    fn adding_the_first_comp_source_promotes_open_a_to_the_base_track() {
+        let (_dir, app) = app_with_open_a_still();
+        assert_eq!(
+            app.comp_stack.len(),
+            2,
+            "the opened plate + the added layer"
+        );
+        // Bottom of the stack (index 0) is slot A.
+        let bottom = app.comp_stack.iter().next().unwrap();
+        assert!(
+            matches!(bottom.source, crate::layer::LayerSource::Image { source, .. } if source == ExrApp::A_SOURCE),
+            "the base track references A_SOURCE"
+        );
+        assert_eq!(
+            app.base_layer_id(),
+            Some(bottom.id),
+            "the base is discoverable as the A_SOURCE layer"
+        );
+        assert!(
+            app.comp_sources.contains_key(&ExrApp::A_SOURCE),
+            "a CompSource is registered for the base plate"
+        );
+    }
+
+    #[test]
+    fn removing_the_last_comp_source_drops_the_base_and_leaves_a_untouched() {
+        let (_dir, mut app) = app_with_open_a_still();
+        // Seed A's own T1 cache to prove base removal never clears it (the
+        // `clear_slot(A_SOURCE)` footgun).
+        app.frame_cache
+            .insert(ExrApp::A_SOURCE, 1, app.exr_data.clone().unwrap());
+
+        // Remove the added comp source (the top layer).
+        let comp_id = app.comp_stack.iter().last().unwrap().id;
+        assert_ne!(Some(comp_id), app.base_layer_id());
+        app.remove_comp_layer(comp_id);
+
+        assert!(
+            app.comp_stack.is_empty(),
+            "base auto-removed with the last comp source → classic viewer takes over"
+        );
+        assert!(app.base_layer_id().is_none());
+        assert!(!app.comp_sources.contains_key(&ExrApp::A_SOURCE));
+        // Slot A itself is untouched: still open, cache intact.
+        assert!(app.loaded_file.is_some() && app.exr_data.is_some());
+        assert!(
+            app.frame_cache.contains(ExrApp::A_SOURCE, 1),
+            "base removal must not clear A's real transport cache"
+        );
+    }
+
+    #[test]
+    fn base_track_trim_spans_the_a_sequence_range_at_offset_zero() {
+        let (dir, paths) = write_sequence(5);
+        let comp = dir.path().join("over.exr");
+        write_rgba_exr(&comp);
+        let mut app = ExrApp {
+            loaded_file: Some(paths[0].clone()),
+            exr_data: Some(std::sync::Arc::new(ExrData::load(&paths[0]).unwrap())),
+            ..Default::default()
+        };
+        app.detect_sequence(&paths[0]); // playback range (1, 5)
+        app.add_comp_source(comp);
+
+        let base = app.comp_stack.get(app.base_layer_id().unwrap()).unwrap();
+        assert_eq!(
+            (base.trim.in_point, base.trim.out_point, base.trim.offset),
+            (1, 5, 0),
+            "the base spans A's range at offset 0 — it drives the clock"
+        );
+    }
+
+    #[test]
+    fn add_comp_source_without_an_open_a_adds_no_base() {
+        // No plate open: the comp sequence drives the transport itself (#99 R4-lite)
+        // and there is no slot A to promote — so no base track.
+        let (_dir, paths) = write_sequence(5);
+        let mut app = ExrApp::default();
+        app.add_comp_source(paths[0].clone());
+        assert!(app.base_layer_id().is_none(), "no plate → no base track");
+        assert_eq!(app.comp_stack.len(), 1, "only the comp source");
+        assert!(app.comp_drives_transport);
+    }
+
+    #[test]
+    fn sync_comp_followers_maps_the_global_playhead_through_the_trim() {
+        // A comp sequence layer follows the shared playhead (#99). Added with no base
+        // plate, the first sequence *drives the transport* (enter at its opened frame
+        // 1), so its Trim aligns 1:1: source_frame(g) == g, blank outside [1, 5].
+        let (_dir, paths) = write_sequence(5);
+        let mut app = ExrApp::default();
+        app.add_comp_source(paths[0].clone());
+        let source = crate::layer::SourceId(COMP_SOURCE_BASE);
+
+        // The first comp sequence established the transport at its opened frame (R4-lite).
+        assert!(
+            app.playback.is_active(),
+            "the comp stack drives the transport"
+        );
+        assert_eq!(app.playback.current_frame, 1);
+        assert!(app.comp_drives_transport);
+        assert_eq!(app.followers.get(&source).unwrap().current_frame, 1);
+        assert!(app.frame_cache.contains(source, 1));
+
+        // Global 3 → source frame 3; not resident, so it's awaited for the pump.
+        app.playback.current_frame = 3;
+        app.sync_comp_followers();
+        let f = app.followers.get(&source).unwrap();
+        assert_eq!(f.current_frame, 3, "follower maps global 1:1");
+        assert_eq!(f.pending, Some(3), "non-resident mapped frame is awaited");
+
+        // Global 6 → source 6, past the range [1, 5]: blank, follower holds.
+        app.playback.current_frame = 6;
+        app.sync_comp_followers();
+        assert_eq!(
+            app.followers.get(&source).unwrap().current_frame,
+            3,
+            "out-of-range global holds the last frame (blank layer)"
+        );
+    }
+
+    #[test]
+    fn per_layer_time_offset_reshifts_the_follower() {
+        // Editing a comp sequence layer's Trim offset (what the per-row time control
+        // does) slides it along the timeline: the follower maps the global frame
+        // through the new offset on the next sync (#99).
+        let (_dir, paths) = write_sequence(10);
+        let mut app = ExrApp::default();
+        app.add_comp_source(paths[0].clone());
+        let source = crate::layer::SourceId(COMP_SOURCE_BASE);
+        let id = app.comp_stack.iter().next().unwrap().id;
+
+        // Transport enters at frame 1, offset 0 → source_frame(global) == global.
+        app.playback.current_frame = 3;
+        app.sync_comp_followers();
+        assert_eq!(app.followers.get(&source).unwrap().current_frame, 3);
+
+        // Nudge the layer +2 frames (what the row DragValue writes), then re-sync.
+        app.comp_stack.get_mut(id).unwrap().trim.offset = 2;
+        app.sync_comp_followers();
+        assert_eq!(
+            app.followers.get(&source).unwrap().current_frame,
+            5,
+            "offset +2 shifts the follower's source frame (3 + 2)"
+        );
     }
 
     #[test]
@@ -5993,7 +7594,7 @@ mod tests {
 
         let mut app = ExrApp::default();
         app.add_comp_source(f);
-        let source = crate::layer::SourceId(0);
+        let source = crate::layer::SourceId(COMP_SOURCE_BASE);
         let cs = app.comp_sources.get(&source).expect("source stored");
         assert_eq!(cs.exr_data.logical_layers.len(), 3, "3 passes → 3 AOVs");
         assert_eq!(cs.aov, 0, "starts on AOV 0");
@@ -6035,7 +7636,6 @@ mod tests {
         };
 
         app.apply_load_result(LoadResult {
-            path: PathBuf::from("superseded.exr"),
             source: ExrApp::A_SOURCE,
             seq_frame: false,
             frame: 0,
@@ -6080,7 +7680,6 @@ mod tests {
         app.loaded_file = Some(dir.path().join("seq.0007.exr"));
 
         app.apply_load_result(LoadResult {
-            path: newf,
             source: ExrApp::A_SOURCE,
             seq_frame: false,
             frame: 0,
@@ -6098,43 +7697,6 @@ mod tests {
             "loading flag cleared — pump_decode is not left gated"
         );
     }
-
-    /// #109/#117: unloading bumps the open generation, so a slot-A open still in
-    /// flight when the user unloads can't resurrect the released image on arrival.
-    #[test]
-    fn unload_supersedes_an_in_flight_open() {
-        let dir = tempfile::tempdir().unwrap();
-        let f = dir.path().join("x.exr");
-        write_rgba_exr(&f);
-        let data = ExrData::load(&f).unwrap();
-
-        // An open is in flight (gen 1, loading).
-        let mut app = ExrApp {
-            loaded_file: Some(f.clone()),
-            open_gen_a: 1,
-            loading_a: true,
-            ..Default::default()
-        };
-        app.unload(false); // bumps the generation; releases the slot
-        assert!(app.open_gen_a > 1, "unload advances the open generation");
-
-        // The now-stale open result lands.
-        app.apply_load_result(LoadResult {
-            path: f,
-            source: ExrApp::A_SOURCE,
-            seq_frame: false,
-            frame: 0,
-            epoch: 0,
-            open_gen: 1,
-            result: Ok(data),
-        });
-
-        assert!(
-            app.exr_data.is_none(),
-            "a late open must not resurrect the unloaded slot"
-        );
-    }
-
     #[test]
     fn matching_error_result_surfaces_and_clears_loading() {
         let mut app = ExrApp {
@@ -6144,7 +7706,6 @@ mod tests {
         };
 
         app.apply_load_result(LoadResult {
-            path: PathBuf::from("current.exr"),
             source: ExrApp::A_SOURCE,
             seq_frame: false,
             frame: 0,
@@ -6155,75 +7716,22 @@ mod tests {
 
         assert_eq!(app.error_msg.as_deref(), Some("bad exr"));
         assert!(!app.loading_a, "matching result clears the loading flag");
-        assert!(app.exr_data.is_none());
     }
 
     #[test]
-    fn a_success_resets_b_and_clears_flags() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("a.exr");
-        write_rgba_exr(&path);
-        let data_a = ExrData::load(&path).unwrap();
-        let data_b = ExrData::load(&path).unwrap();
-
-        let mut app = ExrApp {
-            loaded_file: Some(path.clone()),
-            exr_data_b: Some(std::sync::Arc::new(data_b)),
-            loading_a: true,
-            followers: std::iter::once((
-                ExrApp::B_SOURCE,
-                SourceState {
-                    loaded_file: Some(PathBuf::from("b.exr")),
-                    loading: true,
-                    ..Default::default()
-                },
-            ))
-            .collect(),
-            ..Default::default()
-        };
-
-        app.apply_load_result(LoadResult {
-            path,
-            source: ExrApp::A_SOURCE,
-            seq_frame: false,
-            frame: 0,
-            epoch: 0,
-            open_gen: 0,
-            result: Ok(data_a),
-        });
-
-        assert!(app.exr_data.is_some(), "A data applied");
-        assert!(app.exr_data_b.is_none(), "B reset when A changes");
-        assert!(
-            app.b().loaded_file.is_none(),
-            "B path cleared when A changes"
-        );
-        assert!(
-            !app.loading_a && !app.b().loading,
-            "both loading flags cleared (A discards any in-flight B)"
-        );
-        assert!(app.error_msg.is_none());
-    }
-
-    #[test]
-    fn swap_image_data_a_preserves_viewer_state_and_b() {
+    fn swap_image_data_a_preserves_viewer_state() {
         // The per-frame playback path (#7): a new A frame lands but the user's
-        // view (zoom, pan, exposure, channel mode, swatches, annotations) and
-        // the reference B must be preserved. Contrast the open path above,
-        // which resets the viewer and drops B.
+        // view (zoom, pan, exposure, channel mode, swatches, annotations) must be
+        // preserved. Contrast the open path, which resets the viewer.
         let dir = tempfile::tempdir().unwrap();
         let path_a0 = dir.path().join("a0.exr");
         let path_a1 = dir.path().join("a1.exr");
-        let path_b = dir.path().join("b.exr");
         write_rgba_exr(&path_a0);
         write_rgba_exr(&path_a1);
-        write_rgba_exr(&path_b);
         let a1 = ExrData::load(&path_a1).unwrap();
-        let b = ExrData::load(&path_b).unwrap();
 
         let mut app = ExrApp {
             exr_data: Some(std::sync::Arc::new(ExrData::load(&path_a0).unwrap())),
-            exr_data_b: Some(std::sync::Arc::new(b)),
             ..Default::default()
         };
         // Simulate a user mid-session: non-default view + annotation + swatch.
@@ -6241,13 +7749,9 @@ mod tests {
             width: 2.0,
         });
 
-        app.swap_image_data(a1, false);
+        app.swap_image_arc(std::sync::Arc::new(a1));
 
         assert!(app.exr_data.is_some(), "new A applied");
-        assert!(
-            app.exr_data_b.is_some(),
-            "B preserved across A frame swap (unlike the open path)"
-        );
         assert_eq!(app.viewer.scale, 3.5, "zoom preserved");
         assert_eq!(
             app.viewer.translation,
@@ -6264,35 +7768,6 @@ mod tests {
         assert_eq!(app.viewer.annotations.len(), 1, "annotations preserved");
         assert!(app.error_msg.is_none());
     }
-
-    #[test]
-    fn swap_image_data_b_preserves_a_and_viewer_state() {
-        // Swapping B is a reference refresh: A and the user's view are untouched.
-        let dir = tempfile::tempdir().unwrap();
-        let path_a = dir.path().join("a.exr");
-        let path_b0 = dir.path().join("b0.exr");
-        let path_b1 = dir.path().join("b1.exr");
-        write_rgba_exr(&path_a);
-        write_rgba_exr(&path_b0);
-        write_rgba_exr(&path_b1);
-        let b1 = ExrData::load(&path_b1).unwrap();
-
-        let mut app = ExrApp {
-            exr_data: Some(std::sync::Arc::new(ExrData::load(&path_a).unwrap())),
-            exr_data_b: Some(std::sync::Arc::new(ExrData::load(&path_b0).unwrap())),
-            ..Default::default()
-        };
-        app.viewer.scale = 2.0;
-        app.viewer.exposure = -0.5;
-
-        app.swap_image_data(b1, true);
-
-        assert!(app.exr_data.is_some(), "A untouched");
-        assert!(app.exr_data_b.is_some(), "new B applied");
-        assert_eq!(app.viewer.scale, 2.0, "zoom preserved");
-        assert_eq!(app.viewer.exposure, -0.5, "exposure preserved");
-    }
-
     #[test]
     fn swap_image_data_clamps_active_layer_to_new_layer_count() {
         // A sequence normally has identical layer structure frame-to-frame, but
@@ -6312,7 +7787,7 @@ mod tests {
         assert_eq!(app.exr_data.as_ref().unwrap().logical_layers.len(), 3);
         app.viewer.active_layer = 2; // valid for 3 passes, invalid for 1
 
-        app.swap_image_data(one, false);
+        app.swap_image_arc(std::sync::Arc::new(one));
 
         assert_eq!(
             app.exr_data.as_ref().unwrap().logical_layers.len(),
@@ -6419,6 +7894,146 @@ mod tests {
     }
 
     #[test]
+    fn comp_layers_persist_and_restore_through_ron_storage() {
+        // #99 PR-B.5: the comp stack survives a restart. Exercises the real bridge —
+        // `save()` flattens, eframe's RON codec round-trips, `restore_comp_layers`
+        // replays through `add_comp_source` — not just a serde round-trip.
+        #[derive(Default)]
+        struct MemStorage(std::collections::HashMap<String, String>);
+        impl eframe::Storage for MemStorage {
+            fn get_string(&self, key: &str) -> Option<String> {
+                self.0.get(key).cloned()
+            }
+            fn set_string(&mut self, key: &str, value: String) {
+                self.0.insert(key.to_owned(), value);
+            }
+            fn flush(&mut self) {}
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let f0 = dir.path().join("one.exr");
+        let f1 = dir.path().join("two.exr");
+        write_rgba_exr(&f0);
+        write_rgba_exr(&f1);
+
+        let mut app = ExrApp::default();
+        app.add_comp_source(f0.clone());
+        app.add_comp_source(f1.clone());
+        assert_eq!(app.comp_stack.len(), 2, "two layers added");
+
+        // Give the top layer non-default per-layer state, so the assertions below
+        // prove the *state* round-trips and not just the paths.
+        let top = app.comp_stack.iter().last().map(|l| l.id).unwrap();
+        {
+            let l = app.comp_stack.get_mut(top).unwrap();
+            l.blend = crate::viewer::BlendMode::Screen;
+            l.opacity = 0.25;
+            l.solo = true;
+            l.name = "renamed".to_string();
+            l.trim = crate::layer::Trim {
+                in_point: 3,
+                out_point: 9,
+                offset: -2,
+            };
+        }
+
+        let mut storage = MemStorage::default();
+        eframe::App::save(&mut app, &mut storage);
+
+        let mut restored: ExrApp = eframe::get_value(&storage, eframe::APP_KEY)
+            .expect("app state round-trips through eframe's RON codec");
+        assert_eq!(
+            restored.comp_stack.len(),
+            0,
+            "the stack itself is runtime-only — it arrives empty and is replayed"
+        );
+        restored.restore_comp_layers();
+
+        assert_eq!(restored.comp_stack.len(), 2, "both layers restored");
+        let names: Vec<_> = restored.comp_stack.iter().map(|l| l.name.clone()).collect();
+        assert_eq!(
+            names,
+            vec!["one.exr".to_string(), "renamed".to_string()],
+            "restored bottom→top in the saved order, keeping the renamed layer"
+        );
+
+        let t = restored.comp_stack.iter().last().unwrap();
+        assert_eq!(t.blend, crate::viewer::BlendMode::Screen, "blend restored");
+        assert!((t.opacity - 0.25).abs() < f32::EPSILON, "opacity restored");
+        assert!(t.solo, "solo restored");
+        assert_eq!(t.trim.in_point, 3);
+        assert_eq!(t.trim.out_point, 9);
+        assert_eq!(t.trim.offset, -2, "per-layer time offset restored");
+
+        // Each restored layer decoded into its own source — no aliasing, and none
+        // landing on the base-plate slot.
+        let sources: Vec<_> = restored
+            .comp_stack
+            .iter()
+            .filter_map(|l| match &l.source {
+                crate::layer::LayerSource::Image { source, .. } => Some(*source),
+                crate::layer::LayerSource::Adjustment => None,
+            })
+            .collect();
+        assert_eq!(sources.len(), 2);
+        assert_ne!(sources[0], sources[1], "distinct sources");
+        assert!(
+            sources.iter().all(|s| *s != ExrApp::A_SOURCE),
+            "restored layers never alias the base-plate slot"
+        );
+        assert!(restored.error_msg.is_none(), "a clean restore is silent");
+    }
+
+    #[test]
+    fn restore_skips_layers_whose_file_is_gone() {
+        // A stale session must not fail wholesale, nor greet the user with an error
+        // box: the missing layer is dropped and the rest of the stack restores.
+        let dir = tempfile::tempdir().unwrap();
+        let present = dir.path().join("here.exr");
+        write_rgba_exr(&present);
+
+        let mut app = ExrApp {
+            persisted_layers: vec![
+                LayerPersist {
+                    path: dir.path().join("deleted.exr"),
+                    name: "deleted.exr".into(),
+                    ..Default::default()
+                },
+                LayerPersist {
+                    path: present.clone(),
+                    name: "here.exr".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        app.restore_comp_layers();
+
+        assert_eq!(app.comp_stack.len(), 1, "only the present file restored");
+        assert_eq!(app.comp_stack.iter().next().unwrap().name, "here.exr");
+        assert!(
+            app.error_msg.is_none(),
+            "a missing file is not an error box"
+        );
+        assert!(
+            app.persisted_layers.is_empty(),
+            "the replayed list is consumed, so a later save re-derives it from the stack"
+        );
+    }
+
+    #[test]
+    fn layer_persist_defaults_keep_a_layer_visible() {
+        // `#[serde(default)]` fills MISSING fields from `Default`, so an app.ron
+        // written before a field existed must not restore an invisible layer — a
+        // derived Default would give opacity 0.0 / enabled false.
+        let d = LayerPersist::default();
+        assert!((d.opacity - 1.0).abs() < f32::EPSILON, "fully opaque");
+        assert!(d.enabled, "enabled");
+        assert!(!d.solo);
+        assert_eq!(d.trim_out, u32::MAX, "spans all frames");
+    }
+
+    #[test]
     fn gpu_resources_is_none_in_default_and_cpu_path() {
         // #54: the GPU core is app-owned on `ExrApp::gpu_resources`. Without a
         // wgpu render surface (Default / headless tests / CPU-only builds),
@@ -6431,162 +8046,6 @@ mod tests {
             "gpu_resources is None without a render surface"
         );
     }
-
-    #[test]
-    fn swap_image_data_clears_proxy_when_full_decode_lands() {
-        // The #58↔#55 contract: a proxy is shown during the async decode, then
-        // `swap_image_data` (the full-res landing) clears it. The viewer's
-        // zoom/pan session state is preserved across the handoff.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("a.exr");
-        write_rgba_exr(&path);
-        let data = ExrData::load(&path).unwrap();
-        let proxy = crate::proxy::ProxyImage::from_exr_data_downsampled(&data, 0, 1).unwrap();
-
-        let mut app = ExrApp {
-            loaded_file: Some(path),
-            loading_a: true, // full decode in flight
-            ..Default::default()
-        };
-        // Simulate the decode worker delivering a proxy first. `set_proxy` needs
-        // an egui ctx to load the texture; borrow one from a throwaway harness
-        // (state callback gives `&egui::Context` directly). Recover `app` via
-        // `std::mem::take` (ExrApp: Default).
-        {
-            use egui_kittest::Harness;
-            let mut h = Harness::new_ui_state(
-                |ui, app: &mut ExrApp| {
-                    app.set_proxy(
-                        ui.ctx(),
-                        crate::proxy::ProxyImage {
-                            pixels: proxy.pixels.clone(),
-                            ..proxy.clone()
-                        },
-                    );
-                },
-                app,
-            );
-            // `set_proxy` calls `ctx.request_repaint`, so use `run_steps(1)`
-            // instead of `run()` (which would loop on the repaint request).
-            h.run_steps(1);
-            app = std::mem::take(h.state_mut());
-        }
-        assert!(app.viewer.has_proxy(), "proxy set during load");
-        app.viewer.scale = 2.5; // user panned/zoomed while the proxy showed
-
-        // Full decode lands → swap clears the proxy, preserves view state.
-        app.swap_image_data(data, false);
-
-        assert!(
-            !app.viewer.has_proxy(),
-            "proxy cleared once full data lands"
-        );
-        assert_eq!(app.viewer.scale, 2.5, "zoom preserved across handoff");
-        assert!(app.exr_data.is_some(), "full data applied");
-    }
-
-    #[test]
-    fn a_success_with_proxy_preserves_view_and_clears_proxy() {
-        // End-to-end seam (#58/#55): the real load-completion path
-        // (`apply_load_result`) must take the swap branch when a proxy is showing
-        // so the proxy→full-res handoff preserves the user's view, while still
-        // dropping the now-meaningless reference B (an explicit new-A open).
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("a.exr");
-        write_rgba_exr(&path);
-        let data = ExrData::load(&path).unwrap();
-        let data_b = ExrData::load(&path).unwrap();
-        let proxy = crate::proxy::ProxyImage::from_exr_data_downsampled(&data, 0, 1).unwrap();
-
-        let mut app = ExrApp {
-            loaded_file: Some(path.clone()),
-            exr_data_b: Some(std::sync::Arc::new(data_b)),
-            loading_a: true, // full decode in flight
-            followers: std::iter::once((
-                ExrApp::B_SOURCE,
-                SourceState {
-                    loaded_file: Some(PathBuf::from("b.exr")),
-                    loading: true,
-                    ..Default::default()
-                },
-            ))
-            .collect(),
-            ..Default::default()
-        };
-        // Decode worker delivers a proxy first (needs an egui ctx to upload).
-        {
-            use egui_kittest::Harness;
-            let mut h = Harness::new_ui_state(
-                |ui, app: &mut ExrApp| {
-                    app.set_proxy(
-                        ui.ctx(),
-                        crate::proxy::ProxyImage {
-                            pixels: proxy.pixels.clone(),
-                            ..proxy.clone()
-                        },
-                    );
-                },
-                app,
-            );
-            h.run_steps(1);
-            app = std::mem::take(h.state_mut());
-        }
-        assert!(app.viewer.has_proxy(), "proxy set during load");
-        app.viewer.scale = 2.5; // user panned/zoomed on the proxy
-
-        // Full decode lands through the real completion path.
-        app.apply_load_result(LoadResult {
-            path,
-            source: ExrApp::A_SOURCE,
-            seq_frame: false,
-            frame: 0,
-            epoch: 0,
-            open_gen: 0,
-            result: Ok(data),
-        });
-
-        assert!(app.exr_data.is_some(), "A data applied");
-        assert!(!app.viewer.has_proxy(), "proxy cleared on handoff");
-        assert_eq!(app.viewer.scale, 2.5, "view preserved across handoff");
-        assert!(app.exr_data_b.is_none(), "B dropped on explicit new-A open");
-        assert!(app.b().loaded_file.is_none(), "B path cleared");
-        assert!(!app.loading_a && !app.b().loading, "loading flags cleared");
-    }
-
-    #[test]
-    fn set_proxy_is_noop_when_full_data_already_loaded() {
-        // A late proxy arriving after the full decode must not clobber full-res.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("a.exr");
-        write_rgba_exr(&path);
-        let data = ExrData::load(&path).unwrap();
-        let proxy = crate::proxy::ProxyImage::from_exr_data_downsampled(&data, 0, 1).unwrap();
-
-        let mut app = ExrApp {
-            exr_data: Some(std::sync::Arc::new(data)), // already loaded
-            ..Default::default()
-        };
-        use egui_kittest::Harness;
-        let mut h = Harness::new_ui_state(
-            |ui, app: &mut ExrApp| {
-                app.set_proxy(
-                    ui.ctx(),
-                    crate::proxy::ProxyImage {
-                        pixels: proxy.pixels.clone(),
-                        ..proxy.clone()
-                    },
-                );
-            },
-            app,
-        );
-        h.run_steps(1);
-        app = std::mem::take(h.state_mut());
-        assert!(
-            !app.viewer.has_proxy(),
-            "late proxy ignored when full data present"
-        );
-    }
-
     #[test]
     fn is_exr_path_is_case_insensitive_and_extension_only() {
         assert!(is_exr_path(std::path::Path::new("/a/b/shot.exr")));
@@ -6598,69 +8057,198 @@ mod tests {
     }
 
     #[test]
-    fn route_single_drop_uses_position() {
-        let p = vec![PathBuf::from("a.exr")];
+    fn top_sample_source_picks_the_last_drawable_draw() {
+        use crate::layer::{LayerStack, SourceId, Trim};
+        let mut stack = LayerStack::new();
+        let s_bottom = SourceId(2);
+        let s_top = SourceId(3);
+        stack.push_image("bottom", s_bottom, 0, Trim::full(0, u32::MAX));
+        stack.push_image("top", s_top, 1, Trim::full(0, u32::MAX));
+        let steps = stack.composite_at(0);
+
+        // All drawable → the top (last) layer wins, carrying its own aov.
+        assert_eq!(top_sample_source(&steps, |_| true), Some((s_top, 1)));
+        // Top not drawable → the next drawable below it.
         assert_eq!(
-            route_dropped_exrs(&p, false),
-            vec![(PathBuf::from("a.exr"), false)],
-            "left half loads as A"
+            top_sample_source(&steps, |s| s == s_bottom),
+            Some((s_bottom, 0))
+        );
+        // Nothing drawable → None.
+        assert_eq!(top_sample_source(&steps, |_| false), None);
+    }
+
+    #[test]
+    fn elide_middle_keeps_both_ends_within_budget() {
+        // Short enough → untouched.
+        assert_eq!(elide_middle("short.exr", 24), "short.exr");
+        assert_eq!(
+            elide_middle("exactly_24_chars_long.ex", 24),
+            "exactly_24_chars_long.ex"
+        );
+
+        // A real offender: both the shot prefix and the version/frame tail survive,
+        // which is what makes two similar names distinguishable in the picker.
+        let long = "ESTU0001_gloomWatcher_v001.karmarendersettings.1001.exr";
+        let out = elide_middle(long, 24);
+        assert_eq!(out.chars().count(), 24, "stays within budget: {out:?}");
+        assert!(out.contains('…'), "elided: {out:?}");
+        assert!(out.starts_with("ESTU0001"), "keeps the head: {out:?}");
+        assert!(out.ends_with(".exr"), "keeps the tail: {out:?}");
+
+        // Multi-byte characters are counted as chars, not bytes (no panic on a
+        // non-ASCII boundary).
+        let uni = "日本語のとても長いファイル名です.exr";
+        let out = elide_middle(uni, 10);
+        assert_eq!(out.chars().count(), 10, "counts chars: {out:?}");
+
+        // Degenerate budgets are passed through rather than panicking.
+        assert_eq!(elide_middle("abcdef", 2), "abcdef");
+    }
+
+    #[test]
+    fn default_compare_b_avoids_the_current_layer() {
+        use crate::layer::{LayerStack, SourceId, Trim};
+        // `LayerId` is opaque, so mint real ones from a stack (bottom→top).
+        let mut stack = LayerStack::new();
+        let a = stack.push_image("a", SourceId(2), 0, Trim::full(0, u32::MAX));
+        let b = stack.push_image("b", SourceId(3), 0, Trim::full(0, u32::MAX));
+        let c = stack.push_image("c", SourceId(4), 0, Trim::full(0, u32::MAX));
+        let ids = [a, b, c];
+
+        // Current is the top layer (the usual default) → compare against the next one
+        // down, so the two panes aren't showing the same thing.
+        assert_eq!(default_compare_b(&ids, Some(c)), Some(b));
+        // Current is lower → the topmost layer is the natural counterpart.
+        assert_eq!(default_compare_b(&ids, Some(a)), Some(c));
+        assert_eq!(default_compare_b(&ids, Some(b)), Some(c));
+        // No current layer → the top of the stack.
+        assert_eq!(default_compare_b(&ids, None), Some(c));
+        // A single layer can only compare against itself.
+        assert_eq!(default_compare_b(&[a], Some(a)), Some(a));
+        // Empty stack → nothing to compare.
+        assert_eq!(default_compare_b(&[], Some(a)), None);
+    }
+
+    #[test]
+    fn comp_layer_draw_resolves_a_named_layer_or_falls_back() {
+        use crate::layer::{LayerStack, SourceId, Trim};
+        let mut stack = LayerStack::new();
+        let s_bottom = SourceId(2);
+        let s_top = SourceId(3);
+        let bottom = stack.push_image("bottom", s_bottom, 0, Trim::full(0, u32::MAX));
+        let top = stack.push_image("top", s_top, 1, Trim::full(0, u32::MAX));
+        let steps = stack.composite_at(0);
+
+        // The current layer resolves to its own draw, wherever it sits in the stack.
+        let d = comp_layer_draw(&steps, Some(bottom), |_| true).expect("bottom resolves");
+        assert_eq!((d.source, d.aov), (s_bottom, 0));
+        let d = comp_layer_draw(&steps, Some(top), |_| true).expect("top resolves");
+        assert_eq!((d.source, d.aov), (s_top, 1));
+
+        // Not drawable (no texture yet) → None, so the caller falls back to Stacked.
+        assert!(comp_layer_draw(&steps, Some(top), |s| s == s_bottom).is_none());
+        // No selection at all → None.
+        assert!(comp_layer_draw(&steps, None, |_| true).is_none());
+        // Selected but absent from this frame's composite (hidden / trimmed blank).
+        let hidden = stack.push_image("hidden", SourceId(4), 0, Trim::full(0, u32::MAX));
+        assert!(
+            comp_layer_draw(&steps, Some(hidden), |_| true).is_none(),
+            "a layer missing from these steps has no side-B draw"
+        );
+    }
+
+    #[test]
+    fn comp_hover_pixel_maps_normalized_and_rejects_outside() {
+        let rect = egui::Rect::from_min_size(egui::pos2(100.0, 50.0), egui::vec2(200.0, 100.0));
+        // Center → center pixel of a 200×100 source.
+        assert_eq!(
+            comp_hover_pixel(egui::pos2(200.0, 100.0), rect, (200, 100)),
+            Some((100, 50))
+        );
+        // Min corner → (0, 0).
+        assert_eq!(
+            comp_hover_pixel(egui::pos2(100.0, 50.0), rect, (200, 100)),
+            Some((0, 0))
+        );
+        // Just outside (left / above) → None.
+        assert_eq!(
+            comp_hover_pixel(egui::pos2(99.0, 100.0), rect, (200, 100)),
+            None
         );
         assert_eq!(
-            route_dropped_exrs(&p, true),
-            vec![(PathBuf::from("a.exr"), true)],
-            "right half loads as B"
+            comp_hover_pixel(egui::pos2(200.0, 49.0), rect, (200, 100)),
+            None
         );
-    }
-
-    #[test]
-    fn route_multi_drop_is_a_then_b_rest_ignored() {
-        let paths = vec![
-            PathBuf::from("a.exr"),
-            PathBuf::from("b.exr"),
-            PathBuf::from("c.exr"),
-        ];
-        // Position is ignored once there are 2+ files: first → A, second → B.
+        // Far edge (u or v == 1.0) is excluded → None.
         assert_eq!(
-            route_dropped_exrs(&paths, true),
-            vec![
-                (PathBuf::from("a.exr"), false),
-                (PathBuf::from("b.exr"), true),
-            ],
+            comp_hover_pixel(egui::pos2(300.0, 100.0), rect, (200, 100)),
+            None
+        );
+        // Zero-sized source → None.
+        assert_eq!(
+            comp_hover_pixel(egui::pos2(150.0, 75.0), rect, (0, 0)),
+            None
+        );
+        // Differing size maps by fraction (stretch-correct): a 50×25 top layer.
+        assert_eq!(
+            comp_hover_pixel(egui::pos2(200.0, 100.0), rect, (50, 25)),
+            Some((25, 12))
         );
     }
 
     #[test]
-    fn route_empty_drop_is_noop() {
-        assert!(route_dropped_exrs(&[], false).is_empty());
+    fn open_layer_adds_a_source_and_records_recent() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("layer.exr");
+        write_rgba_exr(&f);
+
+        // Prove the unified entry re-shows the panel even if it was toggled off.
+        let mut app = ExrApp {
+            show_layers_panel: false,
+            ..Default::default()
+        };
+        app.open_layer(f.clone());
+
+        assert_eq!(
+            app.comp_stack.len(),
+            1,
+            "the dropped/opened file became a layer"
+        );
+        assert_eq!(app.comp_sources.len(), 1, "one source backs the layer");
+        assert_eq!(
+            app.recent_files.first(),
+            Some(&f),
+            "the file is recorded as most-recent"
+        );
+        assert!(
+            app.show_layers_panel,
+            "opening a layer shows the Layers panel"
+        );
     }
 
     #[test]
-    fn cursor_targets_right_splits_on_window_center() {
-        // Window spanning screen-points x: 0..1000 (center 500).
-        let rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1000.0, 800.0));
-        assert!(!cursor_targets_right(egui::pos2(499.0, 10.0), rect));
-        assert!(cursor_targets_right(egui::pos2(501.0, 10.0), rect));
-        // Exactly at center counts as right (`>=`).
-        assert!(cursor_targets_right(egui::pos2(500.0, 10.0), rect));
-    }
+    fn add_comp_source_past_cap_reports_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("layer.exr");
+        write_rgba_exr(&f);
 
-    #[test]
-    fn cursor_targets_right_uses_window_screen_center_not_origin() {
-        // Off-origin window (e.g. dragged to the right of the primary monitor):
-        // screen-points x 400..1400, center 900. Proves we compare against the
-        // window's *screen-space* center, so multi-monitor / moved windows work.
-        let rect = egui::Rect::from_min_max(egui::pos2(400.0, 0.0), egui::pos2(1400.0, 800.0));
-        assert!(!cursor_targets_right(egui::pos2(850.0, 0.0), rect));
-        assert!(cursor_targets_right(egui::pos2(950.0, 0.0), rect));
-    }
+        let mut app = ExrApp::default();
+        for _ in 0..COMP_LAYER_CAP {
+            app.add_comp_source(f.clone());
+        }
+        assert_eq!(app.comp_stack.len(), COMP_LAYER_CAP);
+        assert!(app.error_msg.is_none(), "no error while filling to the cap");
 
-    #[test]
-    fn cursor_targets_right_handles_negative_origin_monitor() {
-        // Secondary monitor to the left of primary: screen-points x -1920..-920,
-        // center -1420. Cursor at -1500 is left of center -> A.
-        let rect = egui::Rect::from_min_max(egui::pos2(-1920.0, 0.0), egui::pos2(-920.0, 800.0));
-        assert!(!cursor_targets_right(egui::pos2(-1500.0, 0.0), rect));
-        assert!(cursor_targets_right(egui::pos2(-1000.0, 0.0), rect));
+        // One past the cap stays capped and reports it, rather than silently
+        // dropping the file (so a multi-file drop past the cap is visible).
+        app.add_comp_source(f.clone());
+        assert_eq!(app.comp_stack.len(), COMP_LAYER_CAP, "stays capped");
+        assert!(
+            app.error_msg
+                .as_deref()
+                .is_some_and(|m| m.contains("Layer limit")),
+            "over-cap add reports the cap"
+        );
     }
 
     // --- Sequence playback (#7, Phase 2) -------------------------------------
@@ -6695,62 +8283,6 @@ mod tests {
         std::fs::write(solo.path().join("only.0001.exr"), b"").unwrap();
         app.detect_sequence(&solo.path().join("only.0001.exr"));
         assert!(!app.playback.is_active());
-    }
-
-    /// #117: unloading slot A must release the app-owned T1 ring (the leak) and
-    /// tear down the decode pump, or the decoded frames stay resident and the
-    /// pump keeps re-issuing `LoadJob`s for the unloaded sequence (a late
-    /// epoch-guarded frame could even resurrect the image).
-    #[test]
-    fn unload_a_releases_the_frame_cache_and_stops_the_decode_pump() {
-        let dir = tempfile::tempdir().unwrap();
-        let f1 = dir.path().join("s.0001.exr");
-        let f2 = dir.path().join("s.0002.exr");
-        write_rgba_exr(&f1);
-        write_rgba_exr(&f2);
-
-        let mut app = ExrApp {
-            exr_data: Some(std::sync::Arc::new(ExrData::load(&f1).unwrap())),
-            loaded_file: Some(f1.clone()),
-            ..Default::default()
-        };
-        app.detect_sequence(&f1);
-        assert!(app.playback.is_active(), "sequence mode entered");
-
-        // Simulate a populated T1 ring + an in-flight decode + a stuck load flag.
-        // `frame_bytes` is captured on the first real decode; set it so the
-        // tracked-footprint accounting has a per-frame size to multiply by.
-        let frame = std::sync::Arc::new(ExrData::load(&f1).unwrap());
-        app.frame_bytes = Some(frame.approx_bytes());
-        app.frame_cache.insert(ExrApp::A_SOURCE, 1, frame);
-        app.inflight.insert(2);
-        app.loading_a = true;
-        let epoch_before = app.playback.epoch;
-        assert!(
-            app.tracked_image_bytes() > 0,
-            "footprint reflects the resident frame"
-        );
-
-        app.unload(false);
-
-        assert!(app.exr_data.is_none(), "image released");
-        assert_eq!(
-            app.tracked_image_bytes(),
-            0,
-            "tracked footprint drops to zero on unload"
-        );
-        assert!(app.frame_cache.is_empty(), "T1 ring freed — no leak");
-        assert!(app.inflight.is_empty(), "no in-flight decodes survive");
-        assert!(!app.playback.is_active(), "sequence torn down");
-        assert!(!app.loading_a, "loading flag cleared");
-        assert_ne!(
-            app.playback.epoch, epoch_before,
-            "epoch bumped so any late decode is dropped on arrival"
-        );
-
-        // The decode-ahead pump issues nothing for an unloaded sequence.
-        app.pump_decode();
-        assert!(app.inflight.is_empty(), "pump stays idle after unload");
     }
 
     #[test]
@@ -6835,7 +8367,6 @@ mod tests {
 
         // The decode fails: pending clears, nothing lands in T1.
         app.apply_load_result(LoadResult {
-            path: dir.path().join("s.0003.exr"),
             source: ExrApp::A_SOURCE,
             seq_frame: true,
             frame: 3,
@@ -6876,7 +8407,6 @@ mod tests {
         app.playback_step(1);
         let data2 = ExrData::load(&f2).unwrap();
         app.apply_load_result(LoadResult {
-            path: f2,
             source: ExrApp::A_SOURCE,
             seq_frame: true,
             frame: 2,
@@ -7187,7 +8717,6 @@ mod tests {
 
         // A stale result for frame 2 (a pre-seek decode) arrives late.
         app.apply_load_result(LoadResult {
-            path: dir.path().join("s.0002.exr"),
             source: ExrApp::A_SOURCE,
             seq_frame: true,
             frame: 2,
@@ -7213,7 +8742,6 @@ mod tests {
         // The live-epoch result then lands and clears the in-flight entry — proof
         // there was no permanent leak.
         app.apply_load_result(LoadResult {
-            path: dir.path().join("s.0002.exr"),
             source: ExrApp::A_SOURCE,
             seq_frame: true,
             frame: 2,
@@ -7246,7 +8774,7 @@ mod tests {
         app.load_rx = Some(orphan_rx);
 
         app.submit_job(LoadJob {
-            path: f1,
+            path: PathBuf::from("x.exr"),
             source: ExrApp::A_SOURCE,
             seq_frame: false,
             frame: 0,
@@ -7504,7 +9032,6 @@ mod tests {
         let full = ExrData::load(&f1).unwrap();
         assert!(!full.beauty_only);
         app.apply_load_result(LoadResult {
-            path: f1,
             source: ExrApp::A_SOURCE,
             seq_frame: true,
             frame: 1,
@@ -7657,10 +9184,6 @@ mod tests {
             PlayState::Playing,
             "Space starts playback when a sequence is loaded"
         );
-        assert!(
-            !app.viewer.blink_state,
-            "Space was consumed by playback, not the blink toggle"
-        );
     }
 
     // --- T1 ring cache + epoch (#56/#57, Phase 3) ----------------------------
@@ -7669,7 +9192,6 @@ mod tests {
     fn deliver_frame(app: &mut ExrApp, path: &std::path::Path, frame: u32) {
         let data = ExrData::load(path).unwrap();
         app.apply_load_result(LoadResult {
-            path: path.to_path_buf(),
             source: ExrApp::A_SOURCE,
             seq_frame: true,
             frame,
@@ -7729,7 +9251,6 @@ mod tests {
         // dropped (recurring paths break the path check; the epoch saves us).
         let data2 = ExrData::load(&f2).unwrap();
         app.apply_load_result(LoadResult {
-            path: f2,
             source: ExrApp::A_SOURCE,
             seq_frame: true,
             frame: 2,
@@ -8019,194 +9540,6 @@ mod tests {
         assert_eq!(
             app.playback.current_frame, 4,
             "follow jumps the playhead to the newest frame"
-        );
-    }
-
-    #[test]
-    fn sequence_advance_holds_the_b_reference() {
-        let (_dir, paths) = write_sequence(3);
-        let b_dir = tempfile::tempdir().unwrap();
-        let bpath = b_dir.path().join("ref.exr");
-        write_rgba_exr(&bpath);
-
-        let mut app = ExrApp::default();
-        app.detect_sequence(&paths[0]);
-        // Load a fixed B reference (A-plays / B-holds).
-        let bref = std::sync::Arc::new(ExrData::load(&bpath).unwrap());
-        app.exr_data_b = Some(bref.clone());
-        app.b_mut().loaded_file = Some(bpath.clone());
-
-        // Play A across frames; B must never be touched by the slot-A swaps.
-        app.playback_toggle();
-        app.advance_playhead();
-        deliver_frame(&mut app, &paths[1], 2);
-        app.advance_playhead();
-        deliver_frame(&mut app, &paths[2], 3);
-
-        assert_eq!(
-            app.playback.current_frame, 3,
-            "A advanced through the sequence"
-        );
-        assert!(
-            app.exr_data_b
-                .as_ref()
-                .is_some_and(|b| std::sync::Arc::ptr_eq(b, &bref)),
-            "B is held as the same Arc — playing A never swaps or clears it"
-        );
-        assert_eq!(
-            app.b().loaded_file.as_deref(),
-            Some(bpath.as_path()),
-            "B's loaded path is unchanged"
-        );
-    }
-
-    /// Deliver a decoded **slot-B** sequence frame (#98): the B `source` tags the
-    /// cache slot on a seq frame.
-    fn deliver_b_frame(app: &mut ExrApp, path: &std::path::Path, frame: u32) {
-        let data = ExrData::load(path).unwrap();
-        app.apply_load_result(LoadResult {
-            path: path.to_path_buf(),
-            source: ExrApp::B_SOURCE,
-            seq_frame: true,
-            frame,
-            epoch: app.playback.epoch,
-            open_gen: 0,
-            result: Ok(data),
-        });
-    }
-
-    /// Build a B sequence in its own dir and arm locked-step B on `app` as if the
-    /// user opened B's first frame while A is loaded (#98).
-    fn arm_b_sequence(app: &mut ExrApp, count: u32) -> (tempfile::TempDir, Vec<PathBuf>) {
-        let dir = tempfile::tempdir().unwrap();
-        let paths: Vec<PathBuf> = (1..=count)
-            .map(|n| {
-                let p = dir.path().join(format!("bref.{n:04}.exr"));
-                write_rgba_exr(&p);
-                p
-            })
-            .collect();
-        app.exr_data_b = Some(std::sync::Arc::new(ExrData::load(&paths[0]).unwrap()));
-        app.b_mut().loaded_file = Some(paths[0].clone());
-        app.detect_sequence_b(&paths[0]);
-        (dir, paths)
-    }
-
-    #[test]
-    fn sequence_b_advances_in_lockstep_with_a() {
-        let (_adir, a) = write_sequence(3);
-        let mut app = ExrApp::default();
-        app.detect_sequence(&a[0]);
-        app.frame_cache_cap = 8; // room for both slots' windows
-        let (_bdir, b) = arm_b_sequence(&mut app, 3);
-        assert!(app.b().sequence.is_some(), "B armed as a sequence");
-        assert_eq!(app.b().current_frame, 1, "B starts on its opened frame");
-        let b1 = app.exr_data_b.clone().unwrap();
-
-        // Play A one frame; B is a slaved, position-aligned function of A.
-        app.playback_toggle();
-        app.advance_playhead();
-        assert_eq!(app.playback.current_frame, 2, "A advanced");
-        assert_eq!(app.b().current_frame, 2, "B tracks A");
-
-        // One worker, one decode at a time: A's playhead lands first and frees the
-        // worker, then B's frame is pumped and delivered.
-        deliver_frame(&mut app, &a[1], 2);
-        deliver_b_frame(&mut app, &b[1], 2);
-        assert!(
-            app.frame_cache.contains(ExrApp::B_SOURCE, 2),
-            "B frame decoded into the B source"
-        );
-        assert!(
-            app.frame_cache.contains(ExrApp::A_SOURCE, 2),
-            "A frame still in the A source (B didn't clobber it)"
-        );
-        assert!(
-            app.exr_data_b
-                .as_ref()
-                .is_some_and(|d| !std::sync::Arc::ptr_eq(d, &b1)),
-            "B display swapped off its opened frame"
-        );
-    }
-
-    #[test]
-    fn apply_load_result_routes_seq_frame_by_source() {
-        let (_adir, a) = write_sequence(2);
-        let mut app = ExrApp::default();
-        app.detect_sequence(&a[0]);
-        app.frame_cache_cap = 8;
-        let (_bdir, b) = arm_b_sequence(&mut app, 2);
-        // A B seq frame (B `source`) is filed under B_SOURCE, never A_SOURCE.
-        deliver_b_frame(&mut app, &b[1], 2);
-        assert!(
-            app.frame_cache.contains(ExrApp::B_SOURCE, 2),
-            "B seq frame routed to the B source"
-        );
-        assert!(
-            !app.frame_cache.contains(ExrApp::A_SOURCE, 2),
-            "not misfiled into the A source"
-        );
-    }
-
-    #[test]
-    fn b_move_to_hole_clears_loading_b_so_pump_is_not_gated() {
-        // #98 regression (Copilot): B is slaved to A, so it can move to a new frame
-        // — or a hole — while a previous B decode is still awaited. If `b.loading`
-        // isn't reset on the move, its stale-frame decode never matches
-        // `b.current_frame`, `b.loading` latches true, and `pump_decode` is gated
-        // forever → playback freeze.
-        let (_adir, a) = write_sequence(4);
-        let mut app = ExrApp::default();
-        app.detect_sequence(&a[0]);
-        app.frame_cache_cap = 8;
-
-        // A B sequence with a hole at frame 3 (files 1, 2, 4).
-        let bdir = tempfile::tempdir().unwrap();
-        for n in [1u32, 2, 4] {
-            write_rgba_exr(&bdir.path().join(format!("bref.{n:04}.exr")));
-        }
-        let b1 = bdir.path().join("bref.0001.exr");
-        app.exr_data_b = Some(std::sync::Arc::new(ExrData::load(&b1).unwrap()));
-        app.b_mut().loaded_file = Some(b1.clone());
-        app.detect_sequence_b(&b1);
-        assert!(
-            app.b()
-                .sequence
-                .as_ref()
-                .is_some_and(|s| s.holes.contains(&3)),
-            "B has a hole at 3"
-        );
-
-        // Simulate B awaiting a frame (a decode in flight), then move B onto the
-        // hole — as a locked-step advance would.
-        app.b_mut().loading = true;
-        app.b_mut().pending = Some(2);
-        app.request_b_frame(3);
-        assert!(
-            !app.b().loading,
-            "hole clears loading_b (pump stays ungated)"
-        );
-        assert_eq!(app.b().pending, None, "no B frame awaited on a hole");
-    }
-
-    #[test]
-    fn opening_a_new_a_drops_locked_step_b() {
-        let (_adir, a) = write_sequence(2);
-        let mut app = ExrApp::default();
-        app.detect_sequence(&a[0]);
-        let (_bdir, _b) = arm_b_sequence(&mut app, 2);
-        assert!(app.b().sequence.is_some());
-        // Opening a different A resets the session — B (a lone reference on its
-        // own) goes with it.
-        let (_a2dir, a2) = write_sequence(2);
-        app.detect_sequence(&a2[0]);
-        assert!(
-            app.b().sequence.is_none(),
-            "locked-step B dropped with the A open"
-        );
-        assert!(
-            !app.frame_cache.contains(ExrApp::B_SOURCE, 1),
-            "B source cleared"
         );
     }
 }

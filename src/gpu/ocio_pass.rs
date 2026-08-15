@@ -331,6 +331,12 @@ pub struct OcioTargets {
     /// an accumulate draw can read the prior accumulation. `[0]`=`scene_view`,
     /// `[1]`=`scene_view_b`.
     accum_tex_bg: [wgpu::BindGroup; 2],
+    /// Cached scene-input bind group for the OCIO-off display-encode pass (R2), over
+    /// `bind_group_layout_tex` (scene view + sampler) — the OCIO-off twin of
+    /// `scene_bind_group`. Built eagerly in `new` (its layout + sampler are known there,
+    /// unlike the OCIO pass's), rebuilt only on resize. Avoids a per-dirty-frame
+    /// `create_bind_group`.
+    display_encode_scene_bg: wgpu::BindGroup,
     /// `render_sig` of the content currently in `display_view`; lets `prepare` skip the
     /// two passes when nothing changed. `None` after (re)creation forces a first render.
     last_render_sig: Option<u64>,
@@ -460,6 +466,22 @@ impl OcioTargets {
                 ],
             })
         });
+        // OCIO-off display-encode scene input, cached like `accum_tex_bg` (same
+        // `tex_layout` + `tex_sampler` = `bind_group_layout_tex` + `gpu.sampler`).
+        let display_encode_scene_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("display-encode scene input (cached)"),
+            layout: tex_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&scene_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(tex_sampler),
+                },
+            ],
+        });
         let blit_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("OCIO blit uniform buffer"),
             size: std::mem::size_of::<crate::gpu::BlitUniforms>() as u64,
@@ -498,6 +520,7 @@ impl OcioTargets {
             scene_view,
             scene_view_b,
             accum_tex_bg,
+            display_encode_scene_bg,
             display_view,
             blit_bind_group,
             blit_uniform_buffer,
@@ -534,6 +557,20 @@ pub struct OcioCallback {
     /// the prior accumulation as `tex_b`) instead of the single-pass loop. Set for the
     /// `Composite` arrangement; false for single / wipe / side-by-side.
     pub accumulate: bool,
+    /// OCIO-off (#99 render-unify R2): run the config-independent display-encode
+    /// pass (scene-linear → sRGB, `GpuState::display_encode_pipeline`) in pass 2's
+    /// slot instead of the OCIO transform, so the layer-stack composite renders
+    /// with OCIO disabled. When false this is the normal OCIO display path.
+    pub use_display_encode: bool,
+    /// Independent placed draws folded into `scene_view` *after* pass 1, each with
+    /// `LoadOp::Load` so they keep whatever the accumulate left behind (#99 Slice 2a).
+    /// Comp Side-by-Side uses this for the current-layer pane: side A accumulates into
+    /// its own sub-rect, then side B — a single layer, so it needs no ping-pong — is
+    /// laid into the disjoint sub-rect beside it. `pipeline_linear` is `blend: None`
+    /// with `ColorWrites::ALL`, so each overwrites colour *and* alpha only where its
+    /// quad covers, leaving the α=−1 no-image sentinel everywhere else. Pass 2 and the
+    /// blit then run once over the combined scene, unchanged.
+    pub overlay_draws: Vec<OcioPass1Draw>,
     pub display_format: wgpu::TextureFormat,
     pub blit_uniforms: crate::gpu::BlitUniforms,
     /// Visible image bounds in egui points (xmin, ymin, xmax, ymax). The OCIO transform is
@@ -604,21 +641,24 @@ impl eframe::egui_wgpu::CallbackTrait for OcioCallback {
             );
         }
 
-        // The OCIO pass may not exist yet (config not loaded); nothing to do then.
-        if callback_resources.get::<OcioGpuPass>().is_none() {
+        // OCIO pass 2 needs the OCIO display transform; if the config isn't loaded
+        // there's nothing to do — UNLESS we're rendering the OCIO-off composite
+        // (R2), whose display stage is the config-independent display-encode pass.
+        if !self.use_display_encode && callback_resources.get::<OcioGpuPass>().is_none() {
             return Vec::new();
         }
 
-        // If OcioTargets was just (re)created, initialize the cached scene
-        // bind group now that we know OcioGpuPass exists. This avoids
-        // recreating it every dirty frame in `render`.
+        // If OcioTargets was just (re)created, initialize the cached scene bind
+        // group for OCIO pass 2 now that we know OcioGpuPass exists. Skipped on the
+        // display-encode path, which builds its own scene input (a different layout).
         //
         // Clone the layout + sampler out of `OcioGpuPass` first (wgpu types are
         // cheaply `Arc`-backed) so we don't hold an immutable borrow of
         // `callback_resources` while taking a mutable one for `OcioTargets`.
-        let scene_bg_missing = callback_resources
-            .get::<OcioTargets>()
-            .is_some_and(|t| t.scene_bind_group.is_none());
+        let scene_bg_missing = !self.use_display_encode
+            && callback_resources
+                .get::<OcioTargets>()
+                .is_some_and(|t| t.scene_bind_group.is_none());
         if scene_bg_missing {
             let (layout, sampler) = {
                 let Some(ocio) = callback_resources.get::<OcioGpuPass>() else {
@@ -642,15 +682,17 @@ impl eframe::egui_wgpu::CallbackTrait for OcioCallback {
         }
 
         let cmd = {
-            let (Some(gpu), Some(ocio), Some(targets)) = (
+            let (Some(gpu), Some(targets)) = (
                 callback_resources
                     .get::<std::sync::Arc<GpuState>>()
                     .map(std::sync::Arc::as_ref),
-                callback_resources.get::<OcioGpuPass>(),
                 callback_resources.get::<OcioTargets>(),
             ) else {
                 return Vec::new();
             };
+            // Pass 2 is the OCIO transform when OCIO is active; on the display-encode
+            // path (R2) it's absent and `gpu.display_encode_pipeline` is used instead.
+            let ocio = callback_resources.get::<OcioGpuPass>();
 
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("OCIO"),
@@ -740,6 +782,40 @@ impl eframe::egui_wgpu::CallbackTrait for OcioCallback {
                 }
             }
 
+            // Pass 1b (comp Side-by-Side, #99 Slice 2a): lay independent draws into the
+            // scene alongside the accumulate result. `LoadOp::Load` keeps pass 1's output
+            // (the parity `start=(N-1)%2` guarantees it landed in `scene_view`), and each
+            // draw's vertex stage maps only its own rect, so a disjoint pane overwrites
+            // just its own pixels. One pass suffices: these draws are independent of each
+            // other and never sample the scene.
+            if !self.overlay_draws.is_empty() {
+                let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("OCIO pass 1b (placed overlay)"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &targets.scene_view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                rp.set_viewport(0.0, 0.0, w as f32, h as f32, 0.0, 1.0);
+                rp.set_pipeline(&gpu.pipeline_linear);
+                for d in &self.overlay_draws {
+                    rp.set_bind_group(0, d.bg_a.as_ref(), &[]);
+                    rp.set_bind_group(1, d.bg_b.as_ref(), &[]);
+                    rp.set_bind_group(2, &gpu.uniform_bind_group, &[d.uniform_offset]);
+                    rp.set_bind_group(3, d.lut_bg.as_ref(), &[]);
+                    rp.draw(0..6, 0..1);
+                }
+            }
+
             // Pass 2: OCIO display transform, scissored to the visible image region (points ->
             // px, clamped to the target) so the expensive shader skips the empty background.
             let ppp = screen_descriptor.pixels_per_point;
@@ -753,15 +829,47 @@ impl eframe::egui_wgpu::CallbackTrait for OcioCallback {
                     [cx, cy, cw, ch]
                 })
                 .filter(|[_, _, sw, sh]| *sw > 0 && *sh > 0);
-            ocio.render(
-                &mut encoder,
-                &targets.display_view,
-                targets
-                    .scene_bind_group
-                    .as_ref()
-                    .expect("scene_bind_group initialized in prepare()"),
-                scissor,
-            );
+            if self.use_display_encode {
+                // OCIO-off (R2): sRGB-encode the scene-linear accumulate into the
+                // display target with the config-independent display-encode pipeline,
+                // then the blit garnishes it exactly like the OCIO path. The scene-input
+                // bind group is cached on `OcioTargets` (built once in `new`).
+                let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("display-encode (OCIO-off)"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &targets.display_view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                if let Some([x, y, sw, sh]) = scissor {
+                    rp.set_scissor_rect(x, y, sw, sh);
+                }
+                rp.set_pipeline(&gpu.display_encode_pipeline);
+                rp.set_bind_group(0, &targets.display_encode_scene_bg, &[]);
+                rp.draw(0..3, 0..1);
+            } else {
+                let Some(ocio) = ocio else {
+                    return Vec::new();
+                };
+                ocio.render(
+                    &mut encoder,
+                    &targets.display_view,
+                    targets
+                        .scene_bind_group
+                        .as_ref()
+                        .expect("scene_bind_group initialized in prepare()"),
+                    scissor,
+                );
+            }
 
             encoder.finish()
         };
@@ -2019,5 +2127,151 @@ mod metal_tests {
                 }
             }
         }
+    }
+
+    // R1 (#99 render-unify): the OCIO-off display-encode pipeline turns a
+    // scene-linear value into its sRGB-encoded display value on-device (validating
+    // the WGSL compiles + the OETF is correct). Renders a known linear grey through
+    // `GpuState::display_encode_pipeline` and reads the 8-bit result back:
+    // sRGB(0.5 linear) ≈ 0.7353 → 187/255; alpha carries through.
+    #[test]
+    fn display_encode_srgb_on_device() {
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let adapter = match pollster::block_on(
+            instance.request_adapter(&wgpu::RequestAdapterOptions::default()),
+        ) {
+            Ok(a) => a,
+            Err(_) => {
+                eprintln!("no GPU adapter available; skipping display-encode test");
+                return;
+            }
+        };
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("display-encode-test-device"),
+            required_features: wgpu::Features::FLOAT32_FILTERABLE,
+            ..Default::default()
+        }))
+        .expect("request_device");
+        let gpu = GpuState::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
+
+        let extent = wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        };
+
+        // Scene-linear source: a 1×1 Rgba32Float pixel at linear 0.5, alpha 1.
+        let scene = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("scene-lin"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let lin = [0.5f32, 0.5, 0.5, 1.0];
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &scene,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::bytes_of(&lin),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(16),
+                rows_per_image: Some(1),
+            },
+            extent,
+        );
+        let scene_view = scene.create_view(&wgpu::TextureViewDescriptor::default());
+        let scene_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("scene-bg"),
+            layout: &gpu.bind_group_layout_tex,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&scene_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&gpu.sampler),
+                },
+            ],
+        });
+
+        // Rgba8Unorm target (matches the `GpuState` target format above).
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("de-target"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("display-encode"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            rp.set_pipeline(&gpu.display_encode_pipeline);
+            rp.set_bind_group(0, &scene_bg, &[]);
+            rp.draw(0..3, 0..1);
+        }
+        let rb = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rb"),
+            size: 256,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &rb,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(256),
+                    rows_per_image: Some(1),
+                },
+            },
+            extent,
+        );
+        queue.submit([encoder.finish()]);
+        rb.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let data = rb.slice(..).get_mapped_range();
+        let got = data[0];
+        assert!(
+            (i32::from(got) - 187).abs() <= 2,
+            "sRGB-encoded 0.5 linear should be ~187/255, got {got}"
+        );
+        assert_eq!(data[3], 255, "alpha carried through");
     }
 }

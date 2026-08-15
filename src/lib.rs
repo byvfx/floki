@@ -33,13 +33,11 @@ mod pixels;
 // Read-ahead file warmer (#164) — overlaps the next frame's file read with the
 // current decode via the OS page cache.
 mod prefetch;
-mod proxy;
 // Persistent on-disk proxy cache (#165) — amortizes the first-touch decode of a
 // scrub proxy across passes/sessions (`~/.floki/proxy-cache`).
 mod proxy_cache;
 mod render_math;
 // Resolves the A/B viewer state into a render program via the layer model (#114).
-mod render_program;
 mod resource_monitor;
 // Pure decode want-list scheduler (#57), driving the decode-ahead pump.
 mod scheduler;

@@ -158,6 +158,11 @@ pub struct GpuState {
     pub blit_pipeline: wgpu::RenderPipeline,
     pub blit_layout: wgpu::BindGroupLayout,
     pub blit_sampler: wgpu::Sampler,
+    /// OCIO-off display encode (#99 render-unify): scene-linear accumulate → sRGB
+    /// display. Input `bind_group_layout_tex` (scene view + sampler), output
+    /// `target_format`. Slots in where OCIO pass 2 goes so the N-layer composite
+    /// renders without OCIO (see [`DISPLAY_ENCODE_SHADER`]).
+    pub display_encode_pipeline: wgpu::RenderPipeline,
 }
 
 const BLIT_SHADER: &str = r#"
@@ -275,6 +280,43 @@ fn fs_main(i: VOut) -> @location(0) vec4<f32> {
     ) / 255.0;
 
     return vec4<f32>(rgb, 1.0);
+}
+"#;
+
+/// Display-encode pass (#99 render-unify): the **OCIO-off** twin of OCIO pass 2.
+/// Samples the scene-linear accumulate and applies the default display encode
+/// (linear → sRGB), so the N-layer composite can render with OCIO *off* — the
+/// existing OCIO blit then garnishes the result (background / user-gamma / dither)
+/// identically to the OCIO path. Exposure is already baked into the accumulate's
+/// top layer (PR-A.4); user gamma is the blit's job. Input is `bind_group_layout_tex`
+/// (texture + sampler); output matches the display target (`target_format`).
+const DISPLAY_ENCODE_SHADER: &str = r#"
+struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VOut {
+    var c = array<vec2<f32>, 3>(vec2<f32>(-1.0,-1.0), vec2<f32>(3.0,-1.0), vec2<f32>(-1.0,3.0));
+    let xy = c[vi];
+    var o: VOut;
+    o.pos = vec4<f32>(xy, 0.0, 1.0);
+    o.uv = vec2<f32>((xy.x + 1.0) * 0.5, 1.0 - (xy.y + 1.0) * 0.5);
+    return o;
+}
+@group(0) @binding(0) var scene_t: texture_2d<f32>;
+@group(0) @binding(1) var scene_s: sampler;
+fn lin_to_srgb(l: f32) -> f32 {
+    if l <= 0.0031308 { return l * 12.92; }
+    return 1.055 * pow(l, 1.0 / 2.4) - 0.055;
+}
+@fragment
+fn fs_main(i: VOut) -> @location(0) vec4<f32> {
+    let c = textureSample(scene_t, scene_s, i.uv);
+    // Carry alpha through unchanged (incl. the <0 "no image" sentinel the blit uses).
+    let rgb = vec3<f32>(
+        lin_to_srgb(max(c.r, 0.0)),
+        lin_to_srgb(max(c.g, 0.0)),
+        lin_to_srgb(max(c.b, 0.0)),
+    );
+    return vec4<f32>(rgb, c.a);
 }
 "#;
 
@@ -809,6 +851,45 @@ impl GpuState {
             (blit_pipeline, blit_layout, blit_sampler)
         };
 
+        // OCIO-off display encode (#99 render-unify): scene-linear → sRGB, output
+        // to the display target. Reuses `bind_group_layout_tex` for its scene input.
+        let display_encode_pipeline = {
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Display Encode Shader"),
+                source: wgpu::ShaderSource::Wgsl(DISPLAY_ENCODE_SHADER.into()),
+            });
+            let de_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Display Encode Layout"),
+                bind_group_layouts: &[Some(&bind_group_layout_tex)],
+                immediate_size: 0,
+            });
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Display Encode Pipeline"),
+                layout: Some(&de_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: target_format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+
         Self {
             pipeline,
             thumbnail_pipeline,
@@ -828,6 +909,7 @@ impl GpuState {
             blit_pipeline,
             blit_layout,
             blit_sampler,
+            display_encode_pipeline,
         }
     }
 

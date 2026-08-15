@@ -1,6 +1,10 @@
 # floki as a Review Player — Chaos Player parity roadmap
 
-> **Status:** planning. Tracking epic: [#99](https://github.com/byvfx/floki/issues/99).
+> **Status:** in progress. Tracking epic: [#99](https://github.com/byvfx/floki/issues/99).
+> The compositing layer-stack unification is underway on `feat/layer-stack-play` (PR #190):
+> Phase 1 (SourceId backend) + Phase 2 (playable comp layers) + the render-foundation R-series
+> (standalone comp render, timeline tracks, base plate in the stack) have landed. **Live
+> progress + the R4 resume point live in [`unification-plan.md`](./unification-plan.md).**
 > **Decision (2026-06-22):** build the core review features **in egui first**; the Qt
 > port ([#44](https://github.com/byvfx/floki/issues/44)) is deferred until this scope
 > ships. Porting onto a moving architecture means re-porting it.

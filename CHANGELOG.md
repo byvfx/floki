@@ -5,6 +5,41 @@ All notable changes to Floki are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+The layer-stack wave (#99). Floki's viewer was built around two hardcoded image
+slots, A and B. It is now built around one **layer stack**: you add as many layers
+as you like, they composite, they play together on a shared timeline, and the
+compare modes became arrangements of that stack rather than a separate system.
+
+### Added
+- **N-layer compositing.** Open or drop any number of EXRs and they stack as
+  layers, composited on the GPU. Each layer has its own blend mode, opacity,
+  visibility, solo, and AOV/pass selection.
+- **A timeline with layer tracks.** The bottom panel shows each layer as a clip bar
+  on a shared frame ruler, with its own cache-fill strip. Drag a bar to retime that
+  layer against the others.
+- **Layers play.** Every sequence layer decodes and advances on the shared
+  transport, so a multi-layer comp scrubs and plays as one.
+- **Blink compare.** A new arrangement that alternates the two compared layers in
+  place on a timer, with an adjustable speed.
+- **The layer stack persists.** Your layers — paths, order, blend, opacity, solo,
+  AOV, and time offset — come back when you relaunch. A layer whose file has moved
+  is skipped without disturbing the rest.
+- **Contact Sheet button and `T` hotkey.** The sheet now shows the *current
+  layer's* passes as a grid; clicking one switches that layer to it.
+
+### Changed
+- **Open and drop add a layer** rather than filling slot A or B. The A/B reference
+  slot, its menu items, and the "Drop for A / Drop for B" split are gone.
+- **Compare modes are arrangements over the stack.** Side-by-Side, Wipe, Diff and
+  Blink now compare the **current layer** (the `Layer:` picker) against a layer you
+  choose (the `vs:` picker), instead of a fixed A-versus-B. Their parameters live in
+  the viewport bar beside the mode selector.
+- **The viewport controls moved into the comp bar** — exposure, gamma, sRGB,
+  channel isolation, pass selection, the sample aperture, and the anamorphic
+  unsqueeze/PAR override.
+
 ## [1.11.0] - 2026-07-14
 
 ### Added
