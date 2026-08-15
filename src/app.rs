@@ -3752,6 +3752,12 @@ impl eframe::App for ExrApp {
         self.draw_help_window(ui.ctx());
         self.draw_tools_window(ui.ctx());
         self.draw_color_management_window(ui.ctx());
+        // Viewer-owned windows, driven from here rather than from `ExrViewer::ui`
+        // (#99 Slice 3b): `ui` has been unreachable since the R4 collapse, which left
+        // View ▸ "Viewport Background…" setting a flag whose window nothing drew. Both
+        // early-return unless their flag is set.
+        self.viewer.background_window(ui.ctx());
+        self.viewer.gradient_editor_window(ui.ctx());
         self.draw_playback_debug(ui.ctx());
         self.draw_playback_hud(ui.ctx());
         self.draw_menu_bar(ui);

@@ -1724,8 +1724,9 @@ impl ExrViewer {
     /// Modal-ish gradient editor (a floating [`egui::Window`]). Lets the user
     /// add/remove/move/recolor stops on a working copy and either apply it as the
     /// active diff colormap or save it as a named preset in `custom_gradients`.
-    /// Rendered once per frame from [`Self::ui`] when `gradient_editor_open`.
-    fn gradient_editor_window(&mut self, ctx: &egui::Context) {
+    /// Rendered once per frame by [`crate::app::ExrApp`] when `gradient_editor_open`
+    /// (#99 Slice 3b — it used to hang off [`Self::ui`], which is unreachable now).
+    pub(crate) fn gradient_editor_window(&mut self, ctx: &egui::Context) {
         if !self.gradient_editor_open {
             return;
         }
@@ -1846,9 +1847,11 @@ impl ExrViewer {
 
     /// The viewport-background settings window (issue #18): mode selector, the
     /// per-mode colour/size/gradient controls, and a named-preset library. Mutates
-    /// `self.prefs.background` live; rendered once per frame from [`Self::ui`] when
-    /// `show_background_window`. Colours are linear (see `background` module docs).
-    fn background_window(&mut self, ctx: &egui::Context) {
+    /// `self.prefs.background` live; rendered once per frame by
+    /// [`crate::app::ExrApp`] when `show_background_window` (#99 Slice 3b — it used to
+    /// hang off [`Self::ui`], leaving the View-menu item a dead click once the R4
+    /// collapse made `ui` unreachable). Colours are linear (see `background` docs).
+    pub(crate) fn background_window(&mut self, ctx: &egui::Context) {
         if !self.show_background_window {
             return;
         }
@@ -2699,8 +2702,8 @@ impl ExrViewer {
                 self.annotation_toolbar(ui);
             }
         });
-        self.gradient_editor_window(ui.ctx());
-        self.background_window(ui.ctx());
+        // The gradient-editor + background windows are drawn by `ExrApp` now
+        // (#99 Slice 3b), so they stay reachable when this `ui` doesn't run.
 
         let layer_count_b = exr_data_b.map(|d| d.logical_layers.len()).unwrap_or(0);
         self.sync_texture_caches(layer_count, layer_count_b);
