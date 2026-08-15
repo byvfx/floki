@@ -1320,7 +1320,7 @@ impl ExrViewer {
     /// one place that holds the renderer. Runs every frame from [`Self::ui`]
     /// (and again inside the contact sheet after its own invalidations). With
     /// no GPU nothing was ever registered — just clear the queue.
-    fn drain_thumb_frees(&mut self, gpu_resources: Option<&crate::gpu::GpuResources>) {
+    pub(crate) fn drain_thumb_frees(&mut self, gpu_resources: Option<&crate::gpu::GpuResources>) {
         if self.pending_thumb_frees.is_empty() {
             return;
         }
@@ -2342,7 +2342,7 @@ impl ExrViewer {
     /// (`ocio_render_gen`, bumped by the app's `rebuild_ocio_pass`). A no-op while
     /// the signature is unchanged. Replaces the old `ocio_cpu` Rc-pointer identity
     /// trick now that the CPU OCIO processor is gone (#59).
-    fn invalidate_thumbnails_on_ocio_change(&mut self) {
+    pub(crate) fn invalidate_thumbnails_on_ocio_change(&mut self) {
         // 0 is the OCIO-off sentinel; when active, mix the generation through an
         // odd multiplier (a bijection on u64, so distinct generations stay
         // distinct). The generation is >= 1 whenever OCIO is active (set by
@@ -2391,7 +2391,7 @@ impl ExrViewer {
     /// layer counts, clearing them (forcing regeneration) whenever a count
     /// changes. `thumbnails` length is the sentinel (it tracks the layer count for
     /// both the CPU and GPU thumbnail caches).
-    fn sync_texture_caches(&mut self, layer_count: usize, layer_count_b: usize) {
+    pub(crate) fn sync_texture_caches(&mut self, layer_count: usize, layer_count_b: usize) {
         if self.thumbnails.len() != layer_count {
             self.thumbnails.clear();
             self.thumbnails.resize(layer_count, None);
@@ -2416,17 +2416,25 @@ impl ExrViewer {
         }
     }
 
-    /// Render the contact sheet: a scrollable grid of per-layer thumbnails for A
-    /// (and B alongside, in the side-by-side / wipe / diff modes). Clicking a
-    /// thumbnail selects that layer and leaves the sheet.
-    fn draw_contact_sheet(
+    /// Render the contact sheet: a scrollable grid of per-layer (AOV) thumbnails for
+    /// one source. Returns the clicked layer index, and closes the sheet — the caller
+    /// decides what "select this layer" means (the comp path points the current comp
+    /// layer's `aov` at it).
+    ///
+    /// One source, not two (#99 Slice 3e): the sheet used to fork on `CompareMode` to
+    /// draw an A/B two-column variant, but that was purely presentational and the A/B
+    /// path is gone. It needs **no viewport** — just the decoded image, a tone
+    /// snapshot, and the thumbnail caches — so it works the same from either caller.
+    ///
+    /// The caller **must** have sized the caches via [`Self::sync_texture_caches`]:
+    /// the per-cell indexing below is unguarded.
+    pub(crate) fn draw_contact_sheet(
         &mut self,
         ui: &mut egui::Ui,
         exr_data: &ExrData,
-        exr_data_b: Option<&ExrData>,
         gpu_resources: Option<&crate::gpu::GpuResources>,
         lut_bg_opt: Option<&std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>>,
-    ) {
+    ) -> Option<usize> {
         // The GPU thumbnail path applies whenever a GPU is present — non-OCIO via
         // the display shader ([`generate`], Phase 1), OCIO via the two-pass
         // [`generate_ocio`] (Phase 2). Under OCIO it requires the `Rgba8Unorm`
@@ -2472,13 +2480,14 @@ impl ExrViewer {
             background: self.prefs.background.clone(),
         };
 
+        let mut clicked: Option<usize> = None;
         let draw_sheet = |viewer: &mut Self,
                           ui: &mut egui::Ui,
                           data: &crate::exr_loader::ExrData,
-                          is_a: bool| {
+                          clicked: &mut Option<usize>| {
             let l_count = data.logical_layers.len();
             egui::ScrollArea::vertical()
-                .id_salt(if is_a { "sheet_a" } else { "sheet_b" })
+                .id_salt("sheet_a")
                 .show(ui, |ui| {
                     // Cap the thumbnails baked per side per frame so a burst
                     // (settle refresh, tone/OCIO/background wipe, first open)
@@ -2537,12 +2546,7 @@ impl ExrViewer {
                             let image: Option<egui::Image<'_>> = if use_gpu {
                                 let gpu = gpu_resources.expect("use_gpu implies gpu_resources");
                                 let ocio_active = viewer.ocio_active;
-                                let missing = if is_a {
-                                    viewer.gpu_thumbnails[i].is_none()
-                                } else {
-                                    viewer.gpu_thumbnails_b[i].is_none()
-                                };
-                                if missing && visible {
+                                if viewer.gpu_thumbnails[i].is_none() && visible {
                                     if bake_budget > 0 {
                                         let baked = if ocio_active {
                                             crate::gpu::thumbnail::generate_ocio(
@@ -2554,11 +2558,7 @@ impl ExrViewer {
                                             )
                                         };
                                         let ok = baked.is_some();
-                                        if is_a {
-                                            viewer.gpu_thumbnails[i] = baked;
-                                        } else {
-                                            viewer.gpu_thumbnails_b[i] = baked;
-                                        }
+                                        viewer.gpu_thumbnails[i] = baked;
                                         if ok {
                                             bake_budget -= 1;
                                             viewer.dbg_thumb_bakes += 1;
@@ -2567,21 +2567,11 @@ impl ExrViewer {
                                         needs_more = true;
                                     }
                                 }
-                                let slot = if is_a {
-                                    viewer.gpu_thumbnails[i].as_ref()
-                                } else {
-                                    viewer.gpu_thumbnails_b[i].as_ref()
-                                };
-                                slot.map(|(id, _, size)| {
+                                viewer.gpu_thumbnails[i].as_ref().map(|(id, _, size)| {
                                     egui::Image::new(egui::load::SizedTexture::new(*id, *size))
                                 })
                             } else {
-                                let missing = if is_a {
-                                    viewer.thumbnails[i].is_none()
-                                } else {
-                                    viewer.thumbnails_b[i].is_none()
-                                };
-                                if missing && visible {
+                                if viewer.thumbnails[i].is_none() && visible {
                                     if bake_budget > 0 {
                                         let baked = viewer.generate_texture(
                                             ui.ctx(),
@@ -2590,11 +2580,7 @@ impl ExrViewer {
                                             Some(THUMB_BOX),
                                         );
                                         let ok = baked.is_some();
-                                        if is_a {
-                                            viewer.thumbnails[i] = baked;
-                                        } else {
-                                            viewer.thumbnails_b[i] = baked;
-                                        }
+                                        viewer.thumbnails[i] = baked;
                                         if ok {
                                             bake_budget -= 1;
                                             viewer.dbg_thumb_bakes += 1;
@@ -2603,12 +2589,7 @@ impl ExrViewer {
                                         needs_more = true;
                                     }
                                 }
-                                let tex = if is_a {
-                                    viewer.thumbnails[i].as_ref()
-                                } else {
-                                    viewer.thumbnails_b[i].as_ref()
-                                };
-                                tex.map(egui::Image::new)
+                                viewer.thumbnails[i].as_ref().map(egui::Image::new)
                             };
 
                             let name = data
@@ -2644,14 +2625,12 @@ impl ExrViewer {
                             );
 
                             if response.clicked() {
+                                // Report the pick and close; the caller decides what
+                                // selecting a layer means for its model.
+                                *clicked = Some(i);
                                 viewer.active_layer = i;
                                 viewer.show_contact_sheet = false;
                                 viewer.first_frame = true;
-                                if !is_a {
-                                    viewer.compare_mode = CompareMode::SingleB;
-                                } else if viewer.compare_mode == CompareMode::SingleB {
-                                    viewer.compare_mode = CompareMode::SingleA;
-                                }
                             }
                             if response.hovered() {
                                 response
@@ -2668,28 +2647,8 @@ impl ExrViewer {
                 });
         };
 
-        if let CompareMode::SideBySide | CompareMode::Wipe | CompareMode::DiffMatte =
-            self.compare_mode
-        {
-            if let Some(exr_b) = exr_data_b {
-                ui.columns(2, |cols| {
-                    cols[0].heading("Image A");
-                    draw_sheet(self, &mut cols[0], exr_data, true);
-                    cols[1].heading("Image B");
-                    draw_sheet(self, &mut cols[1], exr_b, false);
-                });
-            } else {
-                draw_sheet(self, ui, exr_data, true);
-            }
-        } else if self.compare_mode == CompareMode::SingleB {
-            if let Some(exr_b) = exr_data_b {
-                draw_sheet(self, ui, exr_b, false);
-            } else {
-                ui.label("Image B not loaded.");
-            }
-        } else {
-            draw_sheet(self, ui, exr_data, true);
-        }
+        draw_sheet(self, ui, exr_data, &mut clicked);
+        clicked
     }
 
     pub fn ui(
@@ -2727,7 +2686,7 @@ impl ExrViewer {
         self.sync_texture_caches(layer_count, layer_count_b);
 
         if self.show_contact_sheet {
-            self.draw_contact_sheet(ui, exr_data, exr_data_b, gpu_resources, lut_bg_opt.as_ref());
+            self.draw_contact_sheet(ui, exr_data, gpu_resources, lut_bg_opt.as_ref());
         } else {
             // Channel/frame hotkeys are handled up-front in `handle_hotkeys`.
             let (tw, th) = exr_data.logical_size(self.active_layer).unwrap_or((1, 1));

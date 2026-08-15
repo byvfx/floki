@@ -7346,6 +7346,78 @@ impl ExrApp {
         self.viewer.last_sampled_val_b = None;
     }
 
+    /// Draw the Contact Sheet for the **current comp layer's** source (#99 Slice 3e):
+    /// a grid of that source's AOVs/passes, where clicking one points the layer's
+    /// `aov` at it — the comp analogue of the classic sheet's "select this layer".
+    /// Returns `false` when there is nothing to show, so the caller falls through to
+    /// the composite rather than rendering a blank viewport.
+    ///
+    /// Owns the per-frame thumbnail housekeeping that `ExrViewer::ui` used to run:
+    /// `sync_texture_caches` (which sizes the caches the sheet indexes **unguarded**),
+    /// the deferred GPU-id drain, and the OCIO-change invalidation.
+    fn draw_comp_contact_sheet(&mut self, ui: &mut egui::Ui) -> bool {
+        let Some(layer_id) = self.active_comp_layer() else {
+            return false;
+        };
+        let Some(crate::layer::LayerSource::Image { source, .. }) =
+            self.comp_stack.get(layer_id).map(|l| l.source.clone())
+        else {
+            return false;
+        };
+        let Some(exr) = self.comp_sources.get(&source).map(|cs| cs.exr_data.clone()) else {
+            return false;
+        };
+
+        // The per-frame app→viewer state the sheet's tone snapshot reads.
+        self.viewer.enable_lut = self.enable_lut && self.lut_bg.is_some();
+        self.viewer.lut_domain_min = self.lut_domain_min;
+        self.viewer.lut_domain_max = self.lut_domain_max;
+        self.viewer.ocio_active = self.ocio_enabled && self.ocio_ready;
+        self.viewer.ocio_render_gen = self.ocio_render_gen;
+        self.viewer.suppress_sampling = self.playback.sampling_suppressed();
+
+        self.viewer.invalidate_thumbnails_on_ocio_change();
+        self.viewer.drain_thumb_frees(self.gpu_resources.as_ref());
+        self.viewer.sync_texture_caches(exr.logical_layers.len(), 0);
+
+        // Header: which source is on show, and an explicit way out. The sheet replaces
+        // the whole viewport (the comp bar that hosts the toggle isn't drawn), so
+        // without this the only exits are clicking a cell or finding the View menu.
+        let name = self
+            .comp_stack
+            .get(layer_id)
+            .map(|l| l.name.clone())
+            .unwrap_or_default();
+        ui.horizontal(|ui| {
+            ui.heading(&name);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button("✕ Close")
+                    .on_hover_text("Back to the composite")
+                    .clicked()
+                {
+                    self.viewer.show_contact_sheet = false;
+                }
+            });
+        });
+        ui.separator();
+
+        let lut = self.lut_bg.clone();
+        let picked =
+            self.viewer
+                .draw_contact_sheet(ui, &exr, self.gpu_resources.as_ref(), lut.as_ref());
+
+        // Point the current layer at the chosen AOV, the comp-model equivalent of the
+        // classic sheet's `active_layer` write.
+        if let Some(aov) = picked
+            && let Some(l) = self.comp_stack.get_mut(layer_id)
+            && let crate::layer::LayerSource::Image { aov: a, .. } = &mut l.source
+        {
+            *a = aov;
+        }
+        true
+    }
+
     fn draw_central_canvas(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default().show_inside(ui, |ui| {
             // The comp stack takes over the viewport whenever it has layers (#99
@@ -7356,31 +7428,12 @@ impl ExrApp {
             // The A/B path below only runs with an empty stack (legacy compare,
             // reachable until render-retire ports it in).
             //
-            // Contact Sheet (#191) is a single-image, per-layer/pass grid, so it
-            // takes priority over the composite: route through `viewer.ui` (the sole
-            // owner of the sheet dispatch + the control bar that hosts the toggle to
-            // exit) against the slot-A source, which stays populated in comp mode.
-            // Without this the toggle only lived inside the legacy branch below and
-            // the comp path never reached it, so the checkbox did nothing.
-            if self.viewer.show_contact_sheet && self.exr_data.is_some() {
-                if let Some(data) = &self.exr_data {
-                    // Same per-frame app→viewer state the legacy branch sets (#151);
-                    // inlined rather than shared because a `&mut self` helper would
-                    // collide with the `&self.exr_data` borrow below.
-                    self.viewer.enable_lut = self.enable_lut && self.lut_bg.is_some();
-                    self.viewer.lut_domain_min = self.lut_domain_min;
-                    self.viewer.lut_domain_max = self.lut_domain_max;
-                    self.viewer.ocio_active = self.ocio_enabled && self.ocio_ready;
-                    self.viewer.ocio_render_gen = self.ocio_render_gen;
-                    self.viewer.suppress_sampling = self.playback.sampling_suppressed();
-                    self.viewer.ui(
-                        ui,
-                        data,
-                        self.exr_data_b.as_deref(),
-                        self.gpu_resources.as_ref(),
-                        self.lut_bg.clone(),
-                    );
-                }
+            // Contact Sheet (#191) is a single-source, per-layer/pass grid, so it
+            // takes priority over the composite. It used to route through `viewer.ui`
+            // against slot A — which the R4 collapse left permanently empty, so the
+            // toggle did nothing. It runs against the **current comp layer's** source
+            // now (#99 Slice 3e) and needs no viewport at all.
+            if self.viewer.show_contact_sheet && self.draw_comp_contact_sheet(ui) {
                 return;
             }
             if !self.comp_stack.is_empty() {
