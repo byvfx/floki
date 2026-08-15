@@ -3980,16 +3980,14 @@ impl ExrApp {
                 .open(&mut self.show_help)
                 .show(ctx, |ui| {
                     ui.heading("Keyboard Shortcuts");
-                    ui.label("1 - View Image A");
-                    ui.label("2 - View Image B (when reference loaded)");
-                    ui.label("Space - Toggle Blink comparison (when reference loaded)");
                     ui.label("R / G / B / A - Isolate specific channel");
                     ui.label("C - Return to full color composite");
                     ui.label("F - Frame image to fit the window");
                     ui.label("F11 - Toggle full-screen (ESC or F11 to exit)");
+                    ui.label("ESC - Cancel an in-progress annotation, else exit full-screen");
                     ui.label("E - Reset exposure to 0.0");
                     ui.label("Shift+G - Reset gamma to 1.0");
-                    ui.label("(or right-click the Exposure / Gamma labels to reset)");
+                    ui.label("(or right-click the EV / γ boxes to reset)");
 
                     ui.add_space(5.0);
                     ui.heading("Mouse Controls");
@@ -3999,7 +3997,7 @@ impl ExrApp {
 
                     ui.add_space(10.0);
                     ui.heading("Features");
-                    ui.label("• Dual Contact Sheets: Enable 'Contact Sheet' and use Compare Modes (A, B, A|B) to view side-by-side contact sheets.");
+                    ui.label("• Contact Sheet: View ▸ Contact Sheet shows every pass of the current layer as a grid; click one to switch the layer to it.");
                     ui.label("• Metadata Explorer: When two images are loaded, EXR Info automatically displays metadata and layers for both Image A and Image B.");
                     ui.label("• Variable Sampling: Pick 1px / 3×3 / 9×9 to average the pixel readout over an aperture.");
                     ui.label("• Compositing: Load Image B, choose 'Comp', and pick a blend mode (Over / Under / Add / Multiply / Screen).");

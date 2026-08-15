@@ -1171,13 +1171,9 @@ impl ExrViewer {
     /// are inert without it. Channel shortcuts apply only in the single-view
     /// layout (not the contact sheet), matching the original inline behavior.
     pub fn handle_hotkeys(&mut self, ui: &egui::Ui, has_b: bool) {
-        // Sending a viewport command requires `ui.ctx()`, which we cannot touch
-        // while the input lock is held — defer it until after the closure.
-        let mut fullscreen_changed = false;
-
         // When a text field wants keyboard input (e.g. the annotation text field or
         // a preset-name box), suppress the single-key viewer shortcuts so typing
-        // "r" doesn't isolate the red channel. F11 / Esc stay live.
+        // "r" doesn't isolate the red channel.
         let editing = ui.ctx().egui_wants_keyboard_input();
 
         ui.input(|i| {
@@ -1192,34 +1188,14 @@ impl ExrViewer {
             if !editing && has_b && i.key_pressed(egui::Key::Space) {
                 self.blink_state = !self.blink_state;
             }
-
-            // Full-screen toggle (F11) and ESC-to-exit work in any mode.
-            if i.key_pressed(egui::Key::F11) {
-                self.fullscreen = !self.fullscreen;
-                fullscreen_changed = true;
-            }
-            // Esc first cancels any in-flight annotation tool/draw/text (#45),
-            // then falls through to exiting fullscreen.
-            if i.key_pressed(egui::Key::Escape) {
-                if self.cancel_annotation() {
-                    // consumed by annotation
-                } else if self.fullscreen {
-                    self.fullscreen = false;
-                    fullscreen_changed = true;
-                }
-            }
         });
 
-        // Channel-isolation, frame-fit, and the E / Shift+G tone resets run in their
-        // own input pass so the comp path — which doesn't run the full viewer `ui` —
-        // can reuse them (#192, #99 Slice 3a) without re-entering this `ui.input`
-        // closure (a nested borrow).
+        // Channel-isolation, frame-fit, the E / Shift+G tone resets, and F11 / Esc run
+        // in their own input pass so the comp path — which doesn't run the full viewer
+        // `ui` — can reuse them (#192, #99 Slices 3a/3f) without re-entering this
+        // `ui.input` closure (a nested borrow). F11 / Esc live *only* there: handling
+        // them here too would toggle fullscreen twice per press and cancel out.
         self.handle_channel_hotkeys(ui);
-
-        if fullscreen_changed {
-            ui.ctx()
-                .send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
-        }
     }
 
     /// Service the C/R/G/B/A channel-isolation shortcuts, `F` frame-fit, and the
@@ -1232,6 +1208,37 @@ impl ExrViewer {
     /// comp path is the only viewport now, and exposure / gamma still drive the
     /// composite, so leaving their shortcuts behind made them unreachable.
     pub fn handle_channel_hotkeys(&mut self, ui: &egui::Ui) {
+        // Fullscreen (F11) and Esc (#99 Slice 3f) run **before** the suppression gate
+        // below, because they must stay live exactly when the single-key shortcuts
+        // must not: Esc's first job is cancelling an in-flight annotation, and the
+        // annotation *text* field holds keyboard focus, so gating Esc on
+        // `egui_wants_keyboard_input` would make it impossible to cancel one.
+        //
+        // `viewer.fullscreen` still gates the menu bar, the timeline panel, and the
+        // side panel, but nothing could set it once `handle_hotkeys` went unreachable.
+        // Esc only falls through to leaving fullscreen when there was no annotation to
+        // cancel. Sending a viewport command needs `ui.ctx()`, which can't be touched
+        // while the input lock is held, so the reads come first.
+        let (f11, esc) = ui.input(|i| {
+            (
+                i.key_pressed(egui::Key::F11),
+                i.key_pressed(egui::Key::Escape),
+            )
+        });
+        let mut fullscreen_changed = false;
+        if f11 {
+            self.fullscreen = !self.fullscreen;
+            fullscreen_changed = true;
+        }
+        if esc && !self.cancel_annotation() && self.fullscreen {
+            self.fullscreen = false;
+            fullscreen_changed = true;
+        }
+        if fullscreen_changed {
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+        }
+
         if ui.ctx().egui_wants_keyboard_input() || self.show_contact_sheet {
             return;
         }
@@ -1246,12 +1253,6 @@ impl ExrViewer {
         }
         if reset_gam {
             self.reset_gamma();
-        }
-        // Esc cancels an in-progress annotation (#45 / #99 Slice 3d). Only consumed
-        // when there was something to cancel, so it stays available to other Esc
-        // handlers (fullscreen exit, Slice 3f).
-        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.cancel_annotation();
         }
         let next = ui.input(|i| {
             if i.key_pressed(egui::Key::F) {
@@ -5523,6 +5524,56 @@ mod gui_tests {
             h.state().viewer.exposure,
             3.0,
             "tone resets stay inert in contact-sheet mode"
+        );
+    }
+
+    #[test]
+    fn fullscreen_and_esc_work_via_comp_entry_point() {
+        // F11 / Esc moved onto the comp entry point (#99 Slice 3f) — `fullscreen` still
+        // gates the menu bar / timeline / side panel, but nothing could set it once
+        // `handle_hotkeys` went unreachable.
+        let mut h = Harness::new_ui_state(
+            |ui, s: &mut State| s.viewer.handle_channel_hotkeys(ui),
+            State {
+                viewer: ExrViewer::default(),
+                has_b: false,
+            },
+        );
+
+        h.key_press(egui::Key::F11);
+        h.run();
+        assert!(h.state().viewer.fullscreen, "F11 enters fullscreen");
+
+        // Esc leaves fullscreen when there's no annotation to cancel.
+        h.key_press(egui::Key::Escape);
+        h.run();
+        assert!(!h.state().viewer.fullscreen, "Esc exits fullscreen");
+
+        // F11 toggles back off, rather than latching.
+        h.key_press(egui::Key::F11);
+        h.run();
+        assert!(h.state().viewer.fullscreen);
+        h.key_press(egui::Key::F11);
+        h.run();
+        assert!(!h.state().viewer.fullscreen, "F11 toggles");
+
+        // Esc is consumed by an in-flight annotation first: fullscreen must survive.
+        h.state_mut().viewer.fullscreen = true;
+        h.state_mut().viewer.anno_tool = crate::annotation::AnnotationTool::Arrow;
+        h.key_press(egui::Key::Escape);
+        h.run();
+        assert!(
+            h.state().viewer.fullscreen,
+            "Esc cancelling an annotation must not also exit fullscreen"
+        );
+
+        // Still live in contact-sheet mode, unlike the channel keys.
+        h.state_mut().viewer.show_contact_sheet = true;
+        h.key_press(egui::Key::F11);
+        h.run();
+        assert!(
+            !h.state().viewer.fullscreen,
+            "F11 stays live with the contact sheet open"
         );
     }
 
