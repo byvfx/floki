@@ -836,7 +836,6 @@ pub struct ExrViewer {
     /// GPU is present, `gpu_thumbnails` is used instead (#67). Cleared on a layer
     /// *count* change or any tone/OCIO change.
     thumbnails: Vec<Option<egui::TextureHandle>>,
-    thumbnails_b: Vec<Option<egui::TextureHandle>>,
     /// GPU contact-sheet thumbnails (#67): per-layer `(egui TextureId, owned
     /// Rgba8Unorm target, full-res size)`. Used instead of `thumbnails` when a GPU
     /// is present and OCIO is off; the CPU `thumbnails` path is the headless / OCIO
@@ -851,14 +850,6 @@ pub struct ExrViewer {
             egui::Vec2,
         )>,
     >,
-    gpu_thumbnails_b: Vec<
-        Option<(
-            egui::TextureId,
-            eframe::egui_wgpu::wgpu::Texture,
-            egui::Vec2,
-        )>,
-    >,
-    /// `TextureId`s awaiting `free_texture`, drained at the top of
     /// `draw_contact_sheet` (the only site with the renderer handle). Invalidation
     /// sites can't free directly (no `gpu_resources`), so they push here instead.
     pending_thumb_frees: Vec<egui::TextureId>,
@@ -873,7 +864,6 @@ pub struct ExrViewer {
     /// changes, catching every mutation path.
     gpu_thumb_bg: Option<crate::background::Background>,
     gpu_textures: Vec<Option<std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>>>,
-    gpu_textures_b: Vec<Option<std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>>>,
 
     /// T2 GPU-texture ring (#56): pre-built active-layer textures keyed by frame
     /// number, so a sequence frame swap binds an already-uploaded texture instead
@@ -956,7 +946,6 @@ pub struct ExrViewer {
     pub normalize_side_by_side: bool,
     pub swatches: Vec<[f32; 4]>,
     pub histogram: Option<[u32; 256]>,
-    pub histogram_b: Option<[u32; 256]>,
     /// Cache key for the computed bins: `(disc, layer_idx, log_histogram)`. The
     /// bins depend on all three, so keying on the layer alone left stale bins when
     /// the log toggle flipped. `disc` is a source discriminator so switching which
@@ -978,7 +967,6 @@ pub struct ExrViewer {
     pub pixel_aspect_override: Option<f32>,
     pub last_hover_pos_img: Option<(usize, usize)>,
     pub last_sampled_val_a: Option<[f32; 4]>,
-    pub last_sampled_val_b: Option<[f32; 4]>,
     /// When set (by the app from `Playback::sampling_suppressed`), the canvas
     /// pixel readout is suppressed: no sampling, the cached values are cleared so
     /// the status bar shows nothing stale, and a hover hint explains why
@@ -1049,14 +1037,11 @@ impl Default for ExrViewer {
     fn default() -> Self {
         Self {
             thumbnails: Vec::new(),
-            thumbnails_b: Vec::new(),
             gpu_thumbnails: Vec::new(),
-            gpu_thumbnails_b: Vec::new(),
             pending_thumb_frees: Vec::new(),
             dbg_thumb_bakes: 0,
             gpu_thumb_bg: None,
             gpu_textures: Vec::new(),
-            gpu_textures_b: Vec::new(),
             t2_rings: std::collections::BTreeMap::new(),
             t2_staging: Vec::new(),
             prefs: ViewerPrefs::default(),
@@ -1094,7 +1079,6 @@ impl Default for ExrViewer {
             normalize_side_by_side: true,
             swatches: Vec::new(),
             histogram: None,
-            histogram_b: None,
             histogram_key: None,
             log_histogram: true,
             scale: 1.0,
@@ -1103,7 +1087,6 @@ impl Default for ExrViewer {
             pixel_aspect_override: None,
             last_hover_pos_img: None,
             last_sampled_val_a: None,
-            last_sampled_val_b: None,
             suppress_sampling: false,
             last_canvas_rect: None,
             last_image_rect: None,
@@ -1230,27 +1213,17 @@ impl ExrViewer {
         }
         self.channel_mode = mode;
         self.thumbnails.fill(None);
-        self.thumbnails_b.fill(None);
-        self.invalidate_gpu_thumbnails(true, true);
+        self.invalidate_gpu_thumbnails();
     }
 
     /// Drain the GPU contact-sheet thumbnail caches (#67), queuing every
     /// registered `TextureId` for deferred `free_texture` (drained in
     /// `draw_contact_sheet`, which holds the renderer). Mirrors the A/B scoping of
-    /// the CPU `thumbnails.fill(None)` sites: `a`/`b` select which side(s) to clear.
-    fn invalidate_gpu_thumbnails(&mut self, a: bool, b: bool) {
-        if a {
-            for slot in self.gpu_thumbnails.iter_mut() {
-                if let Some((id, _, _)) = slot.take() {
-                    self.pending_thumb_frees.push(id);
-                }
-            }
-        }
-        if b {
-            for slot in self.gpu_thumbnails_b.iter_mut() {
-                if let Some((id, _, _)) = slot.take() {
-                    self.pending_thumb_frees.push(id);
-                }
+    /// the CPU `thumbnails.fill(None)` sites.
+    fn invalidate_gpu_thumbnails(&mut self) {
+        for slot in self.gpu_thumbnails.iter_mut() {
+            if let Some((id, _, _)) = slot.take() {
+                self.pending_thumb_frees.push(id);
             }
         }
     }
@@ -1282,10 +1255,9 @@ impl ExrViewer {
     /// #147) — the LUT is baked into thumbnails exactly like exposure/gamma.
     pub(crate) fn invalidate_tone(&mut self) {
         self.thumbnails.fill(None);
-        self.thumbnails_b.fill(None);
         // GPU thumbnails bake the tone into a cached texture (unlike the live
         // viewport uniform), so an exposure/gamma change must re-render them.
-        self.invalidate_gpu_thumbnails(true, true);
+        self.invalidate_gpu_thumbnails();
     }
 
     /// `pub(crate)`: the comp viewport bar hosts the tone controls now (#99 Slice 3a).
@@ -1994,16 +1966,15 @@ impl ExrViewer {
         if sig != self.ocio_sig {
             self.ocio_sig = sig;
             self.thumbnails.fill(None);
-            self.thumbnails_b.fill(None);
             // Toggling OCIO flips the GPU thumbnail backend (display shader vs the
             // OCIO two-pass); clear the GPU cache so stale thumbnails don't linger.
-            self.invalidate_gpu_thumbnails(true, true);
+            self.invalidate_gpu_thumbnails();
         }
     }
 
     /// While blink is active (and B is loaded), alternate the displayed image
     /// between A and B on `blink_interval`, requesting repaints to keep cycling.
-    pub(crate) fn sync_texture_caches(&mut self, layer_count: usize, layer_count_b: usize) {
+    pub(crate) fn sync_texture_caches(&mut self, layer_count: usize) {
         if self.thumbnails.len() != layer_count {
             self.thumbnails.clear();
             self.thumbnails.resize(layer_count, None);
@@ -2015,16 +1986,6 @@ impl ExrViewer {
             self.gpu_thumbnails.resize_with(layer_count, || None);
             self.gpu_textures.clear();
             self.gpu_textures.resize(layer_count, None);
-        }
-        if self.thumbnails_b.len() != layer_count_b {
-            self.thumbnails_b.clear();
-            self.thumbnails_b.resize(layer_count_b, None);
-            for (id, _, _) in self.gpu_thumbnails_b.drain(..).flatten() {
-                self.pending_thumb_frees.push(id);
-            }
-            self.gpu_thumbnails_b.resize_with(layer_count_b, || None);
-            self.gpu_textures_b.clear();
-            self.gpu_textures_b.resize(layer_count_b, None);
         }
     }
 
@@ -2066,7 +2027,7 @@ impl ExrViewer {
             && !self.ocio_active
             && self.gpu_thumb_bg.as_ref() != Some(&self.prefs.background)
         {
-            self.invalidate_gpu_thumbnails(true, true);
+            self.invalidate_gpu_thumbnails();
             self.gpu_thumb_bg = Some(self.prefs.background.clone());
         }
 
@@ -3177,32 +3138,6 @@ impl ExrViewer {
         self.histogram_key = None;
     }
 
-    /// Drop the cached image-B **viewport** bind groups so the compare draws
-    /// rebuild from the newly swapped B data. In locked-step A/B playback (#98)
-    /// this runs on every B frame swap (how the next B frame paints); split from
-    /// the thumbnail clear so B playback doesn't re-bake the contact sheet every
-    /// frame (mirror the A #144 split).
-    pub fn invalidate_reference_viewport(&mut self) {
-        self.gpu_textures_b.fill(None);
-    }
-
-    /// Drop the cached image-B contact-sheet **thumbnails** (CPU + GPU). Skipped
-    /// while the transport is busy (`ExrApp::thumbs_suppressed`) during B playback,
-    /// refreshed on settle (#98/#144).
-    pub fn invalidate_reference_thumbnails(&mut self) {
-        self.thumbnails_b.fill(None);
-        self.invalidate_gpu_thumbnails(false, true);
-    }
-
-    /// Drop every cached reference-image (B) texture so the viewport rebuilds from the
-    /// newly loaded data. The caches otherwise only refresh when the layer *count*
-    /// changes, so re-loading a different B with the same layer count would keep showing the
-    /// stale image. Clears the GPU bind groups and the contact-sheet thumbnails (CPU + GPU).
-    pub fn invalidate_reference_textures(&mut self) {
-        self.invalidate_reference_thumbnails();
-        self.invalidate_reference_viewport();
-    }
-
     /// Drop the cached image-A **viewport** bind groups so the central canvas
     /// rebuilds from the newly swapped data. This is the half of the A swap that
     /// must run on *every* frame — it's how the next sequence frame actually
@@ -3218,7 +3153,7 @@ impl ExrViewer {
     /// sheet freezes during playback instead of re-baking every layer per frame.
     pub fn invalidate_active_thumbnails(&mut self) {
         self.thumbnails.fill(None);
-        self.invalidate_gpu_thumbnails(true, false);
+        self.invalidate_gpu_thumbnails();
     }
 
     /// Clear the slot-A proxy (first-paint) texture. Called when the full-res
@@ -3445,11 +3380,6 @@ impl ExrViewer {
         Some(ctx.load_texture("exr_proxy", color_image, egui::TextureOptions::LINEAR))
     }
 
-    /// Source discriminator for the classic A/B histogram cache key — distinct from
-    /// any comp `SourceId` (which pass their own id), so switching between the
-    /// classic path and a comp layer always invalidates the bins.
-    pub const HIST_DISC_CLASSIC: u64 = u64::MAX;
-
     /// Compute the 256-bin luminance histogram of `data`'s logical layer `layer_idx`
     /// (`None` if that layer has no resolvable RGB). Parallelized per-row: each
     /// thread accumulates its own `[u32; 256]`, then reduce by summing — for a 4K
@@ -3508,7 +3438,7 @@ impl ExrViewer {
 
     /// Comp-path histogram (#99 R4): the current layer's source at `layer_idx`
     /// (its AOV), keyed by `disc` (its `SourceId`) so switching layers/AOVs
-    /// recomputes. No B in comp mode, so `histogram_b` is cleared. Mirrors
+    /// recomputes. Mirrors
     /// [`Self::calculate_histogram`]'s cache gate.
     pub fn calculate_histogram_for(&mut self, exr_data: &ExrData, layer_idx: usize, disc: u64) {
         let key = (disc, layer_idx, self.log_histogram);
@@ -3516,30 +3446,6 @@ impl ExrViewer {
             return;
         }
         self.histogram = Self::histogram_bins(exr_data, layer_idx, self.log_histogram);
-        self.histogram_b = None;
-        self.histogram_key = Some(key);
-    }
-
-    pub fn calculate_histogram(&mut self, exr_data: &ExrData, exr_data_b: Option<&ExrData>) {
-        let key = (
-            Self::HIST_DISC_CLASSIC,
-            self.active_layer,
-            self.log_histogram,
-        );
-        if self.histogram_key == Some(key) {
-            return;
-        }
-
-        let log_histogram = self.log_histogram;
-        self.histogram = Self::histogram_bins(exr_data, self.active_layer, log_histogram);
-        self.histogram_b = exr_data_b.and_then(|d| {
-            Self::histogram_bins(
-                d,
-                self.active_layer
-                    .min(d.logical_layers.len().saturating_sub(1)),
-                log_histogram,
-            )
-        });
         self.histogram_key = Some(key);
     }
 }
@@ -4357,7 +4263,7 @@ mod gui_tests {
         Harness::new_ui_state(
             |ui, s: &mut SmokeState| {
                 let SmokeState { viewer, a } = s;
-                viewer.sync_texture_caches(a.logical_layers.len(), 0);
+                viewer.sync_texture_caches(a.logical_layers.len());
                 if viewer.show_contact_sheet {
                     viewer.draw_contact_sheet(ui, a, None, None);
                 }
