@@ -1247,6 +1247,12 @@ impl ExrViewer {
         if reset_gam {
             self.reset_gamma();
         }
+        // Esc cancels an in-progress annotation (#45 / #99 Slice 3d). Only consumed
+        // when there was something to cancel, so it stays available to other Esc
+        // handlers (fullscreen exit, Slice 3f).
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.cancel_annotation();
+        }
         let next = ui.input(|i| {
             if i.key_pressed(egui::Key::F) {
                 self.first_frame = true;
@@ -2261,8 +2267,8 @@ impl ExrViewer {
     }
 
     /// The annotation toolbar row: tool selection, colour, stroke width, undo/redo,
-    /// clear. Shown under the mode-param row while `show_annotation_bar`.
-    fn annotation_toolbar(&mut self, ui: &mut egui::Ui) {
+    /// clear. `pub(crate)` so the comp viewport bar can host it (#99 Slice 3d).
+    pub(crate) fn annotation_toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label("Annotate:");
             for tool in AnnotationTool::DRAW_TOOLS {
@@ -3150,78 +3156,7 @@ impl ExrViewer {
                 && (val_a_opt.is_some() || val_b_opt.is_some())
                 && let (Some(x), Some(y)) = (x_final, y_final)
             {
-                egui::Window::new("Pixel Tooltip")
-                    .fixed_pos(pos + egui::vec2(15.0, 15.0))
-                    .title_bar(false)
-                    .resizable(false)
-                    .collapsible(false)
-                    .show(ui.ctx(), |ui| {
-                        ui.label(format!("x={x} y={y}"));
-
-                        if let Some(val_a) = val_a_opt {
-                            ui.horizontal(|ui| {
-                                colored_rgba_label(
-                                    ui,
-                                    if val_b_opt.is_some() { "A:" } else { "" },
-                                    val_a,
-                                );
-                                let (r, g, b) = (
-                                    (val_a[0].clamp(0.0, 1.0) * 255.0) as u8,
-                                    (val_a[1].clamp(0.0, 1.0) * 255.0) as u8,
-                                    (val_a[2].clamp(0.0, 1.0) * 255.0) as u8,
-                                );
-                                let (rect, _) = ui.allocate_exact_size(
-                                    egui::vec2(16.0, 16.0),
-                                    egui::Sense::hover(),
-                                );
-                                ui.painter().rect_filled(
-                                    rect,
-                                    0.0,
-                                    egui::Color32::from_rgb(r, g, b),
-                                );
-                            });
-                            let (h, s, v, l) = rgb_to_hsvl(val_a[0], val_a[1], val_a[2]);
-                            ui.label(
-                                egui::RichText::new(format!("H:{h:.0} S:{s:.2} V:{v:.2} L:{l:.5}"))
-                                    .color(egui::Color32::LIGHT_GRAY),
-                            );
-                        }
-
-                        if let Some(val_b) = val_b_opt {
-                            ui.horizontal(|ui| {
-                                colored_rgba_label(ui, "B:", val_b);
-                                let (r, g, b) = (
-                                    (val_b[0].clamp(0.0, 1.0) * 255.0) as u8,
-                                    (val_b[1].clamp(0.0, 1.0) * 255.0) as u8,
-                                    (val_b[2].clamp(0.0, 1.0) * 255.0) as u8,
-                                );
-                                let (rect, _) = ui.allocate_exact_size(
-                                    egui::vec2(16.0, 16.0),
-                                    egui::Sense::hover(),
-                                );
-                                ui.painter().rect_filled(
-                                    rect,
-                                    0.0,
-                                    egui::Color32::from_rgb(r, g, b),
-                                );
-                            });
-                            let (h, s, v, l) = rgb_to_hsvl(val_b[0], val_b[1], val_b[2]);
-                            ui.label(
-                                egui::RichText::new(format!("H:{h:.0} S:{s:.2} V:{v:.2} L:{l:.5}"))
-                                    .color(egui::Color32::LIGHT_GRAY),
-                            );
-                        }
-
-                        if let (Some(val_a), Some(val_b)) = (val_a_opt, val_b_opt) {
-                            let diff = [
-                                (val_b[0] - val_a[0]).abs(),
-                                (val_b[1] - val_a[1]).abs(),
-                                (val_b[2] - val_a[2]).abs(),
-                                (val_b[3] - val_a[3]).abs(),
-                            ];
-                            colored_rgba_label(ui, "Diff:", diff);
-                        }
-                    });
+                pixel_tooltip_window(ui.ctx(), pos, x, y, val_a_opt, val_b_opt);
 
                 // Shift+Click to add a persistent swatch
                 if ui.input(|i| i.modifiers.shift)
@@ -3654,6 +3589,15 @@ impl ExrViewer {
         let image_rect = panes.image_rect;
         let disp_rect = panes.disp_rect;
         self.last_image_rect = Some(image_rect);
+        // Per-axis screen scale `(scale * par, scale)`: annotations are stored in
+        // *native* image pixels, so dividing by this maps a screen point back and they
+        // stay anchored across an anamorphic squeeze/unsqueeze toggle (#179).
+        let view_scale = egui::vec2(self.scale * par, self.scale);
+        // Annotation drawing (#45), restored into the comp path (#99 Slice 3d) — it
+        // lived only in the legacy branch, so the whole feature went dark with the R4
+        // collapse while `handle_canvas_interaction` still checked `anno_tool` and
+        // suppressed pan for a tool that could no longer be selected.
+        self.handle_annotation_input(&response, image_rect, view_scale);
         // The pane-B rect, for the per-pane pixel readout (`pick_comp_side`). `None`
         // outside Side-by-Side: Wipe overlays both layers in the *same* rect, so its
         // readout splits via `wipe_side_at` (see `comp_hover_side`), and Diff is a
@@ -3761,6 +3705,14 @@ impl ExrViewer {
         }
         ctx.neutral_view_ops.set(false);
         ctx.blend_override.set(None);
+
+        // Annotation overlay + the in-place text field (#45 / #99 Slice 3d). Drawn here
+        // rather than at the end of the function so the Diff path — which emits an
+        // immediate callback and so leaves `ocio_draws` empty, taking the early return
+        // below — still gets them. Order is safe either way: the composite paints into
+        // the slot reserved above, so anything appended after that sits on top.
+        self.draw_annotations(&painter, image_rect, view_scale);
+        self.annotation_text_popup(ui, image_rect, view_scale);
 
         let ocio_draws = std::mem::take(&mut *ctx.ocio_draws.borrow_mut());
         if ocio_draws.is_empty() {
@@ -4917,6 +4869,69 @@ fn rgb_to_hsvl(r: f32, g: f32, b: f32) -> (f32, f32, f32, f32) {
     let l = 0.2126 * r + 0.7152 * g + 0.0722 * b;
 
     (h, s, v, l)
+}
+
+/// One value block of the pixel tooltip: the per-channel coloured RGBA numbers, a
+/// solid colour patch of the value, and its HSVL line. Factored out of the classic
+/// tooltip so the comp path can reuse it verbatim (#99 Slice 3d).
+fn pixel_value_block(ui: &mut egui::Ui, prefix: &str, val: [f32; 4]) {
+    ui.horizontal(|ui| {
+        colored_rgba_label(ui, prefix, val);
+        let (r, g, b) = (
+            (val[0].clamp(0.0, 1.0) * 255.0) as u8,
+            (val[1].clamp(0.0, 1.0) * 255.0) as u8,
+            (val[2].clamp(0.0, 1.0) * 255.0) as u8,
+        );
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+        ui.painter()
+            .rect_filled(rect, 0.0, egui::Color32::from_rgb(r, g, b));
+    });
+    let (h, s, v, l) = rgb_to_hsvl(val[0], val[1], val[2]);
+    ui.label(
+        egui::RichText::new(format!("H:{h:.0} S:{s:.2} V:{v:.2} L:{l:.5}"))
+            .color(egui::Color32::LIGHT_GRAY),
+    );
+}
+
+/// The floating pixel-readout tooltip that follows the cursor, showing the sampled
+/// coordinate and value(s). `val_b` is the second value in a two-input compare (the
+/// classic A/B path); when both are present a `Diff:` row is appended. Shared by the
+/// classic viewport and the comp path (#99 Slice 3d), which passes `val_b = None`
+/// because its readout samples whichever single pane the cursor is over.
+pub(crate) fn pixel_tooltip_window(
+    ctx: &egui::Context,
+    pos: egui::Pos2,
+    x: usize,
+    y: usize,
+    val_a: Option<[f32; 4]>,
+    val_b: Option<[f32; 4]>,
+) {
+    if val_a.is_none() && val_b.is_none() {
+        return;
+    }
+    egui::Window::new("Pixel Tooltip")
+        .fixed_pos(pos + egui::vec2(15.0, 15.0))
+        .title_bar(false)
+        .resizable(false)
+        .collapsible(false)
+        .show(ctx, |ui| {
+            ui.label(format!("x={x} y={y}"));
+            if let Some(a) = val_a {
+                pixel_value_block(ui, if val_b.is_some() { "A:" } else { "" }, a);
+            }
+            if let Some(b) = val_b {
+                pixel_value_block(ui, "B:", b);
+            }
+            if let (Some(a), Some(b)) = (val_a, val_b) {
+                let diff = [
+                    (b[0] - a[0]).abs(),
+                    (b[1] - a[1]).abs(),
+                    (b[2] - a[2]).abs(),
+                    (b[3] - a[3]).abs(),
+                ];
+                colored_rgba_label(ui, "Diff:", diff);
+            }
+        });
 }
 
 fn colored_rgba_label(ui: &mut egui::Ui, prefix: &str, val: [f32; 4]) {

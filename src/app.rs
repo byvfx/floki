@@ -3655,6 +3655,33 @@ fn top_sample_source(
     })
 }
 
+/// How many characters of a layer's file name the comp viewport bar's pickers show
+/// before eliding. Two of them share that row with every other control.
+const COMP_BAR_NAME_CHARS: usize = 24;
+
+/// Shorten a label to at most `max` characters, eliding the middle with `…` (#99
+/// Slice 3d follow-up). EXR layer names are full file names — often 50+ characters
+/// like `ESTU0001_gloomWatcher_v001.karmarendersettings.1001.exr` — and two of them
+/// sit in the comp viewport bar, which pushed the controls to its right off-screen
+/// even maximized. Keeping both ends preserves the distinguishing parts (the shot
+/// prefix and the version/frame suffix), which a plain truncation would lose. Callers
+/// pair it with a hover tooltip carrying the full name. Pure.
+fn elide_middle(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max || max < 3 {
+        return s.to_string();
+    }
+    // Split the budget around the ellipsis, biasing the tail (version/frame) when odd.
+    let keep = max - 1;
+    let head = keep / 2 + keep % 2;
+    let tail = keep - head;
+    let chars: Vec<char> = s.chars().collect();
+    let mut out: String = chars[..head].iter().collect();
+    out.push('…');
+    out.extend(&chars[n - tail..]);
+    out
+}
+
 /// The default compare pane (side B) for a stack whose layers are `ids` **bottom→top**
 /// and whose current layer is `current` (#99 Slice 2a). Picks the topmost layer that
 /// *isn't* the current one, so the two panes differ without the user choosing anything
@@ -6314,20 +6341,24 @@ impl ExrApp {
             .map(|cs| cs.exr_data.image.attributes.pixel_aspect)
             .unwrap_or(1.0);
 
-        ui.horizontal(|ui| {
+        // Wrapped, so a long layer name pushes the trailing controls onto a second line
+        // instead of clipping them off the right edge.
+        ui.horizontal_wrapped(|ui| {
             // Which layer is current (Nuke's input selector). Only worth showing
             // with more than one layer to choose from.
             if layer_list.len() > 1 {
                 ui.label("Layer:");
                 egui::ComboBox::from_id_salt("comp_current_layer")
-                    .selected_text(cur_name)
+                    .selected_text(elide_middle(&cur_name, COMP_BAR_NAME_CHARS))
                     .show_ui(ui, |ui| {
                         for (id, nm) in &layer_list {
                             if ui.selectable_label(*id == layer_id, nm).clicked() {
                                 self.selected_comp_layer = Some(*id);
                             }
                         }
-                    });
+                    })
+                    .response
+                    .on_hover_text(&cur_name);
                 ui.separator();
             }
 
@@ -6455,14 +6486,16 @@ impl ExrApp {
                         .unwrap_or_else(|| "—".to_string());
                     ui.label("vs:");
                     egui::ComboBox::from_id_salt("comp_compare_b")
-                        .selected_text(cmp_b_name)
+                        .selected_text(elide_middle(&cmp_b_name, COMP_BAR_NAME_CHARS))
                         .show_ui(ui, |ui| {
                             for (id, nm) in &layer_list {
                                 if ui.selectable_label(Some(*id) == cmp_b, nm).clicked() {
                                     self.compare_b_layer = Some(*id);
                                 }
                             }
-                        });
+                        })
+                        .response
+                        .on_hover_text(&cmp_b_name);
                     // Per-arrangement parameters (#99 Slice 3c). These lived in the
                     // classic `mode_param_row` — a second toolbar row that slid in — but
                     // the comp bar is one row, so they go behind a menu. Shared with
@@ -6493,6 +6526,19 @@ impl ExrApp {
                 }
             }
 
+            // Annotations (#45 / #99 Slice 3d). Hiding the bar also drops the active
+            // tool, so a hidden bar can never leave a tool armed — which would suppress
+            // canvas pan (`handle_canvas_interaction` checks `anno_tool`).
+            ui.separator();
+            if ui
+                .toggle_value(&mut self.viewer.show_annotation_bar, "✎ Annotate")
+                .on_hover_text("Draw arrows / boxes / freehand / text over the image")
+                .changed()
+                && !self.viewer.show_annotation_bar
+            {
+                self.viewer.anno_tool = crate::annotation::AnnotationTool::None;
+            }
+
             // The rarely-touched controls, behind a menu as the classic row had them
             // (#99 Slice 3a). The standalone Unsqueeze checkbox (#194) folds in here.
             ui.separator();
@@ -6505,6 +6551,8 @@ impl ExrApp {
                     ui.selectable_value(&mut self.viewer.sample_aperture, 3, "3×3");
                     ui.selectable_value(&mut self.viewer.sample_aperture, 9, "9×9");
                 });
+                ui.checkbox(&mut self.viewer.show_tooltip, "Show Pixel Tooltip")
+                    .on_hover_text("Float the sampled value next to the cursor");
 
                 ui.separator();
                 // Anamorphic unsqueeze (#179 / #194): the master toggle persists via
@@ -6541,6 +6589,11 @@ impl ExrApp {
                 });
             });
         });
+        // The annotation tool row, on its own line below the bar so the main row keeps
+        // its width (the classic UI gave it a separate toolbar row too).
+        if self.viewer.show_annotation_bar {
+            self.viewer.annotation_toolbar(ui);
+        }
         ui.separator();
     }
 
@@ -7265,6 +7318,16 @@ impl ExrApp {
             Some((x, y, v)) => {
                 self.viewer.last_hover_pos_img = Some((x, y));
                 self.viewer.last_sampled_val_a = v;
+                // The floating cursor tooltip (#99 Slice 3d): another casualty of the
+                // R4 collapse — it lived in `viewer.ui`'s `handle_pixel_sampling`.
+                // Reuses that window verbatim via `pixel_tooltip_window`, with no B
+                // value: the comp readout samples whichever single pane the cursor is
+                // over, so a two-value A/B block would be meaningless here.
+                if self.viewer.show_tooltip
+                    && let Some(pos) = hover
+                {
+                    crate::viewer::pixel_tooltip_window(ui.ctx(), pos, x, y, v, None);
+                }
                 // Shift+Click saves the sampled pixel as a persistent swatch — the
                 // comp-path analogue of the classic sampler (#99 R4), which lived in
                 // `viewer.ui` and so never fired here. `v` is the raw source value
@@ -8620,6 +8683,34 @@ mod tests {
         );
         // Nothing drawable → None.
         assert_eq!(top_sample_source(&steps, |_| false), None);
+    }
+
+    #[test]
+    fn elide_middle_keeps_both_ends_within_budget() {
+        // Short enough → untouched.
+        assert_eq!(elide_middle("short.exr", 24), "short.exr");
+        assert_eq!(
+            elide_middle("exactly_24_chars_long.ex", 24),
+            "exactly_24_chars_long.ex"
+        );
+
+        // A real offender: both the shot prefix and the version/frame tail survive,
+        // which is what makes two similar names distinguishable in the picker.
+        let long = "ESTU0001_gloomWatcher_v001.karmarendersettings.1001.exr";
+        let out = elide_middle(long, 24);
+        assert_eq!(out.chars().count(), 24, "stays within budget: {out:?}");
+        assert!(out.contains('…'), "elided: {out:?}");
+        assert!(out.starts_with("ESTU0001"), "keeps the head: {out:?}");
+        assert!(out.ends_with(".exr"), "keeps the tail: {out:?}");
+
+        // Multi-byte characters are counted as chars, not bytes (no panic on a
+        // non-ASCII boundary).
+        let uni = "日本語のとても長いファイル名です.exr";
+        let out = elide_middle(uni, 10);
+        assert_eq!(out.chars().count(), 10, "counts chars: {out:?}");
+
+        // Degenerate budgets are passed through rather than panicking.
+        assert_eq!(elide_middle("abcdef", 2), "abcdef");
     }
 
     #[test]
