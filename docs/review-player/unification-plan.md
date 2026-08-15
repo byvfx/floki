@@ -1,11 +1,11 @@
 # Layer-Stack Unification — making the layer model core to floki
 
-> Status: **the collapse is DONE** (updated 2026-08-15). Phases 1–3 are complete: the `LayerStack` is
+> Status: **DONE** (updated 2026-08-15). Phases 1–3 are complete: the `LayerStack` is
 > the only model floki renders and plays. `render_program.rs`, `CompareMode`, `ExrViewer::ui`, the
 > whole A/B render path, and every `_b` slot field are **deleted** (~3300 lines). All five
 > arrangements — Stacked / Side-by-Side / Wipe / Diff / Blink — are comp-path native, and the
-> viewport chrome the R4 collapse had silently dropped is restored. **Remaining: layer persistence**
-> (see the R4 handoff below). Supersedes the ad-hoc PR-C/PR-D framing.
+> viewport chrome the R4 collapse had silently dropped is restored. **Layer persistence has landed
+> too**, so the epic is complete end to end. Supersedes the ad-hoc PR-C/PR-D framing.
 > Builds on the shipped additive Layers panel (epic #99, PR-B) and the layer model spine
 > (`src/layer.rs`, #103). See `layer-model.md` for the model itself.
 
@@ -736,11 +736,16 @@ is the Chaos-Player bottom timeline tracks. See the "Render foundation" progress
 is deleted, and the viewport chrome that had gone dead with it is restored. See the "Slice 3" block
 above for the sub-slice breakdown and the lessons.
 
-**The unification is complete.** The `LayerStack` is the single model floki renders and plays;
-compare modes are `Arrangement`s over it; open/drop adds a layer. **Resume next → layer persistence**
-(`Vec<LayerPersist>` on `ExrApp`: path + name / blend / opacity / enabled / solo / aov / trim,
-re-decoded on load with fresh `LayerId`/`SourceId`; NEVER `#[serde(flatten)]` — it wipes `app.ron`).
-That is the last item from the original Phase-4 list. Non-blocking follow-ups are listed in the R4
-handoff above, plus two parked items from 3h: re-homing proxy **first-paint** onto `add_comp_source`
-(`draw_proxy` is `#[allow(dead_code)]`; scrub proxy is unaffected) and deciding whether
-`layer::Layout` survives now that `Arrangement` is the live viewport axis.
+**Layer persistence is DONE** (`c98cd04`, PR-B.5): `CompSource` gained a `path`; `save()` flattens the
+stack into `Vec<LayerPersist>` through the same persist-time bridge `persisted_prefs` uses, and
+`restore_comp_layers` replays it through `add_comp_source` so restore takes the *same* path as a
+normal open. Flat fields (the model stays non-`Serialize`; ids are session-scoped), a hand-written
+`Default` (a derived one would restore invisible layers, since `#[serde(default)]` fills *missing*
+fields), the base plate skipped, and missing files skipped silently.
+
+**THE UNIFICATION IS COMPLETE.** The `LayerStack` is the single model floki renders and plays;
+compare modes are `Arrangement`s over it; open/drop adds a layer; the stack persists. Remaining work
+is all non-blocking — see the R4 handoff above, plus two items parked during 3h: re-homing proxy
+**first-paint** onto `add_comp_source` (`draw_proxy` is `#[allow(dead_code)]`; scrub proxy is
+unaffected) and deciding whether `layer::Layout` survives now that `Arrangement` is the live viewport
+axis. A CHANGELOG `## [Unreleased]` section for the whole wave landed with persistence.
