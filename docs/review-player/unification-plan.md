@@ -1,12 +1,11 @@
 # Layer-Stack Unification — making the layer model core to floki
 
-> Status: **in progress** (updated 2026-08). Phases 1–2 + the R-series are done; the R4 collapse is
-> underway — open/drop = add a layer, the comp-path readout / EXR Info / histogram, and **all four
-> compare arrangements** (render-retire Slices 2a+2b) have landed. Next: **Slice 3, rescoped after an
-> audit** — the A/B path is already unreachable, so the deletion is cheap, but the viewport chrome
-> that went dead with it (exposure/gamma above all) is restored first, in sub-slices 3a–3h. Resume
-> point and concrete next steps: the **R4 handoff** section below. Supersedes the ad-hoc PR-C/PR-D
-> framing.
+> Status: **the collapse is DONE** (updated 2026-08-15). Phases 1–3 are complete: the `LayerStack` is
+> the only model floki renders and plays. `render_program.rs`, `CompareMode`, `ExrViewer::ui`, the
+> whole A/B render path, and every `_b` slot field are **deleted** (~3300 lines). All five
+> arrangements — Stacked / Side-by-Side / Wipe / Diff / Blink — are comp-path native, and the
+> viewport chrome the R4 collapse had silently dropped is restored. **Remaining: layer persistence**
+> (see the R4 handoff below). Supersedes the ad-hoc PR-C/PR-D framing.
 > Builds on the shipped additive Layers panel (epic #99, PR-B) and the layer model spine
 > (`src/layer.rs`, #103). See `layer-model.md` for the model itself.
 
@@ -625,6 +624,46 @@ groundwork the final collapse (**R4**) sits on. All in `src/app.rs` + the GPU re
   `comp_hover_side`, fed by `ExrViewer::last_wipe`. Follow-up: the Diff + wipe sliders still live
   only in the A/B toolbar, so Slice 3 must re-home rather than delete them.
 
+### Slice 3 — the A/B retire  (`3916cee`…`8b6ced0`, 2026-08-14/15)
+
+**The audit finding that reframed the slice:** `open_file` had zero callers, so slot A was permanently
+`None` and `ExrViewer::ui` was already unreachable. The deletion was therefore nearly free — the real
+work was restoring the viewport chrome that had gone dark with it, *before* deleting.
+
+- **3a** `3916cee` — exposure / gamma / sRGB (+ `E` / `Shift+G` re-homed onto `handle_channel_hotkeys`),
+  the sample aperture, and the PAR override behind a `Display ▾` menu. Also the snapshot-crop fix —
+  done in `finish_snapshot`, **not** at the `last_image_rect` write site as planned: the comp path
+  reuses that rect for the cursor→pixel readout, so a canvas-clipped value would skew it when zoomed.
+- **3b** `cfdcdbe` — the background + gradient-editor windows drawn by `ExrApp` (the View-menu item had
+  been a dead click).
+- **3c** `e6d50f7` — the Wipe / Diff parameters, extracted as shared `wipe_params_ui` /
+  `diff_params_ui` behind per-arrangement menus. `wipe_line_opacity` had **no** other control, so a
+  persisted `0.0` left the comp wipe line invisible with no way back.
+- **3d** `2b38faf` — annotations (#45) and the pixel tooltip, the latter factored into
+  `pixel_tooltip_window` + `pixel_value_block` and shared. Also the viewport-bar layout fix
+  (`elide_middle` + `horizontal_wrapped`) once the bar overflowed.
+- **3e** `59ecc91` — Contact Sheet independence: one source, returns the clicked layer, driven from
+  `ExrApp::draw_comp_contact_sheet` against the **current comp layer**. This retired the `viewer.ui`
+  shim. Later given a `▦ Sheet` button + `T` hotkey (in `f22cd77`).
+- **3f** `16f7b22` — F11 / Esc. `fullscreen` still gated the menu bar and panels, so the *mode* was
+  live with no way in or out.
+- **3g** `4f78b5c` — blink as `Arrangement::Blink`, with the pure `blink_phase`.
+- **3h.1** `f22cd77` — the A/B render path (~2100 lines): `ExrViewer::ui`, `draw_canvas_gpu`,
+  `emit_mode_draws`, `handle_pixel_sampling`, the toolbar rows, `render_program()`, `CompareMode`,
+  `CanvasLayout`, `layer_stack`, and all of `render_program.rs`. `Arrangement` moved to `layer.rs`.
+- **3h.2 + 3h.3** `8b6ced0` — the `_b` slot state and the dead open/unload path (~1230 lines). Zero
+  residual `B_SOURCE` / `exr_data_b` / `sync_b_to_a` references.
+
+**Recurring lessons.** (1) Three separate deletions failed *silently* rather than at compile time,
+because a fork's `is_b`/`compare_mode` value became constant rather than absent — the fix each time was
+to collapse the fork, not delete one arm. (2) Moving a hotkey means **removing** it from the old
+handler: `handle_hotkeys` delegates to `handle_channel_hotkeys`, so a key serviced in both toggles
+twice and reads as dead. (3) Broken intra-doc links (~14 across the slice) are a real defect clippy
+does not catch. (4) Two things were **parked, not deleted** — `draw_proxy` (unreachable, but
+`proxy.rs`/`proxy_cache.rs` are live for scrub proxy) and `layer::Layout` (redundant with
+`Arrangement`, but model API); and `detect_sequence` was restored as `#[cfg(test)]` because ~45 live
+playback tests use it as a fixture.
+
 ## Execution checklist — Phase 1  *(complete; kept for reference — resume point is Phase 4 / R4 below)*
 
 Symbols are stable; line numbers drift (grep the name). Keep A/B pinned to
@@ -692,12 +731,16 @@ Phase 2 section above for the slice-by-slice breakdown.
 renders standalone in any colour mode, drives the transport, includes the base plate, and the panel
 is the Chaos-Player bottom timeline tracks. See the "Render foundation" progress-log block above.
 
-**Resume next → render-retire (Phase 3) Slice 3a.** Open/drop = add a layer, the comp-path pixel
-readout, EXR Info, the histogram, and **all four compare arrangements** (Slices 2a+2b) have landed.
-Slice 3 has been **audited and rescoped**: because `open_file` has no callers, `ExrViewer::ui` is
-already unreachable, so the A/B deletion is nearly free — but a large amount of viewport chrome
-(exposure/gamma/sRGB, the background + gradient windows, annotations, the Contact Sheet, blink,
-F11/Esc, the diff/wipe parameters) went dead with it and must be **restored first**. See "Slice 3,
-rescoped" for the audit table and the 3a–3h sub-slice order.
-Layer persistence (`Vec<LayerPersist>`) is independent. Readout fast-follows: the floating cursor
-tooltip + the aperture combo in comp mode.
+**Phase 3 (the render retire) is DONE** (`3916cee`…`8b6ced0`): the A/B path — `ExrViewer::ui`,
+`draw_canvas_gpu`, `emit_mode_draws`, `render_program.rs`, `CompareMode`, and every `_b` slot field —
+is deleted, and the viewport chrome that had gone dead with it is restored. See the "Slice 3" block
+above for the sub-slice breakdown and the lessons.
+
+**The unification is complete.** The `LayerStack` is the single model floki renders and plays;
+compare modes are `Arrangement`s over it; open/drop adds a layer. **Resume next → layer persistence**
+(`Vec<LayerPersist>` on `ExrApp`: path + name / blend / opacity / enabled / solo / aov / trim,
+re-decoded on load with fresh `LayerId`/`SourceId`; NEVER `#[serde(flatten)]` — it wipes `app.ron`).
+That is the last item from the original Phase-4 list. Non-blocking follow-ups are listed in the R4
+handoff above, plus two parked items from 3h: re-homing proxy **first-paint** onto `add_comp_source`
+(`draw_proxy` is `#[allow(dead_code)]`; scrub proxy is unaffected) and deciding whether
+`layer::Layout` survives now that `Arrangement` is the live viewport axis.
