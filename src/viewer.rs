@@ -289,6 +289,22 @@ pub(crate) fn comp_pane_layout(
     }
 }
 
+/// Which pane a blink compare shows at `time` (seconds), and when it next flips
+/// (#99 Slice 3g). Flips every `interval` seconds; returns `(shows_b, next_flip_at)`.
+/// The caller schedules a repaint for the flip rather than repainting continuously —
+/// the image only changes at the boundary, and a bare per-frame repaint re-runs the
+/// whole render including the OCIO passes (#146). A non-positive or non-finite
+/// interval degenerates to "always pane A", never a divide-by-zero. Pure.
+pub(crate) fn blink_phase(time: f64, interval: f32) -> (bool, f64) {
+    let interval = f64::from(interval);
+    if !(interval.is_finite() && interval > 0.0) || !time.is_finite() {
+        return (false, time);
+    }
+    let phase = (time / interval).floor();
+    let shows_b = (phase as i64).rem_euclid(2) == 1;
+    (shows_b, (phase + 1.0) * interval)
+}
+
 /// The drawn wipe line: its handle centre plus the two endpoints spanning the image.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) struct WipeLine {
@@ -375,17 +391,23 @@ pub(crate) fn pick_comp_side(
     rect_a.contains(pos).then_some(CompSide::A)
 }
 
-/// Which compare pane the cursor is over, across every arrangement (#99 Slice 2b): a
-/// Wipe (`wipe` = `Some((centre, angle))`) overlays both layers in `rect_a` and splits
-/// on the wipe line, while Side-by-Side splits on two rects. `None` when the cursor is
-/// over neither pane, so the readout blanks rather than reporting the wrong layer.
-/// Pure.
+/// Which compare pane the cursor is over, across every arrangement (#99 Slices 2b/3g).
+/// Side-by-Side splits on two rects; a Wipe (`wipe` = `Some((centre, angle))`) overlays
+/// both layers in `rect_a` and splits on the wipe line; a Blink (`blink_b` = `Some`)
+/// fills `rect_a` with one pane at a time, so the *phase* decides, not the cursor.
+/// `None` when the cursor is over no pane at all, so the readout blanks rather than
+/// reporting the wrong layer. Pure.
 pub(crate) fn comp_hover_side(
     pos: egui::Pos2,
     rect_a: egui::Rect,
     rect_b: Option<egui::Rect>,
     wipe: Option<([f32; 2], f32)>,
+    blink_b: Option<bool>,
 ) -> Option<CompSide> {
+    if let Some(showing_b) = blink_b {
+        let side = if showing_b { CompSide::B } else { CompSide::A };
+        return rect_a.contains(pos).then_some(side);
+    }
     match wipe {
         Some((center, angle)) => rect_a
             .contains(pos)
@@ -1037,6 +1059,11 @@ pub struct ExrViewer {
     /// Transient.
     pub last_wipe: Option<([f32; 2], f32)>,
 
+    /// Which pane the last comp frame's Blink arrangement showed (#99 Slice 3g);
+    /// `None` outside Blink. Blink fills the rect with one pane at a time, so the
+    /// pixel readout follows the phase rather than the cursor. Transient.
+    pub last_blink_b: Option<bool>,
+
     /// Annotation overlay (#45) — all transient (per-session, never persisted).
     /// Shapes are stored in image space so they track pan/zoom.
     pub annotations: Vec<Annotation>,
@@ -1144,6 +1171,7 @@ impl Default for ExrViewer {
             last_image_rect: None,
             last_image_rect_b: None,
             last_wipe: None,
+            last_blink_b: None,
             annotations: Vec::new(),
             anno_tool: AnnotationTool::None,
             anno_color: egui::Color32::RED,
@@ -2835,6 +2863,7 @@ impl ExrViewer {
                 // The classic A/B path has no comp Side-by-Side pane.
                 self.last_image_rect_b = None;
                 self.last_wipe = None;
+                self.last_blink_b = None;
                 self.last_image_rect = Some(crate::snapshot::active_area_rect(
                     rect,
                     disp_rect,
@@ -3309,8 +3338,9 @@ impl ExrViewer {
         };
         match program.arrangement {
             // Single (one draw) and Composite (A over B — see the stacking-order note
-            // below).
-            render_program::Arrangement::Stacked => {
+            // below). `Blink` is comp-path-only (#99 Slice 3g) and never reaches the
+            // A/B resolver, which drives blink through `compare_mode` instead.
+            render_program::Arrangement::Stacked | render_program::Arrangement::Blink => {
                 if program.is_composite {
                     if let Some(bg_b) = pick_b() {
                         if ctx.ocio_active {
@@ -3504,6 +3534,15 @@ impl ExrViewer {
         // `tex_b` at image-local uv.
         let is_wipe = side_b.is_some() && matches!(arrangement, Arrangement::Wipe { .. });
         let is_diff = side_b.is_some() && arrangement == Arrangement::Diff;
+        // Blink alternates the two panes in place: one draw at the full rect, binding
+        // whichever pane the phase selects. Schedule the repaint for the flip itself.
+        let blink_b = (side_b.is_some() && arrangement == Arrangement::Blink).then(|| {
+            let (shows_b, next_flip) = blink_phase(ui.input(|i| i.time), self.blink_interval);
+            let wait = (next_flip - ui.input(|i| i.time)).max(0.0);
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_secs_f64(wait));
+            shows_b
+        });
         let render_state = gpu_resources.render_state();
         let (bw, bh) = base_size;
         let tex_size = egui::vec2(bw.max(1) as f32, bh.max(1) as f32);
@@ -3570,6 +3609,8 @@ impl ExrViewer {
         }
         // Recorded *after* the drag, so the readout splits on the line as drawn.
         self.last_wipe = is_wipe.then_some((self.wipe_center, self.wipe_angle));
+        // Which pane blink is showing, so the readout reports the visible one.
+        self.last_blink_b = blink_b;
 
         // Re-bake + upload the gradient LUTs on ramp change (stable handles otherwise).
         self.sync_gradient_luts(gpu_resources);
@@ -3636,9 +3677,32 @@ impl ExrViewer {
             }
         }
 
-        // Wipe/Diff already emitted their single 2-input draw; the accumulate fold below
-        // is for Stacked (the whole composite) and Side-by-Side pane A.
-        let stack_draws = if is_wipe || is_diff { &[][..] } else { draws };
+        // Blink: one draw at the full rect, binding the pane the phase selects. Pane A
+        // reuses the normal accumulate fold below (it is a one-layer "composite"), so
+        // only the B phase needs its own draw.
+        if blink_b == Some(true)
+            && let Some(b) = side_b.as_ref()
+        {
+            ctx.draw(
+                &painter,
+                b.draw.bind_group.clone(),
+                None,
+                rect,
+                image_rect,
+                false, // is_diff
+                false, // is_composite
+                b.draw.opacity,
+            );
+        }
+
+        // Wipe/Diff emitted their single 2-input draw, and Blink's B phase its own; the
+        // accumulate fold below is for Stacked (the whole composite), Side-by-Side pane
+        // A, and Blink's A phase.
+        let stack_draws = if is_wipe || is_diff || blink_b == Some(true) {
+            &[][..]
+        } else {
+            draws
+        };
         let n = stack_draws.len();
         for (i, d) in stack_draws.iter().enumerate() {
             let (is_composite, is_top) = comp_layer_flags(i, n);
@@ -4616,6 +4680,7 @@ impl ExrViewer {
         self.last_image_rect = Some(image_rect);
         self.last_image_rect_b = None; // proxy is always a single image
         self.last_wipe = None;
+        self.last_blink_b = None;
 
         // Paint the tone-baked proxy texture, upscaled via linear filtering into
         // the full image rect. egui uploads the texture to the GPU itself, so this
@@ -5121,6 +5186,55 @@ mod gui_tests {
     }
 
     #[test]
+    fn blink_phase_alternates_and_reports_the_next_flip() {
+        use super::blink_phase;
+        // 1s interval: [0,1) shows A, [1,2) shows B, and so on.
+        assert_eq!(blink_phase(0.0, 1.0), (false, 1.0));
+        assert_eq!(blink_phase(0.5, 1.0), (false, 1.0));
+        assert_eq!(blink_phase(1.0, 1.0), (true, 2.0));
+        assert!(blink_phase(1.9, 1.0).0);
+        assert!(!blink_phase(2.0, 1.0).0, "flips back on the third beat");
+
+        // A sub-second interval still alternates, and the next flip is ahead of now.
+        let (_, next) = blink_phase(10.02, 0.25);
+        assert!(next > 10.02 && next <= 10.27, "next flip {next} is ahead");
+        assert_ne!(
+            blink_phase(10.02, 0.25).0,
+            blink_phase(10.30, 0.25).0,
+            "adjacent quarter-second beats show different panes"
+        );
+
+        // Degenerate intervals must not divide by zero or panic — they pin to pane A.
+        assert_eq!(blink_phase(5.0, 0.0), (false, 5.0));
+        assert_eq!(blink_phase(5.0, -1.0), (false, 5.0));
+        assert_eq!(blink_phase(5.0, f32::NAN), (false, 5.0));
+        assert!(!blink_phase(f64::NAN, 1.0).0);
+    }
+
+    #[test]
+    fn comp_hover_side_follows_the_blink_phase_not_the_cursor() {
+        use super::{CompSide, comp_hover_side};
+        let rect = egui::Rect::from_min_size(egui::pos2(100.0, 50.0), egui::vec2(200.0, 100.0));
+
+        // Blink fills the one rect with a single pane, so the phase decides — the same
+        // cursor position reports A or B depending on which is on screen.
+        let pos = egui::pos2(150.0, 100.0);
+        assert_eq!(
+            comp_hover_side(pos, rect, None, None, Some(false)),
+            Some(CompSide::A)
+        );
+        assert_eq!(
+            comp_hover_side(pos, rect, None, None, Some(true)),
+            Some(CompSide::B)
+        );
+        // Still nothing outside the image.
+        assert_eq!(
+            comp_hover_side(egui::pos2(10.0, 100.0), rect, None, None, Some(true)),
+            None
+        );
+    }
+
+    #[test]
     fn wipe_line_endpoints_centers_and_spans_the_image() {
         use super::wipe_line_endpoints;
         let rect = egui::Rect::from_min_size(egui::pos2(100.0, 50.0), egui::vec2(200.0, 100.0));
@@ -5155,26 +5269,26 @@ mod gui_tests {
         // At 0° the normal is +x, so right of centre is tex_b (pane B) — matching
         // `fs_main`'s `dist >= 0` test.
         assert_eq!(
-            comp_hover_side(egui::pos2(250.0, 100.0), rect, None, wipe),
+            comp_hover_side(egui::pos2(250.0, 100.0), rect, None, wipe, None),
             Some(CompSide::B)
         );
         assert_eq!(
-            comp_hover_side(egui::pos2(150.0, 100.0), rect, None, wipe),
+            comp_hover_side(egui::pos2(150.0, 100.0), rect, None, wipe, None),
             Some(CompSide::A)
         );
         // Outside the image → no readout at all.
         assert_eq!(
-            comp_hover_side(egui::pos2(50.0, 100.0), rect, None, wipe),
+            comp_hover_side(egui::pos2(50.0, 100.0), rect, None, wipe, None),
             None
         );
         // No wipe → the Side-by-Side two-rect split.
         let rect_b = egui::Rect::from_min_size(egui::pos2(300.0, 50.0), egui::vec2(200.0, 100.0));
         assert_eq!(
-            comp_hover_side(egui::pos2(350.0, 100.0), rect, Some(rect_b), None),
+            comp_hover_side(egui::pos2(350.0, 100.0), rect, Some(rect_b), None, None),
             Some(CompSide::B)
         );
         assert_eq!(
-            comp_hover_side(egui::pos2(150.0, 100.0), rect, Some(rect_b), None),
+            comp_hover_side(egui::pos2(150.0, 100.0), rect, Some(rect_b), None, None),
             Some(CompSide::A)
         );
     }

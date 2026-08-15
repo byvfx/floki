@@ -6456,6 +6456,7 @@ impl ExrApp {
                         Arrangement::SideBySide => "Side by Side",
                         Arrangement::Wipe { .. } => "Wipe",
                         Arrangement::Diff => "Diff",
+                        Arrangement::Blink => "Blink",
                     })
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut arr, Arrangement::Stacked, "Stacked");
@@ -6470,6 +6471,7 @@ impl ExrApp {
                             arr = Arrangement::Wipe { position: 0.5 };
                         }
                         ui.selectable_value(&mut arr, Arrangement::Diff, "Diff");
+                        ui.selectable_value(&mut arr, Arrangement::Blink, "Blink");
                     });
                 self.comp_arrangement = arr;
 
@@ -6518,6 +6520,14 @@ impl ExrApp {
                             ui.menu_button("Diff ▾", |ui| self.viewer.diff_params_ui(ui))
                                 .response
                                 .on_hover_text("Gain, colormap, metric, and noise floor");
+                        }
+                        Arrangement::Blink => {
+                            ui.label("Speed");
+                            ui.add(
+                                egui::Slider::new(&mut self.viewer.blink_interval, 0.05..=5.0)
+                                    .suffix("s"),
+                            )
+                            .on_hover_text("How long each pane is shown before flipping");
                         }
                         Arrangement::Stacked => {}
                     }
@@ -7287,9 +7297,10 @@ impl ExrApp {
         let rect_a = self.viewer.last_image_rect;
         let rect_b = self.viewer.last_image_rect_b;
         let wipe = self.viewer.last_wipe;
+        let blink_b = self.viewer.last_blink_b;
         let picked = hover
             .zip(rect_a)
-            .and_then(|(pos, ir)| crate::viewer::comp_hover_side(pos, ir, rect_b, wipe));
+            .and_then(|(pos, ir)| crate::viewer::comp_hover_side(pos, ir, rect_b, wipe, blink_b));
         // Name the status-bar row after the pane actually sampled, not always the
         // composite's top layer.
         if picked == Some(crate::viewer::CompSide::B)

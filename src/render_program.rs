@@ -85,6 +85,10 @@ pub enum Arrangement {
     SideBySide,
     /// `|A − B|` heat map over the two draws (the `DiffMatte` inspection).
     Diff,
+    /// Alternate the two panes in place on a timer (#99 Slice 3g) — the A/B
+    /// `blink_state` reframed as an arrangement. One draw, filling the viewport;
+    /// which pane it binds flips every `blink_interval`.
+    Blink,
 }
 
 /// The resolved program the draw paths consume instead of matching `compare_mode`
@@ -200,7 +204,11 @@ fn configure(stack: &mut LayerStack, ids: (LayerId, LayerId), input: &ResolveInp
     }
     stack.set_layout(
         match arrangement_of(input.compare_mode, input.wipe_position) {
-            Arrangement::Stacked | Arrangement::Diff => crate::layer::Layout::Stack,
+            // Blink is comp-path-only (#99 Slice 3g); `arrangement_of` never yields it
+            // from a `CompareMode`, but the match must stay exhaustive.
+            Arrangement::Stacked | Arrangement::Diff | Arrangement::Blink => {
+                crate::layer::Layout::Stack
+            }
             Arrangement::Wipe { position } => crate::layer::Layout::Wipe { position },
             Arrangement::SideBySide => crate::layer::Layout::Grid { cols: 2 },
         },
