@@ -1261,7 +1261,27 @@ impl ExrApp {
     /// playing (#146). The outcome arrives over `snapshot_rx`.
     fn finish_snapshot(&mut self, image: &egui::ColorImage, pixels_per_point: f32) {
         // Crop to the active image area (#52), falling back to the full canvas.
-        let Some(rect) = self.viewer.last_image_rect.or(self.viewer.last_canvas_rect) else {
+        //
+        // The clamp to the canvas happens here rather than at the `last_image_rect`
+        // write site (#99 Slice 3a): the comp path reuses that rect for the cursor→
+        // pixel readout (`comp_hover_pixel` normalizes across it), so storing a
+        // canvas-clipped rect would skew the readout whenever the image is zoomed
+        // past the viewport. The legacy path clamped on write and had separate hover
+        // geometry; doing it here keeps both consumers correct. Two panes span the
+        // canvas, so Side-by-Side takes the whole canvas.
+        let Some(rect) = self
+            .viewer
+            .last_image_rect
+            .zip(self.viewer.last_canvas_rect)
+            .map(|(img, canvas)| {
+                crate::snapshot::active_area_rect(
+                    canvas,
+                    img,
+                    self.viewer.last_image_rect_b.is_some(),
+                )
+            })
+            .or(self.viewer.last_canvas_rect)
+        else {
             return;
         };
         let cropped = crate::snapshot::crop_to_rect(image, rect, pixels_per_point);
@@ -6326,6 +6346,54 @@ impl ExrApp {
                 ui.separator();
             }
 
+            // Tone controls (#99 Slice 3a). These lived only in the classic viewer's
+            // `primary_row`, which the R4 collapse made unreachable — yet
+            // `draw_comp_composite` still applies `exposure` / `gamma` / `srgb` to the
+            // composite, so they were frozen at whatever persisted. Same widgets and
+            // same right-click-to-reset behaviour as the row they replace.
+            let exp = ui
+                .add(
+                    egui::DragValue::new(&mut self.viewer.exposure)
+                        .speed(0.01)
+                        .range(-5.0..=5.0)
+                        .prefix("EV ")
+                        .fixed_decimals(2),
+                )
+                .on_hover_text("Drag to adjust • right-click resets to 0.0 (key: E)");
+            if exp.changed() {
+                self.viewer.invalidate_tone();
+            }
+            if exp.secondary_clicked() {
+                self.viewer.reset_exposure();
+            }
+            let gam = ui
+                .add(
+                    egui::DragValue::new(&mut self.viewer.gamma)
+                        .speed(0.01)
+                        .range(0.1..=5.0)
+                        .prefix("γ ")
+                        .fixed_decimals(2),
+                )
+                .on_hover_text("Drag to adjust • right-click resets to 1.0 (key: Shift+G)");
+            if gam.changed() {
+                self.viewer.invalidate_tone();
+            }
+            if gam.secondary_clicked() {
+                self.viewer.reset_gamma();
+            }
+            if ui
+                .button("⟲")
+                .on_hover_text("Reset exposure (0.0) & gamma (1.0)")
+                .clicked()
+            {
+                self.viewer.reset_exposure();
+                self.viewer.reset_gamma();
+            }
+            if ui.checkbox(&mut self.viewer.srgb, "sRGB").changed() {
+                self.viewer.invalidate_tone();
+            }
+            ui.separator();
+
             // Channel isolation — the same C/R/G/B/A the classic top row had; the
             // composite honors `channel_mode` on its top layer.
             ui.label("Channel:");
@@ -6398,16 +6466,53 @@ impl ExrApp {
                 }
             }
 
-            // Anamorphic unsqueeze toggle (#194), surfaced here since the comp path
-            // doesn't draw the classic viewer's Display ▾ menu. Only for non-square
-            // pixels; the render stretch uses the base layer's PAR (`base_par`).
-            if (cur_par - 1.0).abs() > f32::EPSILON {
+            // The rarely-touched controls, behind a menu as the classic row had them
+            // (#99 Slice 3a). The standalone Unsqueeze checkbox (#194) folds in here.
+            ui.separator();
+            ui.menu_button("Display ▾", |ui| {
+                // Readout aperture. `sample_pixel` (shared with the comp readout) has
+                // always honored this; only its control was unreachable.
+                ui.label("Sample:");
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.viewer.sample_aperture, 1, "1px");
+                    ui.selectable_value(&mut self.viewer.sample_aperture, 3, "3×3");
+                    ui.selectable_value(&mut self.viewer.sample_aperture, 9, "9×9");
+                });
+
                 ui.separator();
-                ui.checkbox(&mut self.viewer.prefs.anamorphic_unsqueeze, "Unsqueeze")
-                    .on_hover_text(format!(
-                        "Stretch anamorphic footage to display aspect (header PAR {cur_par})"
-                    ));
-            }
+                // Anamorphic unsqueeze (#179 / #194): the master toggle persists via
+                // `ViewerPrefs`; the optional custom factor overrides the header PAR.
+                ui.checkbox(
+                    &mut self.viewer.prefs.anamorphic_unsqueeze,
+                    "Unsqueeze anamorphic",
+                )
+                .on_hover_text(
+                    "Stretch non-square-pixel (anamorphic) footage to its display aspect",
+                );
+                let unsqueeze = self.viewer.prefs.anamorphic_unsqueeze;
+                ui.add_enabled_ui(unsqueeze, |ui| {
+                    let mut custom = self.viewer.pixel_aspect_override.is_some();
+                    if ui
+                        .checkbox(&mut custom, "Custom factor")
+                        .on_hover_text("Override the header pixel aspect ratio")
+                        .changed()
+                    {
+                        // Seed from the current layer's header PAR, or a common 2×
+                        // squeeze when the header is square/absent.
+                        let seed = if cur_par > 0.0 && (cur_par - 1.0).abs() > f32::EPSILON {
+                            cur_par
+                        } else {
+                            2.0
+                        };
+                        self.viewer.pixel_aspect_override = custom.then_some(seed);
+                    }
+                    if let Some(factor) = self.viewer.pixel_aspect_override.as_mut() {
+                        ui.add(egui::DragValue::new(factor).speed(0.01).range(0.1..=4.0));
+                    } else {
+                        ui.label(format!("Header PAR: {cur_par}"));
+                    }
+                });
+            });
         });
         ui.separator();
     }

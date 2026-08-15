@@ -1208,20 +1208,12 @@ impl ExrViewer {
                     fullscreen_changed = true;
                 }
             }
-
-            // Reset exposure (E) / gamma (Shift+G). Gamma deliberately uses
-            // Shift+G because plain `G` isolates the green channel below.
-            if !editing && i.key_pressed(egui::Key::E) {
-                self.reset_exposure();
-            }
-            if !editing && i.modifiers.shift && i.key_pressed(egui::Key::G) {
-                self.reset_gamma();
-            }
         });
 
-        // Channel-isolation (+ frame-fit) shortcuts run in their own input pass so
-        // the comp path — which doesn't run the full viewer `ui` — can reuse them
-        // (#192) without re-entering this `ui.input` closure (a nested borrow).
+        // Channel-isolation, frame-fit, and the E / Shift+G tone resets run in their
+        // own input pass so the comp path — which doesn't run the full viewer `ui` —
+        // can reuse them (#192, #99 Slice 3a) without re-entering this `ui.input`
+        // closure (a nested borrow).
         self.handle_channel_hotkeys(ui);
 
         if fullscreen_changed {
@@ -1230,14 +1222,30 @@ impl ExrViewer {
         }
     }
 
-    /// Service the C/R/G/B/A channel-isolation shortcuts (and `F` frame-fit). Split
-    /// out of `handle_hotkeys` so the comp central path can offer one-keystroke
-    /// isolation in comp mode (#192), where the full viewer `ui` (and thus
+    /// Service the C/R/G/B/A channel-isolation shortcuts, `F` frame-fit, and the
+    /// `E` / `Shift+G` tone resets. Split out of `handle_hotkeys` so the comp central
+    /// path can offer them in comp mode (#192), where the full viewer `ui` (and thus
     /// `handle_hotkeys`) never runs. Suppressed while a text field wants keyboard
     /// input or the contact sheet is open, matching `handle_hotkeys`.
+    ///
+    /// The tone resets live here rather than in `handle_hotkeys` (#99 Slice 3a): the
+    /// comp path is the only viewport now, and exposure / gamma still drive the
+    /// composite, so leaving their shortcuts behind made them unreachable.
     pub fn handle_channel_hotkeys(&mut self, ui: &egui::Ui) {
         if ui.ctx().egui_wants_keyboard_input() || self.show_contact_sheet {
             return;
+        }
+        let (reset_exp, reset_gam) = ui.input(|i| {
+            (
+                i.key_pressed(egui::Key::E),
+                i.key_pressed(egui::Key::G) && i.modifiers.shift,
+            )
+        });
+        if reset_exp {
+            self.reset_exposure();
+        }
+        if reset_gam {
+            self.reset_gamma();
         }
         let next = ui.input(|i| {
             if i.key_pressed(egui::Key::F) {
@@ -1334,12 +1342,14 @@ impl ExrViewer {
         self.invalidate_gpu_thumbnails(true, true);
     }
 
-    fn reset_exposure(&mut self) {
+    /// `pub(crate)`: the comp viewport bar hosts the tone controls now (#99 Slice 3a).
+    pub(crate) fn reset_exposure(&mut self) {
         self.exposure = 0.0;
         self.invalidate_tone();
     }
 
-    fn reset_gamma(&mut self) {
+    /// `pub(crate)` — see [`Self::reset_exposure`].
+    pub(crate) fn reset_gamma(&mut self) {
         self.gamma = 1.0;
         self.invalidate_tone();
     }
@@ -5476,6 +5486,54 @@ mod gui_tests {
             h.state().viewer.channel_mode,
             ChannelMode::B,
             "channel hotkeys must stay inert in contact-sheet mode via the comp entry point"
+        );
+    }
+
+    #[test]
+    fn tone_reset_hotkeys_work_via_comp_entry_point() {
+        // E / Shift+G moved from `handle_hotkeys` (unreachable since the R4 collapse)
+        // onto the comp entry point (#99 Slice 3a), because exposure/gamma still drive
+        // the composite. Plain G must keep isolating the green channel, not reset gamma.
+        let mut h = Harness::new_ui_state(
+            |ui, s: &mut State| s.viewer.handle_channel_hotkeys(ui),
+            State {
+                viewer: ExrViewer {
+                    exposure: 2.0,
+                    gamma: 2.2,
+                    ..ExrViewer::default()
+                },
+                has_b: false,
+            },
+        );
+
+        h.key_press(egui::Key::E);
+        h.run();
+        assert_eq!(h.state().viewer.exposure, 0.0, "E resets exposure");
+        assert_eq!(h.state().viewer.gamma, 2.2, "E leaves gamma alone");
+
+        // Plain G is channel isolation, NOT a gamma reset.
+        h.key_press(egui::Key::G);
+        h.run();
+        assert_eq!(h.state().viewer.gamma, 2.2, "plain G must not reset gamma");
+        assert_eq!(
+            h.state().viewer.channel_mode,
+            ChannelMode::G,
+            "plain G isolates the green channel"
+        );
+
+        h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::G);
+        h.run();
+        assert_eq!(h.state().viewer.gamma, 1.0, "Shift+G resets gamma");
+
+        // Inert with the contact sheet open, matching the channel keys.
+        h.state_mut().viewer.exposure = 3.0;
+        h.state_mut().viewer.show_contact_sheet = true;
+        h.key_press(egui::Key::E);
+        h.run();
+        assert_eq!(
+            h.state().viewer.exposure,
+            3.0,
+            "tone resets stay inert in contact-sheet mode"
         );
     }
 
