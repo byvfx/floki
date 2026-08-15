@@ -169,24 +169,6 @@ impl Layer {
     }
 }
 
-/// Spatial arrangement of the visible layers — the axis the old `CompareMode`
-/// conflated with blend. `Stack` composites in one viewport; `Wipe`/`Grid` lay
-/// visible layers out side by side. Independent of each layer's [`BlendMode`].
-///
-/// Superseded for the live viewport by [`Arrangement`]; retained as the model-side
-/// expression of the same idea.
-#[derive(Clone, Copy, PartialEq, Debug, Default)]
-#[allow(dead_code)] // superseded by `Arrangement` for the viewport axis (#99 Slice 3h)
-pub enum Layout {
-    /// Composite bottom-to-top in a single viewport (today's Single / Composite).
-    #[default]
-    Stack,
-    /// Split-screen wipe between the visible layers at `position` ∈ `[0, 1]`.
-    Wipe { position: f32 },
-    /// Tile the visible layers in a grid `cols` wide (SideBySide / N-way / sheet).
-    Grid { cols: u32 },
-}
-
 /// How the comp viewport presents the stack (#99). `Stacked` shows the whole
 /// composite; every other arrangement is a **two-pane compare** between the current
 /// layer (pane A) and the `vs:` layer (pane B), each drawn on its own.
@@ -241,11 +223,10 @@ pub struct Draw {
 }
 
 /// An ordered comp stack: index `0` is the **bottom** layer (drawn first), higher
-/// indices draw over it. Owns `LayerId` allocation and the global [`Layout`].
+/// indices draw over it. Owns `LayerId` allocation.
 #[derive(Clone, Debug, Default)]
 pub struct LayerStack {
     layers: Vec<Layer>,
-    layout: Layout,
     next_id: u64,
 }
 
@@ -265,17 +246,6 @@ impl LayerStack {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.layers.is_empty()
-    }
-
-    #[allow(dead_code)] // read back by the arrangement UI; landed ahead of #104/#98
-    #[must_use]
-    pub fn layout(&self) -> Layout {
-        self.layout
-    }
-
-    #[allow(dead_code)] // see `Layout`
-    pub fn set_layout(&mut self, layout: Layout) {
-        self.layout = layout;
     }
 
     /// Layers bottom-to-top. Double-ended so callers can walk top→bottom via
@@ -591,14 +561,5 @@ mod tests {
             assert_eq!(d.aov, i, "distinct AOV per layer");
             assert_eq!(d.blend, BlendMode::Add);
         }
-    }
-
-    #[test]
-    fn layout_defaults_to_stack_and_is_settable() {
-        let mut s = LayerStack::new();
-        assert_eq!(s.layout(), Layout::Stack);
-        // N-way compare arrangement: a grid, independent of per-layer blend.
-        s.set_layout(Layout::Grid { cols: 2 });
-        assert_eq!(s.layout(), Layout::Grid { cols: 2 });
     }
 }
