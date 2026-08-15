@@ -18,12 +18,13 @@
 //!
 //! # The structural idea
 //!
-//! floki's current A/B compare slots + [`crate::viewer::CompareMode`] are a
-//! hardcoded two-input special case. This module generalizes them to a `Vec<Layer>`, and in
-//! doing so splits the **two axes that `CompareMode` conflates**:
+//! floki's old A/B compare slots + `CompareMode` were a hardcoded two-input
+//! special case (deleted in #99 Slice 3h). This module generalizes them to a
+//! `Vec<Layer>`, and in doing so splits the **two axes `CompareMode` conflated**:
 //!
-//! - **Arrangement** — *where* visible layers are placed: one viewport, a wipe, or
-//!   a grid. This is [`Layout`].
+//! - **Arrangement** — *where* visible layers are placed: one viewport, a wipe, a
+//!   grid, or an alternating blink. This is [`Arrangement`], the live viewport
+//!   axis; [`Layout`] is its older model-side twin, kept but unused.
 //! - **Blend** — *how* stacked layers combine: [`crate::viewer::BlendMode`]
 //!   (reused unchanged; it is the single source of truth shared with the shader).
 //!
@@ -168,11 +169,14 @@ impl Layer {
     }
 }
 
-/// Spatial arrangement of the visible layers — the axis `CompareMode` conflates
-/// with blend. `Stack` composites in one viewport; `Wipe`/`Grid` lay visible
-/// layers out side by side. Arrangement is independent of each layer's
-/// [`BlendMode`].
+/// Spatial arrangement of the visible layers — the axis the old `CompareMode`
+/// conflated with blend. `Stack` composites in one viewport; `Wipe`/`Grid` lay
+/// visible layers out side by side. Independent of each layer's [`BlendMode`].
+///
+/// Superseded for the live viewport by [`Arrangement`]; retained as the model-side
+/// expression of the same idea.
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
+#[allow(dead_code)] // superseded by `Arrangement` for the viewport axis (#99 Slice 3h)
 pub enum Layout {
     /// Composite bottom-to-top in a single viewport (today's Single / Composite).
     #[default]
@@ -181,6 +185,33 @@ pub enum Layout {
     Wipe { position: f32 },
     /// Tile the visible layers in a grid `cols` wide (SideBySide / N-way / sheet).
     Grid { cols: u32 },
+}
+
+/// How the comp viewport presents the stack (#99). `Stacked` shows the whole
+/// composite; every other arrangement is a **two-pane compare** between the current
+/// layer (pane A) and the `vs:` layer (pane B), each drawn on its own.
+///
+/// This is the viewport-presentation axis, distinct from [`Layout`], which is the
+/// model's own (currently cosmetic) notion of arrangement. It lives here beside its
+/// twin now that the A/B `render_program` module that defined it is gone (Slice 3h).
+///
+/// The geometry stays in the draw paths: `viewer::comp_pane_layout` resolves the
+/// rects, and the wipe/diff maths lives in the shader.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub enum Arrangement {
+    /// One viewport showing the full composite, bottom→top.
+    #[default]
+    Stacked,
+    /// Both panes in one rect, split by a draggable line at `position` ∈ `[0, 1]`.
+    Wipe { position: f32 },
+    /// The two panes tiled left/right, abutting at a divider.
+    SideBySide,
+    /// `|A − B|` false-colour heat map over the two panes. Display-space, so it
+    /// deliberately opts out of the colour-managed path.
+    Diff,
+    /// Alternate the two panes in place on a timer, flipping every
+    /// `ExrViewer::blink_interval`.
+    Blink,
 }
 
 /// One step of the resolved composite for a given global frame, bottom-to-top.
@@ -242,6 +273,7 @@ impl LayerStack {
         self.layout
     }
 
+    #[allow(dead_code)] // see `Layout`
     pub fn set_layout(&mut self, layout: Layout) {
         self.layout = layout;
     }

@@ -1,6 +1,6 @@
 //! The image canvas: pan/zoom, channel/exposure/gamma controls, the six
-//! [`CompareMode`]s, pixel sampling, histogram and contact sheet. State lives in
-//! [`ExrViewer`]; [`ExrViewer::ui`] is the per-frame entry point.
+//! `Arrangement`s, pixel sampling, histogram and contact sheet. State lives in
+//! [`ExrViewer`]; `draw_comp_composite` is the per-frame entry point.
 //!
 //! # Texture generation
 //!
@@ -24,7 +24,6 @@
 use crate::annotation::{Annotation, AnnotationKind, AnnotationTool};
 use crate::exr_loader::ExrData;
 use crate::gradient::{Colormap, DiffMetric, Gradient};
-use crate::render_program;
 use eframe::egui;
 use exr::prelude::f16;
 use rayon::prelude::*;
@@ -41,7 +40,7 @@ fn rgb3_to_vec4(c: [f32; 3]) -> [f32; 4] {
 /// spills off-screen. Mirrors the SBS layout in [`ExrViewer::emit_mode_draws`],
 /// measured in unscaled space (the `scale` cancels out of the fit ratio).
 ///
-/// Takes `side_by_side` as a plain bool rather than a [`CompareMode`] so the comp path
+/// Takes `side_by_side` as a plain bool rather than a compare enum so the comp path
 /// can drive it from its own `Arrangement` (#99 Slice 2a) — the A/B compare enum is
 /// slated for deletion with the render retire.
 fn framing_bounds(
@@ -108,21 +107,7 @@ impl ChannelMode {
     }
 }
 
-/// How A and B are shown together. `SingleA`/`SingleB` ignore the other image;
-/// the rest require a loaded B. `Wipe`, `SideBySide` and `DiffMatte`/`Composite`
-/// are all resolved in-shader on the GPU path (and have CPU-fallback generators
-/// for `DiffMatte`/`Composite` — see the module-level docs).
-#[derive(PartialEq, Clone, Copy, Debug)]
-pub enum CompareMode {
-    SingleA,
-    SingleB,
-    Wipe,
-    SideBySide,
-    DiffMatte,
-    Composite,
-}
-
-/// Compositing operator for [`CompareMode::Composite`] (premultiplied-alpha
+/// Compositing operator for a layer in the comp stack (premultiplied-alpha
 /// aware). Encoded for the shader via [`Self::as_u32`]. Serde-serializable so the
 /// Layers panel can persist each layer's blend (#99 PR-B; safe fieldless enum).
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug, serde::Serialize, serde::Deserialize)]
@@ -169,29 +154,6 @@ impl BlendMode {
             Self::Screen => "Screen",
         }
     }
-}
-
-/// Per-frame canvas geometry computed once in [`ExrViewer::ui`] and handed to the
-/// GPU/CPU draw paths, so they take one value instead of a long parameter list
-/// and don't recompute layout. All rects are in screen space.
-struct CanvasLayout {
-    /// Full canvas rect allocated for the image.
-    rect: egui::Rect,
-    /// Display-window rect (the EXR's framing), scaled + translated.
-    disp_rect: egui::Rect,
-    /// Data-window rect: where image A's pixels actually land.
-    image_rect: egui::Rect,
-    /// Size of image A in screen pixels (`tex_size * scale`).
-    image_size: egui::Vec2,
-    /// Pixel dimensions of image A's active layer.
-    tex_size: egui::Vec2,
-    /// Pixel dimensions of image B's active layer, if B is loaded.
-    tex_size_b: Option<egui::Vec2>,
-    /// Horizontal anamorphic unsqueeze factor for B (#179). A's factor is already
-    /// baked into `image_size`/`image_rect`, so single-image/composite/wipe/diff
-    /// draws need nothing further; only the Side-by-Side path lays B out separately
-    /// and must apply B's own factor here.
-    par_b: f32,
 }
 
 /// One resolved Layers-panel composite layer for [`ExrViewer::draw_comp_composite`]
@@ -246,7 +208,7 @@ pub(crate) struct CompPanes {
 /// presence squeezes Wipe/Diff into the left half. Pure, so that distinction is
 /// unit-testable without a GPU.
 pub(crate) fn comp_pane_layout(
-    arrangement: crate::render_program::Arrangement,
+    arrangement: crate::layer::Arrangement,
     canvas_center: egui::Pos2,
     translation: egui::Vec2,
     scale: f32,
@@ -254,7 +216,7 @@ pub(crate) fn comp_pane_layout(
     side_b: Option<(egui::Vec2, f32)>,
     normalize: bool,
 ) -> CompPanes {
-    let split = matches!(arrangement, crate::render_program::Arrangement::SideBySide)
+    let split = matches!(arrangement, crate::layer::Arrangement::SideBySide)
         .then_some(side_b)
         .flatten();
     match split {
@@ -560,11 +522,6 @@ impl<T> T2Ring<T> {
     fn contains(&self, frame: u32) -> bool {
         self.map.contains_key(&frame)
     }
-
-    fn get(&self, frame: u32) -> Option<&T> {
-        self.map.get(&frame)
-    }
-
     /// Set the on-screen frame (bound for paint, never evicted).
     fn set_frame(&mut self, frame: Option<u32>) {
         self.frame = frame;
@@ -871,8 +828,8 @@ impl Default for ViewerPrefs {
 }
 
 /// All canvas state for one A/B pair: view transform, tone controls, the active
-/// [`CompareMode`], the texture caches described in the module docs, plus
-/// sampling/histogram/contact-sheet state. Driven each frame by [`Self::ui`].
+/// the arrangement, the texture caches described in the module docs, plus
+/// sampling/histogram/contact-sheet state. Driven each frame by the comp path.
 pub struct ExrViewer {
     /// Per-layer **decimated** contact-sheet thumbnails (A/B). The CPU thumbnail
     /// bake ([`Self::generate_texture`]) is the headless / no-GPU fallback; when a
@@ -961,12 +918,10 @@ pub struct ExrViewer {
     /// so the GPU texture is re-uploaded only when the gradient ramp changes.
     bg_gradient_lut: Vec<f32>,
     bg_gradient_sig: Option<Gradient>,
-    pub blink_state: bool,
     pub blink_interval: f32,
     pub fullscreen: bool,
     // Add viewing options like exposure, gamma, srgb toggle
     pub exposure: f32,
-    pub overscan_opacity: f32,
     pub gamma: f32,
     pub srgb: bool,
     pub enable_lut: bool,
@@ -990,7 +945,6 @@ pub struct ExrViewer {
     ocio_sig: u64,
     pub show_tooltip: bool,
     pub channel_mode: ChannelMode,
-    pub compare_mode: CompareMode,
     pub blend_mode: BlendMode,
     pub sample_aperture: usize,
     pub wipe_center: [f32; 2],
@@ -1034,7 +988,6 @@ pub struct ExrViewer {
     /// Natural (unclipped) height of the contextual mode-param row, recorded each
     /// frame it renders so the slide-in animation knows how far to grow. Transient
     /// runtime state — not persisted.
-    row2_full_height: f32,
 
     /// The image canvas rect (egui points) from the last frame, used by the
     /// snapshot feature (#19) to crop the framebuffer screenshot to the image
@@ -1090,21 +1043,10 @@ pub struct ExrViewer {
     /// viewport layout so the proxy lands in the same rect the full-res render
     /// will occupy (the proxy texture itself is lower-res and upscaled).
     proxy_full_size: Option<egui::Vec2>,
-
-    /// The two-layer A/B comp stack (#114): slot A at the bottom, slot B on top.
-    /// The existing `compare_mode` / `blend_mode` / `active_layer` fields remain
-    /// the source of truth; each frame [`crate::render_program::resolve`]
-    /// reconfigures this stack from them and reads its `composite_at`, so the draw
-    /// paths dispatch off the layer model instead of branching on `CompareMode`
-    /// inline. `layer_ids` are stable for the session — the cache-key seam toward
-    /// `(LayerId, source_frame)` (`src/cache.rs`).
-    layer_stack: crate::layer::LayerStack,
-    layer_ids: (crate::layer::LayerId, crate::layer::LayerId),
 }
 
 impl Default for ExrViewer {
     fn default() -> Self {
-        let (layer_stack, layer_ids) = crate::render_program::new_ab_stack();
         Self {
             thumbnails: Vec::new(),
             thumbnails_b: Vec::new(),
@@ -1128,11 +1070,9 @@ impl Default for ExrViewer {
             new_bg_preset_name: String::new(),
             bg_gradient_lut: Vec::new(),
             bg_gradient_sig: None,
-            blink_state: false,
             blink_interval: 1.0,
             fullscreen: false,
             exposure: 0.0,
-            overscan_opacity: 0.2,
             gamma: 1.0,
             srgb: true,
             enable_lut: false,
@@ -1143,7 +1083,6 @@ impl Default for ExrViewer {
             ocio_sig: 0,
             show_tooltip: true,
             channel_mode: ChannelMode::RGB,
-            compare_mode: CompareMode::SingleA,
             blend_mode: BlendMode::Over,
             sample_aperture: 1,
             wipe_center: [0.5, 0.5],
@@ -1166,7 +1105,6 @@ impl Default for ExrViewer {
             last_sampled_val_a: None,
             last_sampled_val_b: None,
             suppress_sampling: false,
-            row2_full_height: 0.0,
             last_canvas_rect: None,
             last_image_rect: None,
             last_image_rect_b: None,
@@ -1183,58 +1121,20 @@ impl Default for ExrViewer {
             anno_text_edit: None,
             proxy_texture: None,
             proxy_full_size: None,
-            layer_stack,
-            layer_ids,
         }
     }
 }
 
 impl ExrViewer {
-    /// Apply keyboard shortcuts that only mutate view state — compare-mode
-    /// selection (1/2/Space) and channel isolation (R/G/B/A/C/F). Extracted
-    /// from [`Self::ui`] as a rendering-free seam so the input handling can be
-    /// driven headlessly in tests (no wgpu device required).
+    /// Every viewer keyboard shortcut: channel isolation (R/G/B/A/C), frame-fit
+    /// (F), the tone resets (E / Shift+G), and fullscreen (F11 / Esc). Called once
+    /// per frame from the comp central path, which is the only viewport (#99).
+    /// Rendering-free, so the input handling is driven headlessly in tests (no wgpu
+    /// device required).
     ///
-    /// `has_b` is whether a reference image (B) is loaded; the B-only shortcuts
-    /// are inert without it. Channel shortcuts apply only in the single-view
-    /// layout (not the contact sheet), matching the original inline behavior.
-    pub fn handle_hotkeys(&mut self, ui: &egui::Ui, has_b: bool) {
-        // When a text field wants keyboard input (e.g. the annotation text field or
-        // a preset-name box), suppress the single-key viewer shortcuts so typing
-        // "r" doesn't isolate the red channel.
-        let editing = ui.ctx().egui_wants_keyboard_input();
-
-        ui.input(|i| {
-            if !editing && i.key_pressed(egui::Key::Num1) {
-                self.compare_mode = CompareMode::SingleA;
-                self.blink_state = false;
-            }
-            if !editing && has_b && i.key_pressed(egui::Key::Num2) {
-                self.compare_mode = CompareMode::SingleB;
-                self.blink_state = false;
-            }
-            if !editing && has_b && i.key_pressed(egui::Key::Space) {
-                self.blink_state = !self.blink_state;
-            }
-        });
-
-        // Channel-isolation, frame-fit, the E / Shift+G tone resets, and F11 / Esc run
-        // in their own input pass so the comp path — which doesn't run the full viewer
-        // `ui` — can reuse them (#192, #99 Slices 3a/3f) without re-entering this
-        // `ui.input` closure (a nested borrow). F11 / Esc live *only* there: handling
-        // them here too would toggle fullscreen twice per press and cancel out.
-        self.handle_channel_hotkeys(ui);
-    }
-
-    /// Service the C/R/G/B/A channel-isolation shortcuts, `F` frame-fit, and the
-    /// `E` / `Shift+G` tone resets. Split out of `handle_hotkeys` so the comp central
-    /// path can offer them in comp mode (#192), where the full viewer `ui` (and thus
-    /// `handle_hotkeys`) never runs. Suppressed while a text field wants keyboard
-    /// input or the contact sheet is open, matching `handle_hotkeys`.
-    ///
-    /// The tone resets live here rather than in `handle_hotkeys` (#99 Slice 3a): the
-    /// comp path is the only viewport now, and exposure / gamma still drive the
-    /// composite, so leaving their shortcuts behind made them unreachable.
+    /// The single-key shortcuts are suppressed while a text field wants keyboard
+    /// input or the contact sheet is open; F11 / Esc deliberately are not — see the
+    /// ordering note in the body.
     pub fn handle_channel_hotkeys(&mut self, ui: &egui::Ui) {
         // Fullscreen (F11) and Esc (#99 Slice 3f) run **before** the suppression gate
         // below, because they must stay live exactly when the single-key shortcuts
@@ -1247,12 +1147,23 @@ impl ExrViewer {
         // Esc only falls through to leaving fullscreen when there was no annotation to
         // cancel. Sending a viewport command needs `ui.ctx()`, which can't be touched
         // while the input lock is held, so the reads come first.
-        let (f11, esc) = ui.input(|i| {
+        // `T` toggles the contact sheet. Like F11/Esc it sits above the gate — the
+        // sheet sets `show_contact_sheet`, which the gate keys off, so handling it
+        // below would let `T` open the sheet but never close it.
+        // Read this BEFORE the input closure: `egui_wants_keyboard_input` locks the
+        // same context, and touching `ui.ctx()` while the input lock is held
+        // deadlocks (the same constraint the viewport command below is subject to).
+        let typing = ui.ctx().egui_wants_keyboard_input();
+        let (f11, esc, sheet) = ui.input(|i| {
             (
                 i.key_pressed(egui::Key::F11),
                 i.key_pressed(egui::Key::Escape),
+                i.key_pressed(egui::Key::T) && !typing,
             )
         });
+        if sheet {
+            self.show_contact_sheet = !self.show_contact_sheet;
+        }
         let mut fullscreen_changed = false;
         if f11 {
             self.fullscreen = !self.fullscreen;
@@ -1346,7 +1257,7 @@ impl ExrViewer {
 
     /// Free queued GPU thumbnail texture ids (#67). Invalidation sites have no
     /// renderer handle, so they defer into `pending_thumb_frees`; this is the
-    /// one place that holds the renderer. Runs every frame from [`Self::ui`]
+    /// one place that holds the renderer. Runs every frame from the comp path
     /// (and again inside the contact sheet after its own invalidations). With
     /// no GPU nothing was ever registered — just clear the queue.
     pub(crate) fn drain_thumb_frees(&mut self, gpu_resources: Option<&crate::gpu::GpuResources>) {
@@ -1389,238 +1300,6 @@ impl ExrViewer {
         self.invalidate_tone();
     }
 
-    /// Whether the active comparison mode has parameters that belong on the
-    /// contextual second toolbar row. Drives the slide-in/out of that row.
-    /// Pure and GPU-free so it can be unit-tested headlessly.
-    ///
-    /// Blink is checked first because, while blinking, [`Self::ui`] overwrites
-    /// `compare_mode` with `SingleA`/`SingleB` each frame (which would otherwise
-    /// report no params) — yet the blink-speed control still needs a home.
-    fn has_mode_params(&self) -> bool {
-        if self.blink_state {
-            return true;
-        }
-        matches!(
-            self.compare_mode,
-            CompareMode::Wipe
-                | CompareMode::DiffMatte
-                | CompareMode::SideBySide
-                | CompareMode::Composite
-        )
-    }
-
-    /// Row 1 of the viewer controls — the always-present essentials: compare-mode
-    /// selector, compact exposure/gamma drag-values, channel isolation, sample
-    /// aperture, and a `Display ▾` menu for the rarely-touched options.
-    fn primary_row(
-        &mut self,
-        ui: &mut egui::Ui,
-        exr_data: &ExrData,
-        has_b: bool,
-        layer_count: usize,
-    ) {
-        ui.horizontal(|ui| {
-            if has_b {
-                ui.label("Compare:");
-                ui.selectable_value(&mut self.compare_mode, CompareMode::SingleA, "A");
-                ui.selectable_value(&mut self.compare_mode, CompareMode::SingleB, "B");
-
-                ui.add_enabled_ui(!self.show_contact_sheet, |ui| {
-                    ui.selectable_value(&mut self.compare_mode, CompareMode::Wipe, "Wipe");
-                });
-                ui.selectable_value(
-                    &mut self.compare_mode,
-                    CompareMode::SideBySide,
-                    "Side-by-Side",
-                );
-                ui.add_enabled_ui(!self.show_contact_sheet, |ui| {
-                    ui.selectable_value(&mut self.compare_mode, CompareMode::DiffMatte, "Diff");
-                    ui.selectable_value(&mut self.compare_mode, CompareMode::Composite, "Comp");
-                });
-                if ui
-                    .toggle_value(&mut self.blink_state, "Blink (Spc)")
-                    .clicked()
-                    && !self.blink_state
-                {
-                    self.compare_mode = CompareMode::SingleA;
-                }
-            }
-
-            // Contact Sheet is a view-mode toggle that belongs with the compare
-            // modes; it applies to any multi-layer image, with or without B.
-            if layer_count > 1
-                && ui
-                    .toggle_value(&mut self.show_contact_sheet, "Contact Sheet")
-                    .changed()
-                && self.show_contact_sheet
-                && (self.compare_mode == CompareMode::Wipe
-                    || self.compare_mode == CompareMode::DiffMatte
-                    || self.compare_mode == CompareMode::Composite)
-            {
-                self.compare_mode = CompareMode::SideBySide;
-            }
-
-            if has_b || layer_count > 1 {
-                ui.separator();
-            }
-
-            // Compact exposure drag-value. Right-click resets to 0.0 (also key E).
-            let exp = ui
-                .add(
-                    egui::DragValue::new(&mut self.exposure)
-                        .speed(0.01)
-                        .range(-5.0..=5.0)
-                        .prefix("EV ")
-                        .fixed_decimals(2),
-                )
-                .on_hover_text("Drag to adjust • right-click resets to 0.0 (key: E)");
-            if exp.changed() {
-                self.invalidate_tone();
-            }
-            if exp.secondary_clicked() {
-                self.reset_exposure();
-            }
-
-            // Compact gamma drag-value. Right-click resets to 1.0 (also Shift+G).
-            let gam = ui
-                .add(
-                    egui::DragValue::new(&mut self.gamma)
-                        .speed(0.01)
-                        .range(0.1..=5.0)
-                        .prefix("γ ")
-                        .fixed_decimals(2),
-                )
-                .on_hover_text("Drag to adjust • right-click resets to 1.0 (key: Shift+G)");
-            if gam.changed() {
-                self.invalidate_tone();
-            }
-            if gam.secondary_clicked() {
-                self.reset_gamma();
-            }
-
-            if ui
-                .button("⟲")
-                .on_hover_text("Reset exposure (0.0) & gamma (1.0)")
-                .clicked()
-            {
-                self.reset_exposure();
-                self.reset_gamma();
-            }
-            if ui.checkbox(&mut self.srgb, "sRGB").changed() {
-                self.invalidate_tone();
-            }
-
-            ui.separator();
-            ui.label("Channel:");
-            let mut mode = self.channel_mode;
-            ui.selectable_value(&mut mode, ChannelMode::RGB, "RGB (C)");
-            ui.selectable_value(&mut mode, ChannelMode::R, "R");
-            ui.selectable_value(&mut mode, ChannelMode::G, "G");
-            ui.selectable_value(&mut mode, ChannelMode::B, "B");
-            ui.selectable_value(&mut mode, ChannelMode::A, "A");
-            self.set_channel_mode(mode);
-
-            ui.separator();
-            // Sample aperture as a compact dropdown.
-            let sample_label = match self.sample_aperture {
-                1 => "1px",
-                9 => "9×9",
-                _ => "3×3",
-            };
-            ui.label("Sample:");
-            egui::ComboBox::from_id_salt("sample_aperture")
-                .selected_text(sample_label)
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.sample_aperture, 1, "1px");
-                    ui.selectable_value(&mut self.sample_aperture, 3, "3×3");
-                    ui.selectable_value(&mut self.sample_aperture, 9, "9×9");
-                });
-
-            // Rarely-touched controls tucked behind a menu.
-            ui.menu_button("Display ▾", |ui| {
-                ui.label("Overscan Opacity:");
-                ui.add(egui::Slider::new(&mut self.overscan_opacity, 0.0..=1.0));
-                ui.checkbox(&mut self.show_tooltip, "Show Pixel Tooltip");
-
-                ui.separator();
-                // Anamorphic unsqueeze (#179): apply the EXR `pixelAspectRatio` as a
-                // horizontal display stretch. The master toggle persists via
-                // `ViewerPrefs`; the optional custom factor overrides the header PAR.
-                ui.checkbox(&mut self.prefs.anamorphic_unsqueeze, "Unsqueeze anamorphic")
-                    .on_hover_text(
-                        "Stretch non-square-pixel (anamorphic) footage to its display aspect",
-                    );
-                ui.add_enabled_ui(self.prefs.anamorphic_unsqueeze, |ui| {
-                    let header_par = exr_data.image.attributes.pixel_aspect;
-                    let mut custom = self.pixel_aspect_override.is_some();
-                    if ui
-                        .checkbox(&mut custom, "Custom factor")
-                        .on_hover_text("Override the header pixel aspect ratio")
-                        .changed()
-                    {
-                        // Seed the override from the header PAR, or a common 2× squeeze
-                        // when the header is square/absent.
-                        let seed = if header_par > 0.0 && header_par != 1.0 {
-                            header_par
-                        } else {
-                            2.0
-                        };
-                        self.pixel_aspect_override = custom.then_some(seed);
-                    }
-                    if let Some(factor) = self.pixel_aspect_override.as_mut() {
-                        ui.add(egui::DragValue::new(factor).speed(0.01).range(0.1..=4.0));
-                    } else {
-                        ui.label(format!("Header PAR: {header_par}"));
-                    }
-                });
-            });
-
-            if !self.show_contact_sheet {
-                ui.separator();
-                if ui.button("Frame (F)").clicked() {
-                    self.first_frame = true;
-                }
-                // Annotation overlay toggle (#45).
-                if ui
-                    .toggle_value(&mut self.show_annotation_bar, "✎ Annotate")
-                    .on_hover_text("Mark up the view (arrows / box / pen / text) before a snapshot")
-                    .clicked()
-                    && !self.show_annotation_bar
-                {
-                    // Hiding the toolbar also drops the active tool so canvas drags
-                    // pan again.
-                    self.anno_tool = AnnotationTool::None;
-                }
-
-                // Layer (pass) selection
-                if layer_count > 1 {
-                    ui.label("Layer:");
-                    let selected_name = exr_data
-                        .logical_layers
-                        .get(self.active_layer)
-                        .map(|l| l.name.as_str())
-                        .unwrap_or("Unnamed");
-                    egui::ComboBox::from_id_salt("layer_select")
-                        .selected_text(selected_name)
-                        .show_ui(ui, |ui| {
-                            for (i, ll) in exr_data.logical_layers.iter().enumerate() {
-                                if ui
-                                    .selectable_value(&mut self.active_layer, i, &ll.name)
-                                    .clicked()
-                                {
-                                    self.first_frame = true;
-                                }
-                            }
-                        });
-                }
-            }
-        });
-    }
-
-    /// Row 2 content — only the active comparison mode's parameters. Rendered
-    /// (clipped/animated) by [`Self::animated_mode_param_row`]. Kept in lockstep
-    /// with [`Self::has_mode_params`]: every arm that draws here must report
-    /// `true` there, and vice versa.
     /// The Wipe parameters: split centre, angle, and the divider-line opacity.
     /// `pub(crate)` and shared with the comp viewport bar (#99 Slice 3c) so the two
     /// entry points can't drift — the comp path is the only *reachable* one now.
@@ -1698,38 +1377,6 @@ impl ExrViewer {
         }
     }
 
-    fn mode_param_row(&mut self, ui: &mut egui::Ui) {
-        // While blinking, `compare_mode` toggles A/B each frame, so key off
-        // `blink_state` and expose the blink-speed control instead.
-        if self.blink_state {
-            ui.label("Blink speed:");
-            ui.add(egui::Slider::new(&mut self.blink_interval, 0.05..=5.0).suffix("s"));
-            return;
-        }
-        match self.compare_mode {
-            CompareMode::Wipe => self.wipe_params_ui(ui),
-            CompareMode::DiffMatte => self.diff_params_ui(ui),
-            CompareMode::SideBySide => {
-                ui.checkbox(&mut self.normalize_side_by_side, "Normalize Size");
-            }
-            CompareMode::Composite => {
-                ui.label("Blend:");
-                egui::ComboBox::from_id_salt("blend_mode_select")
-                    .selected_text(self.blend_mode.label())
-                    .show_ui(ui, |ui| {
-                        for mode in BlendMode::ALL {
-                            ui.selectable_value(&mut self.blend_mode, mode, mode.label());
-                        }
-                    });
-            }
-            CompareMode::SingleA | CompareMode::SingleB => {}
-        }
-    }
-
-    /// Draw the diff colormap legend: a horizontal bar sampling the active
-    /// gradient left→right, captioned with the diff magnitude `0 → 1/gain` that
-    /// spans black→saturated. The legend is a visualization aid; it is not
-    /// interactive.
     fn diff_legend(&self, ui: &mut egui::Ui) {
         let grad = self.prefs.diff_colormap.gradient();
         let (rect, _) = ui.allocate_exact_size(egui::vec2(120.0, 14.0), egui::Sense::hover());
@@ -1772,7 +1419,7 @@ impl ExrViewer {
     /// add/remove/move/recolor stops on a working copy and either apply it as the
     /// active diff colormap or save it as a named preset in `custom_gradients`.
     /// Rendered once per frame by [`crate::app::ExrApp`] when `gradient_editor_open`
-    /// (#99 Slice 3b — it used to hang off [`Self::ui`], which is unreachable now).
+    /// (#99 Slice 3b — it used to hang off the now-deleted `ExrViewer::ui`).
     pub(crate) fn gradient_editor_window(&mut self, ctx: &egui::Context) {
         if !self.gradient_editor_open {
             return;
@@ -1896,7 +1543,7 @@ impl ExrViewer {
     /// per-mode colour/size/gradient controls, and a named-preset library. Mutates
     /// `self.prefs.background` live; rendered once per frame by
     /// [`crate::app::ExrApp`] when `show_background_window` (#99 Slice 3b — it used to
-    /// hang off [`Self::ui`], leaving the View-menu item a dead click once the R4
+    /// hang off the now-deleted `ExrViewer::ui`, leaving the View-menu item a dead click once the R4
     /// collapse made `ui` unreachable). Colours are linear (see `background` docs).
     pub(crate) fn background_window(&mut self, ctx: &egui::Context) {
         if !self.show_background_window {
@@ -2194,7 +1841,7 @@ impl ExrViewer {
     /// Effective horizontal unsqueeze factor for the **primary (A)** image, whose
     /// header pixel aspect ratio is `header_par` (#179). The manual override wins
     /// over the header PAR when set. The reference (B) image is unsqueezed from its
-    /// own header only (`sanitize_unsqueeze` on B's PAR in [`Self::ui`]), so a
+    /// own header only (`sanitize_unsqueeze` on the compare pane PAR), so a
     /// custom factor set to fix A does not distort a differently-squeezed B.
     fn unsqueeze_factor(&self, header_par: f32) -> f32 {
         self.sanitize_unsqueeze(self.pixel_aspect_override.unwrap_or(header_par))
@@ -2333,44 +1980,6 @@ impl ExrViewer {
     /// visible slice is `full_height * t`, where `t` eases 0→1 as the row appears
     /// and 1→0 as it leaves. Contents are clipped to the revealed slice so they
     /// appear to slide out from under Row 1.
-    fn animated_mode_param_row(&mut self, ui: &mut egui::Ui) {
-        let id = ui.make_persistent_id("viewer_row2_anim");
-        let t = ui
-            .ctx()
-            .animate_bool_with_time(id, self.has_mode_params(), 0.12);
-        if t <= 0.0 {
-            return;
-        }
-        ui.scope(|ui| {
-            let full_h = self.row2_full_height.max(1.0);
-            let (rect, _) = ui.allocate_exact_size(
-                egui::vec2(ui.available_width(), full_h * t),
-                egui::Sense::hover(),
-            );
-            // Lay the full-height row out at the top of the allocated slice, then
-            // clip to the slice so only `full_h * t` of it shows.
-            let mut child = ui.new_child(
-                egui::UiBuilder::new()
-                    .max_rect(egui::Rect::from_min_size(
-                        rect.min,
-                        egui::vec2(rect.width(), full_h),
-                    ))
-                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
-            );
-            child.set_clip_rect(rect);
-            self.mode_param_row(&mut child);
-            let measured = child.min_rect().height();
-            if measured > 0.0 {
-                self.row2_full_height = measured;
-            }
-        });
-    }
-
-    /// Re-render contact-sheet thumbnails when the OCIO managed look changes —
-    /// toggled on/off (`ocio_active`) or a new config / display / view
-    /// (`ocio_render_gen`, bumped by the app's `rebuild_ocio_pass`). A no-op while
-    /// the signature is unchanged. Replaces the old `ocio_cpu` Rc-pointer identity
-    /// trick now that the CPU OCIO processor is gone (#59).
     pub(crate) fn invalidate_thumbnails_on_ocio_change(&mut self) {
         // 0 is the OCIO-off sentinel; when active, mix the generation through an
         // odd multiplier (a bijection on u64, so distinct generations stay
@@ -2394,32 +2003,6 @@ impl ExrViewer {
 
     /// While blink is active (and B is loaded), alternate the displayed image
     /// between A and B on `blink_interval`, requesting repaints to keep cycling.
-    fn apply_blink_mode(&mut self, ui: &egui::Ui, has_b: bool) {
-        if self.blink_state && has_b {
-            let time = ui.input(|i| i.time);
-            let interval = f64::from(self.blink_interval);
-            let phase = (time / interval) as usize;
-            // Wake exactly at the next A/B flip instead of repainting at the
-            // full refresh rate between flips (#146): the image only changes
-            // every `blink_interval`, but a bare request_repaint re-ran the
-            // whole frame (including the OCIO passes) continuously.
-            let next_flip = (phase + 1) as f64 * interval;
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_secs_f64(
-                    (next_flip - time).max(0.0),
-                ));
-            if phase.is_multiple_of(2) {
-                self.compare_mode = CompareMode::SingleA;
-            } else {
-                self.compare_mode = CompareMode::SingleB;
-            }
-        }
-    }
-
-    /// Resize the per-layer thumbnail / GPU-texture caches to the current A/B
-    /// layer counts, clearing them (forcing regeneration) whenever a count
-    /// changes. `thumbnails` length is the sentinel (it tracks the layer count for
-    /// both the CPU and GPU thumbnail caches).
     pub(crate) fn sync_texture_caches(&mut self, layer_count: usize, layer_count_b: usize) {
         if self.thumbnails.len() != layer_count {
             self.thumbnails.clear();
@@ -2450,7 +2033,7 @@ impl ExrViewer {
     /// decides what "select this layer" means (the comp path points the current comp
     /// layer's `aov` at it).
     ///
-    /// One source, not two (#99 Slice 3e): the sheet used to fork on `CompareMode` to
+    /// One source, not two (#99 Slice 3e): the sheet used to fork on the A/B compare mode to
     /// draw an A/B two-column variant, but that was purely presentational and the A/B
     /// path is gone. It needs **no viewport** — just the decoded image, a tone
     /// snapshot, and the thumbnail caches — so it works the same from either caller.
@@ -2679,518 +2262,12 @@ impl ExrViewer {
         draw_sheet(self, ui, exr_data, &mut clicked);
         clicked
     }
-
-    pub fn ui(
-        &mut self,
-        ui: &mut egui::Ui,
-        exr_data: &ExrData,
-        exr_data_b: Option<&ExrData>,
-        gpu_resources: Option<&crate::gpu::GpuResources>,
-        lut_bg_opt: Option<std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>>,
-    ) {
-        self.handle_hotkeys(ui, exr_data_b.is_some());
-
-        // Free queued GPU thumbnail ids every frame (#148): invalidations fire
-        // with the contact sheet closed too (tone changes, frame swaps), and
-        // draining only in the sheet draw kept one stale generation of
-        // thumbnail textures in VRAM until the sheet was next opened.
-        self.drain_thumb_frees(gpu_resources);
-
-        self.invalidate_thumbnails_on_ocio_change();
-
-        self.apply_blink_mode(ui, exr_data_b.is_some());
-
-        let layer_count = exr_data.logical_layers.len();
-        egui::Panel::top("viewer_controls").show_inside(ui, |ui| {
-            self.primary_row(ui, exr_data, exr_data_b.is_some(), layer_count);
-            self.animated_mode_param_row(ui);
-            if self.show_annotation_bar {
-                self.annotation_toolbar(ui);
-            }
-        });
-        // The gradient-editor + background windows are drawn by `ExrApp` now
-        // (#99 Slice 3b), so they stay reachable when this `ui` doesn't run.
-
-        let layer_count_b = exr_data_b.map(|d| d.logical_layers.len()).unwrap_or(0);
-        self.sync_texture_caches(layer_count, layer_count_b);
-
-        if self.show_contact_sheet {
-            self.draw_contact_sheet(ui, exr_data, gpu_resources, lut_bg_opt.as_ref());
-        } else {
-            // Channel/frame hotkeys are handled up-front in `handle_hotkeys`.
-            let (tw, th) = exr_data.logical_size(self.active_layer).unwrap_or((1, 1));
-            let tex_size = egui::vec2(tw as f32, th as f32);
-            let mut tex_size_b = None;
-            if let Some(data_b) = exr_data_b {
-                let layer_b = self
-                    .active_layer
-                    .min(data_b.logical_layers.len().saturating_sub(1));
-                if let Some((bw, bh)) = data_b.logical_size(layer_b) {
-                    tex_size_b = Some(egui::vec2(bw as f32, bh as f32));
-                }
-            }
-
-            // Anamorphic unsqueeze factors (#179): A from its header
-            // `pixelAspectRatio` plus the manual override; B from B's header only
-            // (the override is A-specific, so it must not distort a differently-
-            // squeezed reference). Both are `1.0` (a no-op) when the toggle is off
-            // or the PAR is 1.0, so square-pixel footage is untouched.
-            let par = self.unsqueeze_factor(exr_data.image.attributes.pixel_aspect);
-            let par_b = exr_data_b
-                .map(|d| self.sanitize_unsqueeze(d.image.attributes.pixel_aspect))
-                .unwrap_or(1.0);
-
-            if let Some(gpu) = gpu_resources {
-                // A layer switch invalidates the per-frame T2 ring (textures are
-                // per-layer). Do this before binding/building below. The ring is
-                // per-`SourceId` (#99); the primary (A) is `T2_SOURCE_A`.
-                let ring_a = self
-                    .t2_rings
-                    .entry(Self::T2_SOURCE_A)
-                    .or_insert_with(T2Ring::new);
-                ring_a.ensure_layer(self.active_layer);
-                // T2 (#56): bind the on-screen frame's pre-built texture if it is
-                // resident, so the swap is an instant bind, not a re-upload.
-                if ring_a.cap() > 0
-                    && let Some(frame) = ring_a.frame
-                    && let Some(t2) = ring_a.get(frame)
-                {
-                    self.gpu_textures[self.active_layer] = Some(t2.bind_group.clone());
-                }
-                if self.gpu_textures[self.active_layer].is_none()
-                    && let Some(t2) = Self::build_layer_texture(
-                        gpu,
-                        exr_data,
-                        self.active_layer,
-                        &mut self.t2_staging,
-                    )
-                {
-                    self.gpu_textures[self.active_layer] = Some(t2.bind_group.clone());
-                    // Cache the freshly-built texture into the T2 ring for the
-                    // on-screen frame (a lazy first paint feeds the ring).
-                    if ring_a.cap() > 0
-                        && let Some(frame) = ring_a.frame
-                    {
-                        ring_a.insert(frame, t2);
-                        ring_a.evict_to_cap();
-                    }
-                }
-                if let Some(data_b) = exr_data_b {
-                    let layer_b = self.t2_layer_for(data_b);
-                    // The compared source (B) rings under `T2_SOURCE_B`. A layer
-                    // switch invalidates its per-frame ring (per-layer).
-                    let ring_b = self
-                        .t2_rings
-                        .entry(Self::T2_SOURCE_B)
-                        .or_insert_with(T2Ring::new);
-                    ring_b.ensure_layer(layer_b);
-                    // B T2 (#166): bind the on-screen B frame's pre-built texture
-                    // if resident, so a locked-step B swap is an instant bind, not
-                    // a re-upload (mirrors A above).
-                    if ring_b.cap() > 0
-                        && let Some(frame) = ring_b.frame
-                        && let Some(t2) = ring_b.get(frame)
-                    {
-                        self.gpu_textures_b[layer_b] = Some(t2.bind_group.clone());
-                    }
-                    if self.gpu_textures_b[layer_b].is_none()
-                        && let Some(t2) =
-                            Self::build_layer_texture(gpu, data_b, layer_b, &mut self.t2_staging)
-                    {
-                        self.gpu_textures_b[layer_b] = Some(t2.bind_group.clone());
-                        // Lazy first paint feeds the B ring for the on-screen frame.
-                        if ring_b.cap() > 0
-                            && let Some(frame) = ring_b.frame
-                        {
-                            ring_b.insert(frame, t2);
-                            ring_b.evict_to_cap();
-                        }
-                    }
-                }
-            }
-
-            // Draw texture. GPU is the only render path (#59); without a GPU
-            // (headless tests) nothing is uploaded, so the canvas draw is skipped.
-            let has_texture = self.gpu_textures[self.active_layer].is_some();
-            if has_texture {
-                let (rect, response) =
-                    ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
-
-                // Record the canvas rect (egui points) so the snapshot (#19) can
-                // crop the framebuffer screenshot to just the image area.
-                self.last_canvas_rect = Some(rect);
-
-                // Fit-to-view (#179): frame the *unsqueezed* extents so "Frame (F)"
-                // and the first-paint fit account for the wider anamorphic image.
-                let fit_size = egui::vec2(tex_size.x * par, tex_size.y);
-                let fit_size_b = tex_size_b.map(|b| egui::vec2(b.x * par_b, b.y));
-                self.handle_canvas_interaction(
-                    ui,
-                    rect,
-                    &response,
-                    fit_size,
-                    fit_size_b,
-                    self.compare_mode == CompareMode::SideBySide,
-                );
-                // Render Image — the x extent carries the anamorphic unsqueeze (#179).
-                let image_size = egui::vec2(tex_size.x * self.scale * par, tex_size.y * self.scale);
-                // Per-axis screen scale for all screen↔image coordinate mapping
-                // (annotations, pixel readout): x includes the unsqueeze, y does not.
-                let view_scale = egui::vec2(self.scale * par, self.scale);
-
-                // Side-by-Side draws each image at its own offset position, so the
-                // single centered overscan geometry below does not apply: skip the
-                // overscan dimming pass and its annotations in that mode.
-                let is_side_by_side = matches!(self.compare_mode, CompareMode::SideBySide);
-
-                let disp_window = exr_data.image.attributes.display_window;
-                let phys_idx = exr_data.logical_layers[self.active_layer].physical_index;
-                let data_window_min = exr_data.image.layer_data[phys_idx]
-                    .attributes
-                    .layer_position;
-
-                let disp_size = egui::vec2(
-                    disp_window.size.x() as f32 * self.scale * par,
-                    disp_window.size.y() as f32 * self.scale,
-                );
-                let disp_rect = egui::Rect::from_min_size(
-                    rect.center() + self.translation - disp_size / 2.0,
-                    disp_size,
-                );
-
-                // Record what the snapshot should crop to (#52): the active image area
-                // rather than the whole canvas (which includes the background).
-                // The classic A/B path has no comp Side-by-Side pane.
-                self.last_image_rect_b = None;
-                self.last_wipe = None;
-                self.last_blink_b = None;
-                self.last_image_rect = Some(crate::snapshot::active_area_rect(
-                    rect,
-                    disp_rect,
-                    is_side_by_side,
-                ));
-
-                let data_offset = egui::vec2(
-                    (data_window_min.0 - disp_window.position.x()) as f32 * self.scale * par,
-                    (data_window_min.1 - disp_window.position.y()) as f32 * self.scale,
-                );
-
-                let image_rect = egui::Rect::from_min_size(disp_rect.min + data_offset, image_size);
-
-                // Annotation drawing (#45) consumes the canvas drag/click when a tool
-                // is active (pan is suppressed above). Coordinates map through
-                // `image_rect`/`scale` so shapes anchor to image pixels.
-                if self.anno_tool.is_active() {
-                    self.handle_annotation_input(&response, image_rect, view_scale);
-                }
-
-                // The display-window overlays below paint unclipped; the draw paths
-                // recompute their own display-clipped painter from `layout`.
-                let unclipped_painter = ui.painter().with_clip_rect(rect);
-
-                // Draw display window bounding box
-                if !is_side_by_side {
-                    draw_dashed_rect(
-                        &unclipped_painter,
-                        disp_rect,
-                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 100),
-                        5.0,
-                        5.0,
-                    );
-                }
-
-                // Always-on display-window resolution ("format") readout — shown
-                // for every image, unlike the overscan/bbox annotations below which
-                // stay gated to data≠display. `disp_window` is full-res even for a
-                // downsampled proxy (`downsampled()` preserves display_window), so
-                // this never flickers on scrub.
-                if !is_side_by_side {
-                    unclipped_painter.text(
-                        disp_rect.right_bottom() + egui::vec2(0.0, 5.0),
-                        egui::Align2::RIGHT_TOP,
-                        format!("{}x{}", disp_window.size.x(), disp_window.size.y()),
-                        egui::FontId::proportional(12.0),
-                        egui::Color32::from_gray(200),
-                    );
-                }
-
-                // Labels for display window
-                let is_overscanned = image_rect.min.x < disp_rect.min.x
-                    || image_rect.min.y < disp_rect.min.y
-                    || image_rect.max.x > disp_rect.max.x
-                    || image_rect.max.y > disp_rect.max.y;
-                let is_cropped = image_rect.min.x > disp_rect.min.x
-                    || image_rect.min.y > disp_rect.min.y
-                    || image_rect.max.x < disp_rect.max.x
-                    || image_rect.max.y < disp_rect.max.y;
-
-                if (is_overscanned || is_cropped) && !is_side_by_side {
-                    unclipped_painter.text(
-                        disp_rect.left_bottom() + egui::vec2(0.0, 5.0),
-                        egui::Align2::LEFT_TOP,
-                        format!("{},{}", disp_window.position.x(), disp_window.position.y()),
-                        egui::FontId::proportional(12.0),
-                        egui::Color32::GRAY,
-                    );
-                    let top_right_x = disp_window.position.x() + disp_window.size.x() as i32;
-                    let top_right_y = disp_window.position.y() + disp_window.size.y() as i32;
-                    unclipped_painter.text(
-                        disp_rect.right_top() - egui::vec2(0.0, 5.0),
-                        egui::Align2::RIGHT_BOTTOM,
-                        format!("{top_right_x},{top_right_y}"),
-                        egui::FontId::proportional(12.0),
-                        egui::Color32::GRAY,
-                    );
-                }
-
-                let layout = CanvasLayout {
-                    rect,
-                    disp_rect,
-                    image_rect,
-                    image_size,
-                    tex_size,
-                    tex_size_b,
-                    par_b,
-                };
-
-                if let Some(gpu) = gpu_resources {
-                    self.draw_canvas_gpu(ui, &layout, exr_data_b, gpu, lut_bg_opt);
-                }
-
-                // Annotation overlay on top of the image (and its in-progress shape).
-                // Painted by egui, so it is included in the snapshot screenshot (#19).
-                let anno_painter = ui.painter().with_clip_rect(rect);
-                self.draw_annotations(&anno_painter, image_rect, view_scale);
-                self.annotation_text_popup(ui, image_rect, view_scale);
-
-                // Draw data window bounding box over the image
-                if (is_overscanned || is_cropped) && !is_side_by_side {
-                    draw_dashed_rect(
-                        &unclipped_painter,
-                        image_rect,
-                        egui::Color32::from_rgba_unmultiplied(255, 200, 100, 180),
-                        4.0,
-                        4.0,
-                    );
-
-                    unclipped_painter.text(
-                        image_rect.right_bottom() + egui::vec2(5.0, 5.0),
-                        egui::Align2::LEFT_TOP,
-                        format!(
-                            "Overscan: {}x{} (pos: {}, {})",
-                            tex_size.x, tex_size.y, data_window_min.0, data_window_min.1
-                        ),
-                        egui::FontId::proportional(12.0),
-                        egui::Color32::from_rgb(255, 200, 100),
-                    );
-                }
-
-                self.handle_pixel_sampling(
-                    ui, &response, exr_data, exr_data_b, rect, image_rect, image_size, tex_size,
-                    tex_size_b, par, par_b,
-                );
-            }
-        }
-    }
-
     /// Hover/sample readout for the canvas: map the cursor to image pixel
     /// coordinates (handling the side-by-side split), sample A (and B) at that
     /// pixel, cache the last sample, show the value tooltip, and add a swatch on
     /// Shift+Click. Geometry (`rect`/`image_rect`/sizes) comes from the caller's
     /// layout so this stays purely about sampling.
     #[allow(clippy::too_many_arguments)]
-    fn handle_pixel_sampling(
-        &mut self,
-        ui: &egui::Ui,
-        response: &egui::Response,
-        exr_data: &ExrData,
-        exr_data_b: Option<&ExrData>,
-        rect: egui::Rect,
-        image_rect: egui::Rect,
-        image_size: egui::Vec2,
-        tex_size: egui::Vec2,
-        tex_size_b: Option<egui::Vec2>,
-        par: f32,
-        par_b: f32,
-    ) {
-        // INV-SAMPLE (#7): while a sequence is advancing (or a seek's frame is
-        // still decoding), suppress the readout — the displayed frame can lag the
-        // playhead and sampling a full ~600 MB `ExrData` on every hover is
-        // wasteful. Clear the cached sample so the status bar shows nothing stale,
-        // and hint why. Re-enables automatically once paused and the frame lands.
-        if self.suppress_sampling {
-            self.last_hover_pos_img = None;
-            self.last_sampled_val_a = None;
-            self.last_sampled_val_b = None;
-            if self.show_tooltip {
-                response
-                    .clone()
-                    .on_hover_text_at_pointer("readout paused during playback / seek");
-            }
-            return;
-        }
-
-        let mut hovered_pixel = None;
-        if let Some(pos) = response.hover_pos() {
-            let mut hover_x = None;
-            let mut hover_y = None;
-            let mut hovered_b = false;
-
-            if self.compare_mode == CompareMode::SideBySide && exr_data_b.is_some() {
-                // Gate on `tex_size_b` (geometry), NOT on `self.textures_b`
-                // (the CPU texture cache): the GPU path populates
-                // `gpu_textures_b` and leaves `textures_b` empty, so the old
-                // `textures_b[...].as_ref().is_some()` gate silently skipped
-                // the entire B-side hover/sampling branch on the GPU path.
-                // `tex_size_b` is the actual prerequisite for the geometry math
-                // below (it's unwrapped multiple times here).
-                if let Some(tex_size_b) = tex_size_b {
-                    // B's x extent carries B's own unsqueeze (`par_b`); A's
-                    // `image_size` already includes `par` from the caller (#179).
-                    let mut image_size_b =
-                        egui::vec2(tex_size_b.x * self.scale * par_b, tex_size_b.y * self.scale);
-                    if self.normalize_side_by_side {
-                        let scale_b = (tex_size.y * self.scale) / tex_size_b.y;
-                        image_size_b =
-                            egui::vec2(tex_size_b.x * scale_b * par_b, tex_size_b.y * scale_b);
-                    }
-                    let combined_width = image_size.x + image_size_b.x;
-                    let combined_height = image_size.y.max(image_size_b.y);
-
-                    let combined_rect = egui::Rect::from_center_size(
-                        rect.center() + self.translation,
-                        egui::vec2(combined_width, combined_height),
-                    );
-
-                    let mut image_rect_a = egui::Rect::from_min_size(combined_rect.min, image_size);
-                    image_rect_a.set_center(egui::pos2(
-                        image_rect_a.center().x,
-                        combined_rect.center().y,
-                    ));
-
-                    let mut image_rect_b = egui::Rect::from_min_size(
-                        egui::pos2(combined_rect.min.x + image_size.x, combined_rect.min.y),
-                        image_size_b,
-                    );
-                    image_rect_b.set_center(egui::pos2(
-                        image_rect_b.center().x,
-                        combined_rect.center().y,
-                    ));
-
-                    if image_rect_a.contains(pos) {
-                        let local = pos - image_rect_a.min;
-                        // Map back to native pixels: x undoes the unsqueeze (#179).
-                        hover_x = Some((local.x / (self.scale * par)) as usize);
-                        hover_y = Some((local.y / self.scale) as usize);
-                    } else if image_rect_b.contains(pos) {
-                        let local = pos - image_rect_b.min;
-                        let scale_b = if self.normalize_side_by_side {
-                            (tex_size.y * self.scale) / tex_size_b.y
-                        } else {
-                            self.scale
-                        };
-                        hover_x = Some((local.x / (scale_b * par_b)) as usize);
-                        hover_y = Some((local.y / scale_b) as usize);
-                        hovered_b = true;
-                    }
-                }
-            } else {
-                let image_local_pos = pos - image_rect.min;
-                if image_local_pos.x >= 0.0 && image_local_pos.y >= 0.0 {
-                    // Map back to native pixels: x undoes the unsqueeze (#179).
-                    hover_x = Some((image_local_pos.x / (self.scale * par)) as usize);
-                    hover_y = Some((image_local_pos.y / self.scale) as usize);
-                }
-            }
-            let mut val_a_opt = None;
-            let mut val_b_opt = None;
-            let mut x_final = None;
-            let mut y_final = None;
-
-            if let (Some(x), Some(y)) = (hover_x, hover_y) {
-                // Check if within bounds of the hovered image
-                let mut valid = false;
-                if hovered_b {
-                    if let Some(s) = tex_size_b
-                        && x < s.x as usize
-                        && y < s.y as usize
-                    {
-                        valid = true;
-                    }
-                } else if x < tex_size.x as usize && y < tex_size.y as usize {
-                    valid = true;
-                }
-
-                if valid {
-                    hovered_pixel = Some((x, y));
-                    x_final = Some(x);
-                    y_final = Some(y);
-                    val_a_opt = self.sample_pixel(exr_data, self.active_layer, x, y);
-                    val_b_opt = if let Some(exr_b) = exr_data_b {
-                        let layer_b = self
-                            .active_layer
-                            .min(exr_b.logical_layers.len().saturating_sub(1));
-                        self.sample_pixel(exr_b, layer_b, x, y)
-                    } else {
-                        None
-                    };
-
-                    self.last_hover_pos_img = Some((x, y));
-                    self.last_sampled_val_a = val_a_opt;
-                    self.last_sampled_val_b = val_b_opt;
-                }
-            }
-
-            if self.show_tooltip
-                && (val_a_opt.is_some() || val_b_opt.is_some())
-                && let (Some(x), Some(y)) = (x_final, y_final)
-            {
-                pixel_tooltip_window(ui.ctx(), pos, x, y, val_a_opt, val_b_opt);
-
-                // Shift+Click to add a persistent swatch
-                if ui.input(|i| i.modifiers.shift)
-                    && response.clicked()
-                    && let Some(v) = val_a_opt.or(val_b_opt)
-                {
-                    self.swatches.push(v);
-                }
-            }
-        }
-
-        if hovered_pixel.is_none() {
-            self.last_hover_pos_img = None;
-            self.last_sampled_val_a = None;
-            self.last_sampled_val_b = None;
-        }
-    }
-
-    /// Reconfigure the held A/B [`crate::layer::LayerStack`] from the current
-    /// viewer state and resolve it into the [`crate::render_program::RenderProgram`]
-    /// the draw paths dispatch on (#114). `effective_mode` is the compare mode
-    /// *after* any blink override, so blink alternates A/B through the model like a
-    /// normal `Single{A,B}` switch. This is the single seam where the draw paths
-    /// read the layer model instead of branching on `CompareMode` directly.
-    fn render_program(
-        &mut self,
-        effective_mode: CompareMode,
-    ) -> crate::render_program::RenderProgram {
-        let input = crate::render_program::ResolveInput {
-            compare_mode: effective_mode,
-            blend_mode: self.blend_mode,
-            active_layer: self.active_layer,
-            wipe_position: self.wipe_center[0],
-        };
-        crate::render_program::resolve(&mut self.layer_stack, self.layer_ids, &input)
-    }
-
-    /// GPU render path (the default): build per-draw uniforms and emit wgpu
-    /// paint callbacks for the active compare mode. Under OCIO the per-image
-    /// pass-1 draws are accumulated into a single display-transform pass. Also
-    /// handles the wipe-handle drag/scroll interaction (hence `&mut self`).
-    /// Re-bake and upload the diff-colormap and background-gradient LUTs when
-    /// their ramps change. The GPU textures are updated in place (stable handles
-    /// off the app-owned `GpuState`, #54), so no bind-group rebuild is needed.
-    /// Split out of `draw_canvas_gpu` (#152) to keep it focused on draw emission.
     fn sync_gradient_luts(&mut self, gpu_resources: &crate::gpu::GpuResources) {
         let render_state = gpu_resources.render_state();
         let colormap_dirty = self.colormap_sig.as_ref() != Some(&self.prefs.diff_colormap);
@@ -3250,11 +2327,10 @@ impl ExrViewer {
             opacity: 1.0,
             is_composite: 0,
             blend_mode: self.blend_mode.as_u32(),
-            is_wipe_mode: if self.compare_mode == CompareMode::Wipe {
-                1
-            } else {
-                0
-            },
+            // The only caller is the comp path, which sets this per-arrangement right
+            // after (`draw_comp_composite`). It used to be derived from the A/B
+            // `compare_mode`, which the comp path overrode anyway (#99 Slice 3h).
+            is_wipe_mode: 0,
             wipe_center: self.wipe_center,
             wipe_angle: self.wipe_angle.to_radians(),
             skip_checker: 0,
@@ -3302,194 +2378,6 @@ impl ExrViewer {
         }
     }
 
-    /// Dispatch the active compare mode's draws through `ctx` (#152), one per
-    /// `Arrangement` arm: Stacked (single / composite), Wipe (one shader draw plus
-    /// the handle overlay), SideBySide (two placed draws plus the divider), and
-    /// Diff. Extracted from the old `draw_all` closure. `p`/`opac` are the target
-    /// painter and layer opacity; `bg_a` is the active-layer A bind group.
-    #[allow(clippy::too_many_arguments)] // frame ctx + program + geometry + painter
-    fn emit_mode_draws(
-        &self,
-        ctx: &DrawCtx,
-        program: &crate::render_program::RenderProgram,
-        layout: &CanvasLayout,
-        exr_data_b: Option<&ExrData>,
-        bg_a: &std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>,
-        p: &egui::Painter,
-        opac: f32,
-    ) {
-        let CanvasLayout {
-            rect,
-            image_rect,
-            image_size,
-            tex_size,
-            tex_size_b,
-            par_b,
-            ..
-        } = *layout;
-        // Slot-B GPU bind group for the active layer, clamped to B's count.
-        let pick_b = || {
-            exr_data_b.and_then(|d| {
-                self.gpu_textures_b[self
-                    .active_layer
-                    .min(d.logical_layers.len().saturating_sub(1))]
-                .clone()
-            })
-        };
-        match program.arrangement {
-            // Single (one draw) and Composite (A over B — see the stacking-order note
-            // below). `Blink` is comp-path-only (#99 Slice 3g) and never reaches the
-            // A/B resolver, which drives blink through `compare_mode` instead.
-            render_program::Arrangement::Stacked | render_program::Arrangement::Blink => {
-                if program.is_composite {
-                    if let Some(bg_b) = pick_b() {
-                        if ctx.ocio_active {
-                            // OCIO path: fold the composite through the scene ping-pong
-                            // (OcioCallback::accumulate). Order preserves today's look —
-                            // A renders over B (#99 decision): bottom = B (a plain copy,
-                            // is_composite=0), top = A over the accumulation
-                            // (is_composite=1, the blend rides A). `tex_b` on the top draw
-                            // is ignored by the ping-pong (it binds the prior accumulation),
-                            // so pass B to keep the render signature reacting to B changing.
-                            //
-                            // Exposure / channel isolation are global view ops: neutralize
-                            // them on the bottom (B) layer so they apply once, on the top
-                            // (A) layer, to the finished composite instead of compounding.
-                            ctx.neutral_view_ops.set(true);
-                            ctx.draw(p, bg_b.clone(), None, rect, image_rect, false, false, opac);
-                            ctx.neutral_view_ops.set(false);
-                            ctx.draw(
-                                p,
-                                bg_a.clone(),
-                                Some(bg_b),
-                                rect,
-                                image_rect,
-                                false,
-                                true,
-                                opac,
-                            );
-                        } else {
-                            // Non-OCIO: a single 2-input pass (no offscreen to ping-pong
-                            // through) — A over B in the blend shader, unchanged.
-                            ctx.draw(
-                                p,
-                                bg_a.clone(),
-                                Some(bg_b),
-                                rect,
-                                image_rect,
-                                false,
-                                true,
-                                opac,
-                            );
-                        }
-                    }
-                } else if let Some(draw) = program.draws.first() {
-                    match draw.input {
-                        render_program::ProgramInput::A => {
-                            ctx.draw(p, bg_a.clone(), None, rect, image_rect, false, false, opac);
-                        }
-                        render_program::ProgramInput::B => {
-                            if let Some(bg_b) = pick_b() {
-                                ctx.draw(p, bg_b, None, rect, image_rect, false, false, opac);
-                            }
-                        }
-                    }
-                }
-            }
-            render_program::Arrangement::Wipe { .. } => {
-                let bg_b_opt = pick_b();
-                // Single draw call: the shader handles the wipe split. Bind the
-                // real B texture so the shader can sample it when is_wipe_mode is
-                // set; falls back to the default texture if no B image is loaded.
-                ctx.draw(
-                    p,
-                    bg_a.clone(),
-                    bg_b_opt,
-                    rect,
-                    image_rect,
-                    false,
-                    false,
-                    opac,
-                );
-
-                // Draw the rotated wipe line and handle.
-                let w = wipe_line_endpoints(image_rect, self.wipe_center, self.wipe_angle);
-                let alpha = (self.wipe_line_opacity * 255.0) as u8;
-                let color = egui::Color32::from_white_alpha(alpha);
-
-                p.line_segment([w.p1, w.p2], (2.0, color));
-                p.circle_filled(w.center, 8.0, color);
-            }
-            render_program::Arrangement::SideBySide => {
-                let bg_b_opt = pick_b();
-                if let (Some(bg_b), Some(size_b)) = (bg_b_opt, tex_size_b) {
-                    // B's x extent carries B's own unsqueeze (`par_b`); A's
-                    // `image_size` already includes `par` from the caller (#179).
-                    let mut image_size_b =
-                        egui::vec2(size_b.x * self.scale * par_b, size_b.y * self.scale);
-                    if self.normalize_side_by_side {
-                        let scale_b = (tex_size.y * self.scale) / size_b.y;
-                        image_size_b = egui::vec2(size_b.x * scale_b * par_b, size_b.y * scale_b);
-                    }
-                    let combined_width = image_size.x + image_size_b.x;
-                    let combined_height = image_size.y.max(image_size_b.y);
-                    let combined_rect = egui::Rect::from_center_size(
-                        rect.center() + self.translation,
-                        egui::vec2(combined_width, combined_height),
-                    );
-                    let mut image_rect_a = egui::Rect::from_min_size(combined_rect.min, image_size);
-                    image_rect_a.set_center(egui::pos2(
-                        image_rect_a.center().x,
-                        combined_rect.center().y,
-                    ));
-                    let mut image_rect_b = egui::Rect::from_min_size(
-                        egui::pos2(combined_rect.min.x + image_size.x, combined_rect.min.y),
-                        image_size_b,
-                    );
-                    image_rect_b.set_center(egui::pos2(
-                        image_rect_b.center().x,
-                        combined_rect.center().y,
-                    ));
-
-                    ctx.draw(
-                        p,
-                        bg_a.clone(),
-                        None,
-                        rect,
-                        image_rect_a,
-                        false,
-                        false,
-                        opac,
-                    );
-                    ctx.draw(p, bg_b, None, rect, image_rect_b, false, false, opac);
-                    p.line_segment(
-                        [
-                            egui::pos2(image_rect_b.min.x, combined_rect.min.y),
-                            egui::pos2(image_rect_b.min.x, combined_rect.max.y),
-                        ],
-                        (2.0, egui::Color32::GRAY),
-                    );
-                } else {
-                    ctx.draw(p, bg_a.clone(), None, rect, image_rect, false, false, opac);
-                }
-            }
-            render_program::Arrangement::Diff => {
-                if let Some(bg_b) = pick_b() {
-                    ctx.draw(
-                        p,
-                        bg_a.clone(),
-                        Some(bg_b),
-                        rect,
-                        image_rect,
-                        true,
-                        false,
-                        opac,
-                    );
-                }
-            }
-        }
-    }
-
     /// Render the Layers-panel composite (#99 PR-B.3): fold `draws` bottom→top
     /// through the OCIO scene ping-pong (the PR-A accumulate path), reusing
     /// [`DrawCtx`] + [`crate::gpu::ocio_pass::OcioCallback`] verbatim — only the
@@ -3513,7 +2401,7 @@ impl ExrViewer {
         base_size: (usize, usize),
         base_par: f32,
         draws: &[CompDraw],
-        arrangement: crate::render_program::Arrangement,
+        arrangement: crate::layer::Arrangement,
         side_b: Option<CompSideB>,
         gpu_resources: &crate::gpu::GpuResources,
         lut_bg_opt: Option<std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>>,
@@ -3524,7 +2412,7 @@ impl ExrViewer {
         // Side-by-Side needs a resolved current layer; without one (hidden, soloed out,
         // trimmed blank) the caller already falls back, but guard here too so the
         // geometry below can rely on the pair.
-        use crate::render_program::Arrangement;
+        use crate::layer::Arrangement;
         let side_b = side_b.filter(|_| arrangement != Arrangement::Stacked);
         let is_sbs = side_b.is_some() && arrangement == Arrangement::SideBySide;
         // Wipe and Diff are single **2-input** draws (`tex_a` + `tex_b`, split or
@@ -3835,227 +2723,11 @@ impl ExrViewer {
         );
     }
 
-    fn draw_canvas_gpu(
-        &mut self,
-        ui: &egui::Ui,
-        layout: &CanvasLayout,
-        exr_data_b: Option<&ExrData>,
-        gpu_resources: &crate::gpu::GpuResources,
-        lut_bg_opt: Option<std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>>,
-    ) {
-        let render_state = gpu_resources.render_state();
-        // `image_size`/`tex_size`/`tex_size_b` are pulled from `layout` inside
-        // `emit_mode_draws`; here we only need the frame rects.
-        let CanvasLayout {
-            rect,
-            disp_rect,
-            image_rect,
-            ..
-        } = *layout;
-        let unclipped_painter = ui.painter().with_clip_rect(rect);
-        let painter = ui.painter().with_clip_rect(rect.intersect(disp_rect));
-
-        // Re-bake + upload the diff colormap and background gradient LUTs only
-        // when their ramps change (stable GPU handles, no bind-group rebuild).
-        self.sync_gradient_luts(gpu_resources);
-
-        // GPU RENDER PATH: the per-frame base uniforms shared by every draw.
-        let content = ui.ctx().content_rect();
-        let uniform_data =
-            self.build_frame_uniforms(image_rect, disp_rect, [content.width(), content.height()]);
-
-        // Build the per-frame draw context: the persistent uniform ring buffer
-        // + LUT/default bind groups from the app-owned `GpuState` (#54, no
-        // per-frame renderer typemap lookup), plus the interior-mutable per-frame
-        // accumulators. `DrawCtx::draw` writes each draw into the ring buffer at a
-        // dynamic offset — no per-draw `create_buffer_init` + `create_bind_group`.
-        let gpu_state = gpu_resources.gpu_state.as_ref();
-        let ctx = DrawCtx {
-            render_state,
-            uniform_data,
-            uniform_buffer: gpu_state.uniform_buffer.clone(),
-            uniform_stride: gpu_state.uniform_stride,
-            active_lut_bg: lut_bg_opt.unwrap_or_else(|| gpu_state.default_lut_bind_group.clone()),
-            default_tex_bg: gpu_state.default_tex_bind_group.clone(),
-            ocio_active: self.ocio_active,
-            force_accumulate: false,
-            uniform_offset: std::cell::Cell::new(0u32),
-            overscan_factor: std::cell::Cell::new(1.0f32),
-            neutral_view_ops: std::cell::Cell::new(false),
-            blend_override: std::cell::Cell::new(None),
-            ocio_sig: std::cell::Cell::new(0xcbf29ce484222325u64),
-            ocio_draws: std::cell::RefCell::new(Vec::new()),
-        };
-
-        let bg_a_opt = self.gpu_textures[self.active_layer].clone();
-        if let Some(bg_a) = bg_a_opt {
-            let comp_mode = if self.blink_state {
-                if ((ui.input(|i| i.time) / self.blink_interval as f64) as usize).is_multiple_of(2)
-                {
-                    CompareMode::SingleA
-                } else {
-                    CompareMode::SingleB
-                }
-            } else {
-                self.compare_mode
-            };
-
-            // Wipe interaction (drag the handle to move, scroll to rotate).
-            if self.compare_mode == CompareMode::Wipe {
-                self.handle_wipe_interaction(ui, image_rect);
-            }
-
-            // Resolve the layer model into the render program the draw paths
-            // dispatch on. `comp_mode` already folds in the blink override, so
-            // blink alternates A/B through the model.
-            let program = self.render_program(comp_mode);
-
-            let is_sbs = matches!(program.arrangement, render_program::Arrangement::SideBySide);
-
-            // OCIO path: one pass over the whole frame. Accumulate the pass-1
-            // draws (draw_gpu pushes into ocio_draws) and emit a single
-            // OcioCallback. The checker + overscan dim are applied post-OCIO in
-            // the blit, so there is no separate dim draw here. Diff opts out: it
-            // renders a display-space heat map via the normal pipeline (see
-            // draw_gpu), so OCIO never runs for it.
-            let ocio_handled = if self.ocio_active
-                && !matches!(program.arrangement, render_program::Arrangement::Diff)
-            {
-                // Overscan is dimmed in the blit (when opacity > 0); when opacity
-                // is 0 we hide it by clipping the callback to the display window.
-                let overscan_dim = !is_sbs && self.overscan_opacity > 0.0;
-                let slot_painter = if !is_sbs && self.overscan_opacity == 0.0 {
-                    &painter
-                } else {
-                    &unclipped_painter
-                };
-                // Reserve the image slot BEFORE annotations so the image renders
-                // beneath the wipe/SBS lines (same layer, insertion order).
-                let slot = slot_painter.add(egui::Shape::Noop);
-                let cb_clip = slot_painter.clip_rect();
-
-                self.emit_mode_draws(
-                    &ctx,
-                    &program,
-                    layout,
-                    exr_data_b,
-                    &bg_a,
-                    &unclipped_painter,
-                    1.0,
-                );
-
-                let draws = std::mem::take(&mut *ctx.ocio_draws.borrow_mut());
-                if !draws.is_empty() {
-                    let display_format = render_state.target_format;
-                    let content = ui.ctx().content_rect();
-                    let blit_uniforms = crate::gpu::BlitUniforms {
-                        display_min: [disp_rect.min.x, disp_rect.min.y],
-                        display_max: [disp_rect.max.x, disp_rect.max.y],
-                        screen_size: [content.width(), content.height()],
-                        overscan_factor: if overscan_dim {
-                            self.overscan_opacity
-                        } else {
-                            1.0
-                        },
-                        bg_mode: self.prefs.background.mode.as_u32() as f32,
-                        bg_checker_size: self.prefs.background.checker_size,
-                        bg_grad_angle: self.prefs.background.gradient_angle,
-                        // Re-apply the user gamma in display space (#93): under
-                        // OCIO the main shader runs with gamma=1 (OCIO owns the
-                        // display chain), so the control would otherwise be inert.
-                        gamma: self.gamma,
-                        _pad_b: 0.0,
-                        bg_checker_dark: rgb3_to_vec4(self.prefs.background.checker_dark),
-                        bg_checker_light: rgb3_to_vec4(self.prefs.background.checker_light),
-                        bg_solid: rgb3_to_vec4(self.prefs.background.solid),
-                    };
-                    // Finalize the render signature with the OCIO generation
-                    // (bumped by the app on any config / display / view change), so
-                    // switching the managed look forces a re-render.
-                    let render_sig =
-                        (ctx.ocio_sig.get() ^ self.ocio_render_gen).wrapping_mul(0x100000001b3);
-                    // Scissor the OCIO transform to the visible image so it skips
-                    // the empty background. Side-by-side spans the canvas with two
-                    // images, so it opts out (None = whole target).
-                    let scissor_pts = if is_sbs {
-                        None
-                    } else {
-                        Some([
-                            image_rect.min.x,
-                            image_rect.min.y,
-                            image_rect.max.x,
-                            image_rect.max.y,
-                        ])
-                    };
-                    let callback = crate::gpu::ocio_pass::OcioCallback {
-                        draws,
-                        // Composite folds its draws through the scene ping-pong; every
-                        // other arrangement renders its draws in the single pass-1 loop.
-                        accumulate: program.is_composite,
-                        // The A/B path emits this callback only under OCIO, so it always
-                        // takes the OCIO display transform, never the display-encode pass.
-                        use_display_encode: false,
-                        // The A/B path places both images as pass-1 draws (it never
-                        // accumulates side-by-side), so it needs no overlay group.
-                        overlay_draws: Vec::new(),
-                        display_format,
-                        blit_uniforms,
-                        scissor_pts,
-                        render_sig,
-                    };
-                    slot_painter.set(
-                        slot,
-                        eframe::egui_wgpu::Callback::new_paint_callback(cb_clip, callback),
-                    );
-                }
-                true
-            } else {
-                false
-            };
-
-            if !ocio_handled {
-                // One draw for everything (#146): the shader blends fragments
-                // outside the display window at `overscan_factor`, so the old
-                // dim pre-pass (which re-ran the full fragment shader over the
-                // whole display window every repaint) is gone. Side-by-Side
-                // renders at full brightness with the full-canvas clip; with
-                // opacity 0 the overscan is hidden, so keep the display-window
-                // scissor and skip the dim entirely.
-                if is_sbs {
-                    self.emit_mode_draws(
-                        &ctx,
-                        &program,
-                        layout,
-                        exr_data_b,
-                        &bg_a,
-                        &unclipped_painter,
-                        1.0,
-                    );
-                } else if self.overscan_opacity > 0.0 {
-                    ctx.overscan_factor.set(self.overscan_opacity);
-                    self.emit_mode_draws(
-                        &ctx,
-                        &program,
-                        layout,
-                        exr_data_b,
-                        &bg_a,
-                        &unclipped_painter,
-                        1.0,
-                    );
-                } else {
-                    self.emit_mode_draws(&ctx, &program, layout, exr_data_b, &bg_a, &painter, 1.0);
-                }
-            }
-        }
-    }
-
-    /// The real render path: upload `layer_index`'s RGBA into a GPU bind group.
-    /// The shader applies channel isolation, exposure, gamma, sRGB and every
-    /// compare mode, so this one generator serves all modes; results are cached
-    /// per layer in `gpu_textures` / `gpu_textures_b`. See the module-level docs.
     /// Build a GPU texture + bind group for one layer of an `ExrData`, returning
     /// the [`T2Texture`] (which keeps the `Texture` handle so it can be explicitly
-    /// destroyed on eviction). UI-thread only (`queue.write_texture`).
+    /// destroyed on eviction). The shader applies channel isolation, exposure,
+    /// gamma, sRGB and every arrangement, so this one generator serves them all.
+    /// UI-thread only (`queue.write_texture`).
     fn build_layer_texture(
         gpu_resources: &crate::gpu::GpuResources,
         exr_data: &ExrData,
@@ -4225,12 +2897,6 @@ impl ExrViewer {
     }
 
     // --- T2 GPU-texture ring (#56) -------------------------------------------
-
-    /// T2-ring source ids while the app is A/B-pinned (#99): the primary (A) and
-    /// the compared follower (B), mirroring `ExrApp::{A,B}_SOURCE`. Phase 2 rings
-    /// the comp stack's N sources under their own ids.
-    const T2_SOURCE_A: crate::layer::SourceId = crate::layer::SourceId(0);
-    const T2_SOURCE_B: crate::layer::SourceId = crate::layer::SourceId(1);
 
     /// `source`'s T2 ring, created empty on first use. Mutating entry points
     /// (`set_t2_cap`, `set_t2_frame`) go through here; reads (`t2_cap`, `t2_len`)
@@ -4598,7 +3264,7 @@ impl ExrViewer {
     /// Apply the canvas zoom/pan interaction for one frame from `response`:
     /// first-frame fit-to-view, cursor-centered wheel/pinch zoom, and drag pan
     /// (suppressed while an annotation tool is active). Extracted from
-    /// [`Self::ui`] so the proxy first-paint path ([`Self::draw_proxy`]) shares
+    /// the comp path so the proxy first-paint path ([`Self::draw_proxy`]) shares
     /// the exact same interaction model — the handoff from proxy to full-res is
     /// visually continuous because zoom/pan state is identical.
     fn handle_canvas_interaction(
@@ -4652,11 +3318,19 @@ impl ExrViewer {
     /// First-paint render path: paint the slot-A proxy texture while the full
     /// `ExrData` decode is in flight (#58/#33). Lays out the image at the
     /// proxy's *full* dimensions (so the rect matches the upcoming full-res
-    /// render) and applies the same zoom/pan interaction as [`Self::ui`], so
+    /// render) and applies the same zoom/pan interaction as the comp path, so
     /// the handoff to full-res is continuous. No panels / contact-sheet /
     /// compare modes — those need a full `ExrData`; the proxy is a stand-in
-    /// until it arrives. Used by [`crate::app::ExrApp::draw_central_canvas`] in
-    /// the loading branch when a proxy is available.
+    /// until it arrives.
+    ///
+    /// **Currently unreachable (#99 Slice 3h).** Its only caller was
+    /// `draw_central_canvas`'s slot-A loading branch, and the R4 collapse routed every
+    /// open through `add_comp_source`, which decodes synchronously — so no first-paint
+    /// proxy is ever produced. Kept rather than deleted because the machinery behind it
+    /// (`proxy.rs`, `proxy_cache.rs`) is **still live for scrub proxy**, and re-homing
+    /// first-paint onto `add_comp_source` is a real feature decision, not deletion
+    /// fallout. See the Slice 3 follow-ups in `docs/review-player/unification-plan.md`.
+    #[allow(dead_code)]
     pub fn draw_proxy(&mut self, ui: &mut egui::Ui) {
         let Some(tex_size) = self.proxy_full_size else {
             return;
@@ -4981,54 +3655,16 @@ fn colored_rgba_label(ui: &mut egui::Ui, prefix: &str, val: [f32; 4]) {
     });
 }
 
-fn draw_dashed_rect(
-    painter: &egui::Painter,
-    rect: egui::Rect,
-    color: egui::Color32,
-    dash_length: f32,
-    gap_length: f32,
-) {
-    let draw_line = |start: egui::Pos2, end: egui::Pos2| {
-        let dir = end - start;
-        let len = dir.length();
-        let stride = dash_length + gap_length;
-        // Degenerate edge or non-advancing stride: nothing to draw (and the
-        // latter would otherwise spin forever / divide by zero on `dir_norm`).
-        if len <= f32::EPSILON || stride <= f32::EPSILON {
-            return;
-        }
-        let dir_norm = dir / len;
-        // Derive each dash offset from an integer index rather than accumulating
-        // a float `t += stride`, so rounding error can't drift over a long edge
-        // (and clippy's `while_float` is satisfied). Last index < len by ceil math.
-        let steps = (len / stride).ceil() as usize;
-        for i in 0..steps {
-            let t = i as f32 * stride;
-            let t_end = (t + dash_length).min(len);
-            painter.line_segment(
-                [start + dir_norm * t, start + dir_norm * t_end],
-                (1.0, color),
-            );
-        }
-    };
-
-    draw_line(rect.left_top(), rect.right_top());
-    draw_line(rect.right_top(), rect.right_bottom());
-    draw_line(rect.right_bottom(), rect.left_bottom());
-    draw_line(rect.left_bottom(), rect.left_top());
-}
-
 #[cfg(test)]
 mod gui_tests {
     //! Headless GUI tests via `egui_kittest`, so they run anywhere — no wgpu
     //! device. Most drive the rendering-free [`ExrViewer::handle_hotkeys`] seam
     //! (events → `key_pressed` → state mutation); the smoke test additionally
-    //! drives the full [`ExrViewer::ui`] CPU path (`render_state = None`) across
-    //! every compare mode to guard the render/extraction seams.
-    use super::{BlendMode, ChannelMode, CompareMode, ExrViewer};
+    //! drives the comp-path entry points headlessly (no GPU `gpu_resources`)
+    //! to guard the hotkey / contact-sheet / geometry seams.
+    use super::{ChannelMode, ExrViewer};
     use crate::annotation::{Annotation, AnnotationKind, AnnotationTool};
     use crate::exr_loader::ExrData;
-    use crate::render_program;
     use eframe::egui;
     use egui_kittest::Harness;
     use exr::prelude::*;
@@ -5147,7 +3783,7 @@ mod gui_tests {
     #[test]
     fn comp_pane_layout_splits_only_in_side_by_side() {
         use super::comp_pane_layout;
-        use crate::render_program::Arrangement;
+        use crate::layer::Arrangement;
         let center = egui::pos2(500.0, 300.0);
         let z = egui::Vec2::ZERO;
         let size_a = egui::vec2(200.0, 100.0);
@@ -5477,25 +4113,20 @@ mod gui_tests {
 
     struct State {
         viewer: ExrViewer,
-        has_b: bool,
     }
 
-    fn harness(has_b: bool) -> Harness<'static, State> {
+    fn harness() -> Harness<'static, State> {
         Harness::new_ui_state(
-            |ui, s: &mut State| {
-                let has_b = s.has_b;
-                s.viewer.handle_hotkeys(ui, has_b);
-            },
+            |ui, s: &mut State| s.viewer.handle_channel_hotkeys(ui),
             State {
                 viewer: ExrViewer::default(),
-                has_b,
             },
         )
     }
 
     #[test]
     fn channel_keys_isolate_and_reset() {
-        let mut h = harness(false);
+        let mut h = harness();
 
         for (key, expected) in [
             (egui::Key::R, ChannelMode::R),
@@ -5512,7 +4143,7 @@ mod gui_tests {
 
     #[test]
     fn reset_keys_zero_exposure_and_gamma() {
-        let mut h = harness(false);
+        let mut h = harness();
         h.state_mut().viewer.exposure = 2.0;
         h.state_mut().viewer.gamma = 2.2;
 
@@ -5529,7 +4160,7 @@ mod gui_tests {
 
     #[test]
     fn plain_g_still_isolates_green_not_gamma_reset() {
-        let mut h = harness(false);
+        let mut h = harness();
         h.state_mut().viewer.gamma = 2.2;
 
         h.key_press(egui::Key::G);
@@ -5548,7 +4179,7 @@ mod gui_tests {
 
     #[test]
     fn channel_keys_are_inert_in_contact_sheet() {
-        let mut h = harness(false);
+        let mut h = harness();
         h.state_mut().viewer.show_contact_sheet = true;
         let before = h.state().viewer.channel_mode;
 
@@ -5571,7 +4202,6 @@ mod gui_tests {
             |ui, s: &mut State| s.viewer.handle_channel_hotkeys(ui),
             State {
                 viewer: ExrViewer::default(),
-                has_b: false,
             },
         );
 
@@ -5606,7 +4236,6 @@ mod gui_tests {
                     gamma: 2.2,
                     ..ExrViewer::default()
                 },
-                has_b: false,
             },
         );
 
@@ -5642,6 +4271,32 @@ mod gui_tests {
     }
 
     #[test]
+    fn t_toggles_the_contact_sheet_both_ways() {
+        // `T` sits above the suppression gate for the same reason F11/Esc do: the
+        // gate keys off `show_contact_sheet`, so handling it below would let `T`
+        // open the sheet but never close it.
+        let mut h = harness();
+
+        h.key_press(egui::Key::T);
+        h.run();
+        assert!(h.state().viewer.show_contact_sheet, "T opens the sheet");
+
+        h.key_press(egui::Key::T);
+        h.run();
+        assert!(
+            !h.state().viewer.show_contact_sheet,
+            "T must also close the sheet — the gate would otherwise swallow it"
+        );
+
+        // The channel keys stay inert while the sheet is open, unlike T.
+        h.state_mut().viewer.show_contact_sheet = true;
+        let before = h.state().viewer.channel_mode;
+        h.key_press(egui::Key::R);
+        h.run();
+        assert_eq!(h.state().viewer.channel_mode, before);
+    }
+
+    #[test]
     fn fullscreen_and_esc_work_via_comp_entry_point() {
         // F11 / Esc moved onto the comp entry point (#99 Slice 3f) — `fullscreen` still
         // gates the menu bar / timeline / side panel, but nothing could set it once
@@ -5650,7 +4305,6 @@ mod gui_tests {
             |ui, s: &mut State| s.viewer.handle_channel_hotkeys(ui),
             State {
                 viewer: ExrViewer::default(),
-                has_b: false,
             },
         );
 
@@ -5691,203 +4345,28 @@ mod gui_tests {
         );
     }
 
-    #[test]
-    fn compare_keys_switch_mode_when_reference_loaded() {
-        let mut h = harness(true);
-
-        h.key_press(egui::Key::Num2);
-        h.run();
-        assert_eq!(h.state().viewer.compare_mode, CompareMode::SingleB);
-
-        h.key_press(egui::Key::Num1);
-        h.run();
-        assert_eq!(h.state().viewer.compare_mode, CompareMode::SingleA);
-    }
-
-    #[test]
-    fn reference_only_shortcuts_are_inert_without_b() {
-        let mut h = harness(false);
-        let before = h.state().viewer.compare_mode;
-
-        h.key_press(egui::Key::Num2);
-        h.run();
-        assert_eq!(
-            h.state().viewer.compare_mode,
-            before,
-            "Num2 must do nothing without a reference image"
-        );
-    }
-
-    #[test]
-    fn space_toggles_blink_only_with_reference() {
-        // With a reference image, Space toggles the blink (A/B flip) state.
-        let mut h = harness(true);
-        assert!(!h.state().viewer.blink_state);
-        h.key_press(egui::Key::Space);
-        h.run();
-        assert!(
-            h.state().viewer.blink_state,
-            "Space should enable blink with B"
-        );
-        h.key_press(egui::Key::Space);
-        h.run();
-        assert!(
-            !h.state().viewer.blink_state,
-            "Space should toggle blink back off"
-        );
-
-        // Without a reference image, Space is inert.
-        let mut h = harness(false);
-        h.key_press(egui::Key::Space);
-        h.run();
-        assert!(
-            !h.state().viewer.blink_state,
-            "Space must be inert without B"
-        );
-    }
-
-    #[test]
-    fn test_blink_interval_math() {
-        let blink_interval = 1.0;
-        let is_even_phase = |time: f64| ((time / blink_interval) as usize).is_multiple_of(2);
-
-        assert!(is_even_phase(0.0));
-        assert!(is_even_phase(0.5));
-        assert!(!is_even_phase(1.0));
-        assert!(!is_even_phase(1.5));
-        assert!(is_even_phase(2.0));
-
-        let blink_interval = 0.5;
-        let is_even_phase = |time: f64| ((time / blink_interval) as usize).is_multiple_of(2);
-        assert!(is_even_phase(0.0));
-        assert!(is_even_phase(0.25));
-        assert!(!is_even_phase(0.5));
-        assert!(!is_even_phase(0.75));
-        assert!(is_even_phase(1.0));
-    }
-
-    #[test]
-    fn has_mode_params_drives_contextual_row() {
-        let mut v = ExrViewer::default();
-
-        // Single-view modes carry no contextual params → no second row.
-        // (Default `compare_mode` is `SingleA`, so check it before mutating.)
-        assert_eq!(v.compare_mode, CompareMode::SingleA);
-        assert!(!v.has_mode_params());
-        v.compare_mode = CompareMode::SingleB;
-        assert!(!v.has_mode_params());
-
-        // Parameterized modes do.
-        for mode in [
-            CompareMode::Wipe,
-            CompareMode::DiffMatte,
-            CompareMode::SideBySide,
-            CompareMode::Composite,
-        ] {
-            v.compare_mode = mode;
-            assert!(v.has_mode_params(), "{mode:?} should show a contextual row");
-        }
-
-        // Blink wins even though it overwrites compare_mode to a single view.
-        v.compare_mode = CompareMode::SingleB;
-        v.blink_state = true;
-        assert!(v.has_mode_params(), "blink exposes the speed control");
-    }
-
-    /// The #114 seam: `render_program` must plumb the live viewer fields
-    /// (compare_mode, blend_mode, active_layer, wipe_center) into the layer model
-    /// and resolve them through `LayerStack::composite_at`. The pure mapping is
-    /// covered in `render_program`'s own tests; this guards the field wiring.
-    #[test]
-    fn render_program_plumbs_viewer_state_into_the_layer_model() {
-        let mut v = ExrViewer::default();
-
-        // SingleA (the default) solos slot A: one stacked draw of A.
-        let p = v.render_program(CompareMode::SingleA);
-        assert_eq!(p.arrangement, render_program::Arrangement::Stacked);
-        assert_eq!(p.draws.len(), 1);
-        assert_eq!(p.draws[0].input, render_program::ProgramInput::A);
-        assert!(!p.is_composite);
-
-        // Composite plumbs blend_mode onto the top (B) draw + flags is_composite,
-        // and active_layer threads into every draw's AOV.
-        v.blend_mode = BlendMode::Screen;
-        v.active_layer = 2;
-        let p = v.render_program(CompareMode::Composite);
-        assert!(p.is_composite);
-        assert_eq!(p.draws.len(), 2);
-        assert_eq!(
-            (p.draws[1].input, p.draws[1].blend),
-            (render_program::ProgramInput::B, BlendMode::Screen)
-        );
-        assert!(p.draws.iter().all(|d| d.aov == 2), "active_layer → aov");
-
-        // Wipe carries wipe_center[0] as the split position.
-        v.wipe_center = [0.3, 0.5];
-        let p = v.render_program(CompareMode::Wipe);
-        assert_eq!(
-            p.arrangement,
-            render_program::Arrangement::Wipe { position: 0.3 }
-        );
-
-        // DiffMatte is the diff inspection — two inputs, never a composite.
-        let p = v.render_program(CompareMode::DiffMatte);
-        assert_eq!(p.arrangement, render_program::Arrangement::Diff);
-        assert!(!p.is_composite);
-        assert_eq!(p.draws.len(), 2);
-    }
-
     struct SmokeState {
         viewer: ExrViewer,
         a: ExrData,
-        b: Option<ExrData>,
     }
 
-    /// Drive `ExrViewer::ui` headless (no GPU `render_state`) with a loaded A and
-    /// B across every compare mode plus the contact sheet, asserting it lays out
-    /// without panicking. Without a GPU the central canvas is not drawn (#59 made
-    /// rendering GPU-only), so this exercises the non-render seams: state
-    /// transitions, contact sheet, pixel sampling, overlays.
-    #[test]
-    fn ui_renders_all_compare_modes_without_panicking() {
-        let dir = tempfile::tempdir().unwrap();
-        let pa = dir.path().join("a.exr");
-        let pb = dir.path().join("b.exr");
-        write_rgba_exr(&pa);
-        write_rgba_exr(&pb);
-        let a = ExrData::load(&pa).unwrap();
-        let b = ExrData::load(&pb).unwrap();
-
-        let mut h = Harness::new_ui_state(
+    /// Drive the contact sheet the way `ExrApp::draw_comp_contact_sheet` does
+    /// (#99 Slice 3h): size the caches first — `draw_contact_sheet` indexes them
+    /// unguarded — then lay the sheet out.
+    fn sheet_harness(a: ExrData) -> Harness<'static, SmokeState> {
+        Harness::new_ui_state(
             |ui, s: &mut SmokeState| {
-                // Disjoint field borrows: &mut viewer + &a/&b.
-                let SmokeState { viewer, a, b } = s;
-                viewer.ui(ui, a, b.as_ref(), None, None);
+                let SmokeState { viewer, a } = s;
+                viewer.sync_texture_caches(a.logical_layers.len(), 0);
+                if viewer.show_contact_sheet {
+                    viewer.draw_contact_sheet(ui, a, None, None);
+                }
             },
             SmokeState {
                 viewer: ExrViewer::default(),
                 a,
-                b: Some(b),
             },
-        );
-
-        for mode in [
-            CompareMode::SingleA,
-            CompareMode::SingleB,
-            CompareMode::Wipe,
-            CompareMode::SideBySide,
-            CompareMode::DiffMatte,
-            CompareMode::Composite,
-        ] {
-            h.state_mut().viewer.compare_mode = mode;
-            h.run();
-        }
-
-        // Contact sheet (single + dual) must also lay out cleanly.
-        h.state_mut().viewer.show_contact_sheet = true;
-        h.run();
-        h.state_mut().viewer.compare_mode = CompareMode::SideBySide;
-        h.run();
+        )
     }
 
     /// The headless contact sheet (no GPU) bakes per-layer thumbnails into the
@@ -5901,17 +4380,7 @@ mod gui_tests {
         write_rgba_exr(&pa);
         let a = ExrData::load(&pa).unwrap();
 
-        let mut h = Harness::new_ui_state(
-            |ui, s: &mut SmokeState| {
-                let SmokeState { viewer, a, b } = s;
-                viewer.ui(ui, a, b.as_ref(), None, None);
-            },
-            SmokeState {
-                viewer: ExrViewer::default(),
-                a,
-                b: None,
-            },
-        );
+        let mut h = sheet_harness(a);
 
         // Open the sheet and lay it out. (egui_kittest's first frame is a sizing
         // pass that doesn't run the ScrollArea content; a second frame bakes it.)
@@ -5944,17 +4413,7 @@ mod gui_tests {
         write_rgba_exr(&pa);
         let a = ExrData::load(&pa).unwrap();
 
-        let mut h = Harness::new_ui_state(
-            |ui, s: &mut SmokeState| {
-                let SmokeState { viewer, a, b } = s;
-                viewer.ui(ui, a, b.as_ref(), None, None);
-            },
-            SmokeState {
-                viewer: ExrViewer::default(),
-                a,
-                b: None,
-            },
-        );
+        let mut h = sheet_harness(a);
 
         // Open + lay out (first frame sizes, second bakes the ScrollArea content).
         h.state_mut().viewer.show_contact_sheet = true;

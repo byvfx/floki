@@ -751,7 +751,7 @@ pub struct ExrApp {
     /// composite (side A) against the current layer (side B). The comp-path analogue
     /// of the A/B `compare_mode`. Runtime-only.
     #[serde(skip)]
-    comp_arrangement: crate::render_program::Arrangement,
+    comp_arrangement: crate::layer::Arrangement,
 
     /// App-owned GPU core (#54): the single home for the persistent `GpuState`
     /// and the OCIO pass publisher. `None` in the CPU-only path (no wgpu
@@ -934,7 +934,7 @@ impl Default for ExrApp {
             comp_readout_b: None,
             compare_b_layer: None,
             selected_comp_layer: None,
-            comp_arrangement: crate::render_program::Arrangement::Stacked,
+            comp_arrangement: crate::layer::Arrangement::Stacked,
             gpu_resources: None,
             ocio_path: String::new(),
             lut_path: String::new(),
@@ -3519,9 +3519,6 @@ impl ExrApp {
             // `apply_load_result` returns before clearing it). #117.
             self.b_mut().loading = false;
             self.clear_b_sequence(); // and any locked-step B state (#98)
-            // B-only compare modes are meaningless without B.
-            self.viewer.compare_mode = crate::viewer::CompareMode::SingleA;
-            self.viewer.blink_state = false;
             // Drop B's histogram (not part of the cache key).
             self.viewer.invalidate_histogram();
         } else {
@@ -3983,6 +3980,7 @@ impl ExrApp {
                     ui.label("R / G / B / A - Isolate specific channel");
                     ui.label("C - Return to full color composite");
                     ui.label("F - Frame image to fit the window");
+                    ui.label("T - Toggle the contact sheet for the current layer");
                     ui.label("F11 - Toggle full-screen (ESC or F11 to exit)");
                     ui.label("ESC - Cancel an in-progress annotation, else exit full-screen");
                     ui.label("E - Reset exposure to 0.0");
@@ -6381,6 +6379,15 @@ impl ExrApp {
                 ui.separator();
             }
 
+            // Contact Sheet, beside the pass control because that is what it is — a
+            // visual pass-picker for the current layer. Always available (single or
+            // multi load), unlike the `Pass:` combo, which needs a multi-pass source.
+            // Only shows the *current* layer's passes, so it follows the `Layer:`
+            // selection; the View-menu item and `T` toggle the same flag.
+            ui.toggle_value(&mut self.viewer.show_contact_sheet, "▦ Sheet")
+                .on_hover_text("Contact sheet of the current layer's passes (T)");
+            ui.separator();
+
             // Tone controls (#99 Slice 3a). These lived only in the classic viewer's
             // `primary_row`, which the R4 collapse made unreachable — yet
             // `draw_comp_composite` still applies `exposure` / `gamma` / `srgb` to the
@@ -6448,7 +6455,7 @@ impl ExrApp {
             if layer_list.len() > 1 {
                 ui.separator();
                 ui.label("Compare:");
-                use crate::render_program::Arrangement;
+                use crate::layer::Arrangement;
                 let mut arr = self.comp_arrangement;
                 egui::ComboBox::from_id_salt("comp_arrangement")
                     .selected_text(match arr {
@@ -7080,12 +7087,6 @@ impl ExrApp {
     /// non-OCIO composite is a follow-up. Assumes the panel is shown with a
     /// non-empty stack (the caller gates on that).
     fn draw_comp_central(&mut self, ui: &mut egui::Ui) {
-        // The comp path doesn't run the full viewer `ui`, so its `handle_hotkeys`
-        // (and the C/R/G/B/A shortcuts within) never fire here. Service the
-        // channel-isolation shortcuts directly so keyboard isolation works in comp
-        // mode too, matching the status-bar quick toggle (#192).
-        self.viewer.handle_channel_hotkeys(ui);
-
         // Nuke-style current-layer control bar at the top of the viewport (#99 R4
         // follow-up): pick the current layer, page through its AOVs/passes, and
         // isolate channels — the classic single-image control row, restored for the
@@ -7176,7 +7177,7 @@ impl ExrApp {
                 .get(&s)
                 .is_some_and(|c| c.bind_group.is_some())
         };
-        let compare = self.comp_arrangement != crate::render_program::Arrangement::Stacked;
+        let compare = self.comp_arrangement != crate::layer::Arrangement::Stacked;
         let side_a_draw = compare
             .then(|| comp_layer_draw(&steps, self.active_comp_layer(), drawable))
             .flatten();
@@ -7224,12 +7225,12 @@ impl ExrApp {
                 }
                 self.comp_arrangement
             }
-            _ => crate::render_program::Arrangement::Stacked,
+            _ => crate::layer::Arrangement::Stacked,
         };
         // Pane A's readout follows pane A: the current layer in compare mode, the
         // composite's topmost drawable layer otherwise.
         let (top, top_exr) = match (side_a_draw, arrangement) {
-            (Some(a), arr) if arr != crate::render_program::Arrangement::Stacked => (
+            (Some(a), arr) if arr != crate::layer::Arrangement::Stacked => (
                 Some((a.source, a.aov)),
                 self.comp_sources
                     .get(&a.source)
@@ -7429,19 +7430,19 @@ impl ExrApp {
 
     fn draw_central_canvas(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default().show_inside(ui, |ui| {
-            // The comp stack takes over the viewport whenever it has layers (#99
-            // R4) — the unified open/drop flow adds every file here, so this is the
-            // primary path. The `show_layers_panel` toggle now hides only the
-            // timeline *tracks* (see `draw_timeline_panel`), not the composite, so
-            // toggling it off shows the composite full-screen instead of a blank.
-            // The A/B path below only runs with an empty stack (legacy compare,
-            // reachable until render-retire ports it in).
+            // Viewer shortcuts run here, *before* the branch, so they work on the
+            // contact-sheet path too — otherwise `T` could open the sheet but never
+            // close it, and F11 / Esc would die at its edge. Exactly one call site:
+            // servicing them in both branches would toggle each key twice per press.
+            self.viewer.handle_channel_hotkeys(ui);
+
+            // The comp stack IS the viewport (#99 Slice 3h): the unified open/drop flow
+            // adds every file to it, so this is the only path. The `show_layers_panel`
+            // toggle hides only the timeline *tracks* (see `draw_timeline_panel`), not
+            // the composite, so toggling it off shows the composite full-screen.
             //
-            // Contact Sheet (#191) is a single-source, per-layer/pass grid, so it
-            // takes priority over the composite. It used to route through `viewer.ui`
-            // against slot A — which the R4 collapse left permanently empty, so the
-            // toggle did nothing. It runs against the **current comp layer's** source
-            // now (#99 Slice 3e) and needs no viewport at all.
+            // Contact Sheet (#191) is a single-source, per-layer/pass grid over the
+            // current layer, so it takes priority over the composite.
             if self.viewer.show_contact_sheet && self.draw_comp_contact_sheet(ui) {
                 return;
             }
@@ -7449,58 +7450,9 @@ impl ExrApp {
                 self.draw_comp_central(ui);
                 return;
             }
-            if self.loaded_file.is_some() {
-                if let Some(data) = &self.exr_data {
-                    self.viewer.enable_lut = self.enable_lut && self.lut_bg.is_some();
-                    self.viewer.lut_domain_min = self.lut_domain_min;
-                    self.viewer.lut_domain_max = self.lut_domain_max;
-                    self.viewer.ocio_active = self.ocio_enabled && self.ocio_ready;
-                    self.viewer.ocio_render_gen = self.ocio_render_gen;
-                    // INV-SAMPLE (#7): suppress the pixel readout while a sequence
-                    // is advancing or a seek's frame is still in flight.
-                    self.viewer.suppress_sampling = self.playback.sampling_suppressed();
-                    // Diff controls, custom gradients, and background + presets are
-                    // single-owned by the viewer now (#151): the UI mutates them in
-                    // place and `save()` persists them straight from the viewer — no
-                    // per-frame push/read-back or `mem::take` shuffle.
-                    self.viewer.ui(
-                        ui,
-                        data,
-                        self.exr_data_b.as_deref(),
-                        self.gpu_resources.as_ref(),
-                        self.lut_bg.clone(),
-                    );
-                } else if self.loading_a {
-                    // A requested but its decode hasn't landed yet (no prior image
-                    // to keep showing). If a low-res first-paint proxy (#58) is
-                    // available, render it; otherwise show a spinner.
-                    if self.viewer.has_proxy() {
-                        // Hydrate the same per-frame viewer state the full `ui`
-                        // path uses, so the proxy renders with the user's tone /
-                        // LUT / OCIO-toggled settings (OCIO itself isn't applied
-                        // to the proxy — see `set_proxy`'s OCIO note).
-                        self.viewer.enable_lut = false; // proxy is a pre-baked CPU texture
-                        self.viewer.draw_proxy(ui);
-                    } else {
-                        let name = self
-                            .loaded_file
-                            .as_ref()
-                            .and_then(|p| p.file_name())
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_default();
-                        ui.centered_and_justified(|ui| {
-                            ui.horizontal(|ui| {
-                                ui.spinner();
-                                ui.label(format!("Loading {name}…"));
-                            });
-                        });
-                    }
-                }
-            } else {
-                ui.centered_and_justified(|ui| {
-                    ui.label("Open an EXR file to begin.");
-                });
-            }
+            ui.centered_and_justified(|ui| {
+                ui.label("Open an EXR file to begin.");
+            });
         });
     }
 }
@@ -9914,10 +9866,6 @@ mod tests {
             app.playback.state,
             PlayState::Playing,
             "Space starts playback when a sequence is loaded"
-        );
-        assert!(
-            !app.viewer.blink_state,
-            "Space was consumed by playback, not the blink toggle"
         );
     }
 
