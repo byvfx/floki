@@ -544,6 +544,11 @@ pub struct ExrApp {
     /// Throttle for the once-per-second playback state trace ([`Self::trace_playback_state`]).
     #[serde(skip)]
     dbg_last_trace: Option<std::time::Instant>,
+    /// Round-robin cursor for [`Self::pump_decode`]'s source order (#204), so the
+    /// single decode slot is shared rather than always going to whichever source
+    /// sorts first and always wants something.
+    #[serde(skip)]
+    pump_rotation: usize,
     /// Whether the last trace tick saw the clock running — the edge detector that
     /// lets [`Self::trace_playback_state`] emit one line on play→pause/stop (#100).
     /// That transition is exactly when INV-SAMPLE is decided, and the trace's
@@ -959,6 +964,7 @@ impl Default for ExrApp {
             decode_submit_at: None,
             last_decode_dur: None,
             dbg_last_trace: None,
+            pump_rotation: 0,
             dbg_was_playing: false,
             recent_files: Vec::new(),
             theme: ThemeChoice::default(),
@@ -2044,8 +2050,27 @@ impl ExrApp {
         let sources: Vec<crate::layer::SourceId> = std::iter::once(Self::A_SOURCE)
             .chain(self.active_followers().map(|(id, _)| *id))
             .collect();
+        // Rotate the starting point each pump so the P0 turn is shared (#204).
+        //
+        // A fixed order starves everything after the first source that always wants
+        // something. There is one decode in flight globally and the loop returns
+        // after submitting one job, so with the clock source first — its playhead
+        // advancing every ~42 ms while a decode takes ~270 ms — it wanted a frame on
+        // every single pump and consumed every slot. Measured with 5 layers: four of
+        // them never reached the P0 pass at all and displayed frame 1 for 30 seconds
+        // while their playheads swept the range twice, compositing a temporally
+        // wrong image.
+        //
+        // Rotation makes the starvation impossible rather than merely unlikely: over
+        // N pumps every source leads once. Priority *between* the passes is
+        // unchanged — every source's playhead (P0) still beats every source's
+        // prefetch (P1), so a lagging layer's current frame outranks the clock
+        // source's read-ahead.
+        let lead = self.pump_rotation % sources.len().max(1);
+        self.pump_rotation = self.pump_rotation.wrapping_add(1);
         for d in [0, depth] {
-            for &source in &sources {
+            for i in 0..sources.len() {
+                let source = sources[(lead + i) % sources.len()];
                 if let Some(w) = self.next_want(source, d) {
                     self.submit_seq(source, w);
                     // Overlap I/O with decode (#164): while the worker decodes `w`,
@@ -7880,6 +7905,59 @@ mod tests {
             "nothing was painted, so nothing is paced"
         );
         assert_eq!(app.playback.measured_fps, 0.0);
+    }
+
+    #[test]
+    fn the_decode_slot_rotates_across_sources_instead_of_starving_them() {
+        // #204: there is one decode in flight globally and `pump_decode` returns
+        // after submitting one job, so a fixed source order starved everything after
+        // the first source that always wants something. The clock source's playhead
+        // advances every ~42 ms while a decode takes ~270 ms, so it wanted a frame on
+        // every pump and took every slot — measured with 5 layers, four of them never
+        // reached the P0 pass and displayed frame 1 for 30 seconds.
+        let (_dir, paths) = write_sequence(10);
+        let mut app = ExrApp::default();
+        app.add_comp_source(paths[0].clone());
+        app.add_comp_source(paths[0].clone());
+        app.add_comp_source(paths[0].clone());
+        let sources: Vec<_> = (0..3)
+            .map(|i| crate::layer::SourceId(COMP_SOURCE_BASE + i))
+            .collect();
+
+        app.playback.state = PlayState::Playing;
+        app.playback_step(1); // every follower now wants a non-resident frame
+
+        // Drain the single slot repeatedly, recording which source each job went to.
+        // Completing with an *error* clears the wait state without caching anything,
+        // so every source keeps wanting a frame — the starvation regime exactly.
+        let mut served: std::collections::HashMap<crate::layer::SourceId, usize> =
+            std::collections::HashMap::new();
+        for _ in 0..30 {
+            app.pump_decode();
+            let Some((src, frame)) = app
+                .followers
+                .iter()
+                .find_map(|(id, st)| st.inflight.iter().next().map(|f| (*id, *f)))
+            else {
+                break;
+            };
+            *served.entry(src).or_default() += 1;
+            app.apply_load_result(LoadResult {
+                source: src,
+                seq_frame: true,
+                frame,
+                epoch: app.playback.epoch,
+                open_gen: 0,
+                result: Err("stub".to_string()),
+            });
+        }
+
+        for s in &sources {
+            assert!(
+                served.get(s).copied().unwrap_or(0) > 0,
+                "every source must get decode turns, but {s:?} got none: {served:?}"
+            );
+        }
     }
 
     #[test]
