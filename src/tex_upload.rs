@@ -75,17 +75,26 @@ pub struct TexUploader {
     inflight: std::collections::HashMap<SourceId, (u32, usize)>,
 }
 
-/// Worker count. Two by default: one is marginally short of feeding two layers at
-/// 24 fps, while more than a handful is actively harmful — the interleave is
-/// already `rayon`-parallel internally and the upload is memory-bandwidth bound, so
-/// extra workers contend for the same bus and starve the paint thread, which is the
-/// exact shape of the reverted decode-pool regression. `FLOKI_TEX_WORKERS`
-/// overrides it for measurement.
+/// Worker count. **One by default, because two measured worse.**
+///
+/// The intuition says a second worker should help — one is marginally short of
+/// feeding two layers at 24 fps. It does not. Going 1 → 2 on 4.6K plate footage
+/// left throughput flat (~28 builds/s either way) while making every build more
+/// expensive, and the giveaway was `create_bind_group` going 0.03 ms → 10.3 ms:
+/// that call moves no pixels, so a 340× slowdown is pure driver-lock contention.
+/// wgpu serializes resource creation and queue writes internally, and the
+/// interleave is already `rayon`-parallel across all cores, so a second worker
+/// adds contention on both without adding a lane. It also competes with the paint
+/// thread's own queue use — the shape of the reverted decode-pool regression
+/// (#204), one layer down.
+///
+/// `FLOKI_TEX_WORKERS` overrides it, which is how the above was measured; keep it
+/// for re-measuring on other GPUs before assuming this generalizes.
 fn worker_count() -> usize {
     std::env::var("FLOKI_TEX_WORKERS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(2)
+        .unwrap_or(1)
         .clamp(1, 8)
 }
 
