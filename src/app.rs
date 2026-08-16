@@ -1499,6 +1499,28 @@ impl ExrApp {
         self.add_comp_source(path);
     }
 
+    /// Open a path given on the command line, through the **same entry as
+    /// File ▸ Open and drag-drop** ([`Self::open_layer`]) — so launching with a
+    /// path exercises the real default path (add-a-layer, comp-drives-transport)
+    /// rather than a special startup route that the soak wouldn't be testing.
+    ///
+    /// Called from `main` right after construction. Safe there for the same reason
+    /// `restore_comp_layers` is: `add_comp_source` decodes synchronously and only
+    /// builds textures when `gpu_resources` is set, which `draw_comp_central`'s
+    /// `ensure_comp_*` does on the first paint anyway.
+    ///
+    /// A missing path is reported into `error_msg` (via `add_comp_source`'s load
+    /// failure) rather than silently ignored — a typo'd path in a soak command
+    /// must be loud.
+    pub fn open_cli_path(&mut self, path: PathBuf) {
+        if !path.exists() {
+            self.error_msg = Some(format!("No such file: {}", path.display()));
+            log::error!(target: "floki::playback", "cli path does not exist: {}", path.display());
+            return;
+        }
+        self.open_layer(path);
+    }
+
     /// Send a decode job to the worker, **respawning it if it has died** (#…).
     /// A dead worker's `job_rx` has been dropped, so `send` fails and hands the
     /// job back inside the `SendError`; drop the stale channels so the next
@@ -3537,7 +3559,14 @@ impl ExrApp {
     /// precisely the moment INV-SAMPLE (#7) is decided.
     fn trace_playback_state(&mut self) {
         use crate::playback::PlayState;
-        if !self.playback.is_active() || !log::log_enabled!(log::Level::Debug) {
+        // Check the target this actually logs to. A bare `log_enabled!` uses
+        // `module_path!()` — `floki::app` — so with the soak's narrow
+        // `RUST_LOG=floki::playback=debug` the gate evaluated a target that isn't
+        // enabled and returned before emitting anything: the capture produced an
+        // empty log while playback ran normally.
+        if !self.playback.is_active()
+            || !log::log_enabled!(target: "floki::playback", log::Level::Debug)
+        {
             return;
         }
         let outstanding = !self.inflight.is_empty()
@@ -7763,6 +7792,171 @@ mod tests {
 
         assert_eq!(app.transport_source, None, "the clock is released");
         assert!(!app.playback.is_active(), "and the timeline with it");
+    }
+
+    // --- #100 comp-path pins ---------------------------------------------------
+    //
+    // Each of these asserts the behaviour the comp path *should* have. They are
+    // `#[ignore]`d against the filed issue so CI stays green while the repro is
+    // permanent; the fix PR's diff is `-#[ignore]` plus the fix. All are GPU-free.
+    //
+    // Common root cause: when the comp stack drives the transport, the primary slot
+    // (`A_SOURCE`) never decodes, and every transport-level gate keyed on it goes
+    // dead.
+
+    /// `deliver_source_frame` with the fidelity flags a playback decode would carry
+    /// (a beauty-only or downsampled proxy frame), set before the `Arc` wrap.
+    fn deliver_source_frame_as(
+        app: &mut ExrApp,
+        source: crate::layer::SourceId,
+        path: &std::path::Path,
+        frame: u32,
+        proxy: bool,
+        beauty_only: bool,
+    ) {
+        let mut data = ExrData::load(path).unwrap();
+        data.proxy = proxy;
+        data.beauty_only = beauty_only;
+        app.apply_load_result(LoadResult {
+            source,
+            seq_frame: true,
+            frame,
+            epoch: app.playback.epoch,
+            open_gen: 0,
+            result: Ok(data),
+        });
+    }
+
+    #[test]
+    #[ignore = "#199: frame_bytes is seeded only from a primary decode, so the comp \
+                path never sizes the T1 ring and the cap stays frozen at its default"]
+    fn comp_transport_seeds_the_t1_sizing_bytes() {
+        // `frame_bytes` is the sole input to `tick_budgets`' T1 branch. Unseeded, the
+        // branch is skipped entirely: `frame_cache_cap` keeps its constructed default
+        // of 8 and the #146 live-pressure shrink can never fire. On real footage that
+        // is ~3.4 GB held with no budget check at all.
+        //
+        // The cap itself isn't asserted here — `tick_budgets` early-returns without a
+        // GPU device, so it is unreachable under the GPU-free test convention. The
+        // seeding is the defect; the cap follows from it mechanically.
+        let (_dir, paths) = write_sequence(5);
+        let mut app = ExrApp::default();
+        app.add_comp_source(paths[0].clone());
+        let source = crate::layer::SourceId(COMP_SOURCE_BASE);
+        assert_eq!(
+            app.clock_source(),
+            source,
+            "the comp source drives the clock"
+        );
+
+        app.playback_step(1);
+        deliver_source_frame(&mut app, source, &paths[1], 2);
+
+        let expected = ExrData::load(&paths[1]).unwrap().approx_bytes();
+        assert_eq!(
+            app.frame_bytes,
+            Some(expected),
+            "a full frame from the clock-driving source must size the ring"
+        );
+    }
+
+    #[test]
+    #[ignore = "#200: tick_stutter's hold gate reads playback.pending / loading_a, \
+                both permanently empty once the comp stack drives the transport"]
+    fn stutter_holds_while_the_clock_source_frame_is_undecoded() {
+        // Stutter's contract is "play every frame; drop the effective fps rather than
+        // skip". With the gate blind to follower state the playhead advances on the
+        // wall clock regardless, `run_held` never accrues, and `ensure_comp_frame`
+        // early-returns on an unchanged source frame — so the *stale* texture stays on
+        // screen while the frame counter moves. Stutter silently becomes drop-frames.
+        use crate::playback::Pacing;
+        let (_dir, paths) = write_sequence(10);
+        let mut app = ExrApp::default();
+        app.add_comp_source(paths[0].clone());
+        let source = crate::layer::SourceId(COMP_SOURCE_BASE);
+
+        app.playback.pacing = Pacing::Stutter;
+        app.playback.loop_mode = LoopMode::Once;
+        app.playback.state = PlayState::Playing;
+        app.playback.fps_target = 24.0;
+        let period = app.playback.period();
+
+        // The clock source is awaiting a frame that has not decoded.
+        app.followers.get_mut(&source).unwrap().pending = Some(2);
+        let before = app.playback.current_frame;
+
+        // Backdate the anchor so the next frame is due this tick.
+        app.playback.anchor = Some(std::time::Instant::now() - period.mul_f32(1.5));
+        app.playback.frames_since_anchor = 0;
+        app.tick_stutter(period);
+
+        assert_eq!(
+            app.playback.current_frame, before,
+            "stutter must hold on the frame the clock source is still decoding"
+        );
+    }
+
+    #[test]
+    #[ignore = "#201: request_comp_frame is fidelity-blind — it tests residency only, \
+                so a proxy-resident frame counts as satisfied and never upgrades"]
+    fn settling_upgrades_a_proxy_comp_frame_to_full() {
+        // INV-SAMPLE (#7): on settle the displayed frame must be full-fidelity, or the
+        // readout and AOV switcher see a frame that doesn't carry every channel. The
+        // slot-A path computes this explicitly (`needs_full`); the comp path has no
+        // equivalent, so the blurry frame stays up indefinitely.
+        let (_dir, paths) = write_sequence(5);
+        let mut app = ExrApp::default();
+        app.add_comp_source(paths[0].clone());
+        let source = crate::layer::SourceId(COMP_SOURCE_BASE);
+
+        app.playback.state = PlayState::Playing;
+        app.playback_step(1);
+        assert_eq!(app.playback.current_frame, 2);
+
+        // Frame 2 arrives as a scrub proxy — fine to display while moving.
+        deliver_source_frame_as(&mut app, source, &paths[1], 2, true, true);
+        assert!(app.frame_cache.contains(source, 2), "the proxy is resident");
+
+        app.playback_stop();
+
+        assert_eq!(
+            app.followers.get(&source).unwrap().pending,
+            Some(2),
+            "settling must re-request the clock source's frame at full fidelity"
+        );
+    }
+
+    #[test]
+    #[ignore = "#201: same fix site — settle_to_full evaluates fullness against \
+                A_SOURCE, which holds no data once the comp stack drives the clock"]
+    fn settling_on_a_full_comp_frame_requests_nothing() {
+        // The other half of the settle contract, and what makes the check above a real
+        // fidelity test rather than an unconditional re-request: an already-full frame
+        // needs no decode. Today this "passes" for the wrong reason (the path is blind
+        // and always clears `pending`), so it is only meaningful paired with the proxy
+        // case above.
+        //
+        // NOTE: the contact-sheet half of #201 — `invalidate_active_thumbnails` being
+        // unreachable because `a_full` is always false — is not pinned here. The
+        // thumbnail vector holds `egui::TextureHandle`s that cannot be constructed
+        // without a device, so it is unobservable under the GPU-free convention and
+        // needs a `gui_tests`-level test instead.
+        let (_dir, paths) = write_sequence(5);
+        let mut app = ExrApp::default();
+        app.add_comp_source(paths[0].clone());
+        let source = crate::layer::SourceId(COMP_SOURCE_BASE);
+
+        app.playback.state = PlayState::Playing;
+        app.playback_step(1);
+        deliver_source_frame(&mut app, source, &paths[1], 2); // full decode
+
+        app.playback_stop();
+
+        assert_eq!(
+            app.followers.get(&source).unwrap().pending,
+            None,
+            "an already-full frame needs no re-decode on settle"
+        );
     }
 
     #[test]
