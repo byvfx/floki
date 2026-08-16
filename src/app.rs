@@ -580,6 +580,20 @@ pub struct ExrApp {
     #[serde(default)]
     persisted_layers: Vec<LayerPersist>,
 
+    /// The comp-texture upload pool (#202) — `None` headless. Owns the worker
+    /// threads that interleave and upload frames off the paint thread.
+    #[serde(skip)]
+    tex_uploader: Option<crate::tex_upload::TexUploader>,
+
+    /// First frame of an env-gated soak run — the clock the warm-up and run window
+    /// in [`Self::tick_soak_harness`] are measured from. `None` outside a soak.
+    #[serde(skip)]
+    soak_started_at: Option<std::time::Instant>,
+    /// Whether the soak harness has already pressed Play (it must fire once, not
+    /// every frame past the warm-up).
+    #[serde(skip)]
+    soak_play_sent: bool,
+
     /// Snapshot to clipboard (issue #19): when true, each snapshot also writes a
     /// timestamped PNG to `~/.floki/snapshots/`. The clipboard copy always happens.
     #[serde(default)]
@@ -1004,6 +1018,9 @@ impl Default for ExrApp {
             track_drag: None,
             transport_source: None,
             comp_stack: crate::layer::LayerStack::new(),
+            tex_uploader: None,
+            soak_started_at: None,
+            soak_play_sent: false,
             comp_next_source: COMP_SOURCE_BASE,
             comp_sources: std::collections::HashMap::new(),
             comp_readout: None,
@@ -1081,6 +1098,14 @@ impl ExrApp {
             .wgpu_render_state
             .clone()
             .map(crate::gpu::GpuResources::new);
+
+        // The comp-texture upload pool (#202). Spawned with the GPU and kept for the
+        // process lifetime; absent a GPU there is nothing to upload to, and every
+        // texture path is already a no-op.
+        app.tex_uploader = app
+            .gpu_resources
+            .as_ref()
+            .map(|g| crate::tex_upload::TexUploader::new(&g.tex_build_ctx()));
 
         // `lut_bg` is a GPU handle and can't persist, but `enable_lut`/`lut_path`
         // do. Without rebuilding the bind group here, a restart leaves the LUT
@@ -2397,6 +2422,50 @@ impl ExrApp {
         self.request_sequence_frame(next);
     }
 
+    /// Unattended soak driver (#100): press Play once the stack is ready, then quit
+    /// after a fixed wall-clock window. Entirely env-gated — absent
+    /// `FLOKI_SOAK_SECS` this is a bool check per frame and nothing else.
+    ///
+    /// Exists because a soak comparison has to be *repeatable*. Hand-clicking Play
+    /// and closing the window varies the run length, the warm-up, and (via the
+    /// persisted stack) even the layer count, which is why earlier before/after
+    /// numbers on this issue were only ever approximate. With this the whole
+    /// measurement is one command.
+    ///
+    /// `FLOKI_SOAK_SECS=<n>`  run for n seconds after Play, then exit.
+    /// `FLOKI_SOAK_WARMUP=<n>` seconds to wait before pressing Play (default 3), so
+    ///                         the restored layers finish their first decode and the
+    ///                         window isn't measuring the open.
+    fn tick_soak_harness(&mut self, ctx: &egui::Context) {
+        let Some(secs) = std::env::var("FLOKI_SOAK_SECS")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+        else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        let started = *self.soak_started_at.get_or_insert(now);
+        let warmup = std::env::var("FLOKI_SOAK_WARMUP")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(3.0);
+        let elapsed = now.duration_since(started).as_secs_f32();
+
+        if !self.soak_play_sent && elapsed >= warmup {
+            self.soak_play_sent = true;
+            log::debug!(target: "floki::playback", "evt=soak_play nsrc={}", self.n_active_sources());
+            if self.playback.state != crate::playback::PlayState::Playing {
+                self.playback_toggle();
+            }
+        }
+        if self.soak_play_sent && elapsed >= warmup + secs {
+            log::debug!(target: "floki::playback", "evt=soak_done elapsed={elapsed:.1}");
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        // The soak drives itself, so keep the loop hot rather than waiting on input.
+        ctx.request_repaint();
+    }
+
     /// Toggle play/pause. Starting playback anchors the frame clock to now.
     fn playback_toggle(&mut self) {
         use crate::playback::PlayState;
@@ -3454,10 +3523,17 @@ impl eframe::App for ExrApp {
         // tracks the OS light/dark setting via egui's input each frame.
         ui.ctx().set_theme(self.theme);
 
+        self.tick_soak_harness(ui.ctx());
+
         // Load EXR files dragged onto the window (and draw the drag-over overlay).
         self.handle_drag_and_drop(ui.ctx());
 
         self.poll_async_loads(ui.ctx());
+
+        // Bind any comp textures the upload workers finished (#202). Before the
+        // transport ticks and well before the canvas draws, so a frame that landed
+        // since the last paint is on screen *this* frame rather than next.
+        self.collect_comp_textures();
 
         // Sequence playback (#7): consume transport keys (Space/←/→) before the
         // viewer sees them, then run the frame clock. Both are no-ops unless a
@@ -3724,6 +3800,18 @@ impl ExrApp {
         // misled me while reading these very logs: `p50=0.0` through a cold pass
         // looks like flawless playback when it means nothing has been displayed yet.
         // `ft_n` gives the sample count alongside.
+        // Texture-build cost over the last second (#202), drained here so the phase
+        // sums are per-trace-window. These now accumulate on the upload workers, so
+        // the total is across the pool and may exceed 1000 ms — it is throughput,
+        // not UI-thread occupancy. `texq` is the UI-side number.
+        let (texb_n, texb_alloc, texb_pack, texb_write, texb_bind, texb_max, texb_mb) =
+            crate::viewer::tex_build_stats::drain();
+        let texb_tot = texb_alloc + texb_pack + texb_write + texb_bind;
+        // Builds in flight on the upload workers (#202). Bounded by the number of
+        // active sources — one per source — so a value pinned at `nsrc` means the
+        // workers are the constraint, and a value at 0 means they are keeping up.
+        let texq = self.tex_uploader.as_ref().map_or(0, |u| u.inflight_len());
+
         const NO_DATA: f32 = -1.0;
         let (p50, p95, p99, pmax) = self
             .playback
@@ -3748,6 +3836,9 @@ impl ExrApp {
              loop={loop_mode:?} dir={dir:?} in={in_pt} out={out_pt} \
              pending={pending} loading_a={loading_a} inflight={inflight:?} \
              clock=s{clock_id} followers=[{followers}] nsrc={nsrc} stale={stale} \
+             texb_n={texb_n} texb_tot={texb_tot:.1} texb_alloc={texb_alloc:.1} \
+             texb_pack={texb_pack:.1} texb_write={texb_write:.1} texb_bind={texb_bind:.1} \
+             texb_max={texb_max:.1} texb_mb={texb_mb:.1} texq={texq} \
              worker={worker} submit_age={submit_age:.2} last_decode={last_decode:.2} \
              precache={precache}/{precache_filled} \
              t1={t1_len}/{t1_cap} frame_bytes={frame_bytes} t2={t2_len}/{t2_cap} \
@@ -5975,8 +6066,10 @@ impl ExrApp {
         let aov = 0;
         let size = exr_data.logical_size(aov).unwrap_or((0, 0));
         let (texture, bind_group) = match self.gpu_resources.as_ref() {
-            Some(gpu) => crate::viewer::ExrViewer::build_source_texture(gpu, &exr_data, aov)
-                .map_or((None, None), |(t, bg)| (Some(t), Some(bg))),
+            Some(gpu) => {
+                crate::viewer::ExrViewer::build_source_texture(&gpu.tex_build_ctx(), &exr_data, aov)
+                    .map_or((None, None), |(t, bg)| (Some(t), Some(bg)))
+            }
             None => (None, None),
         };
 
@@ -6041,7 +6134,7 @@ impl ExrApp {
             return;
         };
         let Some((texture, bind_group)) =
-            crate::viewer::ExrViewer::build_source_texture(gpu, &exr_data, aov)
+            crate::viewer::ExrViewer::build_source_texture(&gpu.tex_build_ctx(), &exr_data, aov)
         else {
             return;
         };
@@ -6054,12 +6147,22 @@ impl ExrApp {
         }
     }
 
-    /// Rebuild a **sequence** comp source's texture to hold `(source_frame, aov)`
-    /// from the T1-cached frame (#99 Phase 2), when the playhead or AOV moved off
-    /// what it currently holds. No-op if already current, headless, the frame isn't
-    /// resident (the last-built frame is held), or the build fails. This is what
-    /// makes an added comp layer *play*: each paint, `draw_comp_central` resolves
-    /// the layer's source frame and rebinds the decoded pixels for it.
+    /// Request a **sequence** comp source's texture for `(source_frame, aov)` from
+    /// the T1-cached frame (#99 Phase 2), when the playhead or AOV moved off what it
+    /// currently holds. No-op if already current, headless, the frame isn't resident
+    /// (the last-built frame is held), or a build for this source is already in
+    /// flight. This is what makes an added comp layer *play*: each paint,
+    /// `draw_comp_central` resolves the layer's source frame and rebinds the decoded
+    /// pixels for it.
+    ///
+    /// The build itself is **asynchronous** (#202): this hands the work to
+    /// [`crate::tex_upload::TexUploader`] and returns, and
+    /// [`Self::collect_comp_textures`] swaps the result in on a later paint. It used
+    /// to interleave and upload the whole frame inline, which measured at ~940 ms of
+    /// every 1000 ms of UI-thread time on 4.6K footage with two layers — the thread
+    /// that has to paint was spending essentially all of itself on `memcpy`, which
+    /// is why displayed throughput sat at ~13 fps against a 24 fps clock however
+    /// fast frames decoded.
     fn ensure_comp_frame(&mut self, source: crate::layer::SourceId, source_frame: u32, aov: usize) {
         let Some(cs) = self.comp_sources.get(&source) else {
             return;
@@ -6067,30 +6170,50 @@ impl ExrApp {
         if cs.cur_frame == Some(source_frame) && cs.aov == aov {
             return;
         }
+        let Some(up) = self.tex_uploader.as_mut() else {
+            return;
+        };
+        // Already building exactly this — waiting is the whole point of the gate.
+        if up.pending_for(source) == Some((source_frame, aov)) {
+            return;
+        }
         // Hold the current texture until the frame is actually resident in T1.
         let Some(arc) = self.frame_cache.peek(source, source_frame) else {
             return;
         };
-        let Some(gpu) = self.gpu_resources.as_ref() else {
+        up.try_submit(source, source_frame, aov, arc);
+    }
+
+    /// Bind every texture the upload workers finished since the last paint (#202),
+    /// and pace off the swap.
+    ///
+    /// A result whose frame the playhead has already passed is still applied. It is
+    /// newer than what is on screen, so it moves the picture forward; the next
+    /// `ensure_comp_frame` immediately asks for the now-current frame. Dropping it
+    /// would hold the layer on an older frame for another full round trip — the
+    /// freeze #204 is about.
+    fn collect_comp_textures(&mut self) {
+        let Some(up) = self.tex_uploader.as_mut() else {
             return;
         };
-        let Some((texture, bind_group)) =
-            crate::viewer::ExrViewer::build_source_texture(gpu, &arc, aov)
-        else {
-            return;
-        };
-        let size = arc.logical_size(aov).unwrap_or((0, 0));
-        let swapped = self.comp_sources.get_mut(&source).is_some_and(|cs| {
-            let changed = cs.cur_frame != Some(source_frame);
-            cs.texture = Some(texture);
-            cs.bind_group = Some(bind_group);
-            cs.aov = aov;
-            cs.size = size;
-            cs.cur_frame = Some(source_frame);
-            changed
-        });
-        if swapped {
-            self.note_display(source, source_frame);
+        let built = up.drain();
+        for b in built {
+            let Some((texture, bind_group)) = b.texture else {
+                continue; // failed build: the slot is already released
+            };
+            // The layer may have been removed while its build was in flight.
+            let swapped = self.comp_sources.get_mut(&b.source).is_some_and(|cs| {
+                let changed = cs.cur_frame != Some(b.frame);
+                cs.texture = Some(texture);
+                cs.bind_group = Some(bind_group);
+                cs.aov = b.aov;
+                cs.size = b.size;
+                cs.cur_frame = Some(b.frame);
+                changed
+            });
+            if swapped {
+                self.note_display(b.source, b.frame);
+            }
         }
     }
 
@@ -6138,7 +6261,7 @@ impl ExrApp {
             return;
         };
         let Some((texture, bind_group)) =
-            crate::viewer::ExrViewer::build_source_texture(gpu, &data, aov)
+            crate::viewer::ExrViewer::build_source_texture(&gpu.tex_build_ctx(), &data, aov)
         else {
             return;
         };
@@ -6180,6 +6303,13 @@ impl ExrApp {
             // source can't hit a stale follower / cache entry. No-op for a still
             // (no follower registered).
             self.followers.remove(&source);
+            // Release the upload gate too (#202), or a source removed mid-build
+            // would leave a permanently-held in-flight slot behind. A result may
+            // still land for it; `collect_comp_textures` drops results for sources
+            // that no longer exist.
+            if let Some(up) = self.tex_uploader.as_mut() {
+                up.forget(source);
+            }
             self.frame_cache.clear_slot(source);
         }
         // Removing the last comp source leaves only the slot-A base track (#99 R3);

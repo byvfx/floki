@@ -45,5 +45,8 @@ mod scheduler;
 // by playback/app.
 mod sequence;
 mod snapshot;
+// Off-thread comp-texture upload (#202) — the paint thread submits a frame and
+// collects a finished GPU texture instead of interleaving and uploading inline.
+mod tex_upload;
 pub mod tools;
 mod viewer;

@@ -20,7 +20,7 @@
 //! [`GpuResources::publish_ocio_pass`] / [`GpuResources::invalidate_ocio_targets`]
 //! so call sites don't hand-roll the insert/remove pair.
 
-use eframe::egui_wgpu::RenderState;
+use eframe::egui_wgpu::{RenderState, wgpu};
 use std::sync::Arc;
 
 use crate::gpu::GpuState;
@@ -74,6 +74,32 @@ impl GpuResources {
     pub const fn render_state(&self) -> &RenderState {
         &self.render_state
     }
+
+    /// The subset of this struct a texture build actually needs, detached from the
+    /// egui surface so it can cross a thread boundary (#202).
+    #[must_use]
+    pub fn tex_build_ctx(&self) -> TexBuildCtx {
+        TexBuildCtx {
+            device: self.render_state.device.clone(),
+            queue: self.render_state.queue.clone(),
+            gpu_state: Arc::clone(&self.gpu_state),
+        }
+    }
+}
+
+/// Everything [`crate::viewer::ExrViewer::build_layer_texture`] touches: a device
+/// to allocate on, a queue to upload through, and the shared sampler/layout.
+///
+/// Extracted from [`GpuResources`] because that owns a `RenderState` — the whole
+/// egui surface, including the renderer lock — which has no business on a worker
+/// thread. The three fields here are all `Clone + Send + Sync` (wgpu handles are
+/// refcounted internally), so this is the seam that lets the comp texture upload
+/// run off the paint thread (#202).
+#[derive(Clone)]
+pub struct TexBuildCtx {
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
+    pub gpu_state: Arc<GpuState>,
 }
 
 impl GpuResources {

@@ -33,6 +33,87 @@ fn rgb3_to_vec4(c: [f32; 3]) -> [f32; 4] {
     [c[0], c[1], c[2], 0.0]
 }
 
+thread_local! {
+    /// Per-thread interleave scratch for [`ExrViewer::build_layer_texture`] (#202).
+    ///
+    /// Thread-local rather than caller-owned because the builders run on both the
+    /// UI thread and every [`crate::tex_upload`] worker, and a shared buffer would
+    /// need a lock in the hottest path in the app. Grows to the largest layer built
+    /// on that thread and stays — during playback of a fixed-size sequence the
+    /// `resize` is a no-op, which is the entire point: a fresh allocation here
+    /// zero-fills ~111 MB on 4.6K footage immediately before every byte is
+    /// overwritten.
+    static STAGING: std::cell::RefCell<Vec<u16>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Cost of [`ExrViewer::build_layer_texture`], split by phase (#202).
+///
+/// Nothing timed the paint path before this, so "the synchronous texture build is
+/// the bottleneck" was an assumption. It mattered *which* phase was expensive,
+/// because they imply different fixes, and the split was not what it looked like:
+/// once the redundant per-build staging allocation was removed, the remaining cost
+/// was ~80% `queue.write_texture` (a full-frame `memcpy` into wgpu's staging belt)
+/// and only ~20% the `rayon`-parallel channel interleave. So the fix could not be
+/// "move the interleave to a worker" — it had to move the whole build.
+///
+/// **Read the totals as worker time, not UI-thread time.** Before #202 these
+/// counters were accumulated entirely on the paint thread, and `texb_tot` against
+/// 1000 ms read directly as "fraction of the UI thread spent uploading" (it peaked
+/// at ~94%). The builds now run on [`crate::tex_upload`]'s pool, so the sum is
+/// across N workers and legitimately exceeds one second per second of wall clock.
+/// The UI-thread question is now answered by `texq` and by frame time, not here.
+///
+/// Process-global and lock-free because the builders are associated functions
+/// reached from several call sites (`ensure_comp_frame` via the pool,
+/// `ensure_base_frame`, `prebuild_t2`, the Add flow) on several threads; threading
+/// a collector through all of them would touch far more code than the measurement
+/// is worth. The 1 Hz trace drains the counters, so each line reports the cost
+/// incurred during that second.
+pub(crate) mod tex_build_stats {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::time::Duration;
+
+    static N: AtomicU64 = AtomicU64::new(0);
+    static ALLOC_NS: AtomicU64 = AtomicU64::new(0);
+    static PACK_NS: AtomicU64 = AtomicU64::new(0);
+    static WRITE_NS: AtomicU64 = AtomicU64::new(0);
+    static BIND_NS: AtomicU64 = AtomicU64::new(0);
+    static MAX_NS: AtomicU64 = AtomicU64::new(0);
+    static BYTES: AtomicU64 = AtomicU64::new(0);
+
+    /// One completed build. `alloc` is `create_texture`, `pack` the channel
+    /// interleave into the staging buffer, `write` the `queue.write_texture` call,
+    /// `bind` the view + bind-group creation.
+    pub fn record(alloc: Duration, pack: Duration, write: Duration, bind: Duration, bytes: u64) {
+        let ns = |d: Duration| d.as_nanos() as u64;
+        let total = ns(alloc) + ns(pack) + ns(write) + ns(bind);
+        N.fetch_add(1, Relaxed);
+        ALLOC_NS.fetch_add(ns(alloc), Relaxed);
+        PACK_NS.fetch_add(ns(pack), Relaxed);
+        WRITE_NS.fetch_add(ns(write), Relaxed);
+        BIND_NS.fetch_add(ns(bind), Relaxed);
+        BYTES.fetch_add(bytes, Relaxed);
+        MAX_NS.fetch_max(total, Relaxed);
+    }
+
+    /// Totals accumulated since the last drain, and reset: `(builds, alloc_ms,
+    /// pack_ms, write_ms, bind_ms, slowest_build_ms, mb_uploaded)`. The four phase
+    /// figures are **sums over the window**, not per-build averages, so they sum to
+    /// the wall-clock milliseconds the UI thread spent here.
+    pub fn drain() -> (u64, f32, f32, f32, f32, f32, f32) {
+        let ms = |a: &AtomicU64| a.swap(0, Relaxed) as f64 / 1e6;
+        (
+            N.swap(0, Relaxed),
+            ms(&ALLOC_NS) as f32,
+            ms(&PACK_NS) as f32,
+            ms(&WRITE_NS) as f32,
+            ms(&BIND_NS) as f32,
+            ms(&MAX_NS) as f32,
+            BYTES.swap(0, Relaxed) as f64 as f32 / (1024.0 * 1024.0),
+        )
+    }
+}
+
 /// The unscaled canvas bounds that "Frame" (F) fits into the viewport. Every mode
 /// except Side-by-Side draws B over A in the same rect, so the extent is just the
 /// A image; Side-by-Side lays A and B out horizontally (B height-normalized to A
@@ -880,10 +961,6 @@ pub struct ExrViewer {
     /// compared sequence ahead of the playhead. An absent ring reads as disabled
     /// (cap/len 0). Phase 2 rings the comp stack's N sources under their own ids.
     t2_rings: std::collections::BTreeMap<crate::layer::SourceId, T2Ring<T2Texture>>,
-    /// Reused staging buffer for the Rgba16Float pack (#142 U3): holds one
-    /// layer's interleaved half bit-patterns, so `build_layer_texture` doesn't
-    /// page-fault a fresh ~66 MB allocation every build during playback.
-    t2_staging: Vec<u16>,
     /// Persisted display preferences, single-owned here (#151): diff controls,
     /// custom gradients, background + presets. `ExrApp` mirrors these to disk only
     /// at eframe `save()`/load time; the UI mutates them in place.
@@ -1031,7 +1108,6 @@ impl Default for ExrViewer {
             gpu_thumb_bg: None,
             gpu_textures: Vec::new(),
             t2_rings: std::collections::BTreeMap::new(),
-            t2_staging: Vec::new(),
             prefs: ViewerPrefs::default(),
             colormap_lut: Vec::new(),
             colormap_sig: None,
@@ -2674,21 +2750,23 @@ impl ExrViewer {
     /// the [`T2Texture`] (which keeps the `Texture` handle so it can be explicitly
     /// destroyed on eviction). The shader applies channel isolation, exposure,
     /// gamma, sRGB and every arrangement, so this one generator serves them all.
-    /// UI-thread only (`queue.write_texture`).
+    ///
+    /// **Not UI-thread bound.** It takes a [`crate::gpu::TexBuildCtx`] rather than
+    /// the whole `GpuResources` precisely so it can run on the upload worker
+    /// ([`crate::tex_upload`], #202) — every wgpu handle it touches is `Send`, and
+    /// `queue.write_texture` is safe from any thread.
     fn build_layer_texture(
-        gpu_resources: &crate::gpu::GpuResources,
+        ctx: &crate::gpu::TexBuildCtx,
         exr_data: &ExrData,
         layer_index: usize,
-        staging: &mut Vec<u16>,
     ) -> Option<T2Texture> {
-        let render_state = gpu_resources.render_state();
         let (layer, r_chan, g_chan, b_chan, a_chan) = exr_data.logical_channels(layer_index)?;
         let width = layer.size.0;
         let height = layer.size.1;
 
         use eframe::egui_wgpu::wgpu;
-        let device = &render_state.device;
-        let queue = &render_state.queue;
+        let device = &ctx.device;
+        let queue = &ctx.queue;
 
         // Choose the upload format from the source channel types (#142). EXR
         // beauty data is overwhelmingly F16: packing + uploading it as
@@ -2709,6 +2787,15 @@ impl ExrViewer {
             height: height as u32,
             depth_or_array_layers: 1,
         };
+        // Phase timing (#202). `t` is advanced by each `lap()`, so the four phases
+        // partition this function's wall time without double-counting.
+        let mut t = std::time::Instant::now();
+        let lap = |t: &mut std::time::Instant| {
+            let now = std::time::Instant::now();
+            let d = now.duration_since(*t);
+            *t = now;
+            d
+        };
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Exr GPU Texture"),
             size: extent,
@@ -2719,6 +2806,8 @@ impl ExrViewer {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
+        let alloc_dur = lap(&mut t);
+
         let dst = wgpu::TexelCopyTextureInfo {
             texture: &texture,
             mip_level: 0,
@@ -2731,75 +2820,92 @@ impl ExrViewer {
             bytes_per_row: Some((width * 4 * bytes_per_channel) as u32),
             rows_per_image: Some(height as u32),
         };
-
-        // Pack rows in parallel (a 4K layer is ~8M pixels — single-threaded was a
-        // noticeable stall on layer switch).
-        if use_f16 {
-            // Fast path (#142 U2): copy half bit-patterns straight from the source
-            // slices — `to_bits` is a reinterpret, so this skips the per-pixel
-            // `to_f32` widening the F32 path pays. Absent channels default: rgb → 0
-            // (half `0x0000`), alpha → 1.0.
-            let r_s = crate::pixels::f16_slice(r_chan);
-            let g_s = crate::pixels::f16_slice(g_chan);
-            let b_s = crate::pixels::f16_slice(b_chan);
-            let a_s = crate::pixels::f16_slice(a_chan);
-            let one = f16::from_f32(1.0).to_bits();
-            // Reuse the per-viewer staging buffer (#142 U3): every element is
-            // overwritten below, so the `resize` fill is inert and — during
-            // playback of a fixed-size sequence — a no-op, avoiding a fresh
-            // ~66 MB page-faulted allocation per build.
-            staging.resize(width * height * 4, 0);
-            let pixels = staging.as_mut_slice();
-            pixels
-                .par_chunks_mut(width * 4)
-                .enumerate()
-                .for_each(|(y, row)| {
-                    for x in 0..width {
-                        let idx = y * width + x;
-                        let i = x * 4;
-                        row[i] = r_s.map_or(0, |s| s[idx].to_bits());
-                        row[i + 1] = g_s.map_or(0, |s| s[idx].to_bits());
-                        row[i + 2] = b_s.map_or(0, |s| s[idx].to_bits());
-                        row[i + 3] = if has_alpha {
-                            a_s.map_or(one, |s| s[idx].to_bits())
-                        } else {
-                            one
-                        };
-                    }
-                });
-            queue.write_texture(dst, bytemuck::cast_slice(&*pixels), buf_layout(2), extent);
-        } else {
-            // F32/U32 sources: hoist the F32 slices (direct index) and widen the
-            // rest per pixel via `sample_channel`.
-            let r_s = sample_channel_f32(r_chan);
-            let g_s = sample_channel_f32(g_chan);
-            let b_s = sample_channel_f32(b_chan);
-            let a_s = sample_channel_f32(a_chan);
-            let mut pixels = vec![0.0f32; width * height * 4];
-            pixels
-                .par_chunks_mut(width * 4)
-                .enumerate()
-                .for_each(|(y, row)| {
-                    for x in 0..width {
-                        let i = x * 4;
-                        row[i] = pixel_val(r_s, r_chan, x, y, width);
-                        row[i + 1] = pixel_val(g_s, g_chan, x, y, width);
-                        row[i + 2] = pixel_val(b_s, b_chan, x, y, width);
-                        row[i + 3] = if has_alpha {
-                            pixel_val(a_s, a_chan, x, y, width)
-                        } else {
-                            1.0
-                        };
-                    }
-                });
-            queue.write_texture(dst, bytemuck::cast_slice(&pixels), buf_layout(4), extent);
-        }
+        // Interleave into the thread's reusable scratch, then hand it to wgpu.
+        //
+        // The scratch is **thread-local and reused** (#202). It used to be a fresh
+        // `Vec` per call on the comp path, which meant every build allocated *and
+        // zero-filled* a buffer — 111 MB on 4.6K plate footage — immediately before
+        // overwriting every byte of it. Removing that redundant memset alone took
+        // the interleave from ~31 ms to ~5 ms per build and roughly tripled
+        // displayed throughput. Thread-local rather than passed in, because the
+        // builders now run on the upload pool as well as the UI thread.
+        let (pack_dur, upload_bytes) = STAGING.with_borrow_mut(|staging| {
+            // Pack rows in parallel (a 4K layer is ~8M pixels — single-threaded was
+            // a noticeable stall on layer switch).
+            if use_f16 {
+                // Fast path (#142 U2): copy half bit-patterns straight from the
+                // source slices — `to_bits` is a reinterpret, so this skips the
+                // per-pixel `to_f32` widening the F32 path pays. Absent channels
+                // default: rgb → 0 (half `0x0000`), alpha → 1.0.
+                let r_s = crate::pixels::f16_slice(r_chan);
+                let g_s = crate::pixels::f16_slice(g_chan);
+                let b_s = crate::pixels::f16_slice(b_chan);
+                let a_s = crate::pixels::f16_slice(a_chan);
+                let one = f16::from_f32(1.0).to_bits();
+                staging.resize(width * height * 4, 0);
+                let pixels = staging.as_mut_slice();
+                pixels
+                    .par_chunks_mut(width * 4)
+                    .enumerate()
+                    .for_each(|(y, row)| {
+                        for x in 0..width {
+                            let idx = y * width + x;
+                            let i = x * 4;
+                            row[i] = r_s.map_or(0, |s| s[idx].to_bits());
+                            row[i + 1] = g_s.map_or(0, |s| s[idx].to_bits());
+                            row[i + 2] = b_s.map_or(0, |s| s[idx].to_bits());
+                            row[i + 3] = if has_alpha {
+                                a_s.map_or(one, |s| s[idx].to_bits())
+                            } else {
+                                one
+                            };
+                        }
+                    });
+                let pack_dur = lap(&mut t);
+                queue.write_texture(dst, bytemuck::cast_slice(&*pixels), buf_layout(2), extent);
+                (pack_dur, (width * height * 4 * 2) as u64)
+            } else {
+                // F32/U32 sources: hoist the F32 slices (direct index) and widen the
+                // rest per pixel via `sample_channel`.
+                let r_s = sample_channel_f32(r_chan);
+                let g_s = sample_channel_f32(g_chan);
+                let b_s = sample_channel_f32(b_chan);
+                let a_s = sample_channel_f32(a_chan);
+                // Same buffer as the F16 path — two `u16` per `f32`. `Vec<u16>`'s
+                // 2-byte alignment is not enough for `f32`, so this goes through
+                // `bytemuck`'s checked cast: a misaligned buffer would panic rather
+                // than corrupt, and in practice the allocator returns 8+ byte
+                // alignment for a buffer this size.
+                staging.resize(width * height * 4 * 2, 0);
+                let pixels: &mut [f32] = bytemuck::cast_slice_mut(staging.as_mut_slice());
+                pixels
+                    .par_chunks_mut(width * 4)
+                    .enumerate()
+                    .for_each(|(y, row)| {
+                        for x in 0..width {
+                            let i = x * 4;
+                            row[i] = pixel_val(r_s, r_chan, x, y, width);
+                            row[i + 1] = pixel_val(g_s, g_chan, x, y, width);
+                            row[i + 2] = pixel_val(b_s, b_chan, x, y, width);
+                            row[i + 3] = if has_alpha {
+                                pixel_val(a_s, a_chan, x, y, width)
+                            } else {
+                                1.0
+                            };
+                        }
+                    });
+                let pack_dur = lap(&mut t);
+                queue.write_texture(dst, bytemuck::cast_slice(&*pixels), buf_layout(4), extent);
+                (pack_dur, (width * height * 4 * 4) as u64)
+            }
+        });
+        let write_dur = lap(&mut t);
 
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        // GpuState is app-owned (#54) — read it directly off `GpuResources`
+        // GpuState is app-owned (#54) — read it directly off the build context
         // instead of the renderer typemap lookup.
-        let gpu_state = gpu_resources.gpu_state.as_ref();
+        let gpu_state = ctx.gpu_state.as_ref();
 
         let bind_group = device.create_bind_group(&eframe::egui_wgpu::wgpu::BindGroupDescriptor {
             label: Some("Exr Texture Bind Group"),
@@ -2815,6 +2921,7 @@ impl ExrViewer {
                 },
             ],
         });
+        tex_build_stats::record(alloc_dur, pack_dur, write_dur, lap(&mut t), upload_bytes);
 
         Some(T2Texture {
             texture,
@@ -2824,22 +2931,22 @@ impl ExrViewer {
 
     /// Build a standalone GPU texture + bind group for one AOV of an `ExrData`,
     /// for the Layers-panel composite sources (#99 PR-B.2). Wraps
-    /// [`Self::build_layer_texture`] (all the F16/F32 packing logic) with a fresh
-    /// staging buffer and hands back just the two GPU handles the caller owns — the
-    /// `Texture` (kept to own the VRAM) and the `Arc<BindGroup>` (bound as a
-    /// composite layer). `None` if the AOV is out of range or the upload fails.
-    /// UI-thread only (`queue.write_texture`). `add` is rare, so the throwaway
-    /// staging `Vec` here — unlike the per-frame T2 path — is not worth pooling.
+    /// [`Self::build_layer_texture`] (all the F16/F32 packing logic) and hands back
+    /// just the two GPU handles the caller owns — the `Texture` (kept to own the
+    /// VRAM) and the `Arc<BindGroup>` (bound as a composite layer). `None` if the
+    /// AOV is out of range or the upload fails.
+    ///
+    /// Safe to call from any thread, and normally called from
+    /// [`crate::tex_upload`]'s worker rather than the paint thread (#202).
     pub(crate) fn build_source_texture(
-        gpu_resources: &crate::gpu::GpuResources,
+        ctx: &crate::gpu::TexBuildCtx,
         exr_data: &ExrData,
         aov: usize,
     ) -> Option<(
         eframe::egui_wgpu::wgpu::Texture,
         std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>,
     )> {
-        let mut staging = Vec::new();
-        let t = Self::build_layer_texture(gpu_resources, exr_data, aov, &mut staging)?;
+        let t = Self::build_layer_texture(ctx, exr_data, aov)?;
         Some((t.texture, t.bind_group))
     }
 
@@ -2910,7 +3017,7 @@ impl ExrViewer {
         if ring.contains(frame) {
             return false;
         }
-        let Some(t2) = Self::build_layer_texture(gpu, exr_data, layer, &mut self.t2_staging) else {
+        let Some(t2) = Self::build_layer_texture(&gpu.tex_build_ctx(), exr_data, layer) else {
             return false;
         };
         ring.insert(frame, t2);
