@@ -1499,6 +1499,28 @@ impl ExrApp {
         self.add_comp_source(path);
     }
 
+    /// Open a path given on the command line, through the **same entry as
+    /// File ▸ Open and drag-drop** ([`Self::open_layer`]) — so launching with a
+    /// path exercises the real default path (add-a-layer, comp-drives-transport)
+    /// rather than a special startup route that the soak wouldn't be testing.
+    ///
+    /// Called from `main` right after construction. Safe there for the same reason
+    /// `restore_comp_layers` is: `add_comp_source` decodes synchronously and only
+    /// builds textures when `gpu_resources` is set, which `draw_comp_central`'s
+    /// `ensure_comp_*` does on the first paint anyway.
+    ///
+    /// A missing path is reported into `error_msg` (via `add_comp_source`'s load
+    /// failure) rather than silently ignored — a typo'd path in a soak command
+    /// must be loud.
+    pub fn open_cli_path(&mut self, path: PathBuf) {
+        if !path.exists() {
+            self.error_msg = Some(format!("No such file: {}", path.display()));
+            log::error!(target: "floki::playback", "cli path does not exist: {}", path.display());
+            return;
+        }
+        self.open_layer(path);
+    }
+
     /// Send a decode job to the worker, **respawning it if it has died** (#…).
     /// A dead worker's `job_rx` has been dropped, so `send` fails and hands the
     /// job back inside the `SendError`; drop the stale channels so the next
@@ -3537,7 +3559,14 @@ impl ExrApp {
     /// precisely the moment INV-SAMPLE (#7) is decided.
     fn trace_playback_state(&mut self) {
         use crate::playback::PlayState;
-        if !self.playback.is_active() || !log::log_enabled!(log::Level::Debug) {
+        // Check the target this actually logs to. A bare `log_enabled!` uses
+        // `module_path!()` — `floki::app` — so with the soak's narrow
+        // `RUST_LOG=floki::playback=debug` the gate evaluated a target that isn't
+        // enabled and returned before emitting anything: the capture produced an
+        // empty log while playback ran normally.
+        if !self.playback.is_active()
+            || !log::log_enabled!(target: "floki::playback", log::Level::Debug)
+        {
             return;
         }
         let outstanding = !self.inflight.is_empty()

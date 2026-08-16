@@ -29,7 +29,16 @@ fn main() -> eframe::Result<()> {
             // This gives us image support:
             egui_extras::install_image_loaders(&cc.egui_ctx);
 
-            Ok(Box::new(app::ExrApp::new(cc)))
+            let mut app = app::ExrApp::new(cc);
+            // Open a file given on the command line. Until now argv was ignored
+            // entirely, so `floki shot.0001.exr` (and the `run` / `soak` wrappers
+            // in scripts/run-windows.ps1, whose help has always documented it)
+            // silently opened an empty session. Routed through the normal
+            // open/drop entry so a CLI launch exercises the real default path.
+            if let Some(arg) = std::env::args().nth(1) {
+                app.open_cli_path(std::path::PathBuf::from(arg));
+            }
+            Ok(Box::new(app))
         }),
     )
 }
