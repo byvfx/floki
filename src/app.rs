@@ -414,6 +414,21 @@ struct SourceState {
     loading: bool,
 }
 
+/// One `sources` row in the playback debug overlay (#100).
+///
+/// `displayed` is the source's `CompSource::cur_frame` — the frame whose pixels are
+/// actually on screen. Every other field is playhead-derived, so it is the only one
+/// that can show the picture failing to keep up with the clock (#204).
+/// Field order is the sort order: by source id.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct DbgFollowerRow {
+    id: u64,
+    playhead: u32,
+    displayed: Option<u32>,
+    pending: Option<u32>,
+    inflight: usize,
+}
+
 /// Top-level application state and the [`eframe::App`] implementation. Owns the
 /// loaded A/B images, the `ExrViewer` canvas, OCIO/LUT colour state, and the
 /// menu/tool UI. Fields marked `#[serde(skip)]` are runtime-only (images, GPU
@@ -529,6 +544,11 @@ pub struct ExrApp {
     /// Throttle for the once-per-second playback state trace ([`Self::trace_playback_state`]).
     #[serde(skip)]
     dbg_last_trace: Option<std::time::Instant>,
+    /// Round-robin cursor for [`Self::pump_decode`]'s source order (#204), so the
+    /// single decode slot is shared rather than always going to whichever source
+    /// sorts first and always wants something.
+    #[serde(skip)]
+    pump_rotation: usize,
     /// Whether the last trace tick saw the clock running — the edge detector that
     /// lets [`Self::trace_playback_state`] emit one line on play→pause/stop (#100).
     /// That transition is exactly when INV-SAMPLE is decided, and the trace's
@@ -944,6 +964,7 @@ impl Default for ExrApp {
             decode_submit_at: None,
             last_decode_dur: None,
             dbg_last_trace: None,
+            pump_rotation: 0,
             dbg_was_playing: false,
             recent_files: Vec::new(),
             theme: ThemeChoice::default(),
@@ -1689,7 +1710,7 @@ impl ExrApp {
             } else {
                 // Cache hit: show immediately, no decode round-trip.
                 self.playback.pending = None;
-                self.playback.note_shown(std::time::Instant::now());
+                self.playback.note_shown(std::time::Instant::now(), frame);
             }
         } else {
             // Miss: mark the playhead as awaited; `pump_decode` submits it (the
@@ -1725,21 +1746,14 @@ impl ExrApp {
             })
             .collect();
         for (source, sf) in wants {
-            let advanced = self
-                .followers
-                .get(&source)
-                .is_some_and(|st| st.current_frame != sf);
             if let Some(st) = self.followers.get_mut(&source) {
                 st.current_frame = sf;
             }
-            // A resident frame on the clock source is on screen this instant — the
-            // comp counterpart of the A path's cache-hit `note_shown` (#100). A miss
-            // is paced when it lands in `apply_load_result` instead. Gated on an
-            // actual advance so a no-op re-sync (a trim-offset drag settling on the
-            // same frame) can't inflate the frame-time ring.
-            if advanced && source == self.clock_source() && self.frame_cache.contains(source, sf) {
-                self.playback.note_shown(std::time::Instant::now());
-            }
+            // Pacing is *not* recorded here. Residency at advance time says the
+            // pixels are available, not that they were painted — and through the
+            // runs where the picture was actually frozen this fired for frames that
+            // never reached the screen (#204). `ensure_comp_frame` counts the texture
+            // swap instead, which is the display itself.
             self.request_comp_frame(source, sf);
         }
     }
@@ -1792,6 +1806,46 @@ impl ExrApp {
     /// `A_SOURCE` directly, so it keeps working in both worlds (#100).
     fn clock_source(&self) -> crate::layer::SourceId {
         self.transport_source.unwrap_or(Self::A_SOURCE)
+    }
+
+    /// Whether the transport is still waiting on the frame it means to display —
+    /// the readiness question the pacer asks, answered for **whichever source
+    /// drives the clock** (#100).
+    ///
+    /// The slot-A fields alone are not that answer: once the comp stack owns the
+    /// transport they are empty by construction (`request_sequence_frame` returns
+    /// before touching them) and a follower carries its own wait state. Reading only
+    /// them made Stutter advance past undecoded frames — silently behaving as
+    /// DropFrames, with `run_held` never accruing and `ensure_comp_frame` holding a
+    /// stale texture (#200).
+    ///
+    /// Deliberately only the clock source: a *trailing* layer that is behind must
+    /// not stall the transport, or an N-layer comp would play at the speed of its
+    /// slowest layer.
+    fn transport_awaiting(&self) -> bool {
+        if self.playback.pending.is_some() || self.loading_a {
+            return true;
+        }
+        self.transport_source.is_some_and(|s| {
+            self.followers
+                .get(&s)
+                .is_some_and(|st| st.pending.is_some() || st.loading)
+        })
+    }
+
+    /// Point the transport at `source` (or release it with `None`), dropping the
+    /// measured frame sizing when the clock actually moves to a different source.
+    ///
+    /// `frame_bytes` is a `get_or_insert_with` latch, so without this a re-point to
+    /// a **different-resolution** follower (#98) would keep sizing the ring off the
+    /// old source forever — the same class of staleness as never seeding it at all.
+    fn set_transport_source(&mut self, source: Option<crate::layer::SourceId>) {
+        if self.transport_source == source {
+            return;
+        }
+        self.transport_source = source;
+        self.frame_bytes = None;
+        self.proxy_bytes = None;
     }
 
     /// The *active* followers — those with a detected sequence (the N-source
@@ -1996,8 +2050,27 @@ impl ExrApp {
         let sources: Vec<crate::layer::SourceId> = std::iter::once(Self::A_SOURCE)
             .chain(self.active_followers().map(|(id, _)| *id))
             .collect();
+        // Rotate the starting point each pump so the P0 turn is shared (#204).
+        //
+        // A fixed order starves everything after the first source that always wants
+        // something. There is one decode in flight globally and the loop returns
+        // after submitting one job, so with the clock source first — its playhead
+        // advancing every ~42 ms while a decode takes ~270 ms — it wanted a frame on
+        // every single pump and consumed every slot. Measured with 5 layers: four of
+        // them never reached the P0 pass at all and displayed frame 1 for 30 seconds
+        // while their playheads swept the range twice, compositing a temporally
+        // wrong image.
+        //
+        // Rotation makes the starvation impossible rather than merely unlikely: over
+        // N pumps every source leads once. Priority *between* the passes is
+        // unchanged — every source's playhead (P0) still beats every source's
+        // prefetch (P1), so a lagging layer's current frame outranks the clock
+        // source's read-ahead.
+        let lead = self.pump_rotation % sources.len().max(1);
+        self.pump_rotation = self.pump_rotation.wrapping_add(1);
         for d in [0, depth] {
-            for &source in &sources {
+            for i in 0..sources.len() {
+                let source = sources[(lead + i) % sources.len()];
                 if let Some(w) = self.next_want(source, d) {
                     self.submit_seq(source, w);
                     // Overlap I/O with decode (#164): while the worker decodes `w`,
@@ -2509,8 +2582,8 @@ impl ExrApp {
         // decode holds the stutter clock, the worker wake (#137) and the
         // in-flight poll drive repaints instead — schedule the period only as
         // a lazy fallback rather than spinning on the overdue deadline.
-        let decode_bound = matches!(self.playback.pacing, Pacing::Stutter)
-            && (self.playback.pending.is_some() || self.loading_a);
+        let decode_bound =
+            matches!(self.playback.pacing, Pacing::Stutter) && self.transport_awaiting();
         let wait = if decode_bound {
             period
         } else {
@@ -2528,7 +2601,7 @@ impl ExrApp {
     /// effective fps without skipping frames. A review tool's default.
     fn tick_stutter(&mut self, period: std::time::Duration) {
         use crate::playback::PlayState;
-        if self.playback.pending.is_some() || self.loading_a {
+        if self.transport_awaiting() {
             return; // still waiting on the current frame — hold.
         }
         let now = std::time::Instant::now();
@@ -2992,12 +3065,21 @@ impl ExrApp {
             match res.result {
                 Ok(data) => {
                     let arc = std::sync::Arc::new(data);
-                    // Measure one **primary (A)** frame to size the shared cache
-                    // budget (homogeneous seq): a follower may be a different
-                    // resolution (#98), so sizing off its frame would mis-size the
-                    // ring. A full A frame seeds `frame_bytes`; a proxy A frame
-                    // seeds `proxy_bytes` (#94).
-                    if is_primary {
+                    // Measure one **clock-driving** frame to size the shared cache
+                    // budget (homogeneous seq): another source may be a different
+                    // resolution (#98), so sizing off an arbitrary one would
+                    // mis-size the ring. A full frame seeds `frame_bytes`; a proxy
+                    // one seeds `proxy_bytes` (#94).
+                    //
+                    // Keyed on the clock source rather than the primary (#100/#199):
+                    // under `comp_drives_transport` slot A never decodes, so this
+                    // never fired, `sizing_bytes` stayed `None`, and `tick_budgets`
+                    // skipped its whole T1 branch — leaving `frame_cache_cap` at its
+                    // constructed default of 8 with no budget check at all (~3.4 GB
+                    // on real footage) and the #146 pressure shrink unable to fire.
+                    // With slot A driving, `clock_source()` *is* `A_SOURCE`, so the
+                    // A/B behaviour is unchanged.
+                    if res.source == self.clock_source() {
                         if arc.proxy {
                             self.proxy_bytes.get_or_insert_with(|| arc.approx_bytes());
                         } else if !arc.beauty_only {
@@ -3040,7 +3122,8 @@ impl ExrApp {
                             self.playback.pending = None;
                             self.viewer.set_t2_frame(Self::A_SOURCE, Some(res.frame));
                             self.swap_image_arc(arc);
-                            self.playback.note_shown(std::time::Instant::now());
+                            self.playback
+                                .note_shown(std::time::Instant::now(), res.frame);
                         }
                     } else if res.frame == self.source_playhead(res.source) {
                         // The awaited follower frame landed (already in the T1 cache,
@@ -3051,16 +3134,10 @@ impl ExrApp {
                             st.loading = false;
                             st.pending = None;
                         }
-                        // Pace off the *clock-driving* follower (#100): `note_shown`
-                        // used to fire only under `is_primary`, so with the comp
-                        // stack driving the transport nothing ever recorded a shown
-                        // frame and `measured_fps` sat at 0.0 — the HUD's headline
-                        // number, and the input to the frame-time percentiles.
-                        // Only the clock source counts; a trailing layer arriving
-                        // late is not a transport tick.
-                        if res.source == self.clock_source() {
-                            self.playback.note_shown(std::time::Instant::now());
-                        }
+                        // Not paced here either: an arriving decode has not been
+                        // painted yet, and under load frequently never is — the
+                        // playhead has moved on by the time it lands (#204).
+                        // `ensure_comp_frame` records the swap that actually shows it.
                         if let Some(ctx) = &self.repaint_ctx {
                             ctx.request_repaint();
                         }
@@ -3597,10 +3674,17 @@ impl ExrApp {
 
         let mut inflight: Vec<u32> = self.inflight.iter().copied().collect();
         inflight.sort_unstable();
-        // Followers, in id order, as `s<id>[*]:<frame>/<pending>/<inflight>` —
-        // `*` marks the clock-driving source. The primary's `pending`/`inflight`
-        // are empty by construction once the comp stack owns the transport, so
-        // this is the field that actually moves during a comp soak (#100).
+        // Followers, in id order, as
+        // `s<id>[*]:<playhead>@<displayed>/<pending>/<inflight>` — `*` marks the
+        // clock-driving source. The primary's `pending`/`inflight` are empty by
+        // construction once the comp stack owns the transport, so this is the field
+        // that actually moves during a comp soak (#100).
+        //
+        // `@<displayed>` is `cs.cur_frame`: the frame whose pixels are on screen.
+        // Every other field here is playhead-derived, so without it "playing" and
+        // "the clock is advancing over a frozen picture" are indistinguishable in a
+        // log — `ensure_comp_frame` holds the last-built texture whenever the wanted
+        // frame isn't resident, and that divergence *is* #204.
         let clock = self.clock_source();
         let followers = {
             let mut v: Vec<_> = self.active_followers().collect();
@@ -3608,10 +3692,14 @@ impl ExrApp {
             v.iter()
                 .map(|(id, st)| {
                     format!(
-                        "s{}{}:{}/{}/{}",
+                        "s{}{}:{}@{}/{}/{}",
                         id.0,
                         if **id == clock { "*" } else { "" },
                         st.current_frame,
+                        self.comp_sources
+                            .get(id)
+                            .and_then(|cs| cs.cur_frame)
+                            .map_or_else(|| "-".to_string(), |f| f.to_string()),
                         st.pending
                             .map_or_else(|| "-".to_string(), |f| f.to_string()),
                         st.inflight.len()
@@ -3620,10 +3708,27 @@ impl ExrApp {
                 .collect::<Vec<_>>()
                 .join(",")
         };
+        // Active sources painting a frame other than the one their playhead is on —
+        // the headline "is the picture keeping up with the clock" number.
+        let stale = self
+            .active_followers()
+            .filter(|(id, st)| {
+                self.comp_sources
+                    .get(id)
+                    .is_some_and(|cs| cs.cur_frame != Some(st.current_frame))
+            })
+            .count();
+        // `-1` for "no data", not `0`. `frame_time_pcts` deliberately returns `None`
+        // until an interval exists, and zeroing that in a stable `key=value` line
+        // reads as a perfect 0 ms frame time — the opposite of what it means. It
+        // misled me while reading these very logs: `p50=0.0` through a cold pass
+        // looks like flawless playback when it means nothing has been displayed yet.
+        // `ft_n` gives the sample count alongside.
+        const NO_DATA: f32 = -1.0;
         let (p50, p95, p99, pmax) = self
             .playback
             .frame_time_pcts()
-            .unwrap_or((0.0, 0.0, 0.0, 0.0));
+            .unwrap_or((NO_DATA, NO_DATA, NO_DATA, NO_DATA));
         let (ram_used, ram_total, vram_used, vram_budget) =
             self.dbg_last_sample.map_or((0, 0, 0, 0), |s| {
                 (
@@ -3642,7 +3747,7 @@ impl ExrApp {
             "evt={evt} state={state:?} frame={frame} epoch={epoch} pacing={pacing:?} \
              loop={loop_mode:?} dir={dir:?} in={in_pt} out={out_pt} \
              pending={pending} loading_a={loading_a} inflight={inflight:?} \
-             clock=s{clock_id} followers=[{followers}] nsrc={nsrc} \
+             clock=s{clock_id} followers=[{followers}] nsrc={nsrc} stale={stale} \
              worker={worker} submit_age={submit_age:.2} last_decode={last_decode:.2} \
              precache={precache}/{precache_filled} \
              t1={t1_len}/{t1_cap} frame_bytes={frame_bytes} t2={t2_len}/{t2_cap} \
@@ -3666,6 +3771,7 @@ impl ExrApp {
             loading_a = self.loading_a,
             clock_id = clock.0,
             nsrc = self.n_active_sources(),
+            stale = stale,
             worker = if self.load_rx.is_some() { "alive" } else { "dead" },
             submit_age = age(self.decode_submit_at.map(|t| now.duration_since(t))),
             last_decode = age(self.last_decode_dur),
@@ -4446,10 +4552,16 @@ impl ExrApp {
         // the transport — this row is what's actually moving.
         let clock_src = self.clock_source().0;
         let n_sources = self.n_active_sources();
-        let follower_state: Vec<(u64, u32, Option<u32>, usize)> = {
+        let follower_state: Vec<DbgFollowerRow> = {
             let mut v: Vec<_> = self
                 .active_followers()
-                .map(|(id, st)| (id.0, st.current_frame, st.pending, st.inflight.len()))
+                .map(|(id, st)| DbgFollowerRow {
+                    id: id.0,
+                    playhead: st.current_frame,
+                    displayed: self.comp_sources.get(id).and_then(|cs| cs.cur_frame),
+                    pending: st.pending,
+                    inflight: st.inflight.len(),
+                })
                 .collect();
             v.sort_unstable();
             v
@@ -4573,10 +4685,20 @@ impl ExrApp {
                         } else {
                             let each = follower_state
                                 .iter()
-                                .map(|(id, cur, pend, nfl)| {
-                                    let clock = if *id == clock_src { "*" } else { "" };
-                                    let p = pend.map_or_else(|| "—".to_string(), |f| f.to_string());
-                                    format!("s{id}{clock} f{cur} pend {p} fly {nfl}")
+                                .map(|r| {
+                                    let (id, cur, nfl) = (r.id, r.playhead, r.inflight);
+                                    let clock = if id == clock_src { "*" } else { "" };
+                                    let p =
+                                        r.pending.map_or_else(|| "—".to_string(), |f| f.to_string());
+                                    // `f<playhead>→<displayed>`; the arrow only shows
+                                    // when they differ, so a healthy row stays quiet
+                                    // and a frozen layer is obvious at a glance.
+                                    let d = match r.displayed {
+                                        Some(s) if s != cur => format!("→{s} STALE"),
+                                        Some(_) => String::new(),
+                                        None => "→— none".to_string(),
+                                    };
+                                    format!("s{id}{clock} f{cur}{d} pend {p} fly {nfl}")
                                 })
                                 .collect::<Vec<_>>()
                                 .join("  ·  ");
@@ -5841,7 +5963,7 @@ impl ExrApp {
         // the T1 sizing seed have to attribute a decode to the transport-driving
         // follower (#100). The id only exists here, after allocation.
         if claims_transport {
-            self.transport_source = Some(source);
+            self.set_transport_source(Some(source));
         }
         let layer_id = self.comp_stack.push_image(name, source, 0, trim);
         // A freshly added layer becomes the "current" layer the viewport bar's AOV /
@@ -5872,6 +5994,16 @@ impl ExrApp {
                     ..Default::default()
                 },
             );
+            // Size the T1 budget from this decode when it drives the clock
+            // (#100/#199). This path decodes **synchronously** and inserts straight
+            // into the cache, so it never reaches `apply_load_result`'s seed — and
+            // it is how every sequence enters the app now that open/drop means "add
+            // a layer". Without it the budget stays unsized until the *next* decode
+            // happens to land, which on a paused first open is never.
+            if source == self.clock_source() {
+                self.frame_bytes
+                    .get_or_insert_with(|| exr_data.approx_bytes());
+            }
         }
 
         self.comp_sources.insert(
@@ -5948,12 +6080,39 @@ impl ExrApp {
             return;
         };
         let size = arc.logical_size(aov).unwrap_or((0, 0));
-        if let Some(cs) = self.comp_sources.get_mut(&source) {
+        let swapped = self.comp_sources.get_mut(&source).is_some_and(|cs| {
+            let changed = cs.cur_frame != Some(source_frame);
             cs.texture = Some(texture);
             cs.bind_group = Some(bind_group);
             cs.aov = aov;
             cs.size = size;
             cs.cur_frame = Some(source_frame);
+            changed
+        });
+        if swapped {
+            self.note_display(source, source_frame);
+        }
+    }
+
+    /// Record that `source` swapped its displayed frame to `source_frame` — the
+    /// pacing measurement's single source of truth (#100/#204).
+    ///
+    /// Called from [`Self::ensure_comp_frame`] on an actual texture swap, because
+    /// **that** is the display event. Residency and decode-arrival are both proxies
+    /// for it and both wrong: a frame can be resident, or can land, without ever
+    /// being painted (the playhead has moved on by then), and a frame can be painted
+    /// long after either. Pacing off those proxies reported the same displayed frame
+    /// twice microseconds apart — and, worse, recorded nothing at all through the
+    /// runs where the picture was genuinely frozen, which is precisely when the
+    /// number matters.
+    ///
+    /// Only the clock source paces: a trailing layer painting late is not a
+    /// transport tick, and counting it would make the frame-time ring report layer
+    /// count as speed.
+    fn note_display(&mut self, source: crate::layer::SourceId, source_frame: u32) {
+        if source == self.clock_source() {
+            self.playback
+                .note_shown(std::time::Instant::now(), source_frame);
         }
     }
 
@@ -6035,7 +6194,7 @@ impl ExrApp {
         // source.
         if self.comp_drives_transport() && self.active_followers().next().is_none() {
             self.playback.clear();
-            self.transport_source = None;
+            self.set_transport_source(None);
         } else if self
             .transport_source
             .is_some_and(|s| !self.followers.contains_key(&s))
@@ -6046,7 +6205,7 @@ impl ExrApp {
             // pacing / sizing instruments keyed on it (#100) go silent. Re-point at
             // a surviving follower.
             let next = self.active_followers().next().map(|(s, _)| *s);
-            self.transport_source = next;
+            self.set_transport_source(next);
         }
     }
 
@@ -7690,6 +7849,11 @@ mod tests {
         // So in 1.12.0's default path (open/drop = add a layer → the comp stack owns
         // the clock) nothing ever recorded a shown frame: `measured_fps` — the HUD's
         // headline number and the input to the frame-time percentiles — stayed 0.0.
+        //
+        // Driven through `note_display`, the seam `ensure_comp_frame` calls on a
+        // texture swap. The swap itself needs a device, so under the GPU-free test
+        // convention the *wiring* into the paint path is covered by inspection, not
+        // here; what this pins is the routing — which source paces and which doesn't.
         let (_dir, paths) = write_sequence(5);
         let mut app = ExrApp::default();
         app.add_comp_source(paths[0].clone());
@@ -7702,28 +7866,112 @@ mod tests {
         );
         assert_eq!(app.clock_source(), source);
 
-        // Walk the playhead, delivering each follower frame as the worker would.
-        for (i, path) in paths.iter().enumerate().skip(1) {
+        for frame in 2..=5u32 {
             app.playback_step(1);
-            deliver_source_frame(&mut app, source, path, u32::try_from(i).unwrap() + 1);
+            app.note_display(source, frame);
         }
 
         assert!(
             app.playback.measured_fps > 0.0,
             "the comp transport is paced, not stuck at 0.0"
         );
-        assert!(
-            app.playback.frame_time_samples() > 0,
-            "the frame-time ring filled from follower arrivals"
+        assert_eq!(
+            app.playback.frame_time_samples(),
+            3,
+            "four displayed frames are three intervals — no double counting"
         );
         assert!(app.playback.frame_time_pcts().is_some());
     }
 
     #[test]
+    fn pacing_ignores_a_resident_frame_that_was_never_displayed() {
+        // The defect that made the metric lie (#204): pacing used to fire when a
+        // frame was resident at advance time, or when a decode landed. Under load
+        // neither implies the pixels ever reached the screen — the playhead moves on
+        // and `ensure_comp_frame` keeps holding the old texture. That reported
+        // healthy frame times through runs where the picture was frozen for seconds.
+        let (_dir, paths) = write_sequence(5);
+        let mut app = ExrApp::default();
+        app.add_comp_source(paths[0].clone());
+        let source = crate::layer::SourceId(COMP_SOURCE_BASE);
+
+        // Walk the playhead and land decodes for every frame — residency and
+        // arrival both happen, display does not.
+        for (i, path) in paths.iter().enumerate().skip(1) {
+            app.playback_step(1);
+            deliver_source_frame(&mut app, source, path, u32::try_from(i).unwrap() + 1);
+            assert!(
+                app.frame_cache
+                    .contains(source, u32::try_from(i).unwrap() + 1)
+            );
+        }
+
+        assert_eq!(
+            app.playback.frame_time_samples(),
+            0,
+            "nothing was painted, so nothing is paced"
+        );
+        assert_eq!(app.playback.measured_fps, 0.0);
+    }
+
+    #[test]
+    fn the_decode_slot_rotates_across_sources_instead_of_starving_them() {
+        // #204: there is one decode in flight globally and `pump_decode` returns
+        // after submitting one job, so a fixed source order starved everything after
+        // the first source that always wants something. The clock source's playhead
+        // advances every ~42 ms while a decode takes ~270 ms, so it wanted a frame on
+        // every pump and took every slot — measured with 5 layers, four of them never
+        // reached the P0 pass and displayed frame 1 for 30 seconds.
+        let (_dir, paths) = write_sequence(10);
+        let mut app = ExrApp::default();
+        app.add_comp_source(paths[0].clone());
+        app.add_comp_source(paths[0].clone());
+        app.add_comp_source(paths[0].clone());
+        let sources: Vec<_> = (0..3)
+            .map(|i| crate::layer::SourceId(COMP_SOURCE_BASE + i))
+            .collect();
+
+        app.playback.state = PlayState::Playing;
+        app.playback_step(1); // every follower now wants a non-resident frame
+
+        // Drain the single slot repeatedly, recording which source each job went to.
+        // Completing with an *error* clears the wait state without caching anything,
+        // so every source keeps wanting a frame — the starvation regime exactly.
+        let mut served: std::collections::HashMap<crate::layer::SourceId, usize> =
+            std::collections::HashMap::new();
+        for _ in 0..30 {
+            app.pump_decode();
+            let Some((src, frame)) = app
+                .followers
+                .iter()
+                .find_map(|(id, st)| st.inflight.iter().next().map(|f| (*id, *f)))
+            else {
+                break;
+            };
+            *served.entry(src).or_default() += 1;
+            app.apply_load_result(LoadResult {
+                source: src,
+                seq_frame: true,
+                frame,
+                epoch: app.playback.epoch,
+                open_gen: 0,
+                result: Err("stub".to_string()),
+            });
+        }
+
+        for s in &sources {
+            assert!(
+                served.get(s).copied().unwrap_or(0) > 0,
+                "every source must get decode turns, but {s:?} got none: {served:?}"
+            );
+        }
+    }
+
+    #[test]
     fn a_trailing_follower_does_not_pace_the_transport() {
-        // Only the clock source counts as a transport tick — a second layer's frame
-        // arriving late is not a displayed transport frame, and letting it call
-        // `note_shown` would make the frame-time ring report layer count as speed.
+        // Only the clock source counts as a transport tick — a second layer painting
+        // is not a displayed transport frame, and letting it pace would make the
+        // frame-time ring report layer count as speed.
         let (_dir, paths) = write_sequence(5);
         let mut app = ExrApp::default();
         app.add_comp_source(paths[0].clone());
@@ -7738,12 +7986,12 @@ mod tests {
         );
 
         app.playback_step(1);
-        deliver_source_frame(&mut app, trailing, &paths[1], 2);
-        deliver_source_frame(&mut app, trailing, &paths[1], 2);
+        app.note_display(trailing, 2);
+        app.note_display(trailing, 3);
         assert_eq!(
             app.playback.frame_time_samples(),
             0,
-            "a trailing layer's arrivals are not transport ticks"
+            "a trailing layer's paints are not transport ticks"
         );
     }
 
@@ -7796,9 +8044,11 @@ mod tests {
 
     // --- #100 comp-path pins ---------------------------------------------------
     //
-    // Each of these asserts the behaviour the comp path *should* have. They are
-    // `#[ignore]`d against the filed issue so CI stays green while the repro is
-    // permanent; the fix PR's diff is `-#[ignore]` plus the fix. All are GPU-free.
+    // Each of these asserts the behaviour the comp path *should* have. All are
+    // GPU-free. The sizing (#199) and Stutter-hold (#200) pins are live — they now
+    // guard the fix. The two INV-SAMPLE pins (#201) stay `#[ignore]`d against their
+    // open issue so CI is green while the repro is permanent; that fix's diff is
+    // `-#[ignore]` plus the change.
     //
     // Common root cause: when the comp stack drives the transport, the primary slot
     // (`A_SOURCE`) never decodes, and every transport-level gate keyed on it goes
@@ -7828,8 +8078,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "#199: frame_bytes is seeded only from a primary decode, so the comp \
-                path never sizes the T1 ring and the cap stays frozen at its default"]
     fn comp_transport_seeds_the_t1_sizing_bytes() {
         // `frame_bytes` is the sole input to `tick_budgets`' T1 branch. Unseeded, the
         // branch is skipped entirely: `frame_cache_cap` keeps its constructed default
@@ -7861,8 +8109,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "#200: tick_stutter's hold gate reads playback.pending / loading_a, \
-                both permanently empty once the comp stack drives the transport"]
     fn stutter_holds_while_the_clock_source_frame_is_undecoded() {
         // Stutter's contract is "play every frame; drop the effective fps rather than
         // skip". With the gate blind to follower state the playhead advances on the

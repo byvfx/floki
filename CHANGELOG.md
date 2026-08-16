@@ -15,10 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A soak capture task.** `scripts\run-windows.ps1 soak` runs the release build
   with the playback trace enabled and tees it to `soak-logs\soak-<timestamp>.log`.
   The trace is now stable `key=value` pairs and carries the budget, pacing, and
-  memory fields, plus one line on the play→pause transition.
+  memory fields, plus one line whenever playback settles — pause or stop.
 - **`inspect_exr` takes paths on the command line** and reports part count,
-  per-part compression, and channel counts — enough to characterize a sequence
-  before soaking it.
+  per-part compression, channel sample types, and the decoded size that sizes the
+  playback cache — enough to characterize a sequence before soaking it. It no
+  longer falls back to hardcoded absolute paths when given no arguments.
 
 ### Fixed
 - **The measured-fps readout no longer reads 0.0 during playback.** It was only
