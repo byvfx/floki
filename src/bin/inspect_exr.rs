@@ -21,12 +21,33 @@ fn inspect_file(path: &str) {
     }
     match MetaData::read_from_file(path, false) {
         Ok(meta) => {
-            // Part count + total channel count are the two manifest numbers that
-            // decide whether a slow frame is a decode or a bandwidth problem.
+            // Part count + total channel count decide whether a slow frame is a
+            // decode or a bandwidth problem.
             let total_channels: usize = meta.headers.iter().map(|h| h.channels.list.len()).sum();
+            // The number that actually sizes the T1 ring: `ExrData::approx_bytes`
+            // sums the *decoded* sample buffers at their native EXR sample size,
+            // so file size (compressed) says nothing about cache occupancy. Mirror
+            // that here — half=2, float=4, uint=4 — per part, since parts can
+            // carry different data windows.
+            let decoded: u64 = meta
+                .headers
+                .iter()
+                .map(|h| {
+                    let px = h.data_window().size.area() as u64;
+                    h.channels
+                        .list
+                        .iter()
+                        .map(|c| px * u64::from(c.sample_type.bytes_per_sample() as u32))
+                        .sum::<u64>()
+                })
+                .sum();
             println!(
                 "  Parts: {}  ·  Channels (all parts): {total_channels}",
                 meta.headers.len()
+            );
+            println!(
+                "  Decoded size: {decoded} bytes ({:.1} MB) — this is what sizes the T1 ring",
+                decoded as f64 / (1024.0 * 1024.0)
             );
             for (i, header) in meta.headers.iter().enumerate() {
                 println!("  Header {i}:");
@@ -37,6 +58,8 @@ fn inspect_file(path: &str) {
                     header.shared_attributes.display_window
                 );
                 println!("    Compression: {:?}", header.compression);
+                // Sample type per channel, not just the name: a float32 crypto or
+                // depth pass costs twice a half beauty channel in the ring.
                 println!(
                     "    Channels ({}): {:?}",
                     header.channels.list.len(),
@@ -44,7 +67,7 @@ fn inspect_file(path: &str) {
                         .channels
                         .list
                         .iter()
-                        .map(|c| &c.name)
+                        .map(|c| format!("{}:{:?}", c.name, c.sample_type))
                         .collect::<Vec<_>>()
                 );
             }
