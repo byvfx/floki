@@ -32,7 +32,8 @@
                       channel counts for the soak manifest, #100 Phase 0)
     Any trailing args after the task are passed through, e.g.:
       scripts\run-windows.ps1 run -- "C:\path\to\image.exr"
-    For run / soak / inspect they go to the *program*; for build / test, to cargo.
+    For run / soak / inspect they go to the *program*, and for test to the test
+    harness (e.g. `test -- --ignored`); only build passes them to cargo itself.
 
 .ENVIRONMENT
     FLOKI_VCPKG     vcpkg root         (default: G:\__projects\_programming\vcpkg)
@@ -148,7 +149,10 @@ try {
         'test'   {
             Invoke-Cargo @('fmt', '--all', '--', '--check')
             Invoke-Cargo @('clippy', '--all-targets', '--', '-D', 'warnings')
-            Invoke-Cargo (@('test', '--all-targets') + $CargoArgs)
+            # Trailing args go to the *test harness*, not to cargo, so `test --
+            # --ignored` / `-- --nocapture` work as well as a bare name filter
+            # (cargo forwards a filter through the separator unchanged).
+            Invoke-Cargo (ProgramArgs @('test', '--all-targets'))
         }
         'soak'   {
             # #100 capture: the 1 Hz `trace_playback_state` line goes to stderr via
