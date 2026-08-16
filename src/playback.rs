@@ -267,10 +267,19 @@ impl Playback {
     /// period out so the current frame gets a full period of dwell before the
     /// first advance (otherwise `tick_playback`'s `anchor + n·period` deadline is
     /// already due on the very frame Play was pressed, skipping the start frame).
+    /// Also resets the pacing baseline. A displayed frame is recorded whenever the
+    /// picture changes, including the first paint after a file is opened — so
+    /// without clearing here, the first interval of a run spans however long the app
+    /// sat *idle* before Play was pressed and is filed as a frame time. Observed: a
+    /// 240-second "frame" on a 40-second run, which then dominates `max` and `p99`.
+    /// Pause → resume is the same hazard, and this covers it: the gap while paused
+    /// is not a frame time either.
     pub fn start_playing(&mut self, now: Instant) {
         self.state = PlayState::Playing;
         self.anchor = Some(now + self.period());
         self.frames_since_anchor = 0;
+        self.last_shown = None;
+        self.last_shown_frame = None;
     }
 
     /// Stop the clock and reset the pacing measurement. The smoothed
@@ -469,6 +478,32 @@ mod tests {
         // A genuinely new frame still records.
         pb.note_shown(t + Duration::from_millis(80), 3);
         assert_eq!(pb.frame_time_samples(), 2);
+    }
+
+    #[test]
+    fn starting_playback_does_not_record_the_idle_gap_as_a_frame_time() {
+        // The first paint after an open records a displayed frame, so the next one —
+        // whenever the user finally presses Play — would otherwise be filed as an
+        // interval covering all the idle time in between. Observed as a 240-second
+        // "frame" on a 40-second run, dominating `max` and `p99`.
+        let mut pb = Playback::default();
+        let t = Instant::now();
+        pb.note_shown(t, 1); // first paint on open
+
+        // ...a long idle, then Play.
+        pb.start_playing(t + Duration::from_secs(240));
+        pb.note_shown(t + Duration::from_secs(240), 2);
+        assert_eq!(
+            pb.frame_time_samples(),
+            0,
+            "the idle span before Play is not a frame time"
+        );
+
+        // Frames shown while actually playing measure normally.
+        pb.note_shown(t + Duration::from_secs(240) + Duration::from_millis(40), 3);
+        assert_eq!(pb.frame_time_samples(), 1);
+        let (_, _, _, max) = pb.frame_time_pcts().unwrap();
+        assert!((max - 40.0).abs() < 1.0, "got {max}");
     }
 
     #[test]
