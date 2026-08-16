@@ -1794,6 +1794,46 @@ impl ExrApp {
         self.transport_source.unwrap_or(Self::A_SOURCE)
     }
 
+    /// Whether the transport is still waiting on the frame it means to display —
+    /// the readiness question the pacer asks, answered for **whichever source
+    /// drives the clock** (#100).
+    ///
+    /// The slot-A fields alone are not that answer: once the comp stack owns the
+    /// transport they are empty by construction (`request_sequence_frame` returns
+    /// before touching them) and a follower carries its own wait state. Reading only
+    /// them made Stutter advance past undecoded frames — silently behaving as
+    /// DropFrames, with `run_held` never accruing and `ensure_comp_frame` holding a
+    /// stale texture (#200).
+    ///
+    /// Deliberately only the clock source: a *trailing* layer that is behind must
+    /// not stall the transport, or an N-layer comp would play at the speed of its
+    /// slowest layer.
+    fn transport_awaiting(&self) -> bool {
+        if self.playback.pending.is_some() || self.loading_a {
+            return true;
+        }
+        self.transport_source.is_some_and(|s| {
+            self.followers
+                .get(&s)
+                .is_some_and(|st| st.pending.is_some() || st.loading)
+        })
+    }
+
+    /// Point the transport at `source` (or release it with `None`), dropping the
+    /// measured frame sizing when the clock actually moves to a different source.
+    ///
+    /// `frame_bytes` is a `get_or_insert_with` latch, so without this a re-point to
+    /// a **different-resolution** follower (#98) would keep sizing the ring off the
+    /// old source forever — the same class of staleness as never seeding it at all.
+    fn set_transport_source(&mut self, source: Option<crate::layer::SourceId>) {
+        if self.transport_source == source {
+            return;
+        }
+        self.transport_source = source;
+        self.frame_bytes = None;
+        self.proxy_bytes = None;
+    }
+
     /// The *active* followers — those with a detected sequence (the N-source
     /// generalization of "B is playing"). A lone-image / absent follower holds a
     /// default `SourceState` and is skipped.
@@ -2509,8 +2549,8 @@ impl ExrApp {
         // decode holds the stutter clock, the worker wake (#137) and the
         // in-flight poll drive repaints instead — schedule the period only as
         // a lazy fallback rather than spinning on the overdue deadline.
-        let decode_bound = matches!(self.playback.pacing, Pacing::Stutter)
-            && (self.playback.pending.is_some() || self.loading_a);
+        let decode_bound =
+            matches!(self.playback.pacing, Pacing::Stutter) && self.transport_awaiting();
         let wait = if decode_bound {
             period
         } else {
@@ -2528,7 +2568,7 @@ impl ExrApp {
     /// effective fps without skipping frames. A review tool's default.
     fn tick_stutter(&mut self, period: std::time::Duration) {
         use crate::playback::PlayState;
-        if self.playback.pending.is_some() || self.loading_a {
+        if self.transport_awaiting() {
             return; // still waiting on the current frame — hold.
         }
         let now = std::time::Instant::now();
@@ -2992,12 +3032,21 @@ impl ExrApp {
             match res.result {
                 Ok(data) => {
                     let arc = std::sync::Arc::new(data);
-                    // Measure one **primary (A)** frame to size the shared cache
-                    // budget (homogeneous seq): a follower may be a different
-                    // resolution (#98), so sizing off its frame would mis-size the
-                    // ring. A full A frame seeds `frame_bytes`; a proxy A frame
-                    // seeds `proxy_bytes` (#94).
-                    if is_primary {
+                    // Measure one **clock-driving** frame to size the shared cache
+                    // budget (homogeneous seq): another source may be a different
+                    // resolution (#98), so sizing off an arbitrary one would
+                    // mis-size the ring. A full frame seeds `frame_bytes`; a proxy
+                    // one seeds `proxy_bytes` (#94).
+                    //
+                    // Keyed on the clock source rather than the primary (#100/#199):
+                    // under `comp_drives_transport` slot A never decodes, so this
+                    // never fired, `sizing_bytes` stayed `None`, and `tick_budgets`
+                    // skipped its whole T1 branch — leaving `frame_cache_cap` at its
+                    // constructed default of 8 with no budget check at all (~3.4 GB
+                    // on real footage) and the #146 pressure shrink unable to fire.
+                    // With slot A driving, `clock_source()` *is* `A_SOURCE`, so the
+                    // A/B behaviour is unchanged.
+                    if res.source == self.clock_source() {
                         if arc.proxy {
                             self.proxy_bytes.get_or_insert_with(|| arc.approx_bytes());
                         } else if !arc.beauty_only {
@@ -5841,7 +5890,7 @@ impl ExrApp {
         // the T1 sizing seed have to attribute a decode to the transport-driving
         // follower (#100). The id only exists here, after allocation.
         if claims_transport {
-            self.transport_source = Some(source);
+            self.set_transport_source(Some(source));
         }
         let layer_id = self.comp_stack.push_image(name, source, 0, trim);
         // A freshly added layer becomes the "current" layer the viewport bar's AOV /
@@ -5872,6 +5921,16 @@ impl ExrApp {
                     ..Default::default()
                 },
             );
+            // Size the T1 budget from this decode when it drives the clock
+            // (#100/#199). This path decodes **synchronously** and inserts straight
+            // into the cache, so it never reaches `apply_load_result`'s seed — and
+            // it is how every sequence enters the app now that open/drop means "add
+            // a layer". Without it the budget stays unsized until the *next* decode
+            // happens to land, which on a paused first open is never.
+            if source == self.clock_source() {
+                self.frame_bytes
+                    .get_or_insert_with(|| exr_data.approx_bytes());
+            }
         }
 
         self.comp_sources.insert(
@@ -6035,7 +6094,7 @@ impl ExrApp {
         // source.
         if self.comp_drives_transport() && self.active_followers().next().is_none() {
             self.playback.clear();
-            self.transport_source = None;
+            self.set_transport_source(None);
         } else if self
             .transport_source
             .is_some_and(|s| !self.followers.contains_key(&s))
@@ -6046,7 +6105,7 @@ impl ExrApp {
             // pacing / sizing instruments keyed on it (#100) go silent. Re-point at
             // a surviving follower.
             let next = self.active_followers().next().map(|(s, _)| *s);
-            self.transport_source = next;
+            self.set_transport_source(next);
         }
     }
 
@@ -7796,9 +7855,11 @@ mod tests {
 
     // --- #100 comp-path pins ---------------------------------------------------
     //
-    // Each of these asserts the behaviour the comp path *should* have. They are
-    // `#[ignore]`d against the filed issue so CI stays green while the repro is
-    // permanent; the fix PR's diff is `-#[ignore]` plus the fix. All are GPU-free.
+    // Each of these asserts the behaviour the comp path *should* have. All are
+    // GPU-free. The sizing (#199) and Stutter-hold (#200) pins are live — they now
+    // guard the fix. The two INV-SAMPLE pins (#201) stay `#[ignore]`d against their
+    // open issue so CI is green while the repro is permanent; that fix's diff is
+    // `-#[ignore]` plus the change.
     //
     // Common root cause: when the comp stack drives the transport, the primary slot
     // (`A_SOURCE`) never decodes, and every transport-level gate keyed on it goes
@@ -7828,8 +7889,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "#199: frame_bytes is seeded only from a primary decode, so the comp \
-                path never sizes the T1 ring and the cap stays frozen at its default"]
     fn comp_transport_seeds_the_t1_sizing_bytes() {
         // `frame_bytes` is the sole input to `tick_budgets`' T1 branch. Unseeded, the
         // branch is skipped entirely: `frame_cache_cap` keeps its constructed default
@@ -7861,8 +7920,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "#200: tick_stutter's hold gate reads playback.pending / loading_a, \
-                both permanently empty once the comp stack drives the transport"]
     fn stutter_holds_while_the_clock_source_frame_is_undecoded() {
         // Stutter's contract is "play every frame; drop the effective fps rather than
         // skip". With the gate blind to follower state the playhead advances on the
