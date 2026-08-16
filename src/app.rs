@@ -1740,21 +1740,14 @@ impl ExrApp {
             })
             .collect();
         for (source, sf) in wants {
-            let advanced = self
-                .followers
-                .get(&source)
-                .is_some_and(|st| st.current_frame != sf);
             if let Some(st) = self.followers.get_mut(&source) {
                 st.current_frame = sf;
             }
-            // A resident frame on the clock source is on screen this instant — the
-            // comp counterpart of the A path's cache-hit `note_shown` (#100). A miss
-            // is paced when it lands in `apply_load_result` instead. Gated on an
-            // actual advance so a no-op re-sync (a trim-offset drag settling on the
-            // same frame) can't inflate the frame-time ring.
-            if advanced && source == self.clock_source() && self.frame_cache.contains(source, sf) {
-                self.playback.note_shown(std::time::Instant::now(), sf);
-            }
+            // Pacing is *not* recorded here. Residency at advance time says the
+            // pixels are available, not that they were painted — and through the
+            // runs where the picture was actually frozen this fired for frames that
+            // never reached the screen (#204). `ensure_comp_frame` counts the texture
+            // swap instead, which is the display itself.
             self.request_comp_frame(source, sf);
         }
     }
@@ -3116,17 +3109,10 @@ impl ExrApp {
                             st.loading = false;
                             st.pending = None;
                         }
-                        // Pace off the *clock-driving* follower (#100): `note_shown`
-                        // used to fire only under `is_primary`, so with the comp
-                        // stack driving the transport nothing ever recorded a shown
-                        // frame and `measured_fps` sat at 0.0 — the HUD's headline
-                        // number, and the input to the frame-time percentiles.
-                        // Only the clock source counts; a trailing layer arriving
-                        // late is not a transport tick.
-                        if res.source == self.clock_source() {
-                            self.playback
-                                .note_shown(std::time::Instant::now(), res.frame);
-                        }
+                        // Not paced here either: an arriving decode has not been
+                        // painted yet, and under load frequently never is — the
+                        // playhead has moved on by the time it lands (#204).
+                        // `ensure_comp_frame` records the swap that actually shows it.
                         if let Some(ctx) = &self.repaint_ctx {
                             ctx.request_repaint();
                         }
@@ -6062,12 +6048,39 @@ impl ExrApp {
             return;
         };
         let size = arc.logical_size(aov).unwrap_or((0, 0));
-        if let Some(cs) = self.comp_sources.get_mut(&source) {
+        let swapped = self.comp_sources.get_mut(&source).is_some_and(|cs| {
+            let changed = cs.cur_frame != Some(source_frame);
             cs.texture = Some(texture);
             cs.bind_group = Some(bind_group);
             cs.aov = aov;
             cs.size = size;
             cs.cur_frame = Some(source_frame);
+            changed
+        });
+        if swapped {
+            self.note_display(source, source_frame);
+        }
+    }
+
+    /// Record that `source` swapped its displayed frame to `source_frame` — the
+    /// pacing measurement's single source of truth (#100/#204).
+    ///
+    /// Called from [`Self::ensure_comp_frame`] on an actual texture swap, because
+    /// **that** is the display event. Residency and decode-arrival are both proxies
+    /// for it and both wrong: a frame can be resident, or can land, without ever
+    /// being painted (the playhead has moved on by then), and a frame can be painted
+    /// long after either. Pacing off those proxies reported the same displayed frame
+    /// twice microseconds apart — and, worse, recorded nothing at all through the
+    /// runs where the picture was genuinely frozen, which is precisely when the
+    /// number matters.
+    ///
+    /// Only the clock source paces: a trailing layer painting late is not a
+    /// transport tick, and counting it would make the frame-time ring report layer
+    /// count as speed.
+    fn note_display(&mut self, source: crate::layer::SourceId, source_frame: u32) {
+        if source == self.clock_source() {
+            self.playback
+                .note_shown(std::time::Instant::now(), source_frame);
         }
     }
 
@@ -7804,6 +7817,11 @@ mod tests {
         // So in 1.12.0's default path (open/drop = add a layer → the comp stack owns
         // the clock) nothing ever recorded a shown frame: `measured_fps` — the HUD's
         // headline number and the input to the frame-time percentiles — stayed 0.0.
+        //
+        // Driven through `note_display`, the seam `ensure_comp_frame` calls on a
+        // texture swap. The swap itself needs a device, so under the GPU-free test
+        // convention the *wiring* into the paint path is covered by inspection, not
+        // here; what this pins is the routing — which source paces and which doesn't.
         let (_dir, paths) = write_sequence(5);
         let mut app = ExrApp::default();
         app.add_comp_source(paths[0].clone());
@@ -7816,28 +7834,59 @@ mod tests {
         );
         assert_eq!(app.clock_source(), source);
 
-        // Walk the playhead, delivering each follower frame as the worker would.
-        for (i, path) in paths.iter().enumerate().skip(1) {
+        for frame in 2..=5u32 {
             app.playback_step(1);
-            deliver_source_frame(&mut app, source, path, u32::try_from(i).unwrap() + 1);
+            app.note_display(source, frame);
         }
 
         assert!(
             app.playback.measured_fps > 0.0,
             "the comp transport is paced, not stuck at 0.0"
         );
-        assert!(
-            app.playback.frame_time_samples() > 0,
-            "the frame-time ring filled from follower arrivals"
+        assert_eq!(
+            app.playback.frame_time_samples(),
+            3,
+            "four displayed frames are three intervals — no double counting"
         );
         assert!(app.playback.frame_time_pcts().is_some());
     }
 
     #[test]
+    fn pacing_ignores_a_resident_frame_that_was_never_displayed() {
+        // The defect that made the metric lie (#204): pacing used to fire when a
+        // frame was resident at advance time, or when a decode landed. Under load
+        // neither implies the pixels ever reached the screen — the playhead moves on
+        // and `ensure_comp_frame` keeps holding the old texture. That reported
+        // healthy frame times through runs where the picture was frozen for seconds.
+        let (_dir, paths) = write_sequence(5);
+        let mut app = ExrApp::default();
+        app.add_comp_source(paths[0].clone());
+        let source = crate::layer::SourceId(COMP_SOURCE_BASE);
+
+        // Walk the playhead and land decodes for every frame — residency and
+        // arrival both happen, display does not.
+        for (i, path) in paths.iter().enumerate().skip(1) {
+            app.playback_step(1);
+            deliver_source_frame(&mut app, source, path, u32::try_from(i).unwrap() + 1);
+            assert!(
+                app.frame_cache
+                    .contains(source, u32::try_from(i).unwrap() + 1)
+            );
+        }
+
+        assert_eq!(
+            app.playback.frame_time_samples(),
+            0,
+            "nothing was painted, so nothing is paced"
+        );
+        assert_eq!(app.playback.measured_fps, 0.0);
+    }
+
+    #[test]
     fn a_trailing_follower_does_not_pace_the_transport() {
-        // Only the clock source counts as a transport tick — a second layer's frame
-        // arriving late is not a displayed transport frame, and letting it call
-        // `note_shown` would make the frame-time ring report layer count as speed.
+        // Only the clock source counts as a transport tick — a second layer painting
+        // is not a displayed transport frame, and letting it pace would make the
+        // frame-time ring report layer count as speed.
         let (_dir, paths) = write_sequence(5);
         let mut app = ExrApp::default();
         app.add_comp_source(paths[0].clone());
@@ -7852,12 +7901,12 @@ mod tests {
         );
 
         app.playback_step(1);
-        deliver_source_frame(&mut app, trailing, &paths[1], 2);
-        deliver_source_frame(&mut app, trailing, &paths[1], 2);
+        app.note_display(trailing, 2);
+        app.note_display(trailing, 3);
         assert_eq!(
             app.playback.frame_time_samples(),
             0,
-            "a trailing layer's arrivals are not transport ticks"
+            "a trailing layer's paints are not transport ticks"
         );
     }
 
