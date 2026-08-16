@@ -28,8 +28,11 @@
     clippy         -> cargo clippy --all-targets -- -D warnings
     soak           -> cargo run --release with RUST_LOG=floki::playback=debug, teeing
                       the 1 Hz playback trace to soak-logs\soak-<timestamp>.log (#100)
-    Any trailing args after the task are passed through to cargo, e.g.:
+    inspect        -> cargo run --release --bin inspect_exr (parts / compression /
+                      channel counts for the soak manifest, #100 Phase 0)
+    Any trailing args after the task are passed through, e.g.:
       scripts\run-windows.ps1 run -- "C:\path\to\image.exr"
+    For run / soak / inspect they go to the *program*; for build / test, to cargo.
 
 .ENVIRONMENT
     FLOKI_VCPKG     vcpkg root         (default: G:\__projects\_programming\vcpkg)
@@ -41,10 +44,11 @@
     scripts\run-windows.ps1            # same as: run
     scripts\run-windows.ps1 run -- "D:\shots\comp_v003.exr"
     scripts\run-windows.ps1 soak -- "X:\seq\shot.0001.exr"
+    scripts\run-windows.ps1 inspect -- "X:\seq\shot.0001.exr"
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('run', 'test', 'build', 'clippy', 'soak')]
+    [ValidateSet('run', 'test', 'build', 'clippy', 'soak', 'inspect')]
     [string]$Task = 'run',
 
     [Parameter(ValueFromRemainingArguments = $true)]
@@ -123,9 +127,23 @@ try {
         if ($LASTEXITCODE -ne 0) { Die "cargo $($argv -join ' ') failed (exit $LASTEXITCODE)" }
     }
 
+    # Args destined for the *program* rather than for cargo. PowerShell consumes the
+    # `--` in `run-windows.ps1 run -- foo.exr` itself, so $CargoArgs arrives without
+    # it and `cargo run --release foo.exr` would make cargo reject `foo.exr` as an
+    # unknown cargo argument. Re-insert the separator.
+    function ProgramArgs([string[]]$argv) {
+        if ($CargoArgs -and $CargoArgs.Count) { return $argv + @('--') + $CargoArgs }
+        return $argv
+    }
+
     switch ($Task) {
-        'run'    { Invoke-Cargo (@('run', '--release') + $CargoArgs) }
+        'run'    { Invoke-Cargo (ProgramArgs @('run', '--release')) }
         'build'  { Invoke-Cargo (@('build', '--release') + $CargoArgs) }
+        'inspect' {
+            # Phase 0 of the #100 soak: dump parts / compression / channel counts for
+            # each frame path given, so the soak numbers are interpretable.
+            Invoke-Cargo (ProgramArgs @('run', '--release', '--bin', 'inspect_exr'))
+        }
         'clippy' { Invoke-Cargo (@('clippy', '--all-targets', '--') + @('-D', 'warnings')) }
         'test'   {
             Invoke-Cargo @('fmt', '--all', '--', '--check')
@@ -142,14 +160,15 @@ try {
             $env:RUST_LOG = 'floki::playback=debug'
             Write-Host "==> RUST_LOG=$env:RUST_LOG" -ForegroundColor Cyan
             Write-Host "==> log: $log" -ForegroundColor Cyan
-            Write-Host "==> cargo run --release $($CargoArgs -join ' ')" -ForegroundColor Green
             # Native stderr surfaces as ErrorRecords, which the script-wide 'Stop'
             # preference would turn into a fatal on the very first log line. Relax
             # it for the capture only.
             $prev = $ErrorActionPreference
             $ErrorActionPreference = 'Continue'
+            $runArgs = ProgramArgs @('run', '--release')
+            Write-Host "==> cargo $($runArgs -join ' ')" -ForegroundColor Green
             try {
-                & cargo run --release @CargoArgs 2>&1 | Tee-Object -FilePath $log
+                & cargo @runArgs 2>&1 | Tee-Object -FilePath $log
             }
             finally {
                 $ErrorActionPreference = $prev
