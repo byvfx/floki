@@ -414,26 +414,6 @@ struct SourceState {
     loading: bool,
 }
 
-/// How many decode workers to run — the number of frames that may decode
-/// concurrently (#204).
-///
-/// Deliberately small relative to core count. [`ExrData::load`] already parallelises
-/// block decompression internally via rayon, so this multiplies *frames* in flight,
-/// not threads per frame; sized to the machine it would simply contend with rayon
-/// for the same cores and win nothing. Two is enough to keep a couple of stacked
-/// layers decoding in parallel — the common case — and four caps the memory that
-/// concurrent in-progress decodes can hold at once, which matters when a single full
-/// frame is hundreds of MB.
-///
-/// One decode at a time was the previous behaviour and the player's hard ceiling: at
-/// a ~20 ms beauty decode that supplies ~18 frames/sec against 24/sec needed for a
-/// *single* layer, divided further by every layer added.
-fn decode_worker_count() -> usize {
-    std::thread::available_parallelism()
-        .map_or(2, |n| n.get() / 4)
-        .clamp(1, 4)
-}
-
 /// One `sources` row in the playback debug overlay (#100).
 ///
 /// `displayed` is the source's `CompSource::cur_frame` — the frame whose pixels are
@@ -565,15 +545,10 @@ pub struct ExrApp {
     #[serde(skip)]
     dbg_last_trace: Option<std::time::Instant>,
     /// Round-robin cursor for [`Self::pump_decode`]'s source order (#204), so the
-    /// decode slots are shared rather than always going to whichever source sorts
-    /// first and always wants something.
+    /// single decode slot is shared rather than always going to whichever source
+    /// sorts first and always wants something.
     #[serde(skip)]
     pump_rotation: usize,
-    /// How many decodes may be in flight at once — the size of the worker pool
-    /// spawned by [`Self::ensure_worker`] (#204). Fixed for the process lifetime;
-    /// see [`decode_worker_count`] for the sizing rationale.
-    #[serde(skip)]
-    decode_workers: usize,
     /// Whether the last trace tick saw the clock running — the edge detector that
     /// lets [`Self::trace_playback_state`] emit one line on play→pause/stop (#100).
     /// That transition is exactly when INV-SAMPLE is decided, and the trace's
@@ -990,7 +965,6 @@ impl Default for ExrApp {
             last_decode_dur: None,
             dbg_last_trace: None,
             pump_rotation: 0,
-            decode_workers: decode_worker_count(),
             dbg_was_playing: false,
             recent_files: Vec::new(),
             theme: ThemeChoice::default(),
@@ -1588,28 +1562,15 @@ impl ExrApp {
         }
     }
 
-    /// Lazily create the load channel + spawn the decode worker **pool**, returning
-    /// a sender for [`LoadJob`]s. Stale results are discarded by
+    /// Lazily create the load channel + spawn the single dedicated worker thread,
+    /// returning a sender for [`LoadJob`]s. The worker processes jobs one at a
+    /// time, so rapidly queued requests serialize instead of spawning many
+    /// parallel GBs-of-RAM parses. Stale results are discarded by
     /// `apply_load_result`'s path check.
-    ///
-    /// This was a single thread, which made the whole player serial: `pump_decode`
-    /// allowed one decode in flight globally, so N stacked layers took turns through
-    /// one ~20 ms beauty decode each. At a 24 fps target that ceiling binds even for
-    /// a *single* layer (measured: ~18 decodes/sec supplied against 24/sec needed),
-    /// and every added layer divides it (#204).
-    ///
-    /// The pool shares one job queue behind a mutex. Only the hand-off is
-    /// serialized — a worker holds the lock just long enough to take a job, then
-    /// decodes outside it — which is nothing against a 10–300 ms decode. Sizing is
-    /// deliberately conservative because [`ExrData::load`] already parallelises block
-    /// decompression internally via rayon, so the pool multiplies *frames* in flight
-    /// rather than threads per frame, and an over-large pool would just contend with
-    /// rayon for the same cores.
     fn ensure_worker(&mut self) -> std::sync::mpsc::Sender<LoadJob> {
         if self.load_rx.is_none() {
             let (job_tx, job_rx) = std::sync::mpsc::channel::<LoadJob>();
             let (result_tx, result_rx) = std::sync::mpsc::channel::<LoadMsg>();
-            let job_rx = std::sync::Arc::new(std::sync::Mutex::new(job_rx));
             let epoch_signal = std::sync::Arc::clone(&self.epoch_signal);
             // Persistent proxy cache (#165), shared with the worker: read-through
             // (hit → skip decode) + write-through on a proxy miss. Cloned before
@@ -1625,103 +1586,83 @@ impl ExrApp {
                     ctx.request_repaint();
                 }
             };
-            for _ in 0..self.decode_workers {
-                let epoch_signal = std::sync::Arc::clone(&epoch_signal);
-                let proxy_cache = std::sync::Arc::clone(&proxy_cache);
-                let result_tx = result_tx.clone();
-                let wake_ui = wake_ui.clone();
-                let job_rx = std::sync::Arc::clone(&job_rx);
-                std::thread::spawn(move || {
-                    // Reused box-filter accumulator for proxy downsampling (#171),
-                    // owned by the worker for its whole life. Proxies are uniform-size
-                    // per sequence, so this allocates + zeroes once instead of per
-                    // channel per frame during scrub/playback (the decode-side analogue
-                    // of the T2 `t2_staging` reuse). Per-worker, so pool members never
-                    // share it.
-                    let mut proxy_scratch: Vec<f32> = Vec::new();
-                    loop {
-                        // Take a job, then release the queue before decoding — holding
-                        // it across the decode would serialize the pool back into one
-                        // worker. `recv` blocks under the lock, so exactly one member
-                        // waits on the queue while the rest wait on the mutex; the
-                        // hand-off is FIFO and costs microseconds.
-                        let job = match job_rx.lock() {
-                            Ok(rx) => match rx.recv() {
-                                Ok(job) => job,
-                                Err(_) => break, // sender dropped: shut down
-                            },
-                            Err(_) => break, // a panicking worker poisoned the queue
-                        };
-                        // Drop a sequence job a newer seek/scrub already superseded,
-                        // **before** paying the decode (#…). Rapid scrubbing queues
-                        // many soon-stale jobs in this FIFO channel; decoding each one
-                        // (only for `apply_load_result` to drop it by epoch) strands
-                        // the awaited frame behind the backlog for seconds. Skipping
-                        // drains the backlog in microseconds. Opens are generation-
-                        // keyed, not epoch-keyed, so they are never skipped here.
-                        if job.seq_frame
-                            && job.epoch < epoch_signal.load(std::sync::atomic::Ordering::Relaxed)
-                        {
-                            continue;
-                        }
-                        // Decode mode while the playhead moves, cheapest first (#94/#56):
-                        // - a **scrub proxy** (downsampled, tiny + fast) when requested,
-                        //   falling back to beauty/full if the fast read isn't available;
-                        // - **beauty-only** (one layer) otherwise while moving (#56 step 3);
-                        // - full all-AOV for opens and the settle re-decode.
-                        // #165: a proxy job checks the on-disk cache first — a hit is a
-                        // raw f16 read (~zero decode); a miss decodes then write-throughs.
-                        let mut store_blob: Option<(crate::proxy_cache::ProxyKey, Vec<u8>)> = None;
-                        let result = match job.proxy_target {
-                            Some(tb) => {
-                                if let Some(cached) = proxy_cache.read(&job.path, tb) {
-                                    Ok(cached)
-                                } else {
-                                    let decoded =
-                                        ExrData::load_proxy_into(&job.path, tb, &mut proxy_scratch)
-                                            .or_else(|_| {
-                                                if job.beauty_only {
-                                                    ExrData::load_beauty(&job.path)
-                                                } else {
-                                                    ExrData::load(&job.path)
-                                                }
-                                            });
-                                    // Cache only a genuine proxy (never a fallback
-                                    // beauty/full). Serialize here (miss-only, <1% of
-                                    // the decode just paid) so the borrow ends before
-                                    // `decoded` is moved into the message; the disk
-                                    // write happens off-thread in the cache's writer.
-                                    if let Ok(data) = &decoded
-                                        && data.proxy
-                                        && let Some(key) =
-                                            crate::proxy_cache::ProxyKey::for_source(&job.path, tb)
-                                    {
-                                        let blob = data.write_proxy_blob(&key);
-                                        store_blob = Some((key, blob));
-                                    }
-                                    decoded
-                                }
-                            }
-                            None if job.beauty_only => ExrData::load_beauty(&job.path),
-                            None => ExrData::load(&job.path),
-                        };
-                        let _ = result_tx.send(LoadMsg::Loaded(Box::new(LoadResult {
-                            source: job.source,
-                            seq_frame: job.seq_frame,
-                            frame: job.frame,
-                            epoch: job.epoch,
-                            open_gen: job.open_gen,
-                            result,
-                        })));
-                        wake_ui();
-                        // Queue the proxy write-through *after* the UI has the frame, so
-                        // the awaited frame never waits on the write path (#165).
-                        if let Some((key, blob)) = store_blob {
-                            proxy_cache.store(&key, blob);
-                        }
+            std::thread::spawn(move || {
+                // Reused box-filter accumulator for proxy downsampling (#171),
+                // owned by the worker for its whole life. Proxies are uniform-size
+                // per sequence, so this allocates + zeroes once instead of per
+                // channel per frame during scrub/playback (the decode-side analogue
+                // of the T2 `t2_staging` reuse).
+                let mut proxy_scratch: Vec<f32> = Vec::new();
+                for job in job_rx {
+                    // Drop a sequence job a newer seek/scrub already superseded,
+                    // **before** paying the decode (#…). Rapid scrubbing queues
+                    // many soon-stale jobs in this FIFO channel; decoding each one
+                    // (only for `apply_load_result` to drop it by epoch) strands
+                    // the awaited frame behind the backlog for seconds. Skipping
+                    // drains the backlog in microseconds. Opens are generation-
+                    // keyed, not epoch-keyed, so they are never skipped here.
+                    if job.seq_frame
+                        && job.epoch < epoch_signal.load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        continue;
                     }
-                });
-            }
+                    // Decode mode while the playhead moves, cheapest first (#94/#56):
+                    // - a **scrub proxy** (downsampled, tiny + fast) when requested,
+                    //   falling back to beauty/full if the fast read isn't available;
+                    // - **beauty-only** (one layer) otherwise while moving (#56 step 3);
+                    // - full all-AOV for opens and the settle re-decode.
+                    // #165: a proxy job checks the on-disk cache first — a hit is a
+                    // raw f16 read (~zero decode); a miss decodes then write-throughs.
+                    let mut store_blob: Option<(crate::proxy_cache::ProxyKey, Vec<u8>)> = None;
+                    let result = match job.proxy_target {
+                        Some(tb) => {
+                            if let Some(cached) = proxy_cache.read(&job.path, tb) {
+                                Ok(cached)
+                            } else {
+                                let decoded =
+                                    ExrData::load_proxy_into(&job.path, tb, &mut proxy_scratch)
+                                        .or_else(|_| {
+                                            if job.beauty_only {
+                                                ExrData::load_beauty(&job.path)
+                                            } else {
+                                                ExrData::load(&job.path)
+                                            }
+                                        });
+                                // Cache only a genuine proxy (never a fallback
+                                // beauty/full). Serialize here (miss-only, <1% of
+                                // the decode just paid) so the borrow ends before
+                                // `decoded` is moved into the message; the disk
+                                // write happens off-thread in the cache's writer.
+                                if let Ok(data) = &decoded
+                                    && data.proxy
+                                    && let Some(key) =
+                                        crate::proxy_cache::ProxyKey::for_source(&job.path, tb)
+                                {
+                                    let blob = data.write_proxy_blob(&key);
+                                    store_blob = Some((key, blob));
+                                }
+                                decoded
+                            }
+                        }
+                        None if job.beauty_only => ExrData::load_beauty(&job.path),
+                        None => ExrData::load(&job.path),
+                    };
+                    let _ = result_tx.send(LoadMsg::Loaded(Box::new(LoadResult {
+                        source: job.source,
+                        seq_frame: job.seq_frame,
+                        frame: job.frame,
+                        epoch: job.epoch,
+                        open_gen: job.open_gen,
+                        result,
+                    })));
+                    wake_ui();
+                    // Queue the proxy write-through *after* the UI has the frame, so
+                    // the awaited frame never waits on the write path (#165).
+                    if let Some((key, blob)) = store_blob {
+                        proxy_cache.store(&key, blob);
+                    }
+                }
+            });
             self.load_tx = Some(job_tx);
             self.load_rx = Some(result_rx);
         }
@@ -2059,13 +2000,17 @@ impl ExrApp {
     /// each playing tick. A no-op while a decode is in flight or a non-sequence
     /// load is busy, which is what keeps it to one outstanding job.
     fn pump_decode(&mut self) {
-        // Up to `decode_workers` decodes in flight across ALL sources (#204). This
-        // was one, globally — which made N stacked layers take turns through a
-        // single ~20 ms decode and capped the player below 24 fps even for one
-        // layer. `next_want`'s residency predicate treats an in-flight frame as
-        // already satisfied, so a second slot asks for the *next* frame rather than
-        // re-submitting the one being decoded.
-        if !self.playback.is_active() || self.in_flight_total() >= self.decode_workers {
+        // One shared worker, one decode at a time across ALL sources (#98/#99):
+        // block while the primary or any follower has an outstanding job or awaited
+        // playhead.
+        if !self.playback.is_active()
+            || !self.inflight.is_empty()
+            || self.loading_a
+            || self
+                .followers
+                .values()
+                .any(|s| !s.inflight.is_empty() || s.loading)
+        {
             return;
         }
         // Depth priority:
@@ -2123,43 +2068,22 @@ impl ExrApp {
         // source's read-ahead.
         let lead = self.pump_rotation % sources.len().max(1);
         self.pump_rotation = self.pump_rotation.wrapping_add(1);
-        // Fill every free slot, not just one: `pump_decode` is called after each
-        // result and each tick, so submitting a single job per call would leave the
-        // rest of the pool idle until the next call and give back most of the
-        // parallelism (#204).
-        //
-        // The scan repeats rather than running once, because a single `(depth,
-        // source)` pair yields at most one job — so one pass could fill only two
-        // slots for a lone source (its playhead and one prefetch). Each pass marks
-        // what it submitted in flight, so `next_want` returns the *following* frame
-        // on the next pass. Terminates on a full pool or a pass that submits
-        // nothing.
-        loop {
-            let mut submitted_any = false;
-            for d in [0, depth] {
-                for i in 0..sources.len() {
-                    if self.in_flight_total() >= self.decode_workers {
-                        return;
+        for d in [0, depth] {
+            for i in 0..sources.len() {
+                let source = sources[(lead + i) % sources.len()];
+                if let Some(w) = self.next_want(source, d) {
+                    self.submit_seq(source, w);
+                    // Overlap I/O with decode (#164): while the worker decodes `w`,
+                    // a background thread pulls the *next* wanted frames' files
+                    // through the page cache, so the worker's next read is a
+                    // memory-speed pointer walk (the decode maps the file) instead
+                    // of a storage stall. Only while a prefetch window is active —
+                    // warming on a bare playhead seek would race the user's intent.
+                    if depth > 0 {
+                        self.warm_ahead(source, w, depth);
                     }
-                    let source = sources[(lead + i) % sources.len()];
-                    if let Some(w) = self.next_want(source, d) {
-                        self.submit_seq(source, w);
-                        // Overlap I/O with decode (#164): while the worker decodes
-                        // `w`, a background thread pulls the *next* wanted frames'
-                        // files through the page cache, so the worker's next read is
-                        // a memory-speed pointer walk (the decode maps the file)
-                        // instead of a storage stall. Only while a prefetch window
-                        // is active — warming on a bare playhead seek would race the
-                        // user's intent.
-                        if depth > 0 {
-                            self.warm_ahead(source, w, depth);
-                        }
-                        submitted_any = true;
-                    }
+                    return;
                 }
-            }
-            if !submitted_any {
-                return;
             }
         }
     }
@@ -2247,30 +2171,6 @@ impl ExrApp {
         }
     }
 
-    /// Total decodes in flight across every source — what [`Self::pump_decode`]
-    /// meters against the worker pool size (#204).
-    fn in_flight_total(&self) -> usize {
-        self.inflight.len()
-            + usize::from(self.loading_a)
-            + self
-                .followers
-                .values()
-                .map(|s| s.inflight.len())
-                .sum::<usize>()
-    }
-
-    /// Whether `source` already has frame `f` decoding. With a pool, this is what
-    /// stops two slots being handed the same frame (#204).
-    fn source_inflight_has(&self, source: crate::layer::SourceId, f: u32) -> bool {
-        if source == Self::A_SOURCE {
-            self.inflight.contains(&f)
-        } else {
-            self.followers
-                .get(&source)
-                .is_some_and(|st| st.inflight.contains(&f))
-        }
-    }
-
     /// Whether `source` has a decodable file for frame `f` — the `next_want`
     /// path-existence predicate, without `frame_path_for`'s allocation in the hot
     /// scheduler closure.
@@ -2324,15 +2224,7 @@ impl ExrApp {
             self.playback.loop_mode,
             ahead,
             behind,
-            // "Already taken care of": in flight, or resident and not awaiting a
-            // fidelity upgrade. The in-flight term is what makes more than one
-            // decode slot safe (#204) — without it a second slot would re-request
-            // the frame the first is still decoding, and the pool would decode the
-            // same frame N times instead of N different frames.
-            |f| {
-                self.source_inflight_has(source, f)
-                    || (self.frame_cache.contains(source, f) && Some(f) != pending)
-            },
+            |f| self.frame_cache.contains(source, f) && Some(f) != pending,
             |f| self.has_source_frame(source, f),
         )
     }
@@ -8033,10 +7925,6 @@ mod tests {
             .collect();
 
         app.playback.state = PlayState::Playing;
-        // One slot, so each pump makes exactly one scheduling choice and the
-        // rotation is observable. With a pool the same starvation would be masked by
-        // there simply being enough slots for everyone.
-        app.decode_workers = 1;
         app.playback_step(1); // every follower now wants a non-resident frame
 
         // Drain the single slot repeatedly, recording which source each job went to.
@@ -8070,47 +7958,6 @@ mod tests {
                 "every source must get decode turns, but {s:?} got none: {served:?}"
             );
         }
-    }
-
-    #[test]
-    fn the_pool_decodes_several_frames_at_once_without_duplicating_any() {
-        // #204: one decode in flight globally capped the player below 24 fps even
-        // for a single layer (~20 ms beauty decode → ~18 frames/sec supplied against
-        // 24/sec needed), and every added layer divided that further. The pool lifts
-        // the ceiling — but only if a second slot asks for the *next* frame rather
-        // than re-requesting the one already decoding, which is what `next_want`'s
-        // in-flight term is for.
-        let (_dir, paths) = write_sequence(10);
-        let mut app = ExrApp::default();
-        app.detect_sequence(&paths[0]);
-        app.frame_cache_cap = 8;
-        app.decode_workers = 4;
-        app.playback_toggle(); // Playing, playhead on frame 1
-
-        app.pump_decode();
-
-        assert_eq!(
-            app.inflight.len(),
-            4,
-            "one pump fills every free slot, not just one"
-        );
-        assert!(
-            app.inflight.contains(&1),
-            "the awaited playhead is still submitted first"
-        );
-        // `inflight` is a HashSet, so distinctness is structural — assert the pool
-        // spread across *different* frames rather than stacking on the playhead.
-        let mut frames: Vec<u32> = app.inflight.iter().copied().collect();
-        frames.sort_unstable();
-        assert_eq!(
-            frames,
-            vec![1, 2, 3, 4],
-            "the playhead plus the prefetch window, each frame requested once"
-        );
-
-        // A second pump with the pool full must add nothing.
-        app.pump_decode();
-        assert_eq!(app.inflight.len(), 4, "a saturated pool submits no more");
     }
 
     #[test]
@@ -10243,12 +10090,6 @@ mod tests {
         let mut app = ExrApp::default();
         app.detect_sequence(&paths[0]);
         app.frame_cache_cap = 4; // prefetch depth = 3
-        // Pin the pool to one worker: this test is about prefetch *ordering* — the
-        // playhead first, then rolling forward one frame at a time — which is
-        // clearest serially. Pool behaviour has its own test below. Explicit because
-        // the production default scales with core count (#204) and would otherwise
-        // make this machine-dependent.
-        app.decode_workers = 1;
         app.playback_toggle(); // Playing, playhead on frame 1
         app.pump_decode(); // submits the playhead (frame 1, not yet cached)
         assert!(app.inflight.contains(&1) && app.inflight.len() == 1);
@@ -10378,11 +10219,6 @@ mod tests {
         app.playback.loop_mode = LoopMode::Once;
         app.playback.state = PlayState::Playing;
         app.playback.fps_target = 24.0;
-        // One worker: this pins the *saturated-pool* recovery path — a stale result
-        // must not leave `loading_a` set and permanently gate the pump. With free
-        // slots the pump simply resubmits and the gate never binds, so the
-        // regression is only reachable when every worker is busy (#204).
-        app.decode_workers = 1;
 
         // Frame 1's decode is in flight (the awaited playhead).
         app.request_sequence_frame(1);
