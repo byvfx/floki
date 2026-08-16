@@ -414,6 +414,21 @@ struct SourceState {
     loading: bool,
 }
 
+/// One `sources` row in the playback debug overlay (#100).
+///
+/// `displayed` is the source's `CompSource::cur_frame` — the frame whose pixels are
+/// actually on screen. Every other field is playhead-derived, so it is the only one
+/// that can show the picture failing to keep up with the clock (#204).
+/// Field order is the sort order: by source id.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct DbgFollowerRow {
+    id: u64,
+    playhead: u32,
+    displayed: Option<u32>,
+    pending: Option<u32>,
+    inflight: usize,
+}
+
 /// Top-level application state and the [`eframe::App`] implementation. Owns the
 /// loaded A/B images, the `ExrViewer` canvas, OCIO/LUT colour state, and the
 /// menu/tool UI. Fields marked `#[serde(skip)]` are runtime-only (images, GPU
@@ -1689,7 +1704,7 @@ impl ExrApp {
             } else {
                 // Cache hit: show immediately, no decode round-trip.
                 self.playback.pending = None;
-                self.playback.note_shown(std::time::Instant::now());
+                self.playback.note_shown(std::time::Instant::now(), frame);
             }
         } else {
             // Miss: mark the playhead as awaited; `pump_decode` submits it (the
@@ -1738,7 +1753,7 @@ impl ExrApp {
             // actual advance so a no-op re-sync (a trim-offset drag settling on the
             // same frame) can't inflate the frame-time ring.
             if advanced && source == self.clock_source() && self.frame_cache.contains(source, sf) {
-                self.playback.note_shown(std::time::Instant::now());
+                self.playback.note_shown(std::time::Instant::now(), sf);
             }
             self.request_comp_frame(source, sf);
         }
@@ -3089,7 +3104,8 @@ impl ExrApp {
                             self.playback.pending = None;
                             self.viewer.set_t2_frame(Self::A_SOURCE, Some(res.frame));
                             self.swap_image_arc(arc);
-                            self.playback.note_shown(std::time::Instant::now());
+                            self.playback
+                                .note_shown(std::time::Instant::now(), res.frame);
                         }
                     } else if res.frame == self.source_playhead(res.source) {
                         // The awaited follower frame landed (already in the T1 cache,
@@ -3108,7 +3124,8 @@ impl ExrApp {
                         // Only the clock source counts; a trailing layer arriving
                         // late is not a transport tick.
                         if res.source == self.clock_source() {
-                            self.playback.note_shown(std::time::Instant::now());
+                            self.playback
+                                .note_shown(std::time::Instant::now(), res.frame);
                         }
                         if let Some(ctx) = &self.repaint_ctx {
                             ctx.request_repaint();
@@ -3646,10 +3663,17 @@ impl ExrApp {
 
         let mut inflight: Vec<u32> = self.inflight.iter().copied().collect();
         inflight.sort_unstable();
-        // Followers, in id order, as `s<id>[*]:<frame>/<pending>/<inflight>` —
-        // `*` marks the clock-driving source. The primary's `pending`/`inflight`
-        // are empty by construction once the comp stack owns the transport, so
-        // this is the field that actually moves during a comp soak (#100).
+        // Followers, in id order, as
+        // `s<id>[*]:<playhead>@<displayed>/<pending>/<inflight>` — `*` marks the
+        // clock-driving source. The primary's `pending`/`inflight` are empty by
+        // construction once the comp stack owns the transport, so this is the field
+        // that actually moves during a comp soak (#100).
+        //
+        // `@<displayed>` is `cs.cur_frame`: the frame whose pixels are on screen.
+        // Every other field here is playhead-derived, so without it "playing" and
+        // "the clock is advancing over a frozen picture" are indistinguishable in a
+        // log — `ensure_comp_frame` holds the last-built texture whenever the wanted
+        // frame isn't resident, and that divergence *is* #204.
         let clock = self.clock_source();
         let followers = {
             let mut v: Vec<_> = self.active_followers().collect();
@@ -3657,10 +3681,14 @@ impl ExrApp {
             v.iter()
                 .map(|(id, st)| {
                     format!(
-                        "s{}{}:{}/{}/{}",
+                        "s{}{}:{}@{}/{}/{}",
                         id.0,
                         if **id == clock { "*" } else { "" },
                         st.current_frame,
+                        self.comp_sources
+                            .get(id)
+                            .and_then(|cs| cs.cur_frame)
+                            .map_or_else(|| "-".to_string(), |f| f.to_string()),
                         st.pending
                             .map_or_else(|| "-".to_string(), |f| f.to_string()),
                         st.inflight.len()
@@ -3669,6 +3697,16 @@ impl ExrApp {
                 .collect::<Vec<_>>()
                 .join(",")
         };
+        // Active sources painting a frame other than the one their playhead is on —
+        // the headline "is the picture keeping up with the clock" number.
+        let stale = self
+            .active_followers()
+            .filter(|(id, st)| {
+                self.comp_sources
+                    .get(id)
+                    .is_some_and(|cs| cs.cur_frame != Some(st.current_frame))
+            })
+            .count();
         let (p50, p95, p99, pmax) = self
             .playback
             .frame_time_pcts()
@@ -3691,7 +3729,7 @@ impl ExrApp {
             "evt={evt} state={state:?} frame={frame} epoch={epoch} pacing={pacing:?} \
              loop={loop_mode:?} dir={dir:?} in={in_pt} out={out_pt} \
              pending={pending} loading_a={loading_a} inflight={inflight:?} \
-             clock=s{clock_id} followers=[{followers}] nsrc={nsrc} \
+             clock=s{clock_id} followers=[{followers}] nsrc={nsrc} stale={stale} \
              worker={worker} submit_age={submit_age:.2} last_decode={last_decode:.2} \
              precache={precache}/{precache_filled} \
              t1={t1_len}/{t1_cap} frame_bytes={frame_bytes} t2={t2_len}/{t2_cap} \
@@ -3715,6 +3753,7 @@ impl ExrApp {
             loading_a = self.loading_a,
             clock_id = clock.0,
             nsrc = self.n_active_sources(),
+            stale = stale,
             worker = if self.load_rx.is_some() { "alive" } else { "dead" },
             submit_age = age(self.decode_submit_at.map(|t| now.duration_since(t))),
             last_decode = age(self.last_decode_dur),
@@ -4495,10 +4534,16 @@ impl ExrApp {
         // the transport — this row is what's actually moving.
         let clock_src = self.clock_source().0;
         let n_sources = self.n_active_sources();
-        let follower_state: Vec<(u64, u32, Option<u32>, usize)> = {
+        let follower_state: Vec<DbgFollowerRow> = {
             let mut v: Vec<_> = self
                 .active_followers()
-                .map(|(id, st)| (id.0, st.current_frame, st.pending, st.inflight.len()))
+                .map(|(id, st)| DbgFollowerRow {
+                    id: id.0,
+                    playhead: st.current_frame,
+                    displayed: self.comp_sources.get(id).and_then(|cs| cs.cur_frame),
+                    pending: st.pending,
+                    inflight: st.inflight.len(),
+                })
                 .collect();
             v.sort_unstable();
             v
@@ -4622,10 +4667,20 @@ impl ExrApp {
                         } else {
                             let each = follower_state
                                 .iter()
-                                .map(|(id, cur, pend, nfl)| {
-                                    let clock = if *id == clock_src { "*" } else { "" };
-                                    let p = pend.map_or_else(|| "—".to_string(), |f| f.to_string());
-                                    format!("s{id}{clock} f{cur} pend {p} fly {nfl}")
+                                .map(|r| {
+                                    let (id, cur, nfl) = (r.id, r.playhead, r.inflight);
+                                    let clock = if id == clock_src { "*" } else { "" };
+                                    let p =
+                                        r.pending.map_or_else(|| "—".to_string(), |f| f.to_string());
+                                    // `f<playhead>→<displayed>`; the arrow only shows
+                                    // when they differ, so a healthy row stays quiet
+                                    // and a frozen layer is obvious at a glance.
+                                    let d = match r.displayed {
+                                        Some(s) if s != cur => format!("→{s} STALE"),
+                                        Some(_) => String::new(),
+                                        None => "→— none".to_string(),
+                                    };
+                                    format!("s{id}{clock} f{cur}{d} pend {p} fly {nfl}")
                                 })
                                 .collect::<Vec<_>>()
                                 .join("  ·  ");

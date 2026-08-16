@@ -154,6 +154,10 @@ pub struct Playback {
     pub measured_fps: f32,
     #[serde(skip)]
     last_shown: Option<Instant>,
+    /// The frame [`Self::note_shown`] last recorded, so a repeat report of the same
+    /// displayed frame is ignored rather than logged as a ~0 ms interval.
+    #[serde(skip)]
+    last_shown_frame: Option<u32>,
     /// The last [`FRAME_TIME_WINDOW`] inter-shown intervals, oldest first (#100).
     /// `measured_fps` is an EWMA with a ~5-frame time constant, so a single long
     /// hitch is smeared into a dip that can't be quantified after the fact — but
@@ -187,6 +191,7 @@ impl Default for Playback {
             pending: None,
             measured_fps: 0.0,
             last_shown: None,
+            last_shown_frame: None,
             frame_times: std::collections::VecDeque::with_capacity(FRAME_TIME_WINDOW),
             epoch: 0,
         }
@@ -236,6 +241,7 @@ impl Playback {
         self.pending = None;
         self.measured_fps = 0.0;
         self.last_shown = None;
+        self.last_shown_frame = None;
         self.frame_times.clear();
         self.sequence = Some(seq);
         self.bump_epoch();
@@ -282,6 +288,7 @@ impl Playback {
         self.frames_since_anchor = 0;
         self.measured_fps = 0.0;
         self.last_shown = None;
+        self.last_shown_frame = None;
         self.frame_times.clear();
         self.pending = None;
     }
@@ -331,9 +338,21 @@ impl Playback {
         self.sequence.as_ref()?.path_for(number)
     }
 
-    /// Record that a frame was shown, updating the smoothed measured fps and the
+    /// Record that `frame` was shown, updating the smoothed measured fps and the
     /// percentile ring.
-    pub fn note_shown(&mut self, now: Instant) {
+    ///
+    /// **Idempotent per frame**: repeating the frame already recorded is ignored.
+    /// The same displayed frame can be reported by more than one path in a single
+    /// update (a cache-residency hit and an arriving decode, say), and the two calls
+    /// land microseconds apart — `1.0 / dt` then produces an instantaneous rate in
+    /// the thousands, which the EWMA happily folds into `measured_fps` (observed:
+    /// 14150 fps on a 24 fps target). A display can only show a given frame once, so
+    /// the second report is never new information.
+    pub fn note_shown(&mut self, now: Instant, frame: u32) {
+        if self.last_shown_frame == Some(frame) {
+            return;
+        }
+        self.last_shown_frame = Some(frame);
         if let Some(prev) = self.last_shown {
             let dt = now.duration_since(prev).as_secs_f32();
             if dt > 0.0 {
@@ -396,8 +415,8 @@ mod tests {
         let mut pb = Playback::default();
         pb.start_playing(Instant::now());
         // Two shown frames give a non-zero measured fps.
-        pb.note_shown(Instant::now());
-        pb.note_shown(Instant::now());
+        pb.note_shown(Instant::now(), 1);
+        pb.note_shown(Instant::now(), 2);
         // (measured_fps may be 0 if the two `now`s coincide; the contract under
         // test is that stop() zeroes it regardless.)
         pb.measured_fps = 24.0;
@@ -407,15 +426,66 @@ mod tests {
         assert!(pb.anchor.is_none());
     }
 
-    /// Feed the ring a run of exact intervals, bypassing the wall clock.
+    /// Feed the ring a run of exact intervals, bypassing the wall clock. Each call
+    /// uses a distinct frame number so the per-frame dedupe never suppresses one.
     fn shown_after(pb: &mut Playback, gaps_ms: &[u64]) {
         let base = Instant::now();
         let mut t = base;
-        pb.note_shown(t);
+        let mut frame = 0u32;
+        pb.note_shown(t, frame);
         for ms in gaps_ms {
             t += Duration::from_millis(*ms);
-            pb.note_shown(t);
+            frame += 1;
+            pb.note_shown(t, frame);
         }
+    }
+
+    #[test]
+    fn note_shown_ignores_a_repeat_of_the_same_frame() {
+        // A displayed frame can be reported by more than one path in a single update
+        // (cache-residency hit and arriving decode), microseconds apart. Recorded as
+        // an interval that is a rate in the thousands, which the EWMA folds into
+        // `measured_fps` — 14150 fps was observed on a 24 fps target (#100). A
+        // display shows a given frame once, so the repeat is never new information.
+        let mut pb = Playback::default();
+        let t = Instant::now();
+        pb.note_shown(t, 1);
+        pb.note_shown(t + Duration::from_millis(40), 2);
+        assert_eq!(pb.frame_time_samples(), 1);
+        let fps_after_two = pb.measured_fps;
+
+        // Same frame again, a hair later — must not record.
+        pb.note_shown(t + Duration::from_micros(40_070), 2);
+        assert_eq!(
+            pb.frame_time_samples(),
+            1,
+            "a repeat of frame 2 records no interval"
+        );
+        assert_eq!(
+            pb.measured_fps, fps_after_two,
+            "and does not disturb the smoothed rate"
+        );
+
+        // A genuinely new frame still records.
+        pb.note_shown(t + Duration::from_millis(80), 3);
+        assert_eq!(pb.frame_time_samples(), 2);
+    }
+
+    #[test]
+    fn note_shown_records_a_frame_shown_again_after_a_loop() {
+        // The dedupe is against the *immediately* preceding frame, not a history:
+        // looping back onto a frame is a real display event and must count, or a
+        // short in/out range would stop being measured entirely.
+        let mut pb = Playback::default();
+        let t = Instant::now();
+        pb.note_shown(t, 1);
+        pb.note_shown(t + Duration::from_millis(40), 2);
+        pb.note_shown(t + Duration::from_millis(80), 1);
+        assert_eq!(
+            pb.frame_time_samples(),
+            2,
+            "1 → 2 → 1 is two intervals; the wrap back to 1 is a real frame"
+        );
     }
 
     #[test]
@@ -480,7 +550,7 @@ mod tests {
         // read "no data", never a zeroed-out perfect score.
         let mut pb = Playback::default();
         assert_eq!(pb.frame_time_pcts(), None, "nothing shown yet");
-        pb.note_shown(Instant::now());
+        pb.note_shown(Instant::now(), 1);
         assert_eq!(pb.frame_time_pcts(), None, "one frame is no interval");
     }
 
