@@ -154,6 +154,13 @@ pub struct Playback {
     pub measured_fps: f32,
     #[serde(skip)]
     last_shown: Option<Instant>,
+    /// The last [`FRAME_TIME_WINDOW`] inter-shown intervals, oldest first (#100).
+    /// `measured_fps` is an EWMA with a ~5-frame time constant, so a single long
+    /// hitch is smeared into a dip that can't be quantified after the fact — but
+    /// "stutter vs drop-frames" is exactly a tail question. This ring keeps the
+    /// raw deltas so [`Self::frame_time_pcts`] can report the tail.
+    #[serde(skip)]
+    frame_times: std::collections::VecDeque<f32>,
     /// Supersession counter (#57). Bumped on every seek / scrub / direction or
     /// sequence change; each decode request and result carries the epoch at issue
     /// time, and the UI drops any result whose epoch no longer matches. Required
@@ -180,10 +187,16 @@ impl Default for Playback {
             pending: None,
             measured_fps: 0.0,
             last_shown: None,
+            frame_times: std::collections::VecDeque::with_capacity(FRAME_TIME_WINDOW),
             epoch: 0,
         }
     }
 }
+
+/// How many inter-shown intervals the percentile ring keeps — 10 s at 24 fps,
+/// long enough for a tail to mean something and short enough that the numbers
+/// still describe *now* rather than the whole session.
+const FRAME_TIME_WINDOW: usize = 240;
 
 impl Playback {
     /// Whether a sequence is loaded (transport UI + keys are active).
@@ -223,6 +236,7 @@ impl Playback {
         self.pending = None;
         self.measured_fps = 0.0;
         self.last_shown = None;
+        self.frame_times.clear();
         self.sequence = Some(seq);
         self.bump_epoch();
     }
@@ -268,6 +282,7 @@ impl Playback {
         self.frames_since_anchor = 0;
         self.measured_fps = 0.0;
         self.last_shown = None;
+        self.frame_times.clear();
         self.pending = None;
     }
 
@@ -316,7 +331,8 @@ impl Playback {
         self.sequence.as_ref()?.path_for(number)
     }
 
-    /// Record that a frame was shown, updating the smoothed measured fps.
+    /// Record that a frame was shown, updating the smoothed measured fps and the
+    /// percentile ring.
     pub fn note_shown(&mut self, now: Instant) {
         if let Some(prev) = self.last_shown {
             let dt = now.duration_since(prev).as_secs_f32();
@@ -327,9 +343,45 @@ impl Playback {
                 } else {
                     inst
                 };
+                if self.frame_times.len() == FRAME_TIME_WINDOW {
+                    self.frame_times.pop_front();
+                }
+                self.frame_times.push_back(dt * 1000.0);
             }
         }
         self.last_shown = Some(now);
+    }
+
+    /// Frame-time tail over the ring, in **milliseconds**: `(p50, p95, p99, max)`.
+    /// `None` until at least one interval has been recorded — an empty ring reads
+    /// as "no data", never as a zeroed-out perfect score.
+    ///
+    /// Nearest-rank percentiles over a sorted copy. The ring is bounded at
+    /// [`FRAME_TIME_WINDOW`], so this is a fixed ~240-element sort — cheap enough
+    /// for the 1 Hz trace and the (opt-in) debug overlay.
+    #[must_use]
+    pub fn frame_time_pcts(&self) -> Option<(f32, f32, f32, f32)> {
+        if self.frame_times.is_empty() {
+            return None;
+        }
+        let mut v: Vec<f32> = self.frame_times.iter().copied().collect();
+        v.sort_unstable_by(f32::total_cmp);
+        // Nearest-rank: the ceil(p·n)-th value, 1-indexed.
+        let at = |p: f32| -> f32 {
+            let n = v.len();
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let rank = (p * n as f32).ceil() as usize;
+            v[rank.clamp(1, n) - 1]
+        };
+        Some((at(0.50), at(0.95), at(0.99), v[v.len() - 1]))
+    }
+
+    /// How many intervals the percentile ring currently holds — the sample count
+    /// behind [`Self::frame_time_pcts`], so a soak log can tell a real p99 from
+    /// one computed over three frames.
+    #[must_use]
+    pub fn frame_time_samples(&self) -> usize {
+        self.frame_times.len()
     }
 }
 
@@ -353,6 +405,99 @@ mod tests {
         assert_eq!(pb.state, PlayState::Stopped);
         assert_eq!(pb.measured_fps, 0.0, "stop clears the stale rate");
         assert!(pb.anchor.is_none());
+    }
+
+    /// Feed the ring a run of exact intervals, bypassing the wall clock.
+    fn shown_after(pb: &mut Playback, gaps_ms: &[u64]) {
+        let base = Instant::now();
+        let mut t = base;
+        pb.note_shown(t);
+        for ms in gaps_ms {
+            t += Duration::from_millis(*ms);
+            pb.note_shown(t);
+        }
+    }
+
+    #[test]
+    fn frame_time_pcts_reports_the_tail_the_ewma_hides() {
+        // 2 of 100 frames hitch at 400 ms, early in the run, then 78 clean frames.
+        // The EWMA has a ~5-frame time constant, so `measured_fps` has fully
+        // recovered by the end and reports the run as healthy — the percentile
+        // ring is what still shows the hitches (#100).
+        let mut pb = Playback::default();
+        let mut gaps = vec![40u64; 20];
+        gaps.extend([400, 400]);
+        gaps.extend(std::iter::repeat_n(40u64, 78));
+        shown_after(&mut pb, &gaps);
+
+        assert_eq!(pb.frame_time_samples(), 100);
+        assert!(
+            pb.measured_fps > 24.0,
+            "the EWMA has forgotten the hitches, reading {:.1} fps",
+            pb.measured_fps
+        );
+
+        let (p50, p95, p99, max) = pb.frame_time_pcts().expect("100 intervals recorded");
+        assert!(
+            (p50 - 40.0).abs() < 1.0,
+            "p50 is the nominal 40 ms, got {p50}"
+        );
+        assert!((p95 - 40.0).abs() < 1.0, "p95 still nominal, got {p95}");
+        assert!(
+            (p99 - 400.0).abs() < 1.0,
+            "2% of frames hitched, so the p99 is a hitch, got {p99}"
+        );
+        assert!(
+            (max - 400.0).abs() < 1.0,
+            "max is the hitch itself, got {max}"
+        );
+    }
+
+    #[test]
+    fn frame_time_ring_is_bounded_and_drops_the_oldest() {
+        // Overfill with a leading hitch: once it slides out of the window the
+        // tail must return to nominal rather than reporting a stale spike.
+        let mut pb = Playback::default();
+        let mut gaps = vec![500u64];
+        gaps.extend(std::iter::repeat_n(40u64, FRAME_TIME_WINDOW + 10));
+        shown_after(&mut pb, &gaps);
+
+        assert_eq!(
+            pb.frame_time_samples(),
+            FRAME_TIME_WINDOW,
+            "the ring is bounded"
+        );
+        let (_, _, _, max) = pb.frame_time_pcts().unwrap();
+        assert!(
+            (max - 40.0).abs() < 1.0,
+            "the evicted 500 ms hitch no longer shows, got {max}"
+        );
+    }
+
+    #[test]
+    fn frame_time_pcts_is_none_before_any_interval() {
+        // One shown frame is a timestamp, not an interval — an empty ring must
+        // read "no data", never a zeroed-out perfect score.
+        let mut pb = Playback::default();
+        assert_eq!(pb.frame_time_pcts(), None, "nothing shown yet");
+        pb.note_shown(Instant::now());
+        assert_eq!(pb.frame_time_pcts(), None, "one frame is no interval");
+    }
+
+    #[test]
+    fn enter_and_stop_clear_the_percentile_ring() {
+        // The ring describes the *current* run; a stale tail carried across a
+        // stop or a new sequence would misreport the next soak segment.
+        let mut pb = Playback::default();
+        shown_after(&mut pb, &[40, 40, 40]);
+        assert!(pb.frame_time_samples() > 0);
+        pb.stop();
+        assert_eq!(pb.frame_time_samples(), 0, "stop clears the ring");
+
+        shown_after(&mut pb, &[40, 40, 40]);
+        assert!(pb.frame_time_samples() > 0);
+        pb.enter(seq(1, 3), 1);
+        assert_eq!(pb.frame_time_samples(), 0, "a new sequence clears the ring");
     }
 
     #[test]

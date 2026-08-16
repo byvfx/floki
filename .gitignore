@@ -10,6 +10,11 @@
 # test time — they're the only way to regression-test DWA open support.
 !tests/fixtures/*.exr
 
+# Soak capture logs (#100) — `run-windows.ps1 soak` output. They carry footage
+# paths (incl. client shares), so they are attached to issues deliberately, never
+# committed.
+soak-logs/
+
 # Local agent guidance / runtime (not versioned)
 CLAUDE.md
 docs/review/
