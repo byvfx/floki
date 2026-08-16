@@ -2,16 +2,14 @@
 //!
 //! The #100 soak manifest instrument: a p99 frame time is uninterpretable
 //! without knowing whether the source is 2K zip or 4K DWA across 30 parts, so
-//! run this against frame 1 of each sequence before soaking. Takes paths on the
-//! command line; with no arguments it falls back to the scratch paths below.
+//! run this against frame 1 of each sequence before soaking.
+//!
+//! Takes paths on the command line. It used to fall back to two hardcoded
+//! absolute paths on a production share when given none — real internal
+//! locations, committed to a public repo and shipped in build artifacts. Passing
+//! a path is required instead.
 
 use exr::prelude::*;
-
-/// Scratch paths used when no argument is given (this started as a dev tool).
-const FALLBACK: [&str; 2] = [
-    r"X:\SuplexFX\TPLS2\206_206-0390\houdini\render\redSea_bty\v003\TPLS2_206_206-0390_render_v003.redSea_bty.1001.exr",
-    r"X:\SuplexFX\TPLS2\206_206-0390\houdini\render\redSea_bty\v003\converted\TPLS2_206_206-0390_render_v003.redSea_bty.1001.exr",
-];
 
 fn inspect_file(path: &str) {
     println!("Inspecting: {path}");
@@ -82,12 +80,12 @@ fn inspect_file(path: &str) {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
-        for path in FALLBACK {
-            inspect_file(path);
-        }
-    } else {
-        for path in &args {
-            inspect_file(path);
-        }
+        eprintln!("usage: inspect_exr <file.exr> [file.exr ...]");
+        eprintln!("  Reports parts, per-part compression, channel sample types, and the");
+        eprintln!("  decoded size that sizes the T1 playback cache.");
+        std::process::exit(2);
+    }
+    for path in &args {
+        inspect_file(path);
     }
 }

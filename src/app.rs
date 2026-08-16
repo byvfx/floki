@@ -3718,10 +3718,17 @@ impl ExrApp {
                     .is_some_and(|cs| cs.cur_frame != Some(st.current_frame))
             })
             .count();
+        // `-1` for "no data", not `0`. `frame_time_pcts` deliberately returns `None`
+        // until an interval exists, and zeroing that in a stable `key=value` line
+        // reads as a perfect 0 ms frame time — the opposite of what it means. It
+        // misled me while reading these very logs: `p50=0.0` through a cold pass
+        // looks like flawless playback when it means nothing has been displayed yet.
+        // `ft_n` gives the sample count alongside.
+        const NO_DATA: f32 = -1.0;
         let (p50, p95, p99, pmax) = self
             .playback
             .frame_time_pcts()
-            .unwrap_or((0.0, 0.0, 0.0, 0.0));
+            .unwrap_or((NO_DATA, NO_DATA, NO_DATA, NO_DATA));
         let (ram_used, ram_total, vram_used, vram_budget) =
             self.dbg_last_sample.map_or((0, 0, 0, 0), |s| {
                 (

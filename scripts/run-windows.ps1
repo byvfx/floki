@@ -30,10 +30,11 @@
                       the 1 Hz playback trace to soak-logs\soak-<timestamp>.log (#100)
     inspect        -> cargo run --release --bin inspect_exr (parts / compression /
                       channel counts for the soak manifest, #100 Phase 0)
-    Any trailing args after the task are passed through, e.g.:
-      scripts\run-windows.ps1 run -- "C:\path\to\image.exr"
-    For run / soak / inspect they go to the *program*, and for test to the test
-    harness (e.g. `test -- --ignored`); only build passes them to cargo itself.
+    Trailing args after the task are forwarded by run / soak / inspect / test / build
+    only; clippy takes none and ignores them. Where they land differs:
+      run / soak / inspect -> the *program*   scripts\run-windows.ps1 run -- "C:\img.exr"
+      test                 -> the test harness   scripts\run-windows.ps1 test -- --ignored
+      build                -> cargo itself       scripts\run-windows.ps1 build -- --bin convert_dir
 
 .ENVIRONMENT
     FLOKI_VCPKG     vcpkg root         (default: G:\__projects\_programming\vcpkg)
