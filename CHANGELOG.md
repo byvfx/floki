@@ -5,6 +5,33 @@ All notable changes to Floki are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Frame-time percentiles.** The playback debug overlay reports p50 / p95 / p99 /
+  max frame time over the last 240 shown frames, alongside the existing smoothed
+  fps. The smoothed number has a ~5-frame time constant, so it hides exactly the
+  hitches a review player is judged on.
+- **A soak capture task.** `scripts\run-windows.ps1 soak` runs the release build
+  with the playback trace enabled and tees it to `soak-logs\soak-<timestamp>.log`.
+  The trace is now stable `key=value` pairs and carries the budget, pacing, and
+  memory fields, plus one line on the play→pause transition.
+- **`inspect_exr` takes paths on the command line** and reports part count,
+  per-part compression, and channel counts — enough to characterize a sequence
+  before soaking it.
+
+### Fixed
+- **The measured-fps readout no longer reads 0.0 during playback.** It was only
+  updated from the primary slot, which stopped decoding when open/drop became "add
+  a layer" in 1.12.0 — so the transport driven by a comp layer was never paced.
+  Playback now paces off whichever source drives the clock.
+
+### Changed
+- The playback debug overlay names what each row actually measures: the T1 row
+  shows whether its cap was sized from a measured frame or is sitting at the
+  default, the T2 row is marked as slot-A only, and new `comp tex` and `sources`
+  rows show the textures and per-layer decode state the comp path really holds.
+
 ## [1.12.0] - 2026-08-15
 
 The layer-stack wave (#99). Floki's viewer was built around two hardcoded image

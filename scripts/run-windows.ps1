@@ -26,6 +26,8 @@
     test           -> cargo fmt --check, clippy -D warnings, cargo test --all-targets
     build          -> cargo build --release
     clippy         -> cargo clippy --all-targets -- -D warnings
+    soak           -> cargo run --release with RUST_LOG=floki::playback=debug, teeing
+                      the 1 Hz playback trace to soak-logs\soak-<timestamp>.log (#100)
     Any trailing args after the task are passed through to cargo, e.g.:
       scripts\run-windows.ps1 run -- "C:\path\to\image.exr"
 
@@ -38,10 +40,11 @@
     scripts\run-windows.ps1 test
     scripts\run-windows.ps1            # same as: run
     scripts\run-windows.ps1 run -- "D:\shots\comp_v003.exr"
+    scripts\run-windows.ps1 soak -- "X:\seq\shot.0001.exr"
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('run', 'test', 'build', 'clippy')]
+    [ValidateSet('run', 'test', 'build', 'clippy', 'soak')]
     [string]$Task = 'run',
 
     [Parameter(ValueFromRemainingArguments = $true)]
@@ -128,6 +131,31 @@ try {
             Invoke-Cargo @('fmt', '--all', '--', '--check')
             Invoke-Cargo @('clippy', '--all-targets', '--', '-D', 'warnings')
             Invoke-Cargo (@('test', '--all-targets') + $CargoArgs)
+        }
+        'soak'   {
+            # #100 capture: the 1 Hz `trace_playback_state` line goes to stderr via
+            # env_logger, so scope RUST_LOG to that target (wgpu/eframe are far too
+            # chatty at debug) and tee the whole run to a timestamped log.
+            $logDir = Join-Path (Get-Location) 'soak-logs'
+            New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+            $log = Join-Path $logDir ("soak-{0}.log" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+            $env:RUST_LOG = 'floki::playback=debug'
+            Write-Host "==> RUST_LOG=$env:RUST_LOG" -ForegroundColor Cyan
+            Write-Host "==> log: $log" -ForegroundColor Cyan
+            Write-Host "==> cargo run --release $($CargoArgs -join ' ')" -ForegroundColor Green
+            # Native stderr surfaces as ErrorRecords, which the script-wide 'Stop'
+            # preference would turn into a fatal on the very first log line. Relax
+            # it for the capture only.
+            $prev = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try {
+                & cargo run --release @CargoArgs 2>&1 | Tee-Object -FilePath $log
+            }
+            finally {
+                $ErrorActionPreference = $prev
+            }
+            if ($LASTEXITCODE -ne 0) { Die "soak run failed (exit $LASTEXITCODE); log: $log" }
+            Write-Host "==> captured: $log" -ForegroundColor Cyan
         }
     }
     Write-Host "==> Done." -ForegroundColor Green

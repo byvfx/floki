@@ -529,6 +529,12 @@ pub struct ExrApp {
     /// Throttle for the once-per-second playback state trace ([`Self::trace_playback_state`]).
     #[serde(skip)]
     dbg_last_trace: Option<std::time::Instant>,
+    /// Whether the last trace tick saw the clock running — the edge detector that
+    /// lets [`Self::trace_playback_state`] emit one line on play→pause/stop (#100).
+    /// That transition is exactly when INV-SAMPLE is decided, and the trace's
+    /// "something is outstanding" gate would otherwise swallow it.
+    #[serde(skip)]
+    dbg_was_playing: bool,
 
     recent_files: Vec<PathBuf>,
     theme: ThemeChoice,
@@ -647,12 +653,6 @@ pub struct ExrApp {
     /// the pump skips its want-list allocation — the common paused / settled case.
     #[serde(skip)]
     last_t2_pump: Option<u32>,
-    /// The B playhead the B T2 ring was last pumped for (#166) — the `last_t2_pump`
-    /// counterpart for slot B, so a full B ring on an unmoved B frame skips its
-    /// want-list allocation.
-    #[serde(skip)]
-    last_t2_pump_b: Option<u32>,
-
     /// A timeline drag is in progress (#143). While held, seeks decode
     /// beauty-only like playback does — the readout is suppressed or showing
     /// the beauty layer anyway — and the release settles the landing frame to
@@ -729,14 +729,21 @@ pub struct ExrApp {
     /// interaction state — the edit it produces lands in the layer's `Trim.offset`.
     #[serde(skip)]
     track_drag: Option<TrackDrag>,
-    /// The comp stack drives the global transport (#99 R4-lite): set when the first
-    /// added comp *sequence* establishes the playhead (there's no slot-A open), so
-    /// the timeline + playback keys light up. While set, the slot-A decode path is
-    /// bypassed (`request_sequence_frame` / `next_want` / the budget split) so the
-    /// clock-driving sequence isn't also decoded as the primary. A real slot-A open
-    /// reclaims the transport (clears this).
+    /// The comp source driving the global transport (#99 R4-lite), or `None` when
+    /// slot A owns the clock. Set when the first added comp *sequence* establishes
+    /// the playhead (there's no slot-A open), so the timeline + playback keys light
+    /// up. While set, the slot-A decode path is bypassed (`request_sequence_frame` /
+    /// `next_want` / the budget split) so the clock-driving sequence isn't also
+    /// decoded as the primary. A real slot-A open reclaims the transport (clears it).
+    ///
+    /// This holds the **id**, not just a flag, because every transport-level gate
+    /// and instrument in this file was written against `A_SOURCE` and goes dead the
+    /// moment the primary stops decoding (#100): pacing (`note_shown`), the T1
+    /// sizing seed (`frame_bytes`), and the stutter hold gate all need to know
+    /// *which* follower is the clock. `Self::comp_drives_transport()` keeps the
+    /// original boolean reading for the sites that only care that it isn't A.
     #[serde(skip)]
-    comp_drives_transport: bool,
+    transport_source: Option<crate::layer::SourceId>,
     /// The Layers panel's composite stack: a viewer-independent N-layer stack the
     /// panel edits and (PR-B.3) composites via the PR-A accumulate ping-pong,
     /// separate from the A/B compare stack so the compare modes stay untouched.
@@ -937,6 +944,7 @@ impl Default for ExrApp {
             decode_submit_at: None,
             last_decode_dur: None,
             dbg_last_trace: None,
+            dbg_was_playing: false,
             recent_files: Vec::new(),
             theme: ThemeChoice::default(),
             persisted_prefs: crate::viewer::ViewerPrefs::default(),
@@ -955,7 +963,6 @@ impl Default for ExrApp {
             ram_budget_gb: 0.0,
             precache_filled: false,
             last_t2_pump: None,
-            last_t2_pump_b: None,
             scrub_active: false,
             watch_enabled: false,
             watch_follow: false,
@@ -974,7 +981,7 @@ impl Default for ExrApp {
             show_layers_panel: true,
             show_side_panel: true,
             track_drag: None,
-            comp_drives_transport: false,
+            transport_source: None,
             comp_stack: crate::layer::LayerStack::new(),
             comp_next_source: COMP_SOURCE_BASE,
             comp_sources: std::collections::HashMap::new(),
@@ -1628,7 +1635,7 @@ impl ExrApp {
         // the slot-A request entirely and just advance the comp followers to the new
         // playhead. (`self.playback.frame_path` points at the clock-driving comp
         // sequence, but decoding it as A_SOURCE would double-decode + steal priority.)
-        if self.comp_drives_transport {
+        if self.comp_drives_transport() {
             self.sync_comp_followers();
             self.pump_decode();
             return;
@@ -1696,8 +1703,20 @@ impl ExrApp {
             })
             .collect();
         for (source, sf) in wants {
+            let advanced = self
+                .followers
+                .get(&source)
+                .is_some_and(|st| st.current_frame != sf);
             if let Some(st) = self.followers.get_mut(&source) {
                 st.current_frame = sf;
+            }
+            // A resident frame on the clock source is on screen this instant — the
+            // comp counterpart of the A path's cache-hit `note_shown` (#100). A miss
+            // is paced when it lands in `apply_load_result` instead. Gated on an
+            // actual advance so a no-op re-sync (a trim-offset drag settling on the
+            // same frame) can't inflate the frame-time ring.
+            if advanced && source == self.clock_source() && self.frame_cache.contains(source, sf) {
+                self.playback.note_shown(std::time::Instant::now());
             }
             self.request_comp_frame(source, sf);
         }
@@ -1738,6 +1757,21 @@ impl ExrApp {
     /// master clock's source; keys A's T1 cache + T2 ring (#99).
     const A_SOURCE: crate::layer::SourceId = crate::layer::SourceId(0);
 
+    /// Whether the comp stack (rather than slot A) owns the global clock — the
+    /// boolean reading of [`Self::transport_source`], for the many sites that only
+    /// need "the primary isn't decoding".
+    fn comp_drives_transport(&self) -> bool {
+        self.transport_source.is_some()
+    }
+
+    /// The source whose decodes the transport is actually paced by: the
+    /// clock-driving comp follower, or [`Self::A_SOURCE`] when slot A owns the
+    /// clock. Every per-frame transport instrument keys off this rather than
+    /// `A_SOURCE` directly, so it keeps working in both worlds (#100).
+    fn clock_source(&self) -> crate::layer::SourceId {
+        self.transport_source.unwrap_or(Self::A_SOURCE)
+    }
+
     /// The *active* followers — those with a detected sequence (the N-source
     /// generalization of "B is playing"). A lone-image / absent follower holds a
     /// default `SourceState` and is skipped.
@@ -1751,7 +1785,7 @@ impl ExrApp {
     /// isn't counted when the comp stack drives the transport (#99 R4-lite) — it
     /// doesn't decode then — so the followers get the whole budget. Floored at 1.
     fn n_active_sources(&self) -> usize {
-        let primary = usize::from(!self.comp_drives_transport);
+        let primary = usize::from(!self.comp_drives_transport());
         (primary + self.active_followers().count()).max(1)
     }
 
@@ -2067,7 +2101,7 @@ impl ExrApp {
         // No primary (slot-A) decode when the comp stack drives the transport
         // (#99 R4-lite): `playback` holds a comp sequence for the clock, but that
         // sequence decodes as its own follower, not as A_SOURCE.
-        if source == Self::A_SOURCE && self.comp_drives_transport {
+        if source == Self::A_SOURCE && self.comp_drives_transport() {
             return None;
         }
         // Split the window RV-style (#169): ~25% reserved behind the playhead,
@@ -2995,6 +3029,16 @@ impl ExrApp {
                             st.loading = false;
                             st.pending = None;
                         }
+                        // Pace off the *clock-driving* follower (#100): `note_shown`
+                        // used to fire only under `is_primary`, so with the comp
+                        // stack driving the transport nothing ever recorded a shown
+                        // frame and `measured_fps` sat at 0.0 — the HUD's headline
+                        // number, and the input to the frame-time percentiles.
+                        // Only the clock source counts; a trailing layer arriving
+                        // late is not a transport tick.
+                        if res.source == self.clock_source() {
+                            self.playback.note_shown(std::time::Instant::now());
+                        }
                         if let Some(ctx) = &self.repaint_ctx {
                             ctx.request_repaint();
                         }
@@ -3484,6 +3528,13 @@ impl ExrApp {
     /// `RUST_LOG=floki=debug` even when the watchdog's own recovery doesn't fire,
     /// which is the case if the stuck state doesn't match its trigger condition.
     /// Zero-cost when debug logging is disabled.
+    ///
+    /// This is also the #100 soak capture (`run-windows.ps1 soak`), so the format
+    /// is stable `key=value` pairs — grep-able and paste-able into an issue — and
+    /// it carries the budget / pacing / memory fields the checklist reads, not just
+    /// the watchdog's. One line is also emitted on the play→pause/stop transition,
+    /// which the `outstanding` early return would otherwise swallow: that is
+    /// precisely the moment INV-SAMPLE (#7) is decided.
     fn trace_playback_state(&mut self) {
         use crate::playback::PlayState;
         if !self.playback.is_active() || !log::log_enabled!(log::Level::Debug) {
@@ -3495,36 +3546,118 @@ impl ExrApp {
                 .followers
                 .values()
                 .any(|s| !s.inflight.is_empty() || s.pending.is_some());
+        let playing = self.playback.state == PlayState::Playing;
+        // The play→settle edge: trace it once even though nothing is outstanding.
+        let settled = self.dbg_was_playing && !playing;
+        self.dbg_was_playing = playing;
         // Only trace while there is something that *should* be progressing.
-        if self.playback.state != PlayState::Playing && !outstanding && !self.loading_a {
+        if !playing && !outstanding && !self.loading_a && !settled {
             return;
         }
         let now = std::time::Instant::now();
-        if self
-            .dbg_last_trace
-            .is_some_and(|t| now.duration_since(t) < std::time::Duration::from_secs(1))
+        // The settle edge bypasses the throttle — it happens once and is the line
+        // the INV-SAMPLE checks are read from.
+        if !settled
+            && self
+                .dbg_last_trace
+                .is_some_and(|t| now.duration_since(t) < std::time::Duration::from_secs(1))
         {
             return;
         }
         self.dbg_last_trace = Some(now);
+
         let mut inflight: Vec<u32> = self.inflight.iter().copied().collect();
         inflight.sort_unstable();
+        // Followers, in id order, as `s<id>[*]:<frame>/<pending>/<inflight>` —
+        // `*` marks the clock-driving source. The primary's `pending`/`inflight`
+        // are empty by construction once the comp stack owns the transport, so
+        // this is the field that actually moves during a comp soak (#100).
+        let clock = self.clock_source();
+        let followers = {
+            let mut v: Vec<_> = self.active_followers().collect();
+            v.sort_unstable_by_key(|(id, _)| **id);
+            v.iter()
+                .map(|(id, st)| {
+                    format!(
+                        "s{}{}:{}/{}/{}",
+                        id.0,
+                        if **id == clock { "*" } else { "" },
+                        st.current_frame,
+                        st.pending
+                            .map_or_else(|| "-".to_string(), |f| f.to_string()),
+                        st.inflight.len()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let (p50, p95, p99, pmax) = self
+            .playback
+            .frame_time_pcts()
+            .unwrap_or((0.0, 0.0, 0.0, 0.0));
+        let (ram_used, ram_total, vram_used, vram_budget) =
+            self.dbg_last_sample.map_or((0, 0, 0, 0), |s| {
+                (
+                    s.sys_used,
+                    s.sys_total,
+                    s.gpu_used.unwrap_or(0),
+                    s.gpu_budget.unwrap_or(0),
+                )
+            });
+        // `secs_f32` rather than Duration's Debug so the numbers are comparable and
+        // sortable in a log rather than mixing `ms`/`s`/`µs` units per line.
+        let age = |d: Option<std::time::Duration>| d.map_or(-1.0, |d| d.as_secs_f32());
+
         log::debug!(
             target: "floki::playback",
-            "state={:?} frame={} pending={:?} loading_a={} inflight={inflight:?} epoch={} \
-             worker={} submit_age={:?} last_decode={:?} precache={}/{} t1={}/{}",
-            self.playback.state,
-            self.playback.current_frame,
-            self.playback.pending,
-            self.loading_a,
-            self.playback.epoch,
-            if self.load_rx.is_some() { "alive" } else { "dead" },
-            self.decode_submit_at.map(|t| now.duration_since(t)),
-            self.last_decode_dur,
-            self.precache,
-            self.precache_filled,
-            self.frame_cache.len(),
-            self.frame_cache_cap,
+            "evt={evt} state={state:?} frame={frame} epoch={epoch} pacing={pacing:?} \
+             loop={loop_mode:?} dir={dir:?} in={in_pt} out={out_pt} \
+             pending={pending} loading_a={loading_a} inflight={inflight:?} \
+             clock=s{clock_id} followers=[{followers}] nsrc={nsrc} \
+             worker={worker} submit_age={submit_age:.2} last_decode={last_decode:.2} \
+             precache={precache}/{precache_filled} \
+             t1={t1_len}/{t1_cap} frame_bytes={frame_bytes} t2={t2_len}/{t2_cap} \
+             evict={evict} drop_epoch={drop_epoch} run_dropped={run_dropped} run_held={run_held} \
+             fps={fps:.1}/{fps_target:.0} ft_n={ft_n} \
+             p50={p50:.1} p95={p95:.1} p99={p99:.1} ft_max={pmax:.1} \
+             ram={ram_used}/{ram_total} vram={vram_used}/{vram_budget}",
+            evt = if settled { "settle" } else { "tick" },
+            state = self.playback.state,
+            frame = self.playback.current_frame,
+            epoch = self.playback.epoch,
+            pacing = self.playback.pacing,
+            loop_mode = self.playback.loop_mode,
+            dir = self.playback.direction,
+            in_pt = self.playback.in_point,
+            out_pt = self.playback.out_point,
+            pending = self
+                .playback
+                .pending
+                .map_or_else(|| "-".to_string(), |f| f.to_string()),
+            loading_a = self.loading_a,
+            clock_id = clock.0,
+            nsrc = self.n_active_sources(),
+            worker = if self.load_rx.is_some() { "alive" } else { "dead" },
+            submit_age = age(self.decode_submit_at.map(|t| now.duration_since(t))),
+            last_decode = age(self.last_decode_dur),
+            precache = self.precache,
+            precache_filled = self.precache_filled,
+            t1_len = self.frame_cache.len(),
+            t1_cap = self.frame_cache_cap,
+            // `none` is the finding, not a missing field: the T1 cap is only sized
+            // once a decode measures a frame (#100).
+            frame_bytes = self
+                .frame_bytes
+                .map_or_else(|| "none".to_string(), |b| b.to_string()),
+            t2_len = self.viewer.t2_len(Self::A_SOURCE),
+            t2_cap = self.viewer.t2_cap(Self::A_SOURCE),
+            evict = self.dbg_evictions,
+            drop_epoch = self.dbg_dropped_epoch,
+            run_dropped = self.run_dropped,
+            run_held = self.run_held,
+            fps = self.playback.measured_fps,
+            fps_target = self.playback.fps_target,
+            ft_n = self.playback.frame_time_samples(),
         );
     }
 
@@ -4258,11 +4391,40 @@ impl ExrApp {
         let (fps_target, fps_measured) = (pb.fps_target, pb.measured_fps);
         let pending = pb.pending;
 
+        let pcts = pb.frame_time_pcts();
+        let pct_n = pb.frame_time_samples();
+
         let t1_len = self.frame_cache.len();
         let t1_cap = self.frame_cache_cap;
         let t2_len = self.viewer.t2_len(Self::A_SOURCE);
         let t2_cap = self.viewer.t2_cap(Self::A_SOURCE);
         let frame_bytes = self.frame_bytes;
+        // The comp path holds one texture per source, rebuilt on the UI thread by
+        // `ensure_comp_frame` — with T2 structurally off there (every ring call site
+        // passes `A_SOURCE`), this is the VRAM the player actually occupies (#100).
+        let comp_tex: Vec<(u64, (usize, usize))> = {
+            let mut v: Vec<_> = self
+                .comp_sources
+                .iter()
+                .filter(|(_, cs)| cs.texture.is_some())
+                .map(|(id, cs)| (id.0, cs.size))
+                .collect();
+            v.sort_unstable();
+            v
+        };
+        // Per-follower transport state. The `worker` row below reads `self.inflight`
+        // and `loading_a`, which are permanently empty once the comp stack drives
+        // the transport — this row is what's actually moving.
+        let clock_src = self.clock_source().0;
+        let n_sources = self.n_active_sources();
+        let follower_state: Vec<(u64, u32, Option<u32>, usize)> = {
+            let mut v: Vec<_> = self
+                .active_followers()
+                .map(|(id, st)| (id.0, st.current_frame, st.pending, st.inflight.len()))
+                .collect();
+            v.sort_unstable();
+            v
+        };
         let proxy_state = (self.proxy_enabled, self.proxy_size, self.proxy_bytes);
         let mut inflight: Vec<u32> = self.inflight.iter().copied().collect();
         inflight.sort_unstable();
@@ -4307,11 +4469,31 @@ impl ExrApp {
                         ui.label(format!("{fps_measured:.1} / {fps_target:.0} target"));
                         ui.end_row();
 
+                        // The EWMA above has a ~5-frame time constant, so a single
+                        // long hitch is smeared into a dip that can't be quantified.
+                        // The tail is the actual "stutter vs drop-frames" evidence
+                        // (#100); `n` is shown so a p99 over three samples reads as
+                        // the non-answer it is.
+                        ui.label("frame time");
+                        ui.label(match pcts {
+                            Some((p50, p95, p99, max)) => format!(
+                                "p50 {p50:.0}  p95 {p95:.0}  p99 {p99:.0}  max {max:.0} ms  (n={pct_n})"
+                            ),
+                            None => "— (no frames shown yet)".to_string(),
+                        });
+                        ui.end_row();
+
                         ui.label("T1 (CPU)");
-                        let t1_frame = frame_bytes
-                            .map(|b| fmt_bytes(b as u64))
-                            .unwrap_or_else(|| "—".into());
-                        ui.label(format!("{t1_len} / {t1_cap} frames  ·  ~{t1_frame}/frame"));
+                        // Sizing provenance, not just occupancy: `frame_bytes` is
+                        // seeded only from a *primary* decode, so with the comp
+                        // stack driving the transport it is never measured and the
+                        // cap sits frozen at its constructed default (#100). Say so
+                        // in the row rather than presenting 8/8 as a live budget.
+                        let t1_sizing = frame_bytes.map_or_else(
+                            || "cap frozen (no sizing decode)".to_string(),
+                            |b| format!("~{}/frame", fmt_bytes(b as u64)),
+                        );
+                        ui.label(format!("{t1_len} / {t1_cap} frames  ·  {t1_sizing}"));
                         ui.end_row();
 
                         // Scrub proxy (#94): whether it's on, the size knob, and the
@@ -4330,7 +4512,11 @@ impl ExrApp {
                         ui.label(px);
                         ui.end_row();
 
-                        ui.label("T2 (GPU)");
+                        // Labelled A-only because it *is* A-only: every ring call
+                        // site passes `A_SOURCE`, so in the comp path this reads
+                        // `off` by construction and is not the VRAM instrument.
+                        // `comp tex` below is (#100).
+                        ui.label("T2 (GPU, A only)");
                         let t2 = if t2_cap == 0 {
                             "off".to_string()
                         } else {
@@ -4339,8 +4525,40 @@ impl ExrApp {
                         ui.label(t2);
                         ui.end_row();
 
+                        ui.label("comp tex");
+                        ui.label(if comp_tex.is_empty() {
+                            "—".to_string()
+                        } else {
+                            let dims = comp_tex
+                                .iter()
+                                .map(|(id, (w, h))| format!("s{id} {w}×{h}"))
+                                .collect::<Vec<_>>()
+                                .join("  ·  ");
+                            format!("{} live  ·  {dims}", comp_tex.len())
+                        });
+                        ui.end_row();
 
-                        ui.label("worker");
+                        ui.label("sources");
+                        ui.label(if follower_state.is_empty() {
+                            format!("{n_sources} active  ·  no followers")
+                        } else {
+                            let each = follower_state
+                                .iter()
+                                .map(|(id, cur, pend, nfl)| {
+                                    let clock = if *id == clock_src { "*" } else { "" };
+                                    let p = pend.map_or_else(|| "—".to_string(), |f| f.to_string());
+                                    format!("s{id}{clock} f{cur} pend {p} fly {nfl}")
+                                })
+                                .collect::<Vec<_>>()
+                                .join("  ·  ");
+                            format!("{n_sources} active  ·  {each}")
+                        });
+                        ui.end_row();
+
+                        // Slot-A only, like the fields it reads — empty by
+                        // construction in the comp path; `sources` above is the
+                        // live one there.
+                        ui.label("worker (A)");
                         let pend = pending.map_or_else(|| "—".to_string(), |f| f.to_string());
                         ui.label(format!(
                             "in-flight {inflight:?}  ·  pending {pend}  ·  loading_a {loading_a}  ·  {}",
@@ -5557,12 +5775,14 @@ impl ExrApp {
         // (#99 R4-lite): enter it so the timeline + playback keys light up (mirrors
         // opening a slot-A sequence). A base plate already active keeps its clock;
         // added comp layers then align to it.
-        if let (Some(seq), Some(cf)) = (&sequence, cf)
+        let claims_transport = if let (Some(seq), Some(cf)) = (&sequence, cf)
             && !self.playback.is_active()
         {
             self.playback.enter(seq.clone(), cf);
-            self.comp_drives_transport = true;
-        }
+            true
+        } else {
+            false
+        };
         let trim = match (&sequence, cf) {
             // Align the opened frame to the current playhead so the just-added layer
             // is visible *immediately*: `offset = cf - global` makes
@@ -5588,6 +5808,12 @@ impl ExrApp {
 
         let source = crate::layer::SourceId(self.comp_next_source);
         self.comp_next_source += 1;
+        // Record *which* source took the clock, not just that one did: pacing and
+        // the T1 sizing seed have to attribute a decode to the transport-driving
+        // follower (#100). The id only exists here, after allocation.
+        if claims_transport {
+            self.transport_source = Some(source);
+        }
         let layer_id = self.comp_stack.push_image(name, source, 0, trim);
         // A freshly added layer becomes the "current" layer the viewport bar's AOV /
         // channel controls + EXR Info act on (Nuke-style, #99 R4 follow-up).
@@ -5778,9 +6004,20 @@ impl ExrApp {
         // If the comp stack drove the transport and its last sequence is gone,
         // release the clock (#99 R4-lite) so the timeline doesn't outlive its
         // source.
-        if self.comp_drives_transport && self.active_followers().next().is_none() {
+        if self.comp_drives_transport() && self.active_followers().next().is_none() {
             self.playback.clear();
-            self.comp_drives_transport = false;
+            self.transport_source = None;
+        } else if self
+            .transport_source
+            .is_some_and(|s| !self.followers.contains_key(&s))
+        {
+            // The clock-driving source itself was removed but others remain. The
+            // transport keeps running off `playback.sequence` (an owned clone), as
+            // it did when this was a bare flag — but the id must not dangle, or the
+            // pacing / sizing instruments keyed on it (#100) go silent. Re-point at
+            // a surviving follower.
+            let next = self.active_followers().next().map(|(s, _)| *s);
+            self.transport_source = next;
         }
     }
 
@@ -7397,6 +7634,137 @@ mod tests {
         );
     }
 
+    /// Deliver a frame to an arbitrary source as the worker would, at the live
+    /// epoch — the comp-follower counterpart of `deliver_frame` (which is hardwired
+    /// to `A_SOURCE`).
+    fn deliver_source_frame(
+        app: &mut ExrApp,
+        source: crate::layer::SourceId,
+        path: &std::path::Path,
+        frame: u32,
+    ) {
+        let data = ExrData::load(path).unwrap();
+        app.apply_load_result(LoadResult {
+            source,
+            seq_frame: true,
+            frame,
+            epoch: app.playback.epoch,
+            open_gen: 0,
+            result: Ok(data),
+        });
+    }
+
+    #[test]
+    fn comp_transport_paces_off_the_clock_driving_follower() {
+        // #100 finding E: `note_shown` fired only under `is_primary`, and the A-path
+        // cache-hit call sits *after* `request_sequence_frame`'s comp early return.
+        // So in 1.12.0's default path (open/drop = add a layer → the comp stack owns
+        // the clock) nothing ever recorded a shown frame: `measured_fps` — the HUD's
+        // headline number and the input to the frame-time percentiles — stayed 0.0.
+        let (_dir, paths) = write_sequence(5);
+        let mut app = ExrApp::default();
+        app.add_comp_source(paths[0].clone());
+
+        let source = crate::layer::SourceId(COMP_SOURCE_BASE);
+        assert_eq!(
+            app.transport_source,
+            Some(source),
+            "the added sequence claimed the clock, and by id"
+        );
+        assert_eq!(app.clock_source(), source);
+
+        // Walk the playhead, delivering each follower frame as the worker would.
+        for (i, path) in paths.iter().enumerate().skip(1) {
+            app.playback_step(1);
+            deliver_source_frame(&mut app, source, path, u32::try_from(i).unwrap() + 1);
+        }
+
+        assert!(
+            app.playback.measured_fps > 0.0,
+            "the comp transport is paced, not stuck at 0.0"
+        );
+        assert!(
+            app.playback.frame_time_samples() > 0,
+            "the frame-time ring filled from follower arrivals"
+        );
+        assert!(app.playback.frame_time_pcts().is_some());
+    }
+
+    #[test]
+    fn a_trailing_follower_does_not_pace_the_transport() {
+        // Only the clock source counts as a transport tick — a second layer's frame
+        // arriving late is not a displayed transport frame, and letting it call
+        // `note_shown` would make the frame-time ring report layer count as speed.
+        let (_dir, paths) = write_sequence(5);
+        let mut app = ExrApp::default();
+        app.add_comp_source(paths[0].clone());
+        app.add_comp_source(paths[0].clone());
+
+        let clock = crate::layer::SourceId(COMP_SOURCE_BASE);
+        let trailing = crate::layer::SourceId(COMP_SOURCE_BASE + 1);
+        assert_eq!(
+            app.clock_source(),
+            clock,
+            "the *first* sequence is the clock"
+        );
+
+        app.playback_step(1);
+        deliver_source_frame(&mut app, trailing, &paths[1], 2);
+        deliver_source_frame(&mut app, trailing, &paths[1], 2);
+        assert_eq!(
+            app.playback.frame_time_samples(),
+            0,
+            "a trailing layer's arrivals are not transport ticks"
+        );
+    }
+
+    #[test]
+    fn removing_the_clock_source_repoints_the_transport() {
+        // With the transport identified by id rather than a bare flag, removing the
+        // clock-driving layer while others remain must re-point it — a dangling id
+        // would silently kill pacing and T1 sizing (#100).
+        let (_dir, paths) = write_sequence(5);
+        let mut app = ExrApp::default();
+        app.add_comp_source(paths[0].clone());
+        app.add_comp_source(paths[0].clone());
+
+        let clock = crate::layer::SourceId(COMP_SOURCE_BASE);
+        let other = crate::layer::SourceId(COMP_SOURCE_BASE + 1);
+        assert_eq!(app.clock_source(), clock);
+
+        // Remove the layer backed by the clock source.
+        let id = app
+            .comp_stack
+            .iter()
+            .find(
+                |l| matches!(&l.source, crate::layer::LayerSource::Image { source, .. } if *source == clock),
+            )
+            .map(|l| l.id)
+            .expect("the clock source's layer");
+        app.remove_comp_layer(id);
+
+        assert_eq!(
+            app.transport_source,
+            Some(other),
+            "the clock re-points at a surviving follower"
+        );
+        assert!(app.playback.is_active(), "the transport keeps running");
+    }
+
+    #[test]
+    fn removing_the_last_comp_sequence_releases_the_clock() {
+        let (_dir, paths) = write_sequence(5);
+        let mut app = ExrApp::default();
+        app.add_comp_source(paths[0].clone());
+        assert!(app.comp_drives_transport());
+
+        let id = app.comp_stack.iter().next().map(|l| l.id).unwrap();
+        app.remove_comp_layer(id);
+
+        assert_eq!(app.transport_source, None, "the clock is released");
+        assert!(!app.playback.is_active(), "and the timeline with it");
+    }
+
     #[test]
     fn add_comp_source_still_registers_no_follower() {
         // A lone (unnumbered) file stays a still: no follower, nothing to play.
@@ -7518,7 +7886,7 @@ mod tests {
         app.add_comp_source(paths[0].clone());
         assert!(app.base_layer_id().is_none(), "no plate → no base track");
         assert_eq!(app.comp_stack.len(), 1, "only the comp source");
-        assert!(app.comp_drives_transport);
+        assert!(app.comp_drives_transport());
     }
 
     #[test]
@@ -7537,7 +7905,7 @@ mod tests {
             "the comp stack drives the transport"
         );
         assert_eq!(app.playback.current_frame, 1);
-        assert!(app.comp_drives_transport);
+        assert!(app.comp_drives_transport());
         assert_eq!(app.followers.get(&source).unwrap().current_frame, 1);
         assert!(app.frame_cache.contains(source, 1));
 
