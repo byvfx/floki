@@ -104,8 +104,17 @@ fn worker_count() -> usize {
 
 impl TexUploader {
     /// Spawn the pool. `ctx` is cloned per worker.
+    ///
+    /// `repaint` is the egui context the workers wake when a build lands. Without
+    /// it a finished texture waits for a paint that may never come: during playback
+    /// the transport repaints continuously and hides the problem, but on a settled
+    /// transport — pause, or a scrub release — the app goes idle the moment the
+    /// decode finishes, and the upgraded texture then sits in the channel until the
+    /// user forces a repaint by touching something. That reads as "scrubbing gets
+    /// stuck until I nudge it again", and it is the cost of having made this path
+    /// asynchronous (#202): the synchronous build could never miss its own frame.
     #[must_use]
-    pub fn new(ctx: &TexBuildCtx) -> Self {
+    pub fn new(ctx: &TexBuildCtx, repaint: eframe::egui::Context) -> Self {
         let (jobs_tx, jobs_rx) = channel::<Job>();
         let (done_tx, done_rx) = channel::<Built>();
         let jobs_rx = Arc::new(std::sync::Mutex::new(jobs_rx));
@@ -115,6 +124,7 @@ impl TexUploader {
             let ctx = ctx.clone();
             let jobs_rx = Arc::clone(&jobs_rx);
             let done_tx = done_tx.clone();
+            let repaint = repaint.clone();
             let spawned = std::thread::Builder::new()
                 .name(format!("floki-tex-upload-{i}"))
                 .spawn(move || {
@@ -146,6 +156,9 @@ impl TexUploader {
                         {
                             return; // receiver dropped
                         }
+                        // Wake the UI so `collect_comp_textures` actually runs. The
+                        // result is useless until a paint binds it.
+                        repaint.request_repaint();
                     }
                 });
             if let Err(e) = spawned {

@@ -1153,7 +1153,7 @@ impl ExrApp {
         app.tex_uploader = app
             .gpu_resources
             .as_ref()
-            .map(|g| crate::tex_upload::TexUploader::new(&g.tex_build_ctx()));
+            .map(|g| crate::tex_upload::TexUploader::new(&g.tex_build_ctx(), cc.egui_ctx.clone()));
 
         // `lut_bg` is a GPU handle and can't persist, but `enable_lut`/`lut_path`
         // do. Without rebuilding the bind group here, a restart leaves the LUT
@@ -3511,7 +3511,16 @@ impl ExrApp {
                     // A/B behaviour is unchanged.
                     if res.source == self.clock_source() {
                         if arc.proxy {
-                            self.proxy_bytes.get_or_insert_with(|| arc.approx_bytes());
+                            // **Most recent, not first.** `get_or_insert` latched
+                            // whichever proxy happened to decode first and never
+                            // moved, which was fine while scrub and playback shared
+                            // one `proxy_size`. Since #209 they don't: playback
+                            // derives its target from the viewport while scrubbing
+                            // keeps the knob, so a 256 px scrub proxy could size the
+                            // whole T1 ring for 9 MB playback proxies — measured
+                            // `t1=278/55314`, a cap 34x too large, where eviction by
+                            // count can never fire before RAM runs out.
+                            self.proxy_bytes = Some(arc.approx_bytes());
                         } else if !arc.beauty_only {
                             self.frame_bytes.get_or_insert_with(|| arc.approx_bytes());
                         }
