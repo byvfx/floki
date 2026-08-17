@@ -1981,7 +1981,7 @@ impl ExrApp {
     ///   sampling + AOV switch are correct.
     /// - Otherwise (a plain paused seek) → full.
     fn decode_beauty_only(&self, frame: u32) -> bool {
-        self.decode_beauty_only_at(frame, self.playback.current_frame)
+        self.decode_beauty_only_at(Self::A_SOURCE, frame, self.playback.current_frame)
     }
 
     /// A source's current playhead (#99): the master transport for the primary
@@ -2005,18 +2005,56 @@ impl ExrApp {
         if source == Self::A_SOURCE {
             self.decode_beauty_only(frame)
         } else {
-            self.decode_beauty_only_at(frame, self.source_playhead(source))
+            self.decode_beauty_only_at(source, frame, self.source_playhead(source))
         }
     }
 
+    /// Whether a cheaper decode can even represent what `source` is showing (#213).
+    ///
+    /// Beauty-only (#56) and proxy (#94) decodes both carry **only logical layer
+    /// 0**, so they are safe only when nothing on screen needs another AOV.
+    ///
+    /// This used to ask `viewer.active_layer`, which is right for the classic
+    /// single-image path — there, the viewer's active layer *is* what's displayed —
+    /// and wrong for a comp stack, where every layer carries its own `aov`. A layer
+    /// on AOV 1 with the viewer on 0 passed the gate, got a frame containing only
+    /// layer 0, and then `logical_channels(1)` returned `None` in
+    /// `build_layer_texture`. The build failed silently, `cur_frame` never advanced,
+    /// and the layer froze **permanently** — while `t1`, `last_decode` and every
+    /// other decode-side metric reported perfect health.
+    ///
+    /// Checks *every* layer drawing this source, not just visible ones: a hidden
+    /// layer on a non-zero AOV would otherwise be served cheap frames it can't
+    /// display and appear frozen the moment it was un-hidden.
+    fn cheap_decode_fits_aov(&self, source: crate::layer::SourceId) -> bool {
+        let mut drawn_by_a_layer = false;
+        for l in self.comp_stack.iter() {
+            if let crate::layer::LayerSource::Image { source: s, aov } = &l.source
+                && *s == source
+            {
+                drawn_by_a_layer = true;
+                if *aov != 0 {
+                    return false;
+                }
+            }
+        }
+        // No comp layer draws it: the classic path, where the viewer's active layer
+        // is what's on screen.
+        drawn_by_a_layer || self.viewer.active_layer == 0
+    }
+
     /// The shared "decode something cheaper while the playhead moves" condition for
-    /// beauty (#56) and proxy (#94): the viewer is on the beauty layer (layer 0 —
-    /// the only layer both cheaper decodes carry) AND the frame is playing, being
-    /// dragged, or a precache prefetch (not the settled playhead). The respective
-    /// `beauty_preview` / `proxy_enabled` kill-switches decide *which* cheaper
-    /// decode is used.
-    fn wants_cheap_decode_at(&self, frame: u32, playhead: u32) -> bool {
-        if self.viewer.active_layer != 0 {
+    /// beauty (#56) and proxy (#94): a cheap decode can represent what `source`
+    /// shows AND the frame is playing, being dragged, or a precache prefetch (not
+    /// the settled playhead). The respective `beauty_preview` / `proxy_enabled`
+    /// kill-switches decide *which* cheaper decode is used.
+    fn wants_cheap_decode_at(
+        &self,
+        source: crate::layer::SourceId,
+        frame: u32,
+        playhead: u32,
+    ) -> bool {
+        if !self.cheap_decode_fits_aov(source) {
             return false;
         }
         if self.playback.is_playing() || self.scrub_active {
@@ -2025,8 +2063,13 @@ impl ExrApp {
         self.precache && frame != playhead
     }
 
-    fn decode_beauty_only_at(&self, frame: u32, playhead: u32) -> bool {
-        self.beauty_preview && self.wants_cheap_decode_at(frame, playhead)
+    fn decode_beauty_only_at(
+        &self,
+        source: crate::layer::SourceId,
+        frame: u32,
+        playhead: u32,
+    ) -> bool {
+        self.beauty_preview && self.wants_cheap_decode_at(source, frame, playhead)
     }
 
     /// The proxy resolution *playback* needs for `source` (#209): the number of
@@ -2207,7 +2250,7 @@ impl ExrApp {
         frame: u32,
         playhead: u32,
     ) -> Option<usize> {
-        if !self.proxy_enabled || !self.wants_cheap_decode_at(frame, playhead) {
+        if !self.proxy_enabled || !self.wants_cheap_decode_at(source, frame, playhead) {
             return None;
         }
         if self.scrub_active {
@@ -6421,7 +6464,19 @@ impl ExrApp {
         let built = up.drain();
         for b in built {
             let Some((texture, bind_group)) = b.texture else {
-                continue; // failed build: the slot is already released
+                // A failed build used to be indistinguishable from "nothing to do",
+                // which is how #213 hid: every build failed, the layer froze, and no
+                // metric said so. Evict the frame that couldn't be built so the next
+                // request re-decodes it rather than re-failing on the same cached
+                // bytes forever — the usual cause is a cheap decode that doesn't
+                // carry the AOV this layer needs.
+                log::warn!(
+                    target: "floki::playback",
+                    "texture build failed: s{} f{} aov{} — evicting to force a re-decode",
+                    b.source.0, b.frame, b.aov
+                );
+                self.frame_cache.remove(b.source, b.frame);
+                continue;
             };
             // The layer may have been removed while its build was in flight.
             let swapped = self.comp_sources.get_mut(&b.source).is_some_and(|cs| {
@@ -9756,6 +9811,84 @@ mod tests {
         assert_eq!(app.viewport_proxy_target(s), PlaybackProxy::Unknown);
         app.viewer.scale = f32::NAN;
         assert_eq!(app.viewport_proxy_target(s), PlaybackProxy::Unknown);
+    }
+
+    #[test]
+    fn a_layer_on_a_non_zero_aov_never_takes_a_cheap_decode() {
+        // #213: beauty-only and proxy decodes carry only logical layer 0. The gate
+        // used to ask `viewer.active_layer`, which describes the classic path, not a
+        // comp stack where each layer has its own AOV. A layer on AOV 1 with the
+        // viewer on 0 passed the gate, got a frame without layer 1, and every
+        // texture build then failed silently — the layer froze permanently while
+        // every decode-side metric read healthy.
+        let dir = tempfile::tempdir().unwrap();
+        touch_sequence(dir.path(), 3);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&dir.path().join("s.0001.exr"));
+        app.viewer.active_layer = 0; // the viewer says "beauty" ...
+        app.proxy_enabled = true;
+        app.beauty_preview = true;
+
+        let s = crate::layer::SourceId(2);
+        seed_comp_source(&mut app, s, &dir.path().join("aov.exr"), 4096, 2048);
+        app.viewer.scale = 0.25;
+        let f = app.playback.current_frame;
+        app.playback_toggle(); // playing
+
+        // ... while the layer drawing this source is on AOV 0: cheap is fine.
+        let lid = app
+            .comp_stack
+            .push_image("l", s, 0, crate::layer::Trim::full(1, 3));
+        assert!(
+            app.decode_proxy_target_at_for(s, f, f).is_some(),
+            "AOV 0 ⇒ a proxy can represent what's on screen"
+        );
+        assert!(app.decode_beauty_only_for(s, f), "AOV 0 ⇒ beauty is enough");
+
+        // Move that layer to AOV 1 — now neither cheap decode can carry it.
+        if let Some(l) = app.comp_stack.get_mut(lid)
+            && let crate::layer::LayerSource::Image { aov, .. } = &mut l.source
+        {
+            *aov = 1;
+        }
+        assert_eq!(
+            app.decode_proxy_target_at_for(s, f, f),
+            None,
+            "AOV 1 ⇒ full decode, or the texture build fails and the layer freezes"
+        );
+        assert!(
+            !app.decode_beauty_only_for(s, f),
+            "AOV 1 ⇒ beauty-only would omit the layer this source displays"
+        );
+
+        // The viewer's own active layer is irrelevant to a comp source — it is not
+        // what that layer draws.
+        app.viewer.active_layer = 3;
+        assert_eq!(app.decode_proxy_target_at_for(s, f, f), None);
+    }
+
+    #[test]
+    fn classic_sequences_still_gate_on_the_viewer_layer() {
+        // The fallback matters: with no comp layer drawing a source, the viewer's
+        // active layer *is* what's displayed, and that path must keep its cheap
+        // decodes. Collapsing the two would silently disable the proxy for every
+        // plain sequence.
+        let dir = tempfile::tempdir().unwrap();
+        touch_sequence(dir.path(), 3);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&dir.path().join("s.0001.exr"));
+        app.proxy_enabled = true;
+        app.beauty_preview = true;
+        let f = app.playback.current_frame;
+        app.playback_toggle();
+
+        app.viewer.active_layer = 0;
+        assert!(app.decode_beauty_only(f), "beauty layer ⇒ cheap decode");
+        app.viewer.active_layer = 2;
+        assert!(
+            !app.decode_beauty_only(f),
+            "non-beauty layer ⇒ full, as before"
+        );
     }
 
     #[test]
