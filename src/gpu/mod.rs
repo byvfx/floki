@@ -7,7 +7,7 @@ pub mod ocio_pass;
 pub mod resources;
 pub mod thumbnail;
 
-pub use resources::GpuResources;
+pub use resources::{GpuResources, TexBuildCtx};
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
