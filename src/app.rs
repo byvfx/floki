@@ -1822,6 +1822,18 @@ impl ExrApp {
             if let Some(st) = self.followers.get_mut(&source) {
                 st.current_frame = sf;
             }
+            // A hidden layer keeps tracking the playhead but asks for nothing
+            // (#211): un-hiding then lands on the right frame and re-warms like any
+            // seek, instead of resuming from wherever it was when it went dark.
+            // Requesting is what costs — decode turns, ring slots, eviction
+            // protection — and none of that should be spent on pixels nobody sees.
+            if !self.source_is_visible(source) {
+                if let Some(st) = self.followers.get_mut(&source) {
+                    st.pending = None;
+                    st.loading = false;
+                }
+                continue;
+            }
             // Pacing is *not* recorded here. Residency at advance time says the
             // pixels are available, not that they were painted — and through the
             // runs where the picture was actually frozen this fired for frames that
@@ -1894,7 +1906,24 @@ impl ExrApp {
     /// clock. Every per-frame transport instrument keys off this rather than
     /// `A_SOURCE` directly, so it keeps working in both worlds (#100).
     fn clock_source(&self) -> crate::layer::SourceId {
-        self.transport_source.unwrap_or(Self::A_SOURCE)
+        let claimed = self.transport_source.unwrap_or(Self::A_SOURCE);
+        // A hidden layer must not drive the clock (#211). Pacing is recorded only
+        // for the clock source, and a hidden source never paints — so with one
+        // holding the clock, `fps=` reads 0.0 through a run that is playing
+        // perfectly, and every pacing percentile goes with it. Observed live:
+        // `settled=[s2:-SOFT, s3:-SOFT, s4:1045full] fps=0.0/24`, where s2 held the
+        // clock while hidden and s4 was the one actually on screen.
+        if self.source_is_visible(claimed) {
+            return claimed;
+        }
+        // Fall back to the lowest-numbered visible sequence follower — id order, so
+        // the choice is stable frame to frame rather than HashMap-random.
+        self.followers
+            .iter()
+            .filter(|(id, s)| s.sequence.is_some() && self.source_is_visible(**id))
+            .map(|(id, _)| *id)
+            .min()
+            .unwrap_or(claimed)
     }
 
     /// Whether the transport is still waiting on the frame it means to display —
@@ -1941,7 +1970,42 @@ impl ExrApp {
     /// generalization of "B is playing"). A lone-image / absent follower holds a
     /// default `SourceState` and is skipped.
     fn active_followers(&self) -> impl Iterator<Item = (&crate::layer::SourceId, &SourceState)> {
-        self.followers.iter().filter(|(_, s)| s.sequence.is_some())
+        self.followers
+            .iter()
+            .filter(|(id, s)| s.sequence.is_some() && self.source_is_visible(**id))
+    }
+
+    /// Whether any **visible** comp layer draws `source` (#211).
+    ///
+    /// Hiding a layer used to stop it rendering but not working: it kept decoding,
+    /// kept taking decode turns, kept dividing the T1 budget and the prefetch
+    /// window, and kept its frames protected from eviction. Hiding a layer is the
+    /// first thing a user reaches for when playback is slow, and it did nothing for
+    /// throughput — the pool was still split N ways.
+    ///
+    /// Routed through [`crate::layer::LayerStack::visible`] rather than checking
+    /// `enabled` directly, so solo is handled by the same rule the compositor
+    /// renders by: with anything soloed, every non-soloed layer is invisible and
+    /// should stop working too.
+    ///
+    /// A source no comp layer references at all counts as visible — that is the
+    /// classic slot-A path, which has no layer to consult.
+    fn source_is_visible(&self, source: crate::layer::SourceId) -> bool {
+        let mut referenced = false;
+        for l in self.comp_stack.iter() {
+            if let crate::layer::LayerSource::Image { source: s, .. } = &l.source
+                && *s == source
+            {
+                referenced = true;
+                break;
+            }
+        }
+        if !referenced {
+            return true;
+        }
+        self.comp_stack.visible().any(|l| {
+            matches!(&l.source, crate::layer::LayerSource::Image { source: s, .. } if *s == source)
+        })
     }
 
     /// Resident source count for the per-source budget splits (#99): the primary
@@ -4175,6 +4239,14 @@ impl ExrApp {
             .active_followers()
             .filter(|(id, _)| self.comp_sources.get(id).is_some_and(|cs| !cs.cur_full))
             .count();
+        // Sequence layers deliberately excluded from every budget and metric above
+        // because they're hidden (#211). Reported so "why is nsrc 1 when I have 3
+        // layers" has an answer in the log rather than looking like a bug.
+        let hidden = self
+            .followers
+            .iter()
+            .filter(|(id, s)| s.sequence.is_some() && !self.source_is_visible(**id))
+            .count();
         // `-1` for "no data", not `0`. `frame_time_pcts` deliberately returns `None`
         // until an interval exists, and zeroing that in a stable `key=value` line
         // reads as a perfect 0 ms frame time — the opposite of what it means. It
@@ -4216,7 +4288,7 @@ impl ExrApp {
             "evt={evt} state={state:?} frame={frame} epoch={epoch} pacing={pacing:?} \
              loop={loop_mode:?} dir={dir:?} in={in_pt} out={out_pt} \
              pending={pending} loading_a={loading_a} inflight={inflight:?} \
-             clock=s{clock_id} followers=[{followers}] nsrc={nsrc} stale={stale} soft={soft} \
+             clock=s{clock_id} followers=[{followers}] nsrc={nsrc} stale={stale} soft={soft} hidden={hidden} \
              texb_n={texb_n} texb_tot={texb_tot:.1} texb_alloc={texb_alloc:.1} \
              texb_pack={texb_pack:.1} texb_write={texb_write:.1} texb_bind={texb_bind:.1} \
              texb_max={texb_max:.1} texb_mb={texb_mb:.1} texq={texq} \
@@ -4245,6 +4317,7 @@ impl ExrApp {
             nsrc = self.n_active_sources(),
             stale = stale,
             soft = soft,
+            hidden = hidden,
             worker = if self.load_rx.is_some() { "alive" } else { "dead" },
             submit_age = age(self.decode_submit_at.map(|t| now.duration_since(t))),
             last_decode = age(self.last_decode_dur),
@@ -9943,6 +10016,158 @@ mod tests {
         assert_eq!(app.viewport_proxy_target(s), PlaybackProxy::Unknown);
         app.viewer.scale = f32::NAN;
         assert_eq!(app.viewport_proxy_target(s), PlaybackProxy::Unknown);
+    }
+
+    #[test]
+    fn hiding_a_layer_stops_it_consuming_the_transport() {
+        // #211: hiding a layer stopped it *rendering* but not *working* — it kept
+        // dividing the T1 budget and prefetch window, kept taking decode turns, and
+        // kept eviction protection. Hiding a layer is the first thing a user reaches
+        // for when playback is slow, and it did nothing for throughput.
+        let (_dir, paths) = write_sequence(5);
+        let mut app = ExrApp::default();
+        app.add_comp_source(paths[0].clone());
+        app.add_comp_source(paths[0].clone());
+        let a = crate::layer::SourceId(COMP_SOURCE_BASE);
+        let b = crate::layer::SourceId(COMP_SOURCE_BASE + 1);
+
+        assert_eq!(app.active_followers().count(), 2, "both visible to start");
+        assert_eq!(app.n_active_sources(), 2, "budget split two ways");
+
+        // Hide the *second* layer (the one that isn't driving the clock).
+        let hidden_layer = app
+            .comp_stack
+            .iter()
+            .find(|l| matches!(&l.source, crate::layer::LayerSource::Image { source, .. } if *source == b))
+            .map(|l| l.id)
+            .expect("layer for source b");
+        if let Some(l) = app.comp_stack.get_mut(hidden_layer) {
+            l.enabled = false;
+        }
+
+        assert!(!app.source_is_visible(b), "hidden");
+        assert!(app.source_is_visible(a), "still visible");
+        assert_eq!(
+            app.active_followers().count(),
+            1,
+            "a hidden layer is not an active source"
+        );
+        assert_eq!(
+            app.n_active_sources(),
+            1,
+            "hiding a layer must actually give the rest of the stack its budget back"
+        );
+        assert!(
+            !app.cache_playheads().iter().any(|(s, _)| *s == b),
+            "a hidden layer's frames lose eviction protection"
+        );
+
+        // It keeps tracking the playhead — so un-hiding lands on the right frame —
+        // but asks for nothing while dark.
+        app.playback.current_frame = 3;
+        app.sync_comp_followers();
+        assert_eq!(
+            app.followers.get(&b).map(|st| st.current_frame),
+            Some(3),
+            "hidden layers still follow the playhead"
+        );
+        assert_eq!(
+            app.followers.get(&b).and_then(|st| st.pending),
+            None,
+            "but request nothing while hidden"
+        );
+
+        // Un-hiding restores it.
+        if let Some(l) = app.comp_stack.get_mut(hidden_layer) {
+            l.enabled = true;
+        }
+        assert_eq!(
+            app.active_followers().count(),
+            2,
+            "un-hidden is active again"
+        );
+    }
+
+    #[test]
+    fn solo_hides_the_others_for_the_transport_too() {
+        // Visibility goes through `LayerStack::visible`, so solo uses the same rule
+        // the compositor renders by: with anything soloed, non-soloed layers are
+        // invisible and must stop consuming decode budget as well.
+        let (_dir, paths) = write_sequence(5);
+        let mut app = ExrApp::default();
+        app.add_comp_source(paths[0].clone());
+        app.add_comp_source(paths[0].clone());
+        let a = crate::layer::SourceId(COMP_SOURCE_BASE);
+        let b = crate::layer::SourceId(COMP_SOURCE_BASE + 1);
+
+        let solo_layer = app
+            .comp_stack
+            .iter()
+            .find(|l| matches!(&l.source, crate::layer::LayerSource::Image { source, .. } if *source == b))
+            .map(|l| l.id)
+            .expect("layer for source b");
+        if let Some(l) = app.comp_stack.get_mut(solo_layer) {
+            l.solo = true;
+        }
+
+        assert!(app.source_is_visible(b), "soloed layer is visible");
+        assert!(!app.source_is_visible(a), "everything else is not");
+        assert_eq!(app.n_active_sources(), 1);
+    }
+
+    #[test]
+    fn the_clock_never_sits_on_a_hidden_layer() {
+        // Pacing is recorded only for the clock source, and a hidden source never
+        // paints — so a hidden layer holding the clock makes `fps=` read 0.0 through
+        // a run that is playing perfectly. Observed live as
+        // `settled=[s2:-SOFT, s3:-SOFT, s4:1045full] fps=0.0/24`.
+        let (_dir, paths) = write_sequence(5);
+        let mut app = ExrApp::default();
+        app.add_comp_source(paths[0].clone());
+        app.add_comp_source(paths[0].clone());
+        let a = crate::layer::SourceId(COMP_SOURCE_BASE);
+        let b = crate::layer::SourceId(COMP_SOURCE_BASE + 1);
+
+        // The first sequence claimed the transport.
+        assert_eq!(app.clock_source(), a);
+
+        let clock_layer = app
+            .comp_stack
+            .iter()
+            .find(|l| matches!(&l.source, crate::layer::LayerSource::Image { source, .. } if *source == a))
+            .map(|l| l.id)
+            .expect("layer for source a");
+        if let Some(l) = app.comp_stack.get_mut(clock_layer) {
+            l.enabled = false;
+        }
+
+        assert_eq!(
+            app.clock_source(),
+            b,
+            "the clock moves to a layer that can actually paint"
+        );
+
+        // With everything hidden there is nothing better — keep the claim rather
+        // than inventing a source, so the transport stays coherent.
+        for l in [clock_layer] {
+            if let Some(l) = app.comp_stack.get_mut(l) {
+                l.enabled = false;
+            }
+        }
+        let other = app
+            .comp_stack
+            .iter()
+            .find(|l| matches!(&l.source, crate::layer::LayerSource::Image { source, .. } if *source == b))
+            .map(|l| l.id)
+            .expect("layer for source b");
+        if let Some(l) = app.comp_stack.get_mut(other) {
+            l.enabled = false;
+        }
+        assert_eq!(
+            app.clock_source(),
+            a,
+            "all hidden ⇒ keep the original claim"
+        );
     }
 
     #[test]
