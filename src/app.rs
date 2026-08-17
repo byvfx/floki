@@ -2045,10 +2045,16 @@ impl ExrApp {
     /// tradeoff to get wrong: at fit-to-window it is visually lossless and still
     /// ~9× cheaper than full res on 4.6K footage.
     ///
-    /// **Sized from `exr_data`, never from `cs.size`.** `cs.size` tracks the
-    /// currently *bound texture*, which during playback is the proxy — feeding that
-    /// back in would shrink the target every frame until it collapsed. `exr_data`
-    /// holds the originally opened full-resolution frame and does not move.
+    /// **Sized from `exr_data`, deliberately not from `cs.size`.** Today `cs.size`
+    /// would also work: it comes from `logical_size`, which returns the proxy's
+    /// recorded `display_size` — the *full-res* display window — so it does not
+    /// shrink when a proxy texture is bound. But that is a property of how proxies
+    /// carry geometry, not of what `cs.size` means, and anything that ever set it
+    /// from real buffer dimensions would create a feedback loop: a smaller bound
+    /// texture asking for a smaller next target, every frame, until the picture
+    /// collapsed to the floor. `exr_data` is the full-resolution frame by
+    /// construction and cannot express that bug, so the target is derived from it
+    /// and a test pins the invariant.
     ///
     /// `None` means **decode full, no proxy at all** — either because the view
     /// needs every source pixel (zoomed to 1:1 or past it), or because there is no
@@ -9702,12 +9708,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut app = ExrApp::default();
         let s = crate::layer::SourceId(2);
-        seed_comp_source(&mut app, s, &dir.path().join("v.exr"), 4096, 2048);
+        seed_comp_source(&mut app, s, &dir.path().join("v.exr"), 1024, 512);
 
         app.viewer.scale = 0.25;
         assert_eq!(
             app.viewport_proxy_target(s),
-            PlaybackProxy::Px(1024),
+            PlaybackProxy::Px(256),
             "fit-to-window"
         );
 
@@ -9716,8 +9722,8 @@ mod tests {
         app.viewer.scale = 0.5;
         assert_eq!(
             app.viewport_proxy_target(s),
-            PlaybackProxy::Px(2048),
-            "2× zoom ⇒ 2× detail"
+            PlaybackProxy::Px(512),
+            "2x zoom => 2x detail"
         );
 
         // At (or past) 1:1 the proxy path switches OFF rather than asking for a
@@ -9766,18 +9772,18 @@ mod tests {
         app.proxy_enabled = true;
 
         let s = crate::layer::SourceId(2);
-        seed_comp_source(&mut app, s, &dir.path().join("l.exr"), 4096, 2048);
+        seed_comp_source(&mut app, s, &dir.path().join("l.exr"), 1024, 512);
         app.viewer.scale = 0.25;
         let f = app.playback.current_frame;
 
         app.playback_toggle(); // play → latch 1024
-        assert_eq!(app.decode_proxy_target_at_for(s, f, f), Some(1024));
+        assert_eq!(app.decode_proxy_target_at_for(s, f, f), Some(256));
 
         // Zooming mid-run does NOT move the target — that is the whole point.
         app.viewer.scale = 1.0;
         assert_eq!(
             app.decode_proxy_target_at_for(s, f, f),
-            Some(1024),
+            Some(256),
             "target is held for the run even though the view changed"
         );
 
@@ -9817,7 +9823,7 @@ mod tests {
         app.proxy_enabled = true;
 
         let s = crate::layer::SourceId(2);
-        seed_comp_source(&mut app, s, &dir.path().join("r.exr"), 4096, 2048);
+        seed_comp_source(&mut app, s, &dir.path().join("r.exr"), 1024, 512);
         app.viewer.scale = 0.25;
 
         app.playback_toggle(); // latch 1024
@@ -9886,8 +9892,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut app = ExrApp::default();
         let s = crate::layer::SourceId(2);
-        let long = 4608;
-        seed_comp_source(&mut app, s, &dir.path().join("sweep.exr"), long, 3164);
+        let long = 1024;
+        seed_comp_source(&mut app, s, &dir.path().join("sweep.exr"), long, 704);
 
         for step in 1..=400 {
             let scale = f64::from(step) * 0.0025; // 0.0025 ..= 1.0
@@ -9907,19 +9913,20 @@ mod tests {
 
     #[test]
     fn viewport_proxy_target_sizes_from_the_source_not_the_bound_texture() {
-        // #209 regression guard. `cs.size` follows the *currently bound texture*,
-        // which during playback is the proxy. Sizing the next proxy from it would
-        // feed back on itself — each frame smaller than the last until the picture
-        // collapsed to `MIN_PROXY_PX`. The target must come from `exr_data`, which
-        // holds the full-resolution frame and does not move.
+        // #209 invariant guard. `cs.size` happens to be safe today — it comes from
+        // `logical_size`, which returns a proxy's recorded full-res `display_size`
+        // — but the target must not depend on that staying true. Anything that set
+        // `cs.size` from real buffer dimensions would feed back on itself: each
+        // frame smaller than the last until the picture collapsed to the floor.
+        // This pins that the target ignores `cs.size` entirely.
         let dir = tempfile::tempdir().unwrap();
         let mut app = ExrApp::default();
         let s = crate::layer::SourceId(2);
-        seed_comp_source(&mut app, s, &dir.path().join("fb.exr"), 4096, 2048);
+        seed_comp_source(&mut app, s, &dir.path().join("fb.exr"), 1024, 512);
         app.viewer.scale = 0.25;
 
         let first = app.viewport_proxy_target(s);
-        assert_eq!(first, PlaybackProxy::Px(1024));
+        assert_eq!(first, PlaybackProxy::Px(256));
 
         // Simulate a proxy texture having been bound, as `ensure_comp_frame` does.
         if let Some(cs) = app.comp_sources.get_mut(&s) {
@@ -9946,25 +9953,27 @@ mod tests {
         app.detect_sequence(&seq);
         app.viewer.active_layer = 0;
         app.proxy_enabled = true;
-        app.proxy_size = 256;
+        // Deliberately *not* the value the viewport derives (256 at this size and
+        // zoom), or the assertions below could not tell the two paths apart.
+        app.proxy_size = 512;
 
         let s = crate::layer::SourceId(2);
-        seed_comp_source(&mut app, s, &dir.path().join("p.exr"), 4096, 2048);
+        seed_comp_source(&mut app, s, &dir.path().join("p.exr"), 1024, 512);
         app.viewer.scale = 0.25;
         let f = app.playback.current_frame;
 
         app.playback_toggle(); // playing
         assert_eq!(
             app.decode_proxy_target_at_for(s, f, f),
-            Some(1024),
+            Some(256),
             "playback derives from the viewport, ignoring the scrub knob"
         );
 
         app.scrub_active = true;
         assert_eq!(
             app.decode_proxy_target_at_for(s, f, f),
-            Some(256),
-            "scrubbing keeps the aggressive fixed target"
+            Some(512),
+            "scrubbing keeps the fixed knob, whatever it is set to"
         );
         app.scrub_active = false;
 
