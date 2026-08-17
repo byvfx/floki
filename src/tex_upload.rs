@@ -56,6 +56,10 @@ pub struct Built {
     pub frame: u32,
     pub aov: usize,
     pub size: (usize, usize),
+    /// Whether the source frame was a **full** decode rather than a proxy or
+    /// beauty-only one (#212). Read off the decoded data here rather than passed
+    /// in, so it can never disagree with the pixels actually uploaded.
+    pub full: bool,
     /// `None` if the build failed (AOV out of range, or the upload was rejected).
     /// Still delivered, so the in-flight slot is released rather than wedging the
     /// source forever.
@@ -100,8 +104,17 @@ fn worker_count() -> usize {
 
 impl TexUploader {
     /// Spawn the pool. `ctx` is cloned per worker.
+    ///
+    /// `repaint` is the egui context the workers wake when a build lands. Without
+    /// it a finished texture waits for a paint that may never come: during playback
+    /// the transport repaints continuously and hides the problem, but on a settled
+    /// transport — pause, or a scrub release — the app goes idle the moment the
+    /// decode finishes, and the upgraded texture then sits in the channel until the
+    /// user forces a repaint by touching something. That reads as "scrubbing gets
+    /// stuck until I nudge it again", and it is the cost of having made this path
+    /// asynchronous (#202): the synchronous build could never miss its own frame.
     #[must_use]
-    pub fn new(ctx: &TexBuildCtx) -> Self {
+    pub fn new(ctx: &TexBuildCtx, repaint: eframe::egui::Context) -> Self {
         let (jobs_tx, jobs_rx) = channel::<Job>();
         let (done_tx, done_rx) = channel::<Built>();
         let jobs_rx = Arc::new(std::sync::Mutex::new(jobs_rx));
@@ -111,6 +124,7 @@ impl TexUploader {
             let ctx = ctx.clone();
             let jobs_rx = Arc::clone(&jobs_rx);
             let done_tx = done_tx.clone();
+            let repaint = repaint.clone();
             let spawned = std::thread::Builder::new()
                 .name(format!("floki-tex-upload-{i}"))
                 .spawn(move || {
@@ -128,18 +142,23 @@ impl TexUploader {
                             &ctx, &job.data, job.aov,
                         );
                         let size = job.data.logical_size(job.aov).unwrap_or((0, 0));
+                        let full = !job.data.proxy && !job.data.beauty_only;
                         if done_tx
                             .send(Built {
                                 source: job.source,
                                 frame: job.frame,
                                 aov: job.aov,
                                 size,
+                                full,
                                 texture: built,
                             })
                             .is_err()
                         {
                             return; // receiver dropped
                         }
+                        // Wake the UI so `collect_comp_textures` actually runs. The
+                        // result is useless until a paint binds it.
+                        repaint.request_repaint();
                     }
                 });
             if let Err(e) = spawned {

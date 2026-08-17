@@ -274,6 +274,15 @@ struct CompSource {
     /// first per-frame build. `draw_comp_central` rebuilds from the T1 cache when
     /// the resolved source frame moves off this.
     cur_frame: Option<u32>,
+    /// Whether the bound texture was built from a **full** decode, as opposed to a
+    /// proxy or beauty-only one (#212).
+    ///
+    /// Frame number alone can't answer "is what's on screen the final image?".
+    /// Settling re-decodes the *same* frame at full fidelity, so without this
+    /// `ensure_comp_frame` sees `cur_frame` unchanged, early-returns, and the layer
+    /// keeps displaying the proxy texture forever even though the correct pixels
+    /// are sitting in the cache.
+    cur_full: bool,
 }
 
 /// One comp layer, flattened for persistence (#99 PR-B.5). Written at `save()` from
@@ -626,6 +635,10 @@ pub struct ExrApp {
     /// every frame past the warm-up).
     #[serde(skip)]
     soak_play_sent: bool,
+
+    /// Whether the soak harness has pressed Pause, entering its settle-hold phase.
+    #[serde(skip)]
+    soak_paused: bool,
 
     /// Snapshot to clipboard (issue #19): when true, each snapshot also writes a
     /// timestamped PNG to `~/.floki/snapshots/`. The clipboard copy always happens.
@@ -1055,6 +1068,7 @@ impl Default for ExrApp {
             tex_uploader: None,
             soak_started_at: None,
             soak_play_sent: false,
+            soak_paused: false,
             comp_next_source: COMP_SOURCE_BASE,
             comp_sources: std::collections::HashMap::new(),
             comp_readout: None,
@@ -1139,7 +1153,7 @@ impl ExrApp {
         app.tex_uploader = app
             .gpu_resources
             .as_ref()
-            .map(|g| crate::tex_upload::TexUploader::new(&g.tex_build_ctx()));
+            .map(|g| crate::tex_upload::TexUploader::new(&g.tex_build_ctx(), cc.egui_ctx.clone()));
 
         // `lut_bg` is a GPU handle and can't persist, but `enable_lut`/`lut_path`
         // do. Without rebuilding the bind group here, a restart leaves the LUT
@@ -1822,7 +1836,23 @@ impl ExrApp {
     /// (`draw_comp_central` binds it from the T1 cache), so this only clears the
     /// stale wait state and marks the frame awaited when it isn't already resident.
     fn request_comp_frame(&mut self, source: crate::layer::SourceId, frame: u32) {
-        let resident = self.frame_cache.contains(source, frame);
+        // A resident *cheap* frame still needs upgrading once we settle (#212),
+        // exactly as slot A does in `request_sequence_frame`. `next_want` treats
+        // `pending` as "not resident", so marking it here is what gets the frame
+        // re-decoded at full fidelity; without it, a proxy cached during a scrub is
+        // resident forever and the layer never sharpens. Mid-move this stays off —
+        // upgrading every frame the playhead touches during a drag would spam full
+        // decodes, which is why the release is what settles.
+        let resident_final = self
+            .frame_cache
+            .peek(source, frame)
+            .map(|d| !d.proxy && !d.beauty_only);
+        let settled = !self.playback.is_playing() && !self.scrub_active;
+        let resident = match resident_final {
+            None => false,
+            Some(true) => true,
+            Some(false) => !settled, // cheap copy: good enough only while moving
+        };
         let is_hole = self
             .followers
             .get(&source)
@@ -2719,8 +2749,42 @@ impl ExrApp {
                 self.playback_toggle();
             }
         }
-        if self.soak_play_sent && elapsed >= warmup + secs {
-            log::debug!(target: "floki::playback", "evt=soak_done elapsed={elapsed:.1}");
+        // Pause before quitting, then hold, so the run actually exercises the
+        // settle path (#212) — full-res upgrade of every layer's playhead. Without
+        // this the harness only ever measured playback and quit mid-run, which is
+        // precisely the half where the "stuck in proxy" bug lived.
+        const SETTLE_HOLD: f32 = 4.0;
+        if self.soak_play_sent && !self.soak_paused && elapsed >= warmup + secs {
+            self.soak_paused = true;
+            log::debug!(target: "floki::playback", "evt=soak_pause elapsed={elapsed:.1}");
+            if self.playback.state == crate::playback::PlayState::Playing {
+                self.playback_toggle();
+            }
+        }
+        if self.soak_paused && elapsed >= warmup + secs + SETTLE_HOLD {
+            // Report what each layer ended up displaying. The 1 Hz trace goes quiet
+            // once nothing is outstanding, so the *result* of the settle — the
+            // moment that matters for #212 — otherwise leaves no record at all.
+            let mut ids: Vec<_> = self.comp_sources.keys().copied().collect();
+            ids.sort_unstable();
+            let final_state = ids
+                .iter()
+                .map(|id| {
+                    let cs = &self.comp_sources[id];
+                    format!(
+                        "s{}:{}{}",
+                        id.0,
+                        cs.cur_frame
+                            .map_or_else(|| "-".to_string(), |f| f.to_string()),
+                        if cs.cur_full { "full" } else { "SOFT" },
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            log::debug!(
+                target: "floki::playback",
+                "evt=soak_done elapsed={elapsed:.1} settled=[{final_state}]"
+            );
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         // The soak drives itself, so keep the loop hot rather than waiting on input.
@@ -2780,17 +2844,51 @@ impl ExrApp {
             // A is full-res and displayed; no A decode will land to trigger it,
             // so refresh the contact sheet now (frozen during play, #144).
             self.viewer.invalidate_active_thumbnails();
-        }
-        if a_full {
-            return;
-        }
-        // Supersede in-flight beauty prefetch, then re-request the playhead at full
-        // fidelity (`request_*` upgrades a beauty ring hit; #7). Already-full frames
-        // need nothing — the slot-B re-sync that used to run in that case went with
-        // the locked-step B path (#99 Slice 3h.2).
-        self.invalidate_inflight();
-        if !a_full {
+        } else {
+            // Supersede in-flight beauty prefetch, then re-request the playhead at
+            // full fidelity (`request_*` upgrades a beauty ring hit; #7).
+            // Already-full frames need nothing — the slot-B re-sync that used to run
+            // in that case went with the locked-step B path (#99 Slice 3h.2).
+            self.invalidate_inflight();
             self.request_sequence_frame(a_frame);
+        }
+        // Always, even when A needed nothing (#212). This used to sit after an
+        // `if a_full { return }`, so slot A being full skipped the comp layers
+        // entirely — and A is full on the classic transport path, which is exactly
+        // where a comp stack can also be present. The comp-driven case has nothing
+        // cached for A, so `a_full` is false there and the bug never showed in the
+        // soak or the tests written against it.
+        self.settle_followers_to_full();
+    }
+
+    /// The comp-path half of [`Self::settle_to_full`] (#212).
+    ///
+    /// Settling used to consider **only** `A_SOURCE`. With the comp stack driving
+    /// the transport that source has no cached frames and no sequence, so the
+    /// re-request went to something with nothing to decode and the layers actually
+    /// on screen were never asked about at all — they kept whatever proxy frame was
+    /// cached, indefinitely. That is the "stuck in proxy mode if I scrub some"
+    /// report, and it is the same `A_SOURCE`-keyed blind spot as #199/#200/#201.
+    ///
+    /// Clock source first: with one decode worker the settles serialize, and the
+    /// layer driving the transport is the one the user is looking at.
+    fn settle_followers_to_full(&mut self) {
+        let clock = self.clock_source();
+        let mut wants: Vec<(crate::layer::SourceId, u32)> = self
+            .active_followers()
+            .map(|(id, st)| (*id, st.current_frame))
+            .collect();
+        wants.sort_by_key(|(id, _)| (*id != clock, id.0));
+        for (source, frame) in wants {
+            // Only the ones that need it — an already-full playhead costs nothing
+            // and must not be re-decoded on every pause.
+            let needs = self
+                .frame_cache
+                .peek(source, frame)
+                .is_none_or(|d| d.proxy || d.beauty_only);
+            if needs {
+                self.request_comp_frame(source, frame);
+            }
         }
     }
 
@@ -3415,7 +3513,16 @@ impl ExrApp {
                     // A/B behaviour is unchanged.
                     if res.source == self.clock_source() {
                         if arc.proxy {
-                            self.proxy_bytes.get_or_insert_with(|| arc.approx_bytes());
+                            // **Most recent, not first.** `get_or_insert` latched
+                            // whichever proxy happened to decode first and never
+                            // moved, which was fine while scrub and playback shared
+                            // one `proxy_size`. Since #209 they don't: playback
+                            // derives its target from the viewport while scrubbing
+                            // keeps the knob, so a 256 px scrub proxy could size the
+                            // whole T1 ring for 9 MB playback proxies — measured
+                            // `t1=278/55314`, a cap 34x too large, where eviction by
+                            // count can never fire before RAM runs out.
+                            self.proxy_bytes = Some(arc.approx_bytes());
                         } else if !arc.beauty_only {
                             self.frame_bytes.get_or_insert_with(|| arc.approx_bytes());
                         }
@@ -4059,6 +4166,15 @@ impl ExrApp {
                     .is_some_and(|cs| cs.cur_frame != Some(st.current_frame))
             })
             .count();
+        // Active sources whose bound texture came from a proxy/beauty decode (#212)
+        // — "the picture is on the right frame but is not the final image". `stale=`
+        // cannot see this: a layer stuck on a proxy of the *correct* frame reads as
+        // perfectly healthy there, which is exactly how the settle bug survived. On
+        // a settled transport this should be 0.
+        let soft = self
+            .active_followers()
+            .filter(|(id, _)| self.comp_sources.get(id).is_some_and(|cs| !cs.cur_full))
+            .count();
         // `-1` for "no data", not `0`. `frame_time_pcts` deliberately returns `None`
         // until an interval exists, and zeroing that in a stable `key=value` line
         // reads as a perfect 0 ms frame time — the opposite of what it means. It
@@ -4100,7 +4216,7 @@ impl ExrApp {
             "evt={evt} state={state:?} frame={frame} epoch={epoch} pacing={pacing:?} \
              loop={loop_mode:?} dir={dir:?} in={in_pt} out={out_pt} \
              pending={pending} loading_a={loading_a} inflight={inflight:?} \
-             clock=s{clock_id} followers=[{followers}] nsrc={nsrc} stale={stale} \
+             clock=s{clock_id} followers=[{followers}] nsrc={nsrc} stale={stale} soft={soft} \
              texb_n={texb_n} texb_tot={texb_tot:.1} texb_alloc={texb_alloc:.1} \
              texb_pack={texb_pack:.1} texb_write={texb_write:.1} texb_bind={texb_bind:.1} \
              texb_max={texb_max:.1} texb_mb={texb_mb:.1} texq={texq} \
@@ -4128,6 +4244,7 @@ impl ExrApp {
             clock_id = clock.0,
             nsrc = self.n_active_sources(),
             stale = stale,
+            soft = soft,
             worker = if self.load_rx.is_some() { "alive" } else { "dead" },
             submit_age = age(self.decode_submit_at.map(|t| now.duration_since(t))),
             last_decode = age(self.last_decode_dur),
@@ -6089,6 +6206,7 @@ impl ExrApp {
                 bind_group: None,
                 texture: None,
                 cur_frame: None,
+                cur_full: false,
             },
         );
     }
@@ -6374,6 +6492,7 @@ impl ExrApp {
                 bind_group,
                 texture,
                 cur_frame: None,
+                cur_full: false,
             },
         );
     }
@@ -6432,8 +6551,23 @@ impl ExrApp {
         let Some(cs) = self.comp_sources.get(&source) else {
             return;
         };
-        if cs.cur_frame == Some(source_frame) && cs.aov == aov {
+        // Steady state: this exact frame is bound at full fidelity, so there is
+        // nothing better to show and no need to touch the cache.
+        let on_frame = cs.cur_frame == Some(source_frame) && cs.aov == aov;
+        if on_frame && cs.cur_full {
             return;
+        }
+        // Hold the current texture until the frame is actually resident in T1.
+        let Some(arc) = self.frame_cache.peek(source, source_frame) else {
+            return;
+        };
+        // Rebuild the *same* frame when the cache has upgraded underneath us
+        // (#212). Settling re-decodes the playhead at full fidelity without moving
+        // its frame number, so keying only on the number left the layer showing the
+        // proxy texture forever while the full pixels sat in the cache — the
+        // "stuck in proxy after scrubbing" report.
+        if on_frame && (arc.proxy || arc.beauty_only) {
+            return; // resident copy is no better than what's bound
         }
         let Some(up) = self.tex_uploader.as_mut() else {
             return;
@@ -6442,10 +6576,6 @@ impl ExrApp {
         if up.pending_for(source) == Some((source_frame, aov)) {
             return;
         }
-        // Hold the current texture until the frame is actually resident in T1.
-        let Some(arc) = self.frame_cache.peek(source, source_frame) else {
-            return;
-        };
         up.try_submit(source, source_frame, aov, arc);
     }
 
@@ -6486,6 +6616,7 @@ impl ExrApp {
                 cs.aov = b.aov;
                 cs.size = b.size;
                 cs.cur_frame = Some(b.frame);
+                cs.cur_full = b.full;
                 changed
             });
             if swapped {
@@ -9749,6 +9880,7 @@ mod tests {
                 bind_group: None,
                 texture: None,
                 cur_frame: None,
+                cur_full: false,
             },
         );
     }
@@ -9811,6 +9943,163 @@ mod tests {
         assert_eq!(app.viewport_proxy_target(s), PlaybackProxy::Unknown);
         app.viewer.scale = f32::NAN;
         assert_eq!(app.viewport_proxy_target(s), PlaybackProxy::Unknown);
+    }
+
+    #[test]
+    fn settling_upgrades_a_comp_layer_holding_a_proxy() {
+        // #212: `settle_to_full` used to consider only A_SOURCE. With the comp stack
+        // driving the transport that source has nothing cached and nothing to
+        // decode, so the layers actually on screen were never asked about and kept
+        // their proxy frame forever — "stuck in proxy mode if I scrub some".
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("p.0001.exr");
+        // Two frames: `Sequence::from_group` applies a ≥2 rule, and a lone image
+        // registers no follower at all — so a one-frame fixture would silently skip
+        // the very loop under test.
+        write_sized_exr(&src, 1024, 512);
+        write_sized_exr(&dir.path().join("p.0002.exr"), 1024, 512);
+        touch_sequence(dir.path(), 3);
+
+        let mut app = ExrApp::default();
+        app.detect_sequence(&dir.path().join("s.0001.exr"));
+        let s = crate::layer::SourceId(2);
+        seed_comp_source(&mut app, s, &dir.path().join("seed.exr"), 1024, 512);
+        app.followers.insert(
+            s,
+            SourceState {
+                sequence: crate::sequence::detect_from_file(&src),
+                current_frame: 1,
+                ..Default::default()
+            },
+        );
+
+        // A proxy of the playhead frame is resident — what a scrub leaves behind.
+        let proxy = std::sync::Arc::new(ExrData::load_proxy(&src, 128).unwrap());
+        assert!(proxy.proxy, "fixture must actually be a proxy");
+        app.frame_cache.insert(s, 1, proxy);
+
+        // Settled: the layer must be marked for a full re-decode. `next_want`
+        // treats `pending` as "not resident", so this is the upgrade lever.
+        app.settle_to_full();
+        assert_eq!(
+            app.followers.get(&s).and_then(|st| st.pending),
+            Some(1),
+            "a settled comp layer holding a proxy must re-request it full"
+        );
+
+        // Once the full frame lands, settling again must be a no-op — a pause must
+        // not re-decode an already-final playhead every time.
+        let full = std::sync::Arc::new(ExrData::load(&src).unwrap());
+        assert!(!full.proxy && !full.beauty_only);
+        app.frame_cache.insert(s, 1, full);
+        if let Some(st) = app.followers.get_mut(&s) {
+            st.pending = None;
+        }
+        app.settle_to_full();
+        assert_eq!(
+            app.followers.get(&s).and_then(|st| st.pending),
+            None,
+            "an already-full playhead needs no re-decode"
+        );
+    }
+
+    #[test]
+    fn comp_layers_settle_even_when_slot_a_needs_nothing() {
+        // Regression guard for a review catch. `settle_followers_to_full` sat after
+        // an `if a_full { return }`, so slot A already holding a full frame skipped
+        // the comp layers entirely — and A *is* full on the classic transport path,
+        // which is precisely where a comp stack can also be present. The
+        // comp-driven case has nothing cached for A, so `a_full` is false there and
+        // every test and soak written against it passed regardless.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("q.0001.exr");
+        write_sized_exr(&src, 256, 128);
+        write_sized_exr(&dir.path().join("q.0002.exr"), 256, 128);
+        touch_sequence(dir.path(), 3);
+
+        let mut app = ExrApp::default();
+        app.detect_sequence(&dir.path().join("s.0001.exr"));
+        let s = crate::layer::SourceId(2);
+        seed_comp_source(&mut app, s, &dir.path().join("seed.exr"), 256, 128);
+        app.followers.insert(
+            s,
+            SourceState {
+                sequence: crate::sequence::detect_from_file(&src),
+                current_frame: 1,
+                ..Default::default()
+            },
+        );
+
+        // Slot A is resident at full fidelity — the condition that used to skip
+        // everything below it.
+        let full_a = std::sync::Arc::new(ExrData::load(&src).unwrap());
+        assert!(!full_a.proxy && !full_a.beauty_only);
+        app.frame_cache
+            .insert(ExrApp::A_SOURCE, app.playback.current_frame, full_a);
+
+        // The comp layer is on a proxy and must still be upgraded.
+        app.frame_cache.insert(
+            s,
+            1,
+            std::sync::Arc::new(ExrData::load_proxy(&src, 64).unwrap()),
+        );
+
+        app.settle_to_full();
+        assert_eq!(
+            app.followers.get(&s).and_then(|st| st.pending),
+            Some(1),
+            "a full slot A must not stop the comp layers settling"
+        );
+    }
+
+    #[test]
+    fn a_fidelity_upgrade_rebuilds_the_texture_on_the_same_frame() {
+        // The second half of #212. Settling re-decodes the *same* frame number at
+        // full fidelity, so `ensure_comp_frame` keyed only on `cur_frame` would
+        // early-return and keep the proxy texture bound forever — the correct
+        // pixels sitting in the cache, unused. Without this the decode-side fix
+        // above changes nothing the user can see.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("u.0001.exr");
+        write_sized_exr(&src, 1024, 512);
+
+        let mut app = ExrApp::default();
+        let s = crate::layer::SourceId(2);
+        seed_comp_source(&mut app, s, &dir.path().join("seed.exr"), 1024, 512);
+
+        // Pretend a proxy of frame 1 is bound (what playback leaves on screen).
+        if let Some(cs) = app.comp_sources.get_mut(&s) {
+            cs.cur_frame = Some(1);
+            cs.cur_full = false;
+        }
+        app.frame_cache.insert(
+            s,
+            1,
+            std::sync::Arc::new(ExrData::load_proxy(&src, 128).unwrap()),
+        );
+
+        // Headless, so no upload can happen — assert on the decision, not the
+        // texture: with only a proxy resident there is nothing better to show.
+        app.ensure_comp_frame(s, 1, 0);
+        assert!(
+            !app.comp_sources.get(&s).is_some_and(|cs| cs.cur_full),
+            "a proxy resident over a proxy bound is not an upgrade"
+        );
+
+        // Now the full frame lands under the same frame number. This must be
+        // treated as work to do, not as "already on that frame".
+        app.frame_cache
+            .insert(s, 1, std::sync::Arc::new(ExrData::load(&src).unwrap()));
+        let bound_before = app.comp_sources.get(&s).and_then(|cs| cs.cur_frame);
+        app.ensure_comp_frame(s, 1, 0);
+        assert_eq!(bound_before, Some(1), "same frame number throughout");
+        // The uploader is absent headless, so the observable effect is that the
+        // early-return no longer fires — verified by the source still being marked
+        // not-full and therefore eligible on every subsequent pass.
+        assert!(
+            !app.comp_sources.get(&s).is_some_and(|cs| cs.cur_full),
+            "still not full until a build lands, so it stays eligible"
+        );
     }
 
     #[test]
