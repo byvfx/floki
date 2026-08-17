@@ -2844,18 +2844,20 @@ impl ExrApp {
             // A is full-res and displayed; no A decode will land to trigger it,
             // so refresh the contact sheet now (frozen during play, #144).
             self.viewer.invalidate_active_thumbnails();
-        }
-        if a_full {
-            return;
-        }
-        // Supersede in-flight beauty prefetch, then re-request the playhead at full
-        // fidelity (`request_*` upgrades a beauty ring hit; #7). Already-full frames
-        // need nothing — the slot-B re-sync that used to run in that case went with
-        // the locked-step B path (#99 Slice 3h.2).
-        self.invalidate_inflight();
-        if !a_full {
+        } else {
+            // Supersede in-flight beauty prefetch, then re-request the playhead at
+            // full fidelity (`request_*` upgrades a beauty ring hit; #7).
+            // Already-full frames need nothing — the slot-B re-sync that used to run
+            // in that case went with the locked-step B path (#99 Slice 3h.2).
+            self.invalidate_inflight();
             self.request_sequence_frame(a_frame);
         }
+        // Always, even when A needed nothing (#212). This used to sit after an
+        // `if a_full { return }`, so slot A being full skipped the comp layers
+        // entirely — and A is full on the classic transport path, which is exactly
+        // where a comp stack can also be present. The comp-driven case has nothing
+        // cached for A, so `a_full` is false there and the bug never showed in the
+        // soak or the tests written against it.
         self.settle_followers_to_full();
     }
 
@@ -9998,6 +10000,55 @@ mod tests {
             app.followers.get(&s).and_then(|st| st.pending),
             None,
             "an already-full playhead needs no re-decode"
+        );
+    }
+
+    #[test]
+    fn comp_layers_settle_even_when_slot_a_needs_nothing() {
+        // Regression guard for a review catch. `settle_followers_to_full` sat after
+        // an `if a_full { return }`, so slot A already holding a full frame skipped
+        // the comp layers entirely — and A *is* full on the classic transport path,
+        // which is precisely where a comp stack can also be present. The
+        // comp-driven case has nothing cached for A, so `a_full` is false there and
+        // every test and soak written against it passed regardless.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("q.0001.exr");
+        write_sized_exr(&src, 256, 128);
+        write_sized_exr(&dir.path().join("q.0002.exr"), 256, 128);
+        touch_sequence(dir.path(), 3);
+
+        let mut app = ExrApp::default();
+        app.detect_sequence(&dir.path().join("s.0001.exr"));
+        let s = crate::layer::SourceId(2);
+        seed_comp_source(&mut app, s, &dir.path().join("seed.exr"), 256, 128);
+        app.followers.insert(
+            s,
+            SourceState {
+                sequence: crate::sequence::detect_from_file(&src),
+                current_frame: 1,
+                ..Default::default()
+            },
+        );
+
+        // Slot A is resident at full fidelity — the condition that used to skip
+        // everything below it.
+        let full_a = std::sync::Arc::new(ExrData::load(&src).unwrap());
+        assert!(!full_a.proxy && !full_a.beauty_only);
+        app.frame_cache
+            .insert(ExrApp::A_SOURCE, app.playback.current_frame, full_a);
+
+        // The comp layer is on a proxy and must still be upgraded.
+        app.frame_cache.insert(
+            s,
+            1,
+            std::sync::Arc::new(ExrData::load_proxy(&src, 64).unwrap()),
+        );
+
+        app.settle_to_full();
+        assert_eq!(
+            app.followers.get(&s).and_then(|st| st.pending),
+            Some(1),
+            "a full slot A must not stop the comp layers settling"
         );
     }
 
