@@ -2097,10 +2097,21 @@ impl ExrApp {
         // the canonical target for that band means an ordinary zoom nudge does not
         // move this value at all — which is what makes re-latching cheap enough to
         // invalidate on (see `relatch_proxy_targets`).
+        //
+        // **Round the factor down, never up.** Rounding up picks *more* decimation
+        // than the view asked for, so the proxy is then upscaled onto the screen —
+        // and the shortfall is worst exactly where it is most visible. Just under
+        // 1:1, `ceil` jumps to factor 2 and delivers **half** the resolution the
+        // viewer needs, a 1.8× upscale, precisely when the user has zoomed in to
+        // inspect detail. Rounding down guarantees `target >= needed`: always
+        // oversampled, never blurred, so "visually lossless at the current view" is
+        // a property rather than an approximation. It costs one decimation band
+        // (~2304 rather than ~1536 on 4.6K plate at fit — about 22 MB per build,
+        // ~1.05 GB/s at 48 builds/s, well inside the ~6 GB/s this path sustains).
         if long <= needed {
             return PlaybackProxy::Full; // factor would be 1: a copy, not a proxy
         }
-        let factor = long.div_ceil(needed.max(1));
+        let factor = long / needed.max(1); // floor
         if factor <= 1 {
             return PlaybackProxy::Full;
         }
@@ -9813,12 +9824,15 @@ mod tests {
         app.playback_toggle(); // pause
 
         // A nudge far too small to change the decimation factor: ring survives.
+        // With the factor rounded *down* (so the proxy is never upscaled), factor 4
+        // spans `needed` in (long/5, long/4] — scale 0.2 to 0.25 here — so 0.24 is
+        // the same decode as 0.25 and must not invalidate anything.
         app.frame_cache.insert(
             s,
             1,
             std::sync::Arc::new(ExrData::load(dir.path().join("r.exr")).unwrap()),
         );
-        app.viewer.scale = 0.26;
+        app.viewer.scale = 0.24;
         app.playback_toggle();
         assert!(
             app.frame_cache.contains(s, 1),
@@ -9857,6 +9871,38 @@ mod tests {
         );
         app.viewer.scale = 100.0;
         assert_eq!(app.viewport_proxy_target(s), PlaybackProxy::Full);
+    }
+
+    #[test]
+    fn the_proxy_is_never_upscaled_onto_the_screen() {
+        // The whole claim of #209 is "visually lossless at the current view", which
+        // holds only if the proxy carries at least as many pixels as the screen
+        // shows. Rounding the decimation factor up broke that just under 1:1 —
+        // `ceil` jumps to factor 2 and delivers half the needed resolution, a 1.8x
+        // upscale, exactly where the user has zoomed in to look closely.
+        //
+        // Swept rather than spot-checked: the failure was at a band boundary, and
+        // hand-picked scales are precisely what misses those.
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = ExrApp::default();
+        let s = crate::layer::SourceId(2);
+        let long = 4608;
+        seed_comp_source(&mut app, s, &dir.path().join("sweep.exr"), long, 3164);
+
+        for step in 1..=400 {
+            let scale = f64::from(step) * 0.0025; // 0.0025 ..= 1.0
+            app.viewer.scale = scale as f32;
+            let needed = (long as f64 * scale).ceil() as usize;
+            match app.viewport_proxy_target(s) {
+                PlaybackProxy::Full => {} // full res is never short
+                PlaybackProxy::Px(px) => assert!(
+                    px >= needed.min(long) || px == MIN_PROXY_PX,
+                    "scale {scale:.4}: proxy {px}px is short of the {needed}px on \
+                     screen — it would be upscaled and look soft"
+                ),
+                PlaybackProxy::Unknown => panic!("scale {scale:.4}: should be known"),
+            }
+        }
     }
 
     #[test]
