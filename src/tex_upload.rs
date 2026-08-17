@@ -56,6 +56,10 @@ pub struct Built {
     pub frame: u32,
     pub aov: usize,
     pub size: (usize, usize),
+    /// Whether the source frame was a **full** decode rather than a proxy or
+    /// beauty-only one (#212). Read off the decoded data here rather than passed
+    /// in, so it can never disagree with the pixels actually uploaded.
+    pub full: bool,
     /// `None` if the build failed (AOV out of range, or the upload was rejected).
     /// Still delivered, so the in-flight slot is released rather than wedging the
     /// source forever.
@@ -128,12 +132,14 @@ impl TexUploader {
                             &ctx, &job.data, job.aov,
                         );
                         let size = job.data.logical_size(job.aov).unwrap_or((0, 0));
+                        let full = !job.data.proxy && !job.data.beauty_only;
                         if done_tx
                             .send(Built {
                                 source: job.source,
                                 frame: job.frame,
                                 aov: job.aov,
                                 size,
+                                full,
                                 texture: built,
                             })
                             .is_err()
