@@ -43,7 +43,13 @@ thread_local! {
     /// `resize` is a no-op, which is the entire point: a fresh allocation here
     /// zero-fills ~111 MB on 4.6K footage immediately before every byte is
     /// overwritten.
-    static STAGING: std::cell::RefCell<Vec<u16>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Held as `f32`, not `u16`, purely for **alignment**. Both paths cast this
+    /// buffer to the type they pack, and a cast is only sound in the
+    /// wider-to-narrower direction: `Vec<f32>` guarantees 4-byte alignment, so
+    /// reinterpreting it as `[u16]` always works, while a `Vec<u16>` is only
+    /// guaranteed 2-byte alignment and reinterpreting *that* as `[f32]` can panic
+    /// inside `bytemuck` on an allocator that doesn't happen to over-align.
+    static STAGING: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Cost of [`ExrViewer::build_layer_texture`], split by phase (#202).
@@ -97,9 +103,14 @@ pub(crate) mod tex_build_stats {
     }
 
     /// Totals accumulated since the last drain, and reset: `(builds, alloc_ms,
-    /// pack_ms, write_ms, bind_ms, slowest_build_ms, mb_uploaded)`. The four phase
-    /// figures are **sums over the window**, not per-build averages, so they sum to
-    /// the wall-clock milliseconds the UI thread spent here.
+    /// pack_ms, write_ms, bind_ms, slowest_build_ms, mb_uploaded)`.
+    ///
+    /// The four phase figures are **sums over the window**, not per-build averages.
+    /// They are summed across the [`crate::tex_upload`] pool, so the total is
+    /// throughput and can legitimately exceed one second per second of wall clock —
+    /// it is *not* paint-thread occupancy. It was exactly that before the builds
+    /// moved off the UI thread, and reading it that way now would overstate the
+    /// cost by the worker count. `texq` is the UI-side number.
     pub fn drain() -> (u64, f32, f32, f32, f32, f32, f32) {
         let ms = |a: &AtomicU64| a.swap(0, Relaxed) as f64 / 1e6;
         (
@@ -2842,8 +2853,10 @@ impl ExrViewer {
                 let b_s = crate::pixels::f16_slice(b_chan);
                 let a_s = crate::pixels::f16_slice(a_chan);
                 let one = f16::from_f32(1.0).to_bits();
-                staging.resize(width * height * 4, 0);
-                let pixels = staging.as_mut_slice();
+                // Two `u16` per `f32`, so half as many elements back the same
+                // number of texels. The narrowing cast is always aligned.
+                staging.resize(width * height * 2, 0.0);
+                let pixels: &mut [u16] = bytemuck::cast_slice_mut(staging.as_mut_slice());
                 pixels
                     .par_chunks_mut(width * 4)
                     .enumerate()
@@ -2871,13 +2884,10 @@ impl ExrViewer {
                 let g_s = sample_channel_f32(g_chan);
                 let b_s = sample_channel_f32(b_chan);
                 let a_s = sample_channel_f32(a_chan);
-                // Same buffer as the F16 path — two `u16` per `f32`. `Vec<u16>`'s
-                // 2-byte alignment is not enough for `f32`, so this goes through
-                // `bytemuck`'s checked cast: a misaligned buffer would panic rather
-                // than corrupt, and in practice the allocator returns 8+ byte
-                // alignment for a buffer this size.
-                staging.resize(width * height * 4 * 2, 0);
-                let pixels: &mut [f32] = bytemuck::cast_slice_mut(staging.as_mut_slice());
+                // Same buffer as the F16 path, used at its native type — no cast,
+                // so no alignment question.
+                staging.resize(width * height * 4, 0.0);
+                let pixels = staging.as_mut_slice();
                 pixels
                     .par_chunks_mut(width * 4)
                     .enumerate()
