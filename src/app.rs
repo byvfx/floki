@@ -1944,11 +1944,21 @@ impl ExrApp {
         if self.playback.pending.is_some() || self.loading_a {
             return true;
         }
-        self.transport_source.is_some_and(|s| {
-            self.followers
-                .get(&s)
-                .is_some_and(|st| st.pending.is_some() || st.loading)
-        })
+        // `clock_source()`, not `transport_source` (#211). Since the clock can now
+        // move off a hidden layer, the two differ exactly when the claimed source is
+        // invisible — and a hidden source requests nothing, so its `pending` is
+        // always `None`. Asking it whether the transport is ready would answer "yes,
+        // always", letting Stutter advance past undecoded frames: #200 reopened by a
+        // different route, and silently, since Stutter would just behave as
+        // DropFrames. The readiness predicate has to track whichever source the
+        // clock logic actually selected.
+        let clock = self.clock_source();
+        if clock == Self::A_SOURCE {
+            return false; // slot A's wait state is the `pending`/`loading_a` check above
+        }
+        self.followers
+            .get(&clock)
+            .is_some_and(|st| st.pending.is_some() || st.loading)
     }
 
     /// Point the transport at `source` (or release it with `None`), dropping the
@@ -10086,6 +10096,51 @@ mod tests {
             2,
             "un-hidden is active again"
         );
+    }
+
+    #[test]
+    fn stutter_readiness_follows_the_clock_when_it_moves_off_a_hidden_layer() {
+        // Review catch. `transport_awaiting` keyed off `transport_source` while the
+        // clock could move to a different source, and a hidden source requests
+        // nothing — so its `pending` is always `None`. Asking it "are we ready?"
+        // answers yes forever, and Stutter advances past undecoded frames: #200
+        // reopened, and silently, since Stutter would just behave as DropFrames.
+        let (_dir, paths) = write_sequence(5);
+        let mut app = ExrApp::default();
+        app.add_comp_source(paths[0].clone());
+        app.add_comp_source(paths[0].clone());
+        let a = crate::layer::SourceId(COMP_SOURCE_BASE);
+        let b = crate::layer::SourceId(COMP_SOURCE_BASE + 1);
+        assert_eq!(app.clock_source(), a, "a claimed the transport");
+
+        // Hide the claimed source; the clock moves to b.
+        let a_layer = app
+            .comp_stack
+            .iter()
+            .find(|l| matches!(&l.source, crate::layer::LayerSource::Image { source, .. } if *source == a))
+            .map(|l| l.id)
+            .expect("layer for a");
+        if let Some(l) = app.comp_stack.get_mut(a_layer) {
+            l.enabled = false;
+        }
+        assert_eq!(app.clock_source(), b);
+
+        // b — the visible clock — is awaiting a frame. The transport must wait.
+        if let Some(st) = app.followers.get_mut(&b) {
+            st.pending = Some(4);
+        }
+        // The hidden ex-clock has nothing pending, which is what used to make this
+        // read "ready".
+        assert_eq!(app.followers.get(&a).and_then(|st| st.pending), None);
+        assert!(
+            app.transport_awaiting(),
+            "readiness must track the visible clock, not the hidden claim"
+        );
+
+        if let Some(st) = app.followers.get_mut(&b) {
+            st.pending = None;
+        }
+        assert!(!app.transport_awaiting(), "nothing awaited ⇒ not waiting");
     }
 
     #[test]
