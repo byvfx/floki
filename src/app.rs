@@ -592,6 +592,14 @@ pub struct ExrApp {
     #[serde(skip)]
     tex_uploader: Option<crate::tex_upload::TexUploader>,
 
+    /// Per-source proxy target held for the duration of a play run (#209), so the
+    /// T1 ring can't end up holding frames decoded at several different zoom
+    /// levels. Empty outside a run, and re-latched by [`Self::relatch_proxy_targets`]
+    /// each time playback starts. Runtime-only — a view transform doesn't outlive
+    /// the session.
+    #[serde(skip)]
+    proxy_target_latch: std::collections::HashMap<crate::layer::SourceId, usize>,
+
     /// First frame of an env-gated soak run — the clock the warm-up and run window
     /// in [`Self::tick_soak_harness`] are measured from. `None` outside a soak.
     #[serde(skip)]
@@ -1025,6 +1033,7 @@ impl Default for ExrApp {
             track_drag: None,
             transport_source: None,
             comp_stack: crate::layer::LayerStack::new(),
+            proxy_target_latch: std::collections::HashMap::new(),
             tex_uploader: None,
             soak_started_at: None,
             soak_play_sent: false,
@@ -2022,6 +2031,9 @@ impl ExrApp {
     /// currently *bound texture*, which during playback is the proxy — feeding that
     /// back in would shrink the target every frame until it collapsed. `exr_data`
     /// holds the originally opened full-resolution frame and does not move.
+    ///
+    /// Callers during playback want [`Self::latched_proxy_target`], not this — see
+    /// there for why the live value must not drive decodes mid-run.
     fn viewport_proxy_target(&self, source: crate::layer::SourceId) -> Option<usize> {
         let cs = self.comp_sources.get(&source)?;
         let (w, h) = cs.exr_data.logical_size(cs.aov)?;
@@ -2044,7 +2056,78 @@ impl ExrApp {
         // it took out seven tests on a 2×2 fixture, and would have been a crash on
         // any small source in the wild.
         let floor = MIN_PROXY_PX.min(long);
-        Some((needed as usize).clamp(floor, long))
+        let needed = (needed as usize).clamp(floor, long);
+
+        // Quantize to the decimation the decoder will actually apply.
+        // `downsampled_into` reduces by an integer `factor = long.div_ceil(max_dim)`,
+        // so a whole band of targets produces a byte-identical decode. Snapping to
+        // the canonical target for that band means an ordinary zoom nudge does not
+        // move this value at all — which is what makes re-latching cheap enough to
+        // invalidate on (see `relatch_proxy_targets`).
+        let factor = if long <= needed {
+            1
+        } else {
+            long.div_ceil(needed.max(1))
+        };
+        Some(long.div_ceil(factor.max(1)).max(1))
+    }
+
+    /// `source`'s proxy target for the current play run, **latched** at the moment
+    /// playback started (#209).
+    ///
+    /// The T1 ring is keyed on `(source, frame)` — resolution is not part of the
+    /// key. The settings knob knows this and calls `frame_cache.clear()` whenever
+    /// `proxy_size` changes, because the cached ring is "the wrong decode mode/size"
+    /// afterwards. Deriving the target from zoom made that same value change
+    /// *continuously*, with no such invalidation, so frames decoded at different
+    /// zoom levels would coexist in the ring and play back as **sharpness flickering
+    /// frame to frame**. Uniform softness reads as a proxy; inconsistent sharpness
+    /// reads as a broken player.
+    ///
+    /// Latching per run fixes it by construction rather than by invalidation: the
+    /// target cannot change while frames are being decoded into the ring, so the
+    /// ring is always internally consistent and no precached range is ever thrown
+    /// away for a zoom nudge. Zooming mid-play shows the latched resolution until
+    /// you pause — and pausing settles the playhead to full res anyway, so the next
+    /// run re-latches to whatever the view has become.
+    fn latched_proxy_target(&self, source: crate::layer::SourceId) -> Option<usize> {
+        self.proxy_target_latch
+            .get(&source)
+            .copied()
+            .or_else(|| self.viewport_proxy_target(source))
+    }
+
+    /// Re-latch every source's proxy target to the current view (#209). Called when
+    /// a play run begins, which is the only moment the target may safely move: the
+    /// ring is about to be filled, and anything stale in it is superseded.
+    ///
+    /// If the target genuinely changed — the user zoomed far enough to cross a
+    /// decimation band between runs — the cached frames are the wrong resolution
+    /// and are dropped, exactly as the `proxy_size` knob does for the same reason.
+    /// Because the target is quantized to the decimation factor, this fires on a
+    /// real change of detail level and not on every small zoom, so a precached
+    /// range survives ordinary framing adjustments.
+    fn relatch_proxy_targets(&mut self) {
+        let next: std::collections::HashMap<_, _> = self
+            .comp_sources
+            .keys()
+            .copied()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .filter_map(|s| self.viewport_proxy_target(s).map(|t| (s, t)))
+            .collect();
+
+        // Only on a change *between* runs. A first play has no previous latch, and
+        // whatever precache put in the ring was decoded at this same live target.
+        let changed = !self.proxy_target_latch.is_empty() && next != self.proxy_target_latch;
+        self.proxy_target_latch = next;
+        if changed {
+            self.frame_cache.clear();
+            // Re-measure: a different proxy size means a different per-frame
+            // footprint, and the T1 budget is sized from it.
+            self.proxy_bytes = None;
+            self.invalidate_inflight();
+        }
     }
 
     /// The proxy `target_blocks` to decode `frame` at (#94/#209), or `None` for a
@@ -2074,7 +2157,7 @@ impl ExrApp {
             return Some(self.proxy_size);
         }
         // Fall back to the fixed knob if the view transform isn't known yet.
-        self.viewport_proxy_target(source).or(Some(self.proxy_size))
+        self.latched_proxy_target(source).or(Some(self.proxy_size))
     }
 
     fn decode_proxy_target(&self, frame: u32) -> Option<usize> {
@@ -2549,9 +2632,13 @@ impl ExrApp {
             self.playback.state = PlayState::Paused;
             self.settle_to_full();
         } else {
-            // Fresh play run → reset the HUD's dropped/held counters (#172).
+            // Fresh play run → reset the HUD's dropped/held counters (#172), and
+            // latch the proxy target to the view as it is now (#209). Play start is
+            // the one safe moment to move it: the ring is about to fill, so nothing
+            // decoded at the previous target survives to mismatch what follows.
             self.run_dropped = 0;
             self.run_held = 0;
+            self.relatch_proxy_targets();
             self.playback.start_playing(std::time::Instant::now());
         }
     }
@@ -9590,6 +9677,89 @@ mod tests {
         assert_eq!(app.viewport_proxy_target(s), None);
         app.viewer.scale = f32::NAN;
         assert_eq!(app.viewport_proxy_target(s), None);
+    }
+
+    #[test]
+    fn proxy_target_is_latched_for_the_duration_of_a_play_run() {
+        // #209: the T1 ring is keyed on (source, frame) — resolution is not in the
+        // key — so a target that moved mid-run would leave frames of several
+        // resolutions in one ring, playing back as sharpness flickering frame to
+        // frame. Latching at play start makes that impossible by construction.
+        let dir = tempfile::tempdir().unwrap();
+        touch_sequence(dir.path(), 3);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&dir.path().join("s.0001.exr"));
+        app.viewer.active_layer = 0;
+        app.proxy_enabled = true;
+
+        let s = crate::layer::SourceId(2);
+        seed_comp_source(&mut app, s, &dir.path().join("l.exr"), 4096, 2048);
+        app.viewer.scale = 0.25;
+        let f = app.playback.current_frame;
+
+        app.playback_toggle(); // play → latch 1024
+        assert_eq!(app.decode_proxy_target_at_for(s, f, f), Some(1024));
+
+        // Zooming mid-run does NOT move the target — that is the whole point.
+        app.viewer.scale = 1.0;
+        assert_eq!(
+            app.decode_proxy_target_at_for(s, f, f),
+            Some(1024),
+            "target is held for the run even though the view changed"
+        );
+
+        // Stopping and starting again re-latches to the view as it now is.
+        app.playback_toggle(); // pause
+        app.playback_toggle(); // play again
+        assert_eq!(
+            app.decode_proxy_target_at_for(s, f, f),
+            Some(4096),
+            "a fresh run picks up the new zoom"
+        );
+    }
+
+    #[test]
+    fn relatching_to_a_new_detail_level_drops_the_wrong_size_ring() {
+        // A ring filled at one resolution is wrong for the next, the same way the
+        // `proxy_size` knob's ring is — and that knob already clears the cache for
+        // exactly this reason. But quantizing to the decimation factor means an
+        // ordinary framing nudge does not count as a change, so a precached range
+        // is not thrown away every time the user touches the zoom.
+        let dir = tempfile::tempdir().unwrap();
+        touch_sequence(dir.path(), 3);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&dir.path().join("s.0001.exr"));
+        app.viewer.active_layer = 0;
+        app.proxy_enabled = true;
+
+        let s = crate::layer::SourceId(2);
+        seed_comp_source(&mut app, s, &dir.path().join("r.exr"), 4096, 2048);
+        app.viewer.scale = 0.25;
+
+        app.playback_toggle(); // latch 1024
+        app.playback_toggle(); // pause
+
+        // A nudge far too small to change the decimation factor: ring survives.
+        app.frame_cache.insert(
+            s,
+            1,
+            std::sync::Arc::new(ExrData::load(dir.path().join("r.exr")).unwrap()),
+        );
+        app.viewer.scale = 0.26;
+        app.playback_toggle();
+        assert!(
+            app.frame_cache.contains(s, 1),
+            "a sub-band zoom nudge must not discard a precached ring"
+        );
+        app.playback_toggle();
+
+        // A real change of detail level: the ring is the wrong resolution now.
+        app.viewer.scale = 1.0;
+        app.playback_toggle();
+        assert!(
+            !app.frame_cache.contains(s, 1),
+            "crossing a decimation band drops frames decoded at the old size"
+        );
     }
 
     #[test]
