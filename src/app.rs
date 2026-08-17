@@ -384,6 +384,15 @@ struct LoadJob {
     /// fallback if the decode errors. See [`ExrData::load_proxy`] (a normal decode
     /// then a post-decode box-filter).
     proxy_target: Option<usize>,
+    /// Which single AOV a cheap decode must carry, as `(physical part index,
+    /// logical layer index)` (#217) — the generalisation that lets a non-beauty
+    /// pass play. `None` means logical layer 0, decoded by the `first_valid_layer`
+    /// path (`load_beauty` / `load_proxy`) exactly as before.
+    ///
+    /// Only read when `beauty_only` or `proxy_target` is set; a full decode carries
+    /// every AOV and has nothing to select. Set by [`ExrApp::cheap_decode_layer`],
+    /// which guarantees the named part holds exactly one logical layer.
+    aov_layer: Option<(usize, usize)>,
 }
 
 /// Message from the decode worker to the UI thread, delivered over `load_rx`. A
@@ -1686,21 +1695,40 @@ impl ExrApp {
                     // - full all-AOV for opens and the settle re-decode.
                     // #165: a proxy job checks the on-disk cache first — a hit is a
                     // raw f16 read (~zero decode); a miss decodes then write-throughs.
+                    // #217: `aov_layer` names a single non-beauty pass to decode; the
+                    // AOV is part of the cache key, or layer 1's proxy would be a
+                    // verified hit for layer 2.
                     let mut store_blob: Option<(crate::proxy_cache::ProxyKey, Vec<u8>)> = None;
+                    let aov = job.aov_layer.map_or(0, |(_, logical)| logical);
                     let result = match job.proxy_target {
                         Some(tb) => {
-                            if let Some(cached) = proxy_cache.read(&job.path, tb) {
+                            if let Some(cached) = proxy_cache.read(&job.path, tb, aov) {
                                 Ok(cached)
                             } else {
-                                let decoded =
-                                    ExrData::load_proxy_into(&job.path, tb, &mut proxy_scratch)
-                                        .or_else(|_| {
-                                            if job.beauty_only {
-                                                ExrData::load_beauty(&job.path)
-                                            } else {
-                                                ExrData::load(&job.path)
-                                            }
-                                        });
+                                let decoded = match job.aov_layer {
+                                    Some((phys, logical)) => ExrData::load_layer_proxy_into(
+                                        &job.path,
+                                        phys,
+                                        logical,
+                                        tb,
+                                        &mut proxy_scratch,
+                                    ),
+                                    None => {
+                                        ExrData::load_proxy_into(&job.path, tb, &mut proxy_scratch)
+                                    }
+                                }
+                                // A full decode is the fallback for *any* failure,
+                                // including a single-layer decode this file's part
+                                // layout can't support: it always carries the AOV,
+                                // so the texture build can't fail and spin the
+                                // evict-and-retry loop (#213). Slow beats stuck.
+                                .or_else(|_| {
+                                    if job.beauty_only && job.aov_layer.is_none() {
+                                        ExrData::load_beauty(&job.path)
+                                    } else {
+                                        ExrData::load(&job.path)
+                                    }
+                                });
                                 // Cache only a genuine proxy (never a fallback
                                 // beauty/full). Serialize here (miss-only, <1% of
                                 // the decode just paid) so the borrow ends before
@@ -1709,7 +1737,7 @@ impl ExrApp {
                                 if let Ok(data) = &decoded
                                     && data.proxy
                                     && let Some(key) =
-                                        crate::proxy_cache::ProxyKey::for_source(&job.path, tb)
+                                        crate::proxy_cache::ProxyKey::for_source(&job.path, tb, aov)
                                 {
                                     let blob = data.write_proxy_blob(&key);
                                     store_blob = Some((key, blob));
@@ -1717,7 +1745,11 @@ impl ExrApp {
                                 decoded
                             }
                         }
-                        None if job.beauty_only => ExrData::load_beauty(&job.path),
+                        None if job.beauty_only => match job.aov_layer {
+                            Some((phys, logical)) => ExrData::load_layer(&job.path, phys, logical)
+                                .or_else(|_| ExrData::load(&job.path)),
+                            None => ExrData::load_beauty(&job.path),
+                        },
                         None => ExrData::load(&job.path),
                     };
                     let _ = result_tx.send(LoadMsg::Loaded(Box::new(LoadResult {
@@ -2131,20 +2163,111 @@ impl ExrApp {
     /// layer on a non-zero AOV would otherwise be served cheap frames it can't
     /// display and appear frozen the moment it was un-hidden.
     fn cheap_decode_fits_aov(&self, source: crate::layer::SourceId) -> bool {
-        let mut drawn_by_a_layer = false;
+        self.cheap_decode_layer(source).is_some()
+    }
+
+    /// The one AOV every consumer of `source` is displaying, or `None` if they
+    /// disagree (#217).
+    ///
+    /// A cheap decode carries a *single* logical layer, so it can only stand in
+    /// when there is a single answer to "which pass is on screen". Two comp layers
+    /// on the same source at different AOVs is the disagreeing case: no one-layer
+    /// decode serves both, and the full decode is the only correct answer.
+    ///
+    /// Checks *every* layer drawing this source, not just visible ones: a hidden
+    /// layer on a different AOV would otherwise be served frames it can't display
+    /// and appear frozen the moment it was un-hidden.
+    fn displayed_aov(&self, source: crate::layer::SourceId) -> Option<usize> {
+        let mut want: Option<usize> = None;
         for l in self.comp_stack.iter() {
             if let crate::layer::LayerSource::Image { source: s, aov } = &l.source
                 && *s == source
             {
-                drawn_by_a_layer = true;
-                if *aov != 0 {
-                    return false;
+                match want {
+                    Some(w) if w != *aov => return None, // two passes, one decode
+                    _ => want = Some(*aov),
                 }
             }
         }
         // No comp layer draws it: the classic path, where the viewer's active layer
         // is what's on screen.
-        drawn_by_a_layer || self.viewer.active_layer == 0
+        want.or(Some(self.viewer.active_layer))
+    }
+
+    /// The layer a cheap decode of `source` must carry — `(physical part index,
+    /// logical AOV index)` — or `None` if no cheap decode can represent what's on
+    /// screen (#213/#217).
+    ///
+    /// This is the #213 invariant, generalised rather than weakened: a decode must
+    /// never be cheaper than what the displayed AOV needs. What changed is *how
+    /// cheap* is achievable. Beauty-only (#56) and proxy (#94) decodes carry
+    /// logical layer 0 and nothing else, so before #217 the only safe answer for a
+    /// non-zero AOV was "decode everything" — a cliff, not a slope: a layer on AOV
+    /// 0 played, the same layer on AOV 1 fell back to a 260 ms all-parts decode.
+    /// `ExrData::load_layer` can now decode any *one* part, so a non-zero AOV takes
+    /// the cheap path too — but only when the part it lives in holds exactly one
+    /// logical layer, which is what [`Self::single_layer_part`] decides.
+    ///
+    /// **The single-layer condition is not a nicety.** A one-layer decode of a part
+    /// holding several passes cannot answer `logical_channels` for any of them
+    /// (`ExrData::resolve_logical` refuses rather than guess), so every texture
+    /// build fails — and #213's evict-and-retry hardening then re-decodes the same
+    /// frame forever. Refusing here keeps that unreachable; `load_layer`'s own
+    /// check is the second line, for a sequence whose part layout changes mid-shot.
+    fn cheap_decode_layer(&self, source: crate::layer::SourceId) -> Option<(usize, usize)> {
+        let aov = self.displayed_aov(source)?;
+        // AOV 0 keeps the proven `first_valid_layer` path (`load_beauty` /
+        // `load_proxy`), which needs no layout knowledge at all — so a source whose
+        // table we can't read still plays as fast as it did before #217.
+        if aov == 0 {
+            return Some((0, 0));
+        }
+        Some((self.single_layer_part(source, aov)?, aov))
+    }
+
+    /// The physical part logical layer `aov` of `source` lives in, **if** that part
+    /// holds exactly one logical layer (#217). `None` otherwise, including when the
+    /// layer table isn't known.
+    ///
+    /// This is the multi-part-render shape — Karma/Houdini write one AOV per part,
+    /// which is what makes part selection able to skip work at all. A single-part
+    /// file with prefixed channels (Blender's `ViewLayer.Combined.R` style) puts
+    /// every pass in one part, so the answer here is `None` for every non-zero AOV
+    /// and those files keep the full decode. That is correct, not a gap: their
+    /// passes share the same compressed blocks, so there is nothing for a
+    /// part-level filter to skip. Channel-level filtering is a separate mechanism.
+    fn single_layer_part(&self, source: crate::layer::SourceId, aov: usize) -> Option<usize> {
+        let data = self.full_layer_table(source)?;
+        let phys = data.logical_layers.get(aov)?.physical_index;
+        let siblings = data
+            .logical_layers
+            .iter()
+            .filter(|l| l.physical_index == phys)
+            .count();
+        (siblings == 1).then_some(phys)
+    }
+
+    /// A **full** decode of `source`, for reading its layer table (#217).
+    ///
+    /// Deliberately not "whatever is on screen": `self.exr_data` is swapped to every
+    /// frame the transport lands, including the cheap ones, and a one-layer decode's
+    /// table is a single renumbered entry — reading part layout from it would answer
+    /// "yes, one layer per part" about every file. A comp source's `exr_data` is the
+    /// open-time decode and is never replaced, so it is the reliable source.
+    ///
+    /// `None` (⇒ no fast path, full decode, i.e. exactly the pre-#217 behaviour) if
+    /// nothing full is at hand. Fail-safe by construction: the fast path is only
+    /// ever taken on a layout we have actually read.
+    fn full_layer_table(&self, source: crate::layer::SourceId) -> Option<&ExrData> {
+        let full = |d: &ExrData| !d.proxy && !d.beauty_only && d.only_layer.is_none();
+        if let Some(cs) = self.comp_sources.get(&source)
+            && full(&cs.exr_data)
+        {
+            return Some(&cs.exr_data);
+        }
+        self.exr_data
+            .as_deref()
+            .filter(|d| source == Self::A_SOURCE && full(d))
     }
 
     /// The shared "decode something cheaper while the playhead moves" condition for
@@ -2503,7 +2626,13 @@ impl ExrApp {
                 // networked-storage cost the cache exists to remove. `contains`
                 // self-gates to `false` when the disk cache is off.
                 let px = self.decode_proxy_target_for(source, w);
-                if px.is_some_and(|px| self.proxy_cache.contains(&path, px)) {
+                // Same AOV the decode will ask the cache for (#217) — checking
+                // layer 0 while the decode wants layer 2 would skip the warm on a
+                // frame that is about to miss and open the source anyway.
+                let aov = self
+                    .cheap_decode_layer(source)
+                    .map_or(0, |(_, logical)| logical);
+                if px.is_some_and(|px| self.proxy_cache.contains(&path, px, aov)) {
                     continue;
                 }
                 self.prefetcher.warm(path);
@@ -2642,6 +2771,13 @@ impl ExrApp {
         // Scrub proxy takes precedence over beauty while moving (#94); `beauty_only`
         // stays as the worker's fallback if the fast proxy read isn't available.
         let proxy_target = self.decode_proxy_target_for(source, w);
+        // Which pass that cheap decode has to carry (#217). Both cheap modes gate on
+        // the same `cheap_decode_layer`, so it answers whenever either is on; layer
+        // 0 stays `None` so the beauty path is byte-for-byte what it was.
+        let aov_layer = (beauty_only || proxy_target.is_some())
+            .then(|| self.cheap_decode_layer(source))
+            .flatten()
+            .filter(|&(_, logical)| logical != 0);
         self.submit_job(LoadJob {
             path,
             source,
@@ -2652,6 +2788,7 @@ impl ExrApp {
             open_gen: 0,
             beauty_only,
             proxy_target,
+            aov_layer,
         });
         // Anchor the stall watchdog: one decode is now outstanding.
         self.decode_submit_at = Some(std::time::Instant::now());
@@ -3737,15 +3874,27 @@ impl ExrApp {
             return;
         }
         {
-            let layer_count = data.logical_layers.len();
-            self.exr_data = Some(data);
             // Clamp the active layer to the new image's last valid index. A
             // sequence normally has identical structure frame-to-frame, but guard
             // against a frame with fewer layers so the per-layer texture index
             // stays valid (sync_texture_caches resizes the cache but does not
             // clamp). A true clamp (not reset-to-0) keeps the user's selection
             // when the new image still has that index in range.
-            self.viewer.active_layer = self.viewer.active_layer.min(layer_count.saturating_sub(1));
+            //
+            // **Only for a whole-image decode** (#217). A cheap decode's table is a
+            // deliberate subset — a per-AOV decode holds exactly one entry — so
+            // clamping to it would drag the user's selection to 0 on the first
+            // played frame. The gate would then agree the source is "on AOV 0",
+            // the fast path would keep working, and the viewer would show the
+            // wrong pass with every metric healthy. Nothing about a partial frame
+            // is evidence the image lost layers.
+            let partial = data.proxy || data.beauty_only || data.only_layer.is_some();
+            let layer_count = data.logical_layers.len();
+            self.exr_data = Some(data);
+            if !partial {
+                self.viewer.active_layer =
+                    self.viewer.active_layer.min(layer_count.saturating_sub(1));
+            }
             // The viewport must rebuild every swap (that's how the next frame
             // paints), but the contact-sheet thumbnails freeze while the transport
             // is busy — otherwise a sheet open over a sequence re-bakes every layer
@@ -4971,10 +5120,13 @@ impl ExrApp {
                         }
                     };
 
+                // `logical_layer`, not `logical_layers.get` — during playback the
+                // live frame may be a per-AOV decode whose own table is renumbered
+                // (#217), and a raw index into it names the wrong pass.
                 let ll_a = self
                     .exr_data
                     .as_ref()
-                    .and_then(|d| d.logical_layers.get(self.viewer.active_layer));
+                    .and_then(|d| d.logical_layer(self.viewer.active_layer));
                 let phys_idx_a = ll_a.map(|l| l.physical_index).unwrap_or(0);
                 let layer_name_a = ll_a.map(|l| l.name.as_str()).unwrap_or("");
 
@@ -4994,7 +5146,7 @@ impl ExrApp {
                 if let Some((src, aov)) = self.comp_readout
                     && let Some(cs) = self.comp_sources.get(&src)
                 {
-                    let ll = cs.exr_data.logical_layers.get(aov);
+                    let ll = cs.exr_data.logical_layer(aov);
                     let phys_idx = ll.map(|l| l.physical_index).unwrap_or(0);
                     let layer_name = ll.map(|l| l.name.as_str()).unwrap_or("");
                     // Row label = the comp layer's name (which of N is on top).
@@ -9941,16 +10093,75 @@ mod tests {
         .expect("write sized exr fixture");
     }
 
-    /// Register `source` as a comp source backed by a `w × h` image, the way the
-    /// Add flow would, so the sizing helpers have something to measure.
-    fn seed_comp_source(
+    /// A `w × h` EXR in the Karma/Houdini shape the per-AOV decode path (#217)
+    /// exists for: `parts` physical parts, each holding exactly **one** render
+    /// pass, so logical layer *n* lives alone in part *n*.
+    fn write_one_aov_per_part_exr(path: &std::path::Path, w: usize, h: usize, parts: usize) {
+        let named = |name: &str| {
+            let mut list = smallvec::SmallVec::new();
+            for c in ["R", "G", "B"] {
+                list.push(AnyChannel::new(
+                    Text::from(c),
+                    FlatSamples::F16(vec![f16::from_f32(0.5); w * h]),
+                ));
+            }
+            Layer::new(
+                (w, h),
+                LayerAttributes {
+                    layer_name: Some(Text::from(name)),
+                    ..Default::default()
+                },
+                Encoding::FAST_LOSSLESS,
+                AnyChannels::sort(list),
+            )
+        };
+        let names = ["beauty", "diffuse", "specular", "normal"];
+        let layers: smallvec::SmallVec<[Layer<AnyChannels<FlatSamples>>; 2]> =
+            (0..parts).map(|i| named(names[i % names.len()])).collect();
+        Image::from_layers(
+            ImageAttributes::new(IntegerBounds::from_dimensions((w, h))),
+            layers,
+        )
+        .write()
+        .to_file(path)
+        .expect("write one-aov-per-part exr fixture");
+    }
+
+    /// A `w × h` EXR in the Blender shape: **one** part whose channel-name
+    /// prefixes encode several passes. Part selection can skip nothing here —
+    /// every pass lives in the same compressed blocks.
+    fn write_single_part_multipass_exr(path: &std::path::Path, w: usize, h: usize) {
+        let mut list = smallvec::SmallVec::new();
+        for name in [
+            "ViewLayer.Combined.R",
+            "ViewLayer.Combined.G",
+            "ViewLayer.Combined.B",
+            "ViewLayer.Depth.Z",
+        ] {
+            list.push(AnyChannel::new(
+                Text::from(name),
+                FlatSamples::F16(vec![f16::from_f32(0.5); w * h]),
+            ));
+        }
+        Image::from_layer(Layer::new(
+            (w, h),
+            LayerAttributes::default(),
+            Encoding::FAST_LOSSLESS,
+            AnyChannels::sort(list),
+        ))
+        .write()
+        .to_file(path)
+        .expect("write single-part multipass exr fixture");
+    }
+
+    /// Register `source` as a comp source backed by an already-written file, the
+    /// way the Add flow would. The stored `exr_data` is a **full** decode, which is
+    /// what `full_layer_table` reads the part layout from (#217).
+    fn seed_comp_source_from(
         app: &mut ExrApp,
         source: crate::layer::SourceId,
         path: &std::path::Path,
-        w: usize,
-        h: usize,
     ) {
-        write_sized_exr(path, w, h);
         let data = std::sync::Arc::new(ExrData::load(path).unwrap());
         let size = data.logical_size(0).unwrap_or((0, 0));
         app.comp_sources.insert(
@@ -9966,6 +10177,18 @@ mod tests {
                 cur_full: false,
             },
         );
+    }
+
+    /// [`seed_comp_source_from`] over a plain single-layer `w × h` RGBA image.
+    fn seed_comp_source(
+        app: &mut ExrApp,
+        source: crate::layer::SourceId,
+        path: &std::path::Path,
+        w: usize,
+        h: usize,
+    ) {
+        write_sized_exr(path, w, h);
+        seed_comp_source_from(app, source, path);
     }
 
     #[test]
@@ -10390,6 +10613,13 @@ mod tests {
         // viewer on 0 passed the gate, got a frame without layer 1, and every
         // texture build then failed silently — the layer froze permanently while
         // every decode-side metric read healthy.
+        //
+        // #217 narrowed *why* this source is refused rather than repealing the
+        // rule: the fixture is a single-layer image, so AOV 1 doesn't exist in it
+        // and no decode can carry it. The invariant is unchanged — a decode must
+        // never be cheaper than the displayed AOV needs. What changed is that a
+        // non-zero AOV which *does* own its own part now has a cheap decode that
+        // carries it (`a_non_zero_aov_takes_the_cheap_path_when_it_owns_its_part`).
         let dir = tempfile::tempdir().unwrap();
         touch_sequence(dir.path(), 3);
         let mut app = ExrApp::default();
@@ -10434,6 +10664,187 @@ mod tests {
         // what that layer draws.
         app.viewer.active_layer = 3;
         assert_eq!(app.decode_proxy_target_at_for(s, f, f), None);
+    }
+
+    /// Stand a playing app up with one comp layer drawing `path` at AOV `aov`,
+    /// returning `(source, layer, frame)` — the shape all three gate tests below
+    /// share.
+    fn playing_with_one_layer_on(
+        app: &mut ExrApp,
+        dir: &std::path::Path,
+        path: &std::path::Path,
+        aov: usize,
+    ) -> (crate::layer::SourceId, crate::layer::LayerId, u32) {
+        touch_sequence(dir, 3);
+        app.detect_sequence(&dir.join("s.0001.exr"));
+        app.proxy_enabled = true;
+        app.beauty_preview = true;
+        app.viewer.scale = 0.25;
+        let s = crate::layer::SourceId(2);
+        seed_comp_source_from(app, s, path);
+        let f = app.playback.current_frame;
+        app.playback_toggle(); // playing
+        let lid = app
+            .comp_stack
+            .push_image("l", s, aov, crate::layer::Trim::full(1, 3));
+        (s, lid, f)
+    }
+
+    #[test]
+    fn a_non_zero_aov_takes_the_cheap_path_when_it_owns_its_part() {
+        // #217: the cliff #213 left behind. A layer on AOV 0 played at proxy
+        // resolution; the same layer on AOV 1 fell back to a full all-parts decode
+        // — 260 ms against 12 ms on the 16-part reference render, the difference
+        // between 24 fps and 3.8. Inspecting a pass is the workflow this app is
+        // for, so it should not be the slow case.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("karma.exr");
+        write_one_aov_per_part_exr(&src, 4096, 2048, 4);
+        let mut app = ExrApp::default();
+        let (s, _lid, f) = playing_with_one_layer_on(&mut app, dir.path(), &src, 1);
+
+        // The decode is allowed to be cheap, and it names the part AOV 1 lives in.
+        assert_eq!(
+            app.cheap_decode_layer(s),
+            Some((1, 1)),
+            "one pass per part ⇒ decode part 1 alone and call it logical layer 1"
+        );
+        assert!(app.decode_beauty_only_for(s, f), "cheap decode allowed");
+        assert!(app.decode_proxy_target_at_for(s, f, f).is_some());
+
+        // Still the #213 invariant, not a hole in it: the decode carries exactly
+        // the AOV on screen, so the texture build has what it needs.
+        let decoded = ExrData::load_layer(&src, 1, 1).expect("the gate's chosen decode");
+        assert!(
+            decoded.logical_channels(1).is_some(),
+            "the frame the gate authorised must be able to answer for the displayed AOV"
+        );
+    }
+
+    #[test]
+    fn a_single_part_file_keeps_the_full_decode_on_every_non_zero_aov() {
+        // The scope limit, pinned. Blender writes one part with the passes encoded
+        // as channel-name prefixes, so every AOV shares the same compressed blocks
+        // and part selection can skip nothing. `load_layer` on that part would
+        // decode a frame that can address neither pass — and #213's evict-and-retry
+        // would re-decode it forever. So the honest claim for #217 is "fast AOV
+        // playback on multi-part renders", not "on all renders".
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("blender.exr");
+        write_single_part_multipass_exr(&src, 4096, 2048);
+        let mut app = ExrApp::default();
+        let (s, _lid, f) = playing_with_one_layer_on(&mut app, dir.path(), &src, 1);
+
+        // Both passes live in part 0, so neither owns it.
+        let table = app.full_layer_table(s).expect("a full decode is stored");
+        assert_eq!(table.logical_layers.len(), 2, "Combined + Depth");
+        assert!(
+            table.logical_layers.iter().all(|l| l.physical_index == 0),
+            "one part holds both"
+        );
+
+        assert_eq!(app.single_layer_part(s, 1), None);
+        assert_eq!(app.cheap_decode_layer(s), None);
+        assert!(
+            !app.decode_beauty_only_for(s, f),
+            "full decode, as before #217"
+        );
+        assert_eq!(app.decode_proxy_target_at_for(s, f, f), None);
+    }
+
+    #[test]
+    fn two_layers_on_one_source_at_different_aovs_force_a_full_decode() {
+        // A cheap decode carries a single logical layer, so it can only stand in
+        // when there is a single answer to "which pass is on screen". Serving the
+        // one that happens to be asked first would freeze the other exactly as #213
+        // did — and hidden layers count, or un-hiding one would freeze it.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("karma.exr");
+        write_one_aov_per_part_exr(&src, 4096, 2048, 4);
+        let mut app = ExrApp::default();
+        let (s, _lid, f) = playing_with_one_layer_on(&mut app, dir.path(), &src, 1);
+        assert!(app.cheap_decode_layer(s).is_some(), "one AOV: fine");
+
+        // A second layer on the same source at a different pass.
+        let other = app
+            .comp_stack
+            .push_image("l2", s, 2, crate::layer::Trim::full(1, 3));
+        assert_eq!(app.displayed_aov(s), None, "two passes, one decode");
+        assert_eq!(app.cheap_decode_layer(s), None);
+        assert!(!app.decode_beauty_only_for(s, f));
+        assert_eq!(app.decode_proxy_target_at_for(s, f, f), None);
+
+        // Hidden still counts — it must be ready the instant it is shown.
+        if let Some(l) = app.comp_stack.get_mut(other) {
+            l.enabled = false;
+        }
+        assert_eq!(
+            app.cheap_decode_layer(s),
+            None,
+            "a hidden layer on another AOV would freeze the moment it was shown"
+        );
+    }
+
+    #[test]
+    fn the_fast_aov_path_is_refused_without_a_trusted_layer_table() {
+        // `full_layer_table` deliberately will not read part layout from the live
+        // frame: `exr_data` is swapped to every frame the transport lands, and a
+        // per-AOV decode's table is a single renumbered entry — which would answer
+        // "one pass per part" about *any* file, including the Blender one above.
+        // With nothing full at hand the answer is the pre-#217 behaviour: decode
+        // everything.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("karma.exr");
+        write_one_aov_per_part_exr(&src, 4096, 2048, 4);
+        let mut app = ExrApp::default();
+        let (s, _lid, f) = playing_with_one_layer_on(&mut app, dir.path(), &src, 1);
+        assert!(
+            app.cheap_decode_layer(s).is_some(),
+            "full table ⇒ fast path"
+        );
+
+        // Swap the source's stored decode for a one-layer one, as if the layout had
+        // been read from a played frame.
+        let partial = std::sync::Arc::new(ExrData::load_layer(&src, 1, 1).unwrap());
+        assert_eq!(partial.logical_layers.len(), 1, "the misleading shape");
+        if let Some(cs) = app.comp_sources.get_mut(&s) {
+            cs.exr_data = partial;
+        }
+        assert!(
+            app.full_layer_table(s).is_none(),
+            "not a table we can trust"
+        );
+        assert_eq!(app.cheap_decode_layer(s), None);
+        assert!(!app.decode_beauty_only_for(s, f));
+    }
+
+    #[test]
+    fn a_played_frame_never_drags_the_active_layer_back_to_zero() {
+        // `swap_image_arc` clamps `active_layer` to the incoming image's layer
+        // count, to survive a frame with fewer layers. A per-AOV decode holds
+        // exactly one entry, so clamping to it would reset the user's pass
+        // selection on the first played frame — and the gate would then agree the
+        // source is "on AOV 0" and keep the fast path running, showing the wrong
+        // pass with every metric healthy.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("karma.exr");
+        write_one_aov_per_part_exr(&src, 64, 32, 4);
+        let mut app = ExrApp::default();
+        app.viewer.active_layer = 2;
+
+        let partial = std::sync::Arc::new(ExrData::load_layer(&src, 2, 2).unwrap());
+        app.swap_image_arc(partial);
+        assert_eq!(
+            app.viewer.active_layer, 2,
+            "a subset frame is not evidence the image lost layers"
+        );
+
+        // A genuinely smaller *full* image still clamps — that guard is why the
+        // clamp is there.
+        let small = dir.path().join("small.exr");
+        write_sized_exr(&small, 64, 32);
+        app.swap_image_arc(std::sync::Arc::new(ExrData::load(&small).unwrap()));
+        assert_eq!(app.viewer.active_layer, 0, "one real layer ⇒ clamp");
     }
 
     #[test]
@@ -10975,6 +11386,7 @@ mod tests {
             open_gen: app.open_gen_a,
             beauty_only: false,
             proxy_target: None,
+            aov_layer: None,
         });
 
         // The dead channel was replaced and a fresh worker spawned; it processes

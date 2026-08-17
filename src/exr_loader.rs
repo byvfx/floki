@@ -18,7 +18,10 @@ const DECODE_PANIC_MSG: &str = "Failed to decode EXR: the decompressor panicked.
 /// change so a stale blob is rejected as a miss rather than mis-parsed. See
 /// [`ExrData::write_proxy_blob`] / [`ExrData::from_proxy_blob`].
 const PROXY_BLOB_MAGIC: &[u8] = b"FPX1";
-const PROXY_BLOB_VERSION: u8 = 1;
+/// v2 (#217) adds the echoed `key.aov` and the [`ExrData::only_layer`] tag, so a
+/// per-AOV proxy is neither served for the wrong pass nor reconstructed as if it
+/// were the beauty layer. A v1 blob is rejected as a miss and re-decoded.
+const PROXY_BLOB_VERSION: u8 = 2;
 /// Per-channel sample-type tags in the blob. Proxies only ever carry F16 or F32
 /// (`downsampled` maps U32 → F32), so those are the only two tags.
 const SAMPLE_TAG_F16: u8 = 0;
@@ -164,7 +167,18 @@ impl ExrData {
     ///
     /// # Errors
     /// Same contract as [`Self::load`], plus an error if `physical_index` is out of
-    /// range.
+    /// range, or if the decoded part turns out to hold more than one logical layer
+    /// (see below).
+    ///
+    /// # Refusing a multi-pass part
+    /// The `only_layer` remap is only unambiguous for a part holding exactly one
+    /// logical layer. `ExrApp::single_layer_part` is what decides that, from the
+    /// full layer table — but it decides *before* the decode, from a table that
+    /// could in principle disagree with this file (a re-rendered frame mid-sequence
+    /// with a different part layout). If it does, every texture build fails, and
+    /// #213's evict-and-retry hardening re-decodes the same wrong thing forever: an
+    /// unbounded loop, not a slow path. Erroring here costs one wasted decode and
+    /// falls the caller back to a full one.
     pub fn load_layer(
         path: impl AsRef<Path>,
         physical_index: usize,
@@ -192,6 +206,14 @@ impl ExrData {
             layer_data: smallvec::smallvec![single.layer_data],
         };
         let mut data = Self::from_image(image, true, false);
+        if data.logical_layers.len() != 1 {
+            return Err(format!(
+                "{}: part {physical_index} holds {} render passes, not one — \
+                 a single-layer decode cannot address them",
+                path_ref.display(),
+                data.logical_layers.len()
+            ));
+        }
         data.only_layer = Some(logical_index);
         Ok(data)
     }
@@ -418,12 +440,23 @@ impl ExrData {
         out.extend_from_slice(PROXY_BLOB_MAGIC);
         out.push(PROXY_BLOB_VERSION);
         out.push((self.beauty_only as u8) | ((self.proxy as u8) << 1));
+        // Which AOV this proxy *is* (#217). Restored on read so the reconstructed
+        // proxy answers for that AOV and refuses every other one, exactly as the
+        // decode it stands in for does.
+        match self.only_layer {
+            Some(n) => {
+                out.push(1);
+                out.extend_from_slice(&(n as u32).to_le_bytes());
+            }
+            None => out.push(0),
+        }
 
         // Echoed key tuple — verified on read to defeat 64-bit filename
         // collisions and catch a stale entry the key hash didn't already exclude.
         out.extend_from_slice(&key.mtime_ns.to_le_bytes());
         out.extend_from_slice(&key.size.to_le_bytes());
         out.extend_from_slice(&key.proxy_px.to_le_bytes());
+        out.extend_from_slice(&key.aov.to_le_bytes());
         write_blob_str(&mut out, &key.path);
 
         // Image geometry: display window + pixel aspect frame the viewport.
@@ -504,12 +537,19 @@ impl ExrData {
         let flags = r.u8()?;
         let beauty_only = flags & 1 != 0;
         let proxy = flags & 2 != 0;
+        let only_layer = match r.u8()? {
+            0 => None,
+            _ => Some(r.u32()? as usize),
+        };
 
         // Reject a collision / stale entry: the echoed tuple must match the key
-        // the caller hashed to find this file.
+        // the caller hashed to find this file. `aov` is in here for #217: without
+        // it, layer 1's cached proxy is a verified "hit" for layer 2 and the wrong
+        // pass renders with nothing failing.
         if r.u64()? != key.mtime_ns
             || r.u64()? != key.size
             || r.u32()? != key.proxy_px
+            || r.u32()? != key.aov
             || r.str()? != key.path
         {
             return None;
@@ -593,7 +633,56 @@ impl ExrData {
         };
         let mut data = Self::from_image(image, beauty_only, proxy);
         data.display_size = display_size;
+        // A per-AOV proxy (#217) must claim the same AOV it was written for, and —
+        // via `resolve_logical` — refuse every other. A blob claiming an AOV it
+        // can't address is rejected outright rather than restored into the state
+        // `load_layer` itself refuses to produce.
+        if let Some(n) = only_layer {
+            if data.logical_layers.len() != 1 {
+                return None;
+            }
+            data.only_layer = Some(n);
+        }
         Some(data)
+    }
+
+    /// Map a caller's logical index (in the *full* image's table) onto this data's
+    /// own, which differ for a single-layer decode (#217). Identity for a decode
+    /// that carries the whole image; `None` when this data **cannot** answer for
+    /// `idx` at all.
+    ///
+    /// Refusing is the important half. A single-layer decode holds one entry, so a
+    /// lenient fallthrough would hand `logical_channels(0)` the entry it *does*
+    /// have — which is AOV 3's pixels — and the caller would render them as AOV 0
+    /// without a single failed call. The T1 ring is keyed `(source, frame)` with no
+    /// AOV in the key, so switching a layer's AOV leaves exactly those stale frames
+    /// resident and asks them for the new index. Wrong pixels, silently, is worse
+    /// than the freeze #213 was about; returning `None` instead makes the texture
+    /// build fail, which `collect_comp_textures` already turns into an evict +
+    /// re-decode.
+    ///
+    /// Only remaps when this data holds exactly one logical layer — the
+    /// multi-part-with-one-AOV-per-part case. A single-part file decodes its whole
+    /// part, so every logical layer is present and already correctly numbered.
+    #[must_use]
+    fn resolve_logical(&self, idx: usize) -> Option<usize> {
+        match self.only_layer {
+            // A whole-image decode: the caller's numbering is ours.
+            None => Some(idx),
+            Some(n) if n == idx && self.logical_layers.len() == 1 => Some(0),
+            // A partial decode asked for an AOV it does not carry.
+            Some(_) => None,
+        }
+    }
+
+    /// The [`LogicalLayer`] a caller's index names, honouring the single-layer
+    /// remap above (#217). Prefer this over indexing `logical_layers` directly
+    /// wherever `idx` is a *caller's* AOV rather than a position in this data's own
+    /// table — during playback the displayed frame may be a one-layer decode, and a
+    /// raw `logical_layers.get(aov)` then reads the wrong entry or none at all.
+    #[must_use]
+    pub fn logical_layer(&self, idx: usize) -> Option<&LogicalLayer> {
+        self.logical_layers.get(self.resolve_logical(idx)?)
     }
 
     /// `(width, height)` of the given logical layer **for display/framing**. For a
@@ -602,24 +691,9 @@ impl ExrData {
     /// physical layer's pixel dims. Note: texture packing reads the real buffer
     /// dims via [`Self::logical_channels`] (`layer.size`) directly, so it is
     /// unaffected by this override.
-    /// Map a caller's logical index (in the *full* image's table) onto this data's
-    /// own, which differ for a single-layer decode (#217). Identity otherwise.
-    ///
-    /// Only remaps when this data holds exactly one logical layer — the
-    /// multi-part-with-one-AOV-per-part case. A single-part file decodes its whole
-    /// part, so every logical layer is present and already correctly numbered.
-    #[must_use]
-    fn resolve_logical(&self, idx: usize) -> usize {
-        match self.only_layer {
-            Some(n) if n == idx && self.logical_layers.len() == 1 => 0,
-            _ => idx,
-        }
-    }
-
     #[must_use]
     pub fn logical_size(&self, idx: usize) -> Option<(usize, usize)> {
-        let idx = self.resolve_logical(idx);
-        let ll = self.logical_layers.get(idx)?;
+        let ll = self.logical_layer(idx)?;
         if let Some(ds) = self.display_size {
             return Some(ds);
         }
@@ -642,8 +716,7 @@ impl ExrData {
         Option<&exr::image::AnyChannel<FlatSamples>>,
         Option<&exr::image::AnyChannel<FlatSamples>>,
     )> {
-        let idx = self.resolve_logical(idx);
-        let ll = self.logical_layers.get(idx)?;
+        let ll = self.logical_layer(idx)?;
         let layer = self.image.layer_data.get(ll.physical_index)?;
         let list = &layer.channel_data.list;
         let get = |o: Option<usize>| o.and_then(|i| list.get(i));
@@ -1628,6 +1701,7 @@ mod tests {
             mtime_ns: 1_700_000_000_123_456_789,
             size: 178_000_000,
             proxy_px: 1024,
+            aov: 0,
         }
     }
 
@@ -1758,6 +1832,52 @@ mod tests {
     }
 
     #[test]
+    fn a_cached_aov_proxy_is_never_served_for_a_different_aov() {
+        // #217, the one that has to be right: a per-AOV proxy of `shot.0007.exr`
+        // shares path, mtime, size and pixel cap with every *other* AOV of the same
+        // frame. With `aov` out of the key they hash to one filename and the header
+        // check passes, so layer 1's pixels come back as a verified hit for layer 2
+        // — the wrong pass on screen, silently, which is worse than the slow decode
+        // the cache exists to avoid.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multipart.exr");
+        write_multipart_exr(&path);
+
+        // (That the two keys also hash to different *filenames* is pinned next to
+        // the hash itself, in `proxy_cache`.)
+        let k1 = crate::proxy_cache::ProxyKey {
+            aov: 1,
+            ..blob_key()
+        };
+        let k2 = crate::proxy_cache::ProxyKey {
+            aov: 2,
+            ..blob_key()
+        };
+
+        let mut scratch = Vec::new();
+        let proxy = ExrData::load_layer_proxy_into(&path, 1, 1, 8, &mut scratch).unwrap();
+        assert_eq!(proxy.only_layer, Some(1));
+        let blob = proxy.write_proxy_blob(&k1);
+
+        // Its own key round-trips, AOV identity intact — so the restored proxy
+        // refuses layer 0 exactly as the decode it stands in for does.
+        let back = ExrData::from_proxy_blob(&blob, &k1).expect("round-trips under its own key");
+        assert_eq!(back.only_layer, Some(1));
+        assert!(back.logical_channels(1).is_some());
+        assert!(back.logical_channels(0).is_none());
+
+        // A different AOV's key is a miss even though everything else matches.
+        assert!(
+            ExrData::from_proxy_blob(&blob, &k2).is_none(),
+            "layer 1's blob must not verify as layer 2"
+        );
+        assert!(
+            ExrData::from_proxy_blob(&blob, &blob_key()).is_none(),
+            "nor as the beauty layer"
+        );
+    }
+
+    #[test]
     fn from_proxy_blob_rejects_absurd_counts_without_allocating() {
         // A corrupt/tampered blob with a valid header + matching key but a layer
         // claiming a 65535×65535 buffer must return None (a cache miss) — the
@@ -1832,6 +1952,131 @@ mod tests {
         .write()
         .to_file(path)
         .expect("write multipart exr");
+    }
+
+    /// Write a multi-part EXR whose **second part carries two render passes**
+    /// (`diffuse.*` + `specular.*`). The Karma shape `load_layer` is built for is
+    /// one AOV per part; this is the shape it must refuse, because a decode of
+    /// part 1 alone cannot say which of the two logical layers it is.
+    fn write_multipass_part_exr(path: &Path) {
+        const W: usize = 2;
+        const H: usize = 2;
+        let named = |name: &str, chans: &[&str]| {
+            let mut list = smallvec::SmallVec::new();
+            for c in chans {
+                list.push(AnyChannel::new(
+                    Text::from(*c),
+                    FlatSamples::F32(vec![0.5; W * H]),
+                ));
+            }
+            Layer::new(
+                (W, H),
+                LayerAttributes {
+                    layer_name: Some(Text::from(name)),
+                    ..Default::default()
+                },
+                Encoding::FAST_LOSSLESS,
+                AnyChannels::sort(list),
+            )
+        };
+        let layers: smallvec::SmallVec<[Layer<AnyChannels<FlatSamples>>; 2]> = smallvec::smallvec![
+            named("beauty", &["R", "G", "B", "A"]),
+            named(
+                "passes",
+                &[
+                    "diffuse.R",
+                    "diffuse.G",
+                    "diffuse.B",
+                    "specular.R",
+                    "specular.G",
+                    "specular.B",
+                ],
+            ),
+        ];
+        Image::from_layers(
+            ImageAttributes::new(IntegerBounds::from_dimensions((W, H))),
+            layers,
+        )
+        .write()
+        .to_file(path)
+        .expect("write multipass-part exr");
+    }
+
+    #[test]
+    fn load_layer_decodes_one_aov_and_answers_for_that_index_only() {
+        // #217: the whole point is that a caller holding full-image indices can ask
+        // a one-part decode for *its* layer. The refusals matter as much as the
+        // hit: the T1 ring is keyed (source, frame) with no AOV, so an AOV switch
+        // leaves these frames resident and asks them for the new index.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multipart.exr");
+        write_multipart_exr(&path);
+
+        let full = ExrData::load(&path).expect("full load");
+        assert_eq!(full.logical_layers.len(), 2, "beauty + normal");
+        assert_eq!(full.logical_layers[1].physical_index, 1);
+
+        let one = ExrData::load_layer(&path, 1, 1).expect("layer 1 decode");
+        assert_eq!(one.only_layer, Some(1));
+        assert_eq!(one.image.layer_data.len(), 1, "only part 1 decoded");
+        assert!(one.beauty_only, "a subset frame: settle re-decodes it full");
+
+        // It answers for the index the caller asked for ...
+        assert!(
+            one.logical_channels(1).is_some(),
+            "the decoded AOV resolves under the caller's own index"
+        );
+        assert_eq!(one.logical_size(1), full.logical_size(1));
+        assert_eq!(
+            one.logical_layer(1).map(|l| l.name.clone()),
+            Some("normal".into())
+        );
+
+        // ... and for no other. Layer 0 is the dangerous one: a lenient remap would
+        // hand back the single entry it holds — the *normal* pass — and it would
+        // render as beauty with nothing failing anywhere.
+        assert!(
+            one.logical_channels(0).is_none(),
+            "a layer-1 decode must not answer as layer 0"
+        );
+        assert!(one.logical_size(0).is_none());
+        assert!(one.logical_channels(2).is_none(), "out of range stays None");
+
+        // Cheaper than the full decode, which is the entire justification.
+        assert!(one.approx_bytes() < full.approx_bytes());
+    }
+
+    #[test]
+    fn load_layer_refuses_a_part_holding_several_passes() {
+        // The gate (`ExrApp::single_layer_part`) should never route here, but it
+        // decides from a layer table read at open time — a sequence whose part
+        // layout changes mid-shot would slip through. Without this check that frame
+        // decodes into an ExrData that can address *nothing*, every texture build
+        // fails, and #213's evict-and-retry re-decodes it forever: an unbounded
+        // loop, not a slow path. An Err costs one decode and falls back to full.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multipass.exr");
+        write_multipass_part_exr(&path);
+
+        let full = ExrData::load(&path).expect("full load");
+        assert_eq!(full.logical_layers.len(), 3, "beauty + diffuse + specular");
+        assert_eq!(full.logical_layers[1].physical_index, 1);
+        assert_eq!(
+            full.logical_layers[2].physical_index, 1,
+            "both passes share part 1 — the ambiguous case"
+        );
+
+        let err = match ExrData::load_layer(&path, 1, 1) {
+            Ok(_) => panic!("a part holding two passes must not decode as one layer"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("render passes"),
+            "error should explain the ambiguity, got: {err}"
+        );
+
+        // Part 0 holds exactly one pass, so it is still addressable.
+        assert!(ExrData::load_layer(&path, 0, 0).is_ok());
     }
 
     #[test]

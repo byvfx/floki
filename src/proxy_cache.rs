@@ -4,7 +4,7 @@
 //! the first touch of every frame still pays the full ~220 ms EXR decode, and
 //! pays it again in every new session. This module persists the downsampled
 //! proxies to disk (`~/.floki/proxy-cache/`), keyed by the source
-//! `path + mtime + size + proxy_px`, so first-touch decode is paid **once,
+//! `path + mtime + size + proxy_px + aov`, so first-touch decode is paid **once,
 //! ever**: a repeat pass or a later session loads the proxy from disk (a raw
 //! f16/f32 dump — a memcpy, ~zero decode) instead of re-decoding the source.
 //! Biggest on networked media and repeated review (dailies, shot iteration),
@@ -44,7 +44,7 @@ const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 /// Folded into every key hash so a future change to the keying scheme yields
 /// different filenames (old entries orphaned + budget-evicted, never mis-hit).
-const KEY_SCHEME: u8 = 1;
+const KEY_SCHEME: u8 = 2;
 
 /// Extension for a cache blob; `<hash>.fpx`. Temp files use `<name>.tmp`.
 const PROXY_EXT: &str = "fpx";
@@ -71,12 +71,21 @@ pub fn gib_to_bytes(gib: f32) -> u64 {
     (f64::from(gib.max(0.0)) * BYTES_PER_GIB) as u64
 }
 
-/// Identity of one cached proxy: the source frame plus the proxy size.
+/// Identity of one cached proxy: the source frame, the proxy size, and which AOV
+/// it holds.
 ///
 /// `mtime_ns` + `size` mean a re-rendered frame keys to a different file
-/// (auto-invalidation); `proxy_px` lets different proxy sizes coexist. The tuple
-/// is both hashed into the filename and echoed into the blob header so the reader
-/// can reject a collision or a stale entry.
+/// (auto-invalidation); `proxy_px` lets different proxy sizes coexist; `aov` lets
+/// different render passes of the *same* frame coexist. The tuple is both hashed
+/// into the filename and echoed into the blob header so the reader can reject a
+/// collision or a stale entry.
+///
+/// **`aov` is load-bearing, not bookkeeping** (#217). Before per-AOV decode every
+/// cached proxy was the beauty layer, so the pass was implicit in the format. Now
+/// that a proxy can hold layer 1, omitting it from the key would make layer 1's
+/// file a *verified* hit for layer 2 — same path, same mtime, same size, same
+/// size cap — and the wrong pass would render with no error anywhere. That is
+/// strictly worse than the slow decode this cache exists to avoid.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProxyKey {
     /// Absolute source path (canonicalized when possible), as a lossy string so
@@ -88,14 +97,18 @@ pub struct ProxyKey {
     pub size: u64,
     /// Proxy long-side pixel cap (the `max_dim` passed to `load_proxy`).
     pub proxy_px: u32,
+    /// Logical layer (AOV) index this proxy carries. `0` is the beauty pass —
+    /// which is also what a whole-first-part `load_proxy` produces, so the two
+    /// share a key by design (they are the same pixels).
+    pub aov: u32,
 }
 
 impl ProxyKey {
-    /// Build a key for `path` at proxy size `proxy_px`, reading the source's
-    /// mtime + size. `None` if the file can't be stat'd (missing / no perms) —
-    /// the caller then just decodes without caching.
+    /// Build a key for `path`'s layer `aov` at proxy size `proxy_px`, reading the
+    /// source's mtime + size. `None` if the file can't be stat'd (missing / no
+    /// perms) — the caller then just decodes without caching.
     #[must_use]
-    pub fn for_source(path: &Path, proxy_px: usize) -> Option<Self> {
+    pub fn for_source(path: &Path, proxy_px: usize, aov: usize) -> Option<Self> {
         let meta = std::fs::metadata(path).ok()?;
         let mtime_ns = meta
             .modified()
@@ -111,6 +124,7 @@ impl ProxyKey {
             mtime_ns,
             size: meta.len(),
             proxy_px: proxy_px as u32,
+            aov: aov as u32,
         })
     }
 
@@ -121,6 +135,7 @@ impl ProxyKey {
         h = fnv1a(&self.mtime_ns.to_le_bytes(), h);
         h = fnv1a(&self.size.to_le_bytes(), h);
         h = fnv1a(&self.proxy_px.to_le_bytes(), h);
+        h = fnv1a(&self.aov.to_le_bytes(), h);
         h
     }
 
@@ -237,16 +252,16 @@ impl ProxyCache {
         }
     }
 
-    /// Try to load a cached proxy for `path` at size `proxy_px`. Returns the
-    /// reconstructed proxy on a verified hit (the caller skips the decode), or
-    /// `None` on any miss / stale / corrupt entry (the caller decodes normally).
-    /// Synchronous — this is on the decode worker's critical path.
+    /// Try to load a cached proxy of `path`'s layer `aov` at size `proxy_px`.
+    /// Returns the reconstructed proxy on a verified hit (the caller skips the
+    /// decode), or `None` on any miss / stale / corrupt entry (the caller decodes
+    /// normally). Synchronous — this is on the decode worker's critical path.
     #[must_use]
-    pub fn read(&self, path: &Path, proxy_px: usize) -> Option<ExrData> {
+    pub fn read(&self, path: &Path, proxy_px: usize, aov: usize) -> Option<ExrData> {
         if !self.enabled.load(Ordering::Relaxed) {
             return None;
         }
-        let key = ProxyKey::for_source(path, proxy_px)?;
+        let key = ProxyKey::for_source(path, proxy_px, aov)?;
         let filename = key.filename();
         let file = self.root.join(&filename);
         // Read + verify the entry. A raw f16/f32 dump, so a hit is a single alloc +
@@ -288,15 +303,16 @@ impl ProxyCache {
         );
     }
 
-    /// Whether a verified-by-name cache entry exists for `path` at `proxy_px`
-    /// (existence only, no header parse). Used to gate the read-ahead warmer so a
-    /// cache-hit pass stops pulling full source EXRs through the page cache.
+    /// Whether a verified-by-name cache entry exists for `path`'s layer `aov` at
+    /// `proxy_px` (existence only, no header parse). Used to gate the read-ahead
+    /// warmer so a cache-hit pass stops pulling full source EXRs through the page
+    /// cache.
     #[must_use]
-    pub fn contains(&self, path: &Path, proxy_px: usize) -> bool {
+    pub fn contains(&self, path: &Path, proxy_px: usize, aov: usize) -> bool {
         if !self.enabled.load(Ordering::Relaxed) {
             return false;
         }
-        let Some(key) = ProxyKey::for_source(path, proxy_px) else {
+        let Some(key) = ProxyKey::for_source(path, proxy_px, aov) else {
             return false;
         };
         self.root.join(key.filename()).exists()
@@ -557,11 +573,20 @@ mod tests {
         let p = dir.path().join("f.exr");
         write_exr(&p, 8, 8, false);
 
-        let k = ProxyKey::for_source(&p, 512).unwrap();
+        let k = ProxyKey::for_source(&p, 512, 0).unwrap();
         // Deterministic for identical inputs.
-        assert_eq!(k.hash(), ProxyKey::for_source(&p, 512).unwrap().hash());
+        assert_eq!(k.hash(), ProxyKey::for_source(&p, 512, 0).unwrap().hash());
         // Proxy size is part of the key.
-        assert_ne!(k.hash(), ProxyKey::for_source(&p, 256).unwrap().hash());
+        assert_ne!(k.hash(), ProxyKey::for_source(&p, 256, 0).unwrap().hash());
+        // So is the AOV (#217). Every other field is identical between two passes
+        // of the same frame at the same size — path, mtime, size, pixel cap — so
+        // without this they share one cache file and layer 1's proxy is served for
+        // layer 2. Wrong pixels, and nothing on the read path can notice.
+        assert_ne!(k.hash(), ProxyKey::for_source(&p, 512, 1).unwrap().hash());
+        assert_ne!(
+            ProxyKey::for_source(&p, 512, 1).unwrap().filename(),
+            ProxyKey::for_source(&p, 512, 2).unwrap().filename(),
+        );
         // Filename is the hex hash + extension.
         assert!(k.filename().ends_with(".fpx"));
         assert_eq!(k.filename().len(), 16 + 4);
@@ -574,10 +599,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("f.exr");
         write_exr(&p, 8, 8, false);
-        let before = ProxyKey::for_source(&p, 512).unwrap();
+        let before = ProxyKey::for_source(&p, 512, 0).unwrap();
         // Rewrite at a different resolution → different size (and mtime).
         write_exr(&p, 16, 16, false);
-        let after = ProxyKey::for_source(&p, 512).unwrap();
+        let after = ProxyKey::for_source(&p, 512, 0).unwrap();
         assert_ne!(before.hash(), after.hash());
     }
 
@@ -592,17 +617,17 @@ mod tests {
         cache.configure(true, gib_to_bytes(1.0));
 
         // Cold: miss.
-        assert!(cache.read(&p, 48).is_none(), "cold read misses");
-        assert!(!cache.contains(&p, 48));
+        assert!(cache.read(&p, 48, 0).is_none(), "cold read misses");
+        assert!(!cache.contains(&p, 48, 0));
 
         // Populate synchronously (avoid racing the writer thread in the test).
         let proxy = ExrData::load_proxy(&p, 48).unwrap();
-        let key = ProxyKey::for_source(&p, 48).unwrap();
+        let key = ProxyKey::for_source(&p, 48, 0).unwrap();
         let blob = proxy.write_proxy_blob(&key);
         std::fs::write(cache_dir.path().join(key.filename()), &blob).unwrap();
 
-        assert!(cache.contains(&p, 48));
-        let hit = cache.read(&p, 48).expect("warm read hits");
+        assert!(cache.contains(&p, 48, 0));
+        let hit = cache.read(&p, 48, 0).expect("warm read hits");
         assert!(hit.proxy && hit.beauty_only);
         assert_eq!(hit.logical_size(0), proxy.logical_size(0));
         assert_eq!(hit.approx_bytes(), proxy.approx_bytes());
@@ -614,10 +639,10 @@ mod tests {
         let p = src.path().join("f.exr");
         write_exr(&p, 8, 8, false);
         let cache = ProxyCache::disabled();
-        assert!(cache.read(&p, 48).is_none());
-        assert!(!cache.contains(&p, 48));
+        assert!(cache.read(&p, 48, 0).is_none());
+        assert!(!cache.contains(&p, 48, 0));
         // store on a disabled cache is a silent no-op (no panic, nothing written).
-        let key = ProxyKey::for_source(&p, 48).unwrap();
+        let key = ProxyKey::for_source(&p, 48, 0).unwrap();
         cache.store(&key, vec![0u8; 4]);
     }
 
@@ -679,16 +704,16 @@ mod tests {
         let cache = ProxyCache::with_root(cache_dir.path().to_path_buf());
         cache.configure(true, gib_to_bytes(1.0));
 
-        assert!(cache.read(&p, 48).is_none(), "cold read misses");
+        assert!(cache.read(&p, 48, 0).is_none(), "cold read misses");
 
         let proxy = ExrData::load_proxy(&p, 48).unwrap();
-        let key = ProxyKey::for_source(&p, 48).unwrap();
+        let key = ProxyKey::for_source(&p, 48, 0).unwrap();
         cache.store(&key, proxy.write_proxy_blob(&key));
 
         // The writer is async; poll (bounded) so a wiring bug fails fast.
         let mut hit = None;
         for _ in 0..200 {
-            if let Some(d) = cache.read(&p, 48) {
+            if let Some(d) = cache.read(&p, 48, 0) {
                 hit = Some(d);
                 break;
             }
@@ -698,16 +723,19 @@ mod tests {
         assert!(hit.proxy && hit.beauty_only);
         assert_eq!(hit.approx_bytes(), proxy.approx_bytes());
         assert_eq!(hit.logical_size(0), proxy.logical_size(0));
-        assert!(cache.contains(&p, 48), "contains() sees the written entry");
+        assert!(
+            cache.contains(&p, 48, 0),
+            "contains() sees the written entry"
+        );
 
         // Clear (routed through the writer) wipes it back to a miss.
         cache.clear();
         for _ in 0..200 {
-            if !cache.contains(&p, 48) {
+            if !cache.contains(&p, 48, 0) {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert!(!cache.contains(&p, 48), "clear removes the entry");
+        assert!(!cache.contains(&p, 48, 0), "clear removes the entry");
     }
 }
