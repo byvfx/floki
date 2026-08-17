@@ -171,6 +171,29 @@ fn bench_local(c: &mut Criterion) {
         group.bench_function(format!("{label}/load_proxy_1024"), |b| {
             b.iter(|| ExrData::load_proxy(std::hint::black_box(path), 1024).unwrap())
         });
+        // #217: the same two paths for a *non-beauty* AOV. Beauty is part 0, which
+        // `first_valid_layer` reaches for free; the question is whether selecting an
+        // arbitrary part is equally cheap, since that is what decides whether
+        // inspecting a pass can play at all. Skipped on single-part files, where
+        // there is no other part to select.
+        let probe = 1;
+        if ExrData::load(path).is_ok_and(|d| d.image.layer_data.len() > probe) {
+            group.bench_function(format!("{label}/load_layer_{probe}"), |b| {
+                b.iter(|| ExrData::load_layer(std::hint::black_box(path), probe, probe).unwrap())
+            });
+            group.bench_function(format!("{label}/load_layer_{probe}_proxy_1024"), |b| {
+                b.iter(|| {
+                    ExrData::load_layer_proxy_into(
+                        std::hint::black_box(path),
+                        probe,
+                        probe,
+                        1024,
+                        &mut Vec::new(),
+                    )
+                    .unwrap()
+                })
+            });
+        }
     }
     group.finish();
 }

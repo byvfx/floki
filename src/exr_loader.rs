@@ -64,6 +64,20 @@ pub struct ExrData {
     /// still built from the small buffers (and upscaled). `None` for real frames,
     /// where the buffer dims *are* the display dims.
     pub display_size: Option<(usize, usize)>,
+    /// For a single-layer decode ([`Self::load_layer`], #217): which index **in the
+    /// full image's layer table** this data represents.
+    ///
+    /// The decode carries one physical layer, so its own `logical_layers` are
+    /// renumbered from 0 — but callers hold indices from the full image and would
+    /// otherwise ask for, say, layer 5 of a table with one entry and get `None`.
+    /// That is not a soft failure: it is #213's silent freeze, where every texture
+    /// build fails and the layer never displays a frame.
+    ///
+    /// [`Self::resolve_logical`] maps the caller's index onto the decoded one. The
+    /// mapping is only unambiguous when the decoded part holds exactly **one**
+    /// logical layer, so the caller must check that before requesting this path —
+    /// see `ExrApp::single_layer_part`.
+    pub only_layer: Option<usize>,
 }
 
 /// A displayable "layer" (render pass) derived from grouping a physical EXR
@@ -122,6 +136,84 @@ impl ExrData {
 
         let image = map_read_err(read_result, path_ref)?;
         Ok(Self::from_image(image, false, false))
+    }
+
+    /// Decode only the **physical layer at `physical_index`** — the AOV
+    /// generalisation of [`Self::load_beauty`] (#217).
+    ///
+    /// `load_beauty` accelerates the beauty pass and nothing else, so inspecting
+    /// any other AOV fell off a cliff: the gate refused every cheap decode and
+    /// playback paid a full all-parts decode. Measured on a 16-part / 421 MB
+    /// render, all layers is **264 ms** against **21 ms** for one — so the
+    /// difference between an AOV that plays and one that crawls is entirely
+    /// whether the other parts get decompressed.
+    ///
+    /// Uses `specific_layer`, added to the `byvfx/exrs` fork for this: the block
+    /// reader rejects every block not belonging to `physical_index`, exactly as
+    /// `first_valid_layer` does for part 0.
+    ///
+    /// `logical_index` is the caller's index **in the full image's** layer table,
+    /// recorded as [`only_layer`](Self::only_layer) so the resulting one-layer
+    /// `ExrData` can still answer `logical_channels(logical_index)`. See that field
+    /// for why the caller must not ask for a part holding more than one logical
+    /// layer.
+    ///
+    /// The result is flagged [`beauty_only`](Self::beauty_only) — not because it is
+    /// the beauty pass, but because it carries a *subset* of the image and so is
+    /// not a valid sampling or AOV-switch source; the settle re-decodes it full.
+    ///
+    /// # Errors
+    /// Same contract as [`Self::load`], plus an error if `physical_index` is out of
+    /// range.
+    pub fn load_layer(
+        path: impl AsRef<Path>,
+        physical_index: usize,
+        logical_index: usize,
+    ) -> std::result::Result<Self, String> {
+        let path_ref = path.as_ref();
+
+        let read_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let builder = read()
+                .no_deep_data()
+                .largest_resolution_level()
+                .all_channels()
+                .specific_layer(physical_index)
+                .all_attributes();
+            match map_file(path_ref) {
+                Some(map) => builder.from_buffered(std::io::Cursor::new(&map[..])),
+                None => builder.from_file(path_ref),
+            }
+        }))
+        .map_err(|_| DECODE_PANIC_MSG.to_string())?;
+
+        let single = map_read_err(read_result, path_ref)?;
+        let image = FlatImage {
+            attributes: single.attributes,
+            layer_data: smallvec::smallvec![single.layer_data],
+        };
+        let mut data = Self::from_image(image, true, false);
+        data.only_layer = Some(logical_index);
+        Ok(data)
+    }
+
+    /// [`Self::load_layer`] followed by the same box-filter downsample
+    /// [`Self::load_proxy`] applies (#217). Only the requested layer is decimated —
+    /// doing all of them would cost ~16x the filter time on a 16-part render for
+    /// pixels nothing is going to display.
+    ///
+    /// # Errors
+    /// Same contract as [`Self::load_layer`].
+    pub fn load_layer_proxy_into(
+        path: impl AsRef<Path>,
+        physical_index: usize,
+        logical_index: usize,
+        max_dim: usize,
+        scratch: &mut Vec<f32>,
+    ) -> std::result::Result<Self, String> {
+        let full = Self::load_layer(path, physical_index, logical_index)?;
+        let mut small = full.downsampled_into(max_dim, scratch);
+        small.only_layer = Some(logical_index);
+        Ok(small)
     }
 
     /// Decode only the **first valid layer** of an EXR — the beauty/main pass by
@@ -303,6 +395,7 @@ impl ExrData {
             beauty_only,
             proxy,
             display_size: None,
+            only_layer: None,
         }
     }
 
@@ -509,8 +602,23 @@ impl ExrData {
     /// physical layer's pixel dims. Note: texture packing reads the real buffer
     /// dims via [`Self::logical_channels`] (`layer.size`) directly, so it is
     /// unaffected by this override.
+    /// Map a caller's logical index (in the *full* image's table) onto this data's
+    /// own, which differ for a single-layer decode (#217). Identity otherwise.
+    ///
+    /// Only remaps when this data holds exactly one logical layer — the
+    /// multi-part-with-one-AOV-per-part case. A single-part file decodes its whole
+    /// part, so every logical layer is present and already correctly numbered.
+    #[must_use]
+    fn resolve_logical(&self, idx: usize) -> usize {
+        match self.only_layer {
+            Some(n) if n == idx && self.logical_layers.len() == 1 => 0,
+            _ => idx,
+        }
+    }
+
     #[must_use]
     pub fn logical_size(&self, idx: usize) -> Option<(usize, usize)> {
+        let idx = self.resolve_logical(idx);
         let ll = self.logical_layers.get(idx)?;
         if let Some(ds) = self.display_size {
             return Some(ds);
@@ -534,6 +642,7 @@ impl ExrData {
         Option<&exr::image::AnyChannel<FlatSamples>>,
         Option<&exr::image::AnyChannel<FlatSamples>>,
     )> {
+        let idx = self.resolve_logical(idx);
         let ll = self.logical_layers.get(idx)?;
         let layer = self.image.layer_data.get(ll.physical_index)?;
         let list = &layer.channel_data.list;
