@@ -52,10 +52,35 @@ struct LoadResult {
 }
 
 /// serde default for `proxy_size` (#94): the scrub-proxy long-side pixel target
-/// (~half of 1080p → ~4× more frames fit, per the OpenRV model).
+/// (~half of 1080p → ~4× more frames fit, per the OpenRV model). Scrub only —
+/// playback derives its own target from the viewport (#209).
 fn default_proxy_size() -> usize {
     1024
 }
+
+/// What resolution playback should decode a source at (#209).
+///
+/// Three states, not two, because "I can't tell" and "full resolution" want
+/// opposite fallbacks and collapsing them breaks one path or the other: treating
+/// unknown as full silently disables the proxy for classic (non-comp) sequences,
+/// while treating full as unknown puts a 256 px scrub proxy on screen at 1:1.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PlaybackProxy {
+    /// Decimate to this long-side pixel target.
+    Px(usize),
+    /// Decode full — the view needs every source pixel, so proxying would cost a
+    /// pointless factor-1 "downsample" and a full-size on-disk proxy blob.
+    Full,
+    /// No registered source or no sane view transform yet. Falls back to the fixed
+    /// `proxy_size` knob, which is what this path did before the target was derived.
+    Unknown,
+}
+
+/// Floor for the viewport-derived playback proxy (#209). A pathological zoom-out
+/// (or a tiny window) shouldn't drive the decode down to a thumbnail — below this
+/// the saving is irrelevant anyway, and the cost is a visibly mushy frame the
+/// instant the user zooms back in.
+const MIN_PROXY_PX: usize = 256;
 
 /// Hard cap on Layers-panel composite sources (#99 PR-B). Playback footprint is
 /// bounded on 8 GB (see the roadmap); the panel disables Add at this many layers.
@@ -585,6 +610,14 @@ pub struct ExrApp {
     #[serde(skip)]
     tex_uploader: Option<crate::tex_upload::TexUploader>,
 
+    /// Per-source proxy target held for the duration of a play run (#209), so the
+    /// T1 ring can't end up holding frames decoded at several different zoom
+    /// levels. Empty outside a run, and re-latched by [`Self::relatch_proxy_targets`]
+    /// each time playback starts. Runtime-only — a view transform doesn't outlive
+    /// the session.
+    #[serde(skip)]
+    proxy_target_latch: std::collections::HashMap<crate::layer::SourceId, PlaybackProxy>,
+
     /// First frame of an env-gated soak run — the clock the warm-up and run window
     /// in [`Self::tick_soak_harness`] are measured from. `None` outside a soak.
     #[serde(skip)]
@@ -1018,6 +1051,7 @@ impl Default for ExrApp {
             track_drag: None,
             transport_source: None,
             comp_stack: crate::layer::LayerStack::new(),
+            proxy_target_latch: std::collections::HashMap::new(),
             tex_uploader: None,
             soak_started_at: None,
             soak_play_sent: false,
@@ -1995,13 +2029,197 @@ impl ExrApp {
         self.beauty_preview && self.wants_cheap_decode_at(frame, playhead)
     }
 
-    /// The scrub-proxy `target_blocks` to decode `frame` at (#94), or `None` for a
+    /// The proxy resolution *playback* needs for `source` (#209): the number of
+    /// physical screen pixels its long side currently occupies.
+    ///
+    /// `viewer.scale` is points per source pixel, so `long × scale ×
+    /// pixels_per_point` is exactly the on-screen footprint in real pixels — the
+    /// point past which more source resolution cannot be seen. Fit-to-window on a
+    /// 1200-point canvas needs ~1200; zooming to 2:1 needs twice that, and asks for
+    /// it automatically. Pausing is unaffected: `settle_to_full` still brings the
+    /// playhead back to full resolution for sampling (INV-SAMPLE).
+    ///
+    /// This replaces `proxy_size` for playback because that knob is the *scrub*
+    /// target — deliberately aggressive for dragging, and a number the user
+    /// otherwise has to trade off against playback sharpness. Derived, there is no
+    /// tradeoff to get wrong: at fit-to-window it is visually lossless and still
+    /// ~9× cheaper than full res on 4.6K footage.
+    ///
+    /// **Sized from `exr_data`, deliberately not from `cs.size`.** Today `cs.size`
+    /// would also work: it comes from `logical_size`, which returns the proxy's
+    /// recorded `display_size` — the *full-res* display window — so it does not
+    /// shrink when a proxy texture is bound. But that is a property of how proxies
+    /// carry geometry, not of what `cs.size` means, and anything that ever set it
+    /// from real buffer dimensions would create a feedback loop: a smaller bound
+    /// texture asking for a smaller next target, every frame, until the picture
+    /// collapsed to the floor. `exr_data` is the full-resolution frame by
+    /// construction and cannot express that bug, so the target is derived from it
+    /// and a test pins the invariant.
+    ///
+    /// `None` means **decode full, no proxy at all** — either because the view
+    /// needs every source pixel (zoomed to 1:1 or past it), or because there is no
+    /// sane view transform yet and guessing would be worse than decoding full.
+    ///
+    /// That distinction matters beyond sharpness. A "proxy" at the source's own
+    /// resolution is a decimation by a factor of 1 — a full-size copy — which the
+    /// on-disk proxy cache then stores *as a proxy*, at ~83 MB per frame on 4.6K
+    /// plate footage. It caches the full frame under a key that only a matching
+    /// zoom will ever hit, burning a 50 GB budget in ~600 frames to save nothing.
+    /// Above the top decimation band the proxy path must be off, not maximal.
+    ///
+    /// Callers during playback want [`Self::latched_proxy_target`], not this — see
+    /// there for why the live value must not drive decodes mid-run.
+    fn viewport_proxy_target(&self, source: crate::layer::SourceId) -> PlaybackProxy {
+        let Some(cs) = self.comp_sources.get(&source) else {
+            return PlaybackProxy::Unknown;
+        };
+        let Some((w, h)) = cs.exr_data.logical_size(cs.aov) else {
+            return PlaybackProxy::Unknown;
+        };
+        let long = w.max(h);
+        let ppp = self
+            .repaint_ctx
+            .as_ref()
+            .map_or(1.0, eframe::egui::Context::pixels_per_point);
+        let scale = self.viewer.scale;
+        if !scale.is_finite() || scale <= 0.0 || !ppp.is_finite() || ppp <= 0.0 {
+            return PlaybackProxy::Unknown; // no view transform yet — keep the old behaviour
+        }
+        let needed = (long as f32 * scale * ppp).ceil();
+        if !needed.is_finite() || needed <= 0.0 {
+            return PlaybackProxy::Unknown;
+        }
+        // Never above the source (no gain past 1:1), and never below the floor —
+        // except that the floor itself cannot exceed the source, or a sub-256px
+        // image inverts the bounds and `clamp` panics. That is not hypothetical:
+        // it took out seven tests on a 2×2 fixture, and would have been a crash on
+        // any small source in the wild.
+        let floor = MIN_PROXY_PX.min(long);
+        let needed = (needed as usize).clamp(floor, long);
+
+        // Quantize to the decimation the decoder will actually apply.
+        // `downsampled_into` reduces by an integer `factor = long.div_ceil(max_dim)`,
+        // so a whole band of targets produces a byte-identical decode. Snapping to
+        // the canonical target for that band means an ordinary zoom nudge does not
+        // move this value at all — which is what makes re-latching cheap enough to
+        // invalidate on (see `relatch_proxy_targets`).
+        //
+        // **Round the factor down, never up.** Rounding up picks *more* decimation
+        // than the view asked for, so the proxy is then upscaled onto the screen —
+        // and the shortfall is worst exactly where it is most visible. Just under
+        // 1:1, `ceil` jumps to factor 2 and delivers **half** the resolution the
+        // viewer needs, a 1.8× upscale, precisely when the user has zoomed in to
+        // inspect detail. Rounding down guarantees `target >= needed`: always
+        // oversampled, never blurred, so "visually lossless at the current view" is
+        // a property rather than an approximation. It costs one decimation band
+        // (~2304 rather than ~1536 on 4.6K plate at fit — about 22 MB per build,
+        // ~1.05 GB/s at 48 builds/s, well inside the ~6 GB/s this path sustains).
+        if long <= needed {
+            return PlaybackProxy::Full; // factor would be 1: a copy, not a proxy
+        }
+        let factor = long / needed.max(1); // floor
+        if factor <= 1 {
+            return PlaybackProxy::Full;
+        }
+        PlaybackProxy::Px(long.div_ceil(factor).max(1))
+    }
+
+    /// `source`'s proxy target for the current play run, **latched** at the moment
+    /// playback started (#209).
+    ///
+    /// The T1 ring is keyed on `(source, frame)` — resolution is not part of the
+    /// key. The settings knob knows this and calls `frame_cache.clear()` whenever
+    /// `proxy_size` changes, because the cached ring is "the wrong decode mode/size"
+    /// afterwards. Deriving the target from zoom made that same value change
+    /// *continuously*, with no such invalidation, so frames decoded at different
+    /// zoom levels would coexist in the ring and play back as **sharpness flickering
+    /// frame to frame**. Uniform softness reads as a proxy; inconsistent sharpness
+    /// reads as a broken player.
+    ///
+    /// Latching per run fixes it by construction rather than by invalidation: the
+    /// target cannot change while frames are being decoded into the ring, so the
+    /// ring is always internally consistent and no precached range is ever thrown
+    /// away for a zoom nudge. Zooming mid-play shows the latched resolution until
+    /// you pause — and pausing settles the playhead to full res anyway, so the next
+    /// run re-latches to whatever the view has become.
+    ///
+    /// The latch stores the whole decision, `None` (decode full) included — not
+    /// just a size. Recording only sizes would let a source latched at full res
+    /// fall through to the live value and start proxying mid-run the moment the
+    /// user zoomed out, which is the mismatch this exists to prevent.
+    fn latched_proxy_target(&self, source: crate::layer::SourceId) -> PlaybackProxy {
+        match self.proxy_target_latch.get(&source) {
+            Some(latched) => *latched,
+            None => self.viewport_proxy_target(source), // no run in progress
+        }
+    }
+
+    /// Re-latch every source's proxy target to the current view (#209). Called when
+    /// a play run begins, which is the only moment the target may safely move: the
+    /// ring is about to be filled, and anything stale in it is superseded.
+    ///
+    /// If the target genuinely changed — the user zoomed far enough to cross a
+    /// decimation band between runs — the cached frames are the wrong resolution
+    /// and are dropped, exactly as the `proxy_size` knob does for the same reason.
+    /// Because the target is quantized to the decimation factor, this fires on a
+    /// real change of detail level and not on every small zoom, so a precached
+    /// range survives ordinary framing adjustments.
+    fn relatch_proxy_targets(&mut self) {
+        let next: std::collections::HashMap<_, _> = self
+            .comp_sources
+            .keys()
+            .copied()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|s| (s, self.viewport_proxy_target(s)))
+            .collect();
+
+        // Only on a change *between* runs. A first play has no previous latch, and
+        // whatever precache put in the ring was decoded at this same live target.
+        let changed = !self.proxy_target_latch.is_empty() && next != self.proxy_target_latch;
+        self.proxy_target_latch = next;
+        if changed {
+            self.frame_cache.clear();
+            // Re-measure: a different proxy size means a different per-frame
+            // footprint, and the T1 budget is sized from it.
+            self.proxy_bytes = None;
+            self.invalidate_inflight();
+        }
+    }
+
+    /// The proxy `target_blocks` to decode `frame` at (#94/#209), or `None` for a
     /// full/beauty decode. Same cheap-while-moving gate as beauty, behind the
     /// `proxy_enabled` kill-switch; the worker falls back to beauty/full if the
     /// fast proxy read isn't available for the file.
+    ///
+    /// Scrubbing keeps the fixed `proxy_size` knob — while dragging, latency beats
+    /// sharpness and aggressive decimation is the point. Playback and precache use
+    /// the viewport-derived target instead.
     fn decode_proxy_target_at(&self, frame: u32, playhead: u32) -> Option<usize> {
-        (self.proxy_enabled && self.wants_cheap_decode_at(frame, playhead))
-            .then_some(self.proxy_size)
+        self.decode_proxy_target_at_for(Self::A_SOURCE, frame, playhead)
+    }
+
+    /// [`Self::decode_proxy_target_at`] for an explicit source, so a follower sizes
+    /// from its own resolution rather than the primary's.
+    fn decode_proxy_target_at_for(
+        &self,
+        source: crate::layer::SourceId,
+        frame: u32,
+        playhead: u32,
+    ) -> Option<usize> {
+        if !self.proxy_enabled || !self.wants_cheap_decode_at(frame, playhead) {
+            return None;
+        }
+        if self.scrub_active {
+            return Some(self.proxy_size);
+        }
+        match self.latched_proxy_target(source) {
+            PlaybackProxy::Px(px) => Some(px),
+            // A decision, not an absence: substituting the 256 px scrub knob here
+            // would put a deliberately-soft frame on screen at 1:1.
+            PlaybackProxy::Full => None,
+            PlaybackProxy::Unknown => Some(self.proxy_size),
+        }
     }
 
     fn decode_proxy_target(&self, frame: u32) -> Option<usize> {
@@ -2014,7 +2232,7 @@ impl ExrApp {
         if source == Self::A_SOURCE {
             self.decode_proxy_target(frame)
         } else {
-            self.decode_proxy_target_at(frame, self.source_playhead(source))
+            self.decode_proxy_target_at_for(source, frame, self.source_playhead(source))
         }
     }
 
@@ -2476,9 +2694,13 @@ impl ExrApp {
             self.playback.state = PlayState::Paused;
             self.settle_to_full();
         } else {
-            // Fresh play run → reset the HUD's dropped/held counters (#172).
+            // Fresh play run → reset the HUD's dropped/held counters (#172), and
+            // latch the proxy target to the view as it is now (#209). Play start is
+            // the one safe moment to move it: the ring is about to fill, so nothing
+            // decoded at the previous target survives to mismatch what follows.
             self.run_dropped = 0;
             self.run_held = 0;
+            self.relatch_proxy_targets();
             self.playback.start_playing(std::time::Instant::now());
         }
     }
@@ -9427,6 +9649,337 @@ mod tests {
         );
         app.scrub_active = false;
         assert!(!app.decode_beauty_only(cur), "released ⇒ full decode again");
+    }
+
+    /// An EXR of an explicit size, for the viewport-proxy sizing tests (#209),
+    /// which need a source whose long side is known and large enough to decimate.
+    fn write_sized_exr(path: &std::path::Path, w: usize, h: usize) {
+        let mut list = smallvec::SmallVec::new();
+        for name in ["R", "G", "B", "A"] {
+            list.push(AnyChannel::new(
+                Text::from(name),
+                FlatSamples::F16(vec![f16::from_f32(0.5); w * h]),
+            ));
+        }
+        Image::from_layer(Layer::new(
+            (w, h),
+            LayerAttributes::default(),
+            Encoding::FAST_LOSSLESS,
+            AnyChannels::sort(list),
+        ))
+        .write()
+        .to_file(path)
+        .expect("write sized exr fixture");
+    }
+
+    /// Register `source` as a comp source backed by a `w × h` image, the way the
+    /// Add flow would, so the sizing helpers have something to measure.
+    fn seed_comp_source(
+        app: &mut ExrApp,
+        source: crate::layer::SourceId,
+        path: &std::path::Path,
+        w: usize,
+        h: usize,
+    ) {
+        write_sized_exr(path, w, h);
+        let data = std::sync::Arc::new(ExrData::load(path).unwrap());
+        let size = data.logical_size(0).unwrap_or((0, 0));
+        app.comp_sources.insert(
+            source,
+            CompSource {
+                path: path.to_path_buf(),
+                exr_data: data,
+                size,
+                aov: 0,
+                bind_group: None,
+                texture: None,
+                cur_frame: None,
+            },
+        );
+    }
+
+    #[test]
+    fn viewport_proxy_target_tracks_on_screen_pixels() {
+        // #209: playback should decode the resolution it can actually show — the
+        // image's on-screen footprint in physical pixels — rather than a number the
+        // user typed. `scale` is points per source pixel, so a 4096-wide source at
+        // scale 0.25 occupies 1024 points, and at 1 point-per-pixel that is 1024
+        // real pixels of detail. Anything finer cannot be seen.
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = ExrApp::default();
+        let s = crate::layer::SourceId(2);
+        seed_comp_source(&mut app, s, &dir.path().join("v.exr"), 1024, 512);
+
+        app.viewer.scale = 0.25;
+        assert_eq!(
+            app.viewport_proxy_target(s),
+            PlaybackProxy::Px(256),
+            "fit-to-window"
+        );
+
+        // Zooming in asks for more source pixels, automatically and in proportion —
+        // the property a fixed knob cannot have.
+        app.viewer.scale = 0.5;
+        assert_eq!(
+            app.viewport_proxy_target(s),
+            PlaybackProxy::Px(512),
+            "2x zoom => 2x detail"
+        );
+
+        // At (or past) 1:1 the proxy path switches OFF rather than asking for a
+        // full-size "proxy". A decimation by 1 is a copy, and the on-disk proxy
+        // cache would store that full frame as a proxy — ~83 MB each on 4.6K plate
+        // footage, under a key only an identical zoom could ever hit.
+        app.viewer.scale = 1.0;
+        assert_eq!(
+            app.viewport_proxy_target(s),
+            PlaybackProxy::Full,
+            "1:1 ⇒ decode full, not a factor-1 proxy"
+        );
+        app.viewer.scale = 4.0;
+        assert_eq!(
+            app.viewport_proxy_target(s),
+            PlaybackProxy::Full,
+            "past 1:1 ⇒ still full"
+        );
+
+        // And a pathological zoom-out floors rather than requesting a thumbnail.
+        app.viewer.scale = 0.000_01;
+        assert_eq!(
+            app.viewport_proxy_target(s),
+            PlaybackProxy::Px(MIN_PROXY_PX),
+            "floored"
+        );
+
+        // A degenerate transform declines to guess: decode full rather than wrong.
+        app.viewer.scale = 0.0;
+        assert_eq!(app.viewport_proxy_target(s), PlaybackProxy::Unknown);
+        app.viewer.scale = f32::NAN;
+        assert_eq!(app.viewport_proxy_target(s), PlaybackProxy::Unknown);
+    }
+
+    #[test]
+    fn proxy_target_is_latched_for_the_duration_of_a_play_run() {
+        // #209: the T1 ring is keyed on (source, frame) — resolution is not in the
+        // key — so a target that moved mid-run would leave frames of several
+        // resolutions in one ring, playing back as sharpness flickering frame to
+        // frame. Latching at play start makes that impossible by construction.
+        let dir = tempfile::tempdir().unwrap();
+        touch_sequence(dir.path(), 3);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&dir.path().join("s.0001.exr"));
+        app.viewer.active_layer = 0;
+        app.proxy_enabled = true;
+
+        let s = crate::layer::SourceId(2);
+        seed_comp_source(&mut app, s, &dir.path().join("l.exr"), 1024, 512);
+        app.viewer.scale = 0.25;
+        let f = app.playback.current_frame;
+
+        app.playback_toggle(); // play → latch 1024
+        assert_eq!(app.decode_proxy_target_at_for(s, f, f), Some(256));
+
+        // Zooming mid-run does NOT move the target — that is the whole point.
+        app.viewer.scale = 1.0;
+        assert_eq!(
+            app.decode_proxy_target_at_for(s, f, f),
+            Some(256),
+            "target is held for the run even though the view changed"
+        );
+
+        // Stopping and starting again re-latches to the view as it now is — here
+        // that means dropping the proxy entirely, since 1:1 needs every pixel.
+        app.playback_toggle(); // pause
+        app.playback_toggle(); // play again
+        assert_eq!(
+            app.decode_proxy_target_at_for(s, f, f),
+            None,
+            "a fresh run picks up the new zoom — at 1:1 that is full res"
+        );
+
+        // And the latched "full res" decision is itself held for the run: zooming
+        // back out mid-run must not quietly start proxying into a ring already
+        // holding full-res frames.
+        app.viewer.scale = 0.25;
+        assert_eq!(
+            app.decode_proxy_target_at_for(s, f, f),
+            None,
+            "the 'no proxy' decision is latched too, not just a size"
+        );
+    }
+
+    #[test]
+    fn relatching_to_a_new_detail_level_drops_the_wrong_size_ring() {
+        // A ring filled at one resolution is wrong for the next, the same way the
+        // `proxy_size` knob's ring is — and that knob already clears the cache for
+        // exactly this reason. But quantizing to the decimation factor means an
+        // ordinary framing nudge does not count as a change, so a precached range
+        // is not thrown away every time the user touches the zoom.
+        let dir = tempfile::tempdir().unwrap();
+        touch_sequence(dir.path(), 3);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&dir.path().join("s.0001.exr"));
+        app.viewer.active_layer = 0;
+        app.proxy_enabled = true;
+
+        let s = crate::layer::SourceId(2);
+        seed_comp_source(&mut app, s, &dir.path().join("r.exr"), 1024, 512);
+        app.viewer.scale = 0.25;
+
+        app.playback_toggle(); // latch 1024
+        app.playback_toggle(); // pause
+
+        // A nudge far too small to change the decimation factor: ring survives.
+        // With the factor rounded *down* (so the proxy is never upscaled), factor 4
+        // spans `needed` in (long/5, long/4] — scale 0.2 to 0.25 here — so 0.24 is
+        // the same decode as 0.25 and must not invalidate anything.
+        app.frame_cache.insert(
+            s,
+            1,
+            std::sync::Arc::new(ExrData::load(dir.path().join("r.exr")).unwrap()),
+        );
+        app.viewer.scale = 0.24;
+        app.playback_toggle();
+        assert!(
+            app.frame_cache.contains(s, 1),
+            "a sub-band zoom nudge must not discard a precached ring"
+        );
+        app.playback_toggle();
+
+        // A real change of detail level: the ring is the wrong resolution now.
+        app.viewer.scale = 1.0;
+        app.playback_toggle();
+        assert!(
+            !app.frame_cache.contains(s, 1),
+            "crossing a decimation band drops frames decoded at the old size"
+        );
+    }
+
+    #[test]
+    fn viewport_proxy_target_handles_a_source_smaller_than_the_floor() {
+        // The floor must not be able to exceed the source, or the clamp bounds
+        // invert and panic. A 2×2 image is a legitimate input — it is what most of
+        // this suite's fixtures are — and an icon-sized source in the wild would
+        // have crashed the app on the first played frame.
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = ExrApp::default();
+        let s = crate::layer::SourceId(2);
+        seed_comp_source(&mut app, s, &dir.path().join("tiny.exr"), 2, 2);
+
+        // There is nothing to decimate on a 2×2 source at any zoom, so the answer is
+        // "decode full" rather than a proxy — which also keeps a pointless full-size
+        // blob out of the on-disk proxy cache.
+        app.viewer.scale = 0.25;
+        assert_eq!(
+            app.viewport_proxy_target(s),
+            PlaybackProxy::Full,
+            "nothing to decimate"
+        );
+        app.viewer.scale = 100.0;
+        assert_eq!(app.viewport_proxy_target(s), PlaybackProxy::Full);
+    }
+
+    #[test]
+    fn the_proxy_is_never_upscaled_onto_the_screen() {
+        // The whole claim of #209 is "visually lossless at the current view", which
+        // holds only if the proxy carries at least as many pixels as the screen
+        // shows. Rounding the decimation factor up broke that just under 1:1 —
+        // `ceil` jumps to factor 2 and delivers half the needed resolution, a 1.8x
+        // upscale, exactly where the user has zoomed in to look closely.
+        //
+        // Swept rather than spot-checked: the failure was at a band boundary, and
+        // hand-picked scales are precisely what misses those.
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = ExrApp::default();
+        let s = crate::layer::SourceId(2);
+        let long = 1024;
+        seed_comp_source(&mut app, s, &dir.path().join("sweep.exr"), long, 704);
+
+        for step in 1..=400 {
+            let scale = f64::from(step) * 0.0025; // 0.0025 ..= 1.0
+            app.viewer.scale = scale as f32;
+            let needed = (long as f64 * scale).ceil() as usize;
+            match app.viewport_proxy_target(s) {
+                PlaybackProxy::Full => {} // full res is never short
+                PlaybackProxy::Px(px) => assert!(
+                    px >= needed.min(long) || px == MIN_PROXY_PX,
+                    "scale {scale:.4}: proxy {px}px is short of the {needed}px on \
+                     screen — it would be upscaled and look soft"
+                ),
+                PlaybackProxy::Unknown => panic!("scale {scale:.4}: should be known"),
+            }
+        }
+    }
+
+    #[test]
+    fn viewport_proxy_target_sizes_from_the_source_not_the_bound_texture() {
+        // #209 invariant guard. `cs.size` happens to be safe today — it comes from
+        // `logical_size`, which returns a proxy's recorded full-res `display_size`
+        // — but the target must not depend on that staying true. Anything that set
+        // `cs.size` from real buffer dimensions would feed back on itself: each
+        // frame smaller than the last until the picture collapsed to the floor.
+        // This pins that the target ignores `cs.size` entirely.
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = ExrApp::default();
+        let s = crate::layer::SourceId(2);
+        seed_comp_source(&mut app, s, &dir.path().join("fb.exr"), 1024, 512);
+        app.viewer.scale = 0.25;
+
+        let first = app.viewport_proxy_target(s);
+        assert_eq!(first, PlaybackProxy::Px(256));
+
+        // Simulate a proxy texture having been bound, as `ensure_comp_frame` does.
+        if let Some(cs) = app.comp_sources.get_mut(&s) {
+            cs.size = (1024, 512);
+        }
+        assert_eq!(
+            app.viewport_proxy_target(s),
+            first,
+            "target must not shrink after a proxy texture is bound"
+        );
+    }
+
+    #[test]
+    fn scrub_keeps_the_fixed_knob_and_playback_derives() {
+        // #209: the two uses are not the same job. Dragging wants aggressive
+        // decimation for latency (the `proxy_size` knob, deliberately small);
+        // playback wants "as sharp as the screen can show". One number cannot serve
+        // both, and making the user trade them off is what gets the feature turned
+        // off entirely.
+        let dir = tempfile::tempdir().unwrap();
+        let seq = dir.path().join("s.0001.exr");
+        touch_sequence(dir.path(), 3);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&seq);
+        app.viewer.active_layer = 0;
+        app.proxy_enabled = true;
+        // Deliberately *not* the value the viewport derives (256 at this size and
+        // zoom), or the assertions below could not tell the two paths apart.
+        app.proxy_size = 512;
+
+        let s = crate::layer::SourceId(2);
+        seed_comp_source(&mut app, s, &dir.path().join("p.exr"), 1024, 512);
+        app.viewer.scale = 0.25;
+        let f = app.playback.current_frame;
+
+        app.playback_toggle(); // playing
+        assert_eq!(
+            app.decode_proxy_target_at_for(s, f, f),
+            Some(256),
+            "playback derives from the viewport, ignoring the scrub knob"
+        );
+
+        app.scrub_active = true;
+        assert_eq!(
+            app.decode_proxy_target_at_for(s, f, f),
+            Some(512),
+            "scrubbing keeps the fixed knob, whatever it is set to"
+        );
+        app.scrub_active = false;
+
+        // The kill-switch still wins over both.
+        app.proxy_enabled = false;
+        assert_eq!(app.decode_proxy_target_at_for(s, f, f), None);
     }
 
     #[test]
