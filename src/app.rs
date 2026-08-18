@@ -6804,6 +6804,29 @@ impl ExrApp {
         if on_frame && (arc.proxy || arc.beauty_only) {
             return; // resident copy is no better than what's bound
         }
+        // A cheap frame decoded for a *different* pass cannot serve this one
+        // (#217). Switching a layer's AOV mid-playback leaves exactly these frames
+        // resident — T1 is keyed `(source, frame)`, with no AOV in the key — so
+        // every one of them is asked for the new pass and cannot answer.
+        //
+        // The build would fail and `collect_comp_textures` would evict it, which is
+        // correct and self-healing; doing it here instead just skips a guaranteed-
+        // dead uploader round trip per frame. The re-decode is not avoidable — the
+        // pixels genuinely are not there — so this does not remove the switch hitch,
+        // only the wasted work inside it.
+        //
+        // The real point is the alarm. That build-failed WARN is #213's, and an
+        // ordinary AOV switch fired it 102 times in one dogfood session; an alarm
+        // that routine is one you learn to scroll past. Restricted to *partial*
+        // frames, so a **full** decode that still cannot serve the AOV falls
+        // through to the failing build and the warning — because that case really
+        // is the bug the alarm is for, and re-decoding it would loop.
+        if (arc.proxy || arc.beauty_only || arc.only_layer.is_some())
+            && arc.logical_channels(aov).is_none()
+        {
+            self.frame_cache.remove(source, source_frame);
+            return;
+        }
         let Some(up) = self.tex_uploader.as_mut() else {
             return;
         };
@@ -7985,10 +8008,42 @@ impl ExrApp {
                 lut,
             );
         } else {
-            let msg = if self.gpu_resources.is_none() {
+            // An empty composite has several causes and they need different actions,
+            // so say which one it is. Reporting "add a source" while the panel shows
+            // "Layers 2/6" is actively misleading — it sent a dogfood session hunting
+            // a decode regression when both layers had simply been toggled off.
+            let image_layers = |it: &mut dyn Iterator<Item = &crate::layer::Layer>| {
+                it.filter(|l| matches!(l.source, crate::layer::LayerSource::Image { .. }))
+                    .count()
+            };
+            let total = image_layers(&mut self.comp_stack.iter());
+            let visible = image_layers(&mut self.comp_stack.visible());
+            let owned;
+            let msg: &str = if self.gpu_resources.is_none() {
                 "No GPU: the compositing viewport is unavailable."
-            } else {
+            } else if total == 0 {
                 "Add a source to the Layers panel to begin."
+            } else if visible == 0 {
+                owned = if self.comp_stack.solo_active() {
+                    "Every layer with a source is hidden by a solo. Clear the solo to \
+                     see the composite."
+                        .to_string()
+                } else {
+                    format!(
+                        "All {total} layers are hidden. Toggle one visible in the \
+                         Layers panel to see the composite."
+                    )
+                };
+                &owned
+            } else {
+                // Visible layers exist but none covers this frame — a trim or time
+                // offset, which is invisible on screen unless said aloud.
+                owned = format!(
+                    "No visible layer covers frame {}. Move the playhead into a \
+                     layer's span, or clear its time offset.",
+                    self.playback.current_frame
+                );
+                &owned
             };
             ui.centered_and_justified(|ui| {
                 ui.label(msg);
@@ -10816,6 +10871,57 @@ mod tests {
         );
         assert_eq!(app.cheap_decode_layer(s), None);
         assert!(!app.decode_beauty_only_for(s, f));
+    }
+
+    #[test]
+    fn switching_aov_drops_the_stale_cheap_frames_without_tripping_the_alarm() {
+        // The dogfood finding: switching a layer's AOV mid-playback fired the
+        // build-failed WARN 102 times in one session. T1 is keyed (source, frame)
+        // with no AOV, so every frame decoded for the old pass is still resident
+        // and cannot answer for the new one. Evicting on the failed build is
+        // correct and self-healing, but it spends an uploader round trip per frame
+        // to learn what is knowable up front — and it turns #213's alarm into
+        // routine noise.
+        //
+        // The re-decode itself is not avoidable and this does not try to avoid it:
+        // those pixels genuinely are not in the cached frames.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("karma.exr");
+        write_one_aov_per_part_exr(&src, 64, 32, 4);
+        let mut app = ExrApp::default();
+        let (s, _lid, _f) = playing_with_one_layer_on(&mut app, dir.path(), &src, 1);
+
+        // A frame decoded for AOV 1, resident, as an AOV switch would leave it.
+        let stale = std::sync::Arc::new(ExrData::load_layer(&src, 1, 1).unwrap());
+        app.frame_cache.insert(s, 7, stale);
+        assert!(app.frame_cache.peek(s, 7).is_some());
+
+        // Ask for AOV 2 from it: dropped immediately, so the next pump re-decodes.
+        app.ensure_comp_frame(s, 7, 2);
+        assert!(
+            app.frame_cache.peek(s, 7).is_none(),
+            "a frame that cannot serve the requested pass is evicted, not submitted"
+        );
+
+        // Its own AOV is untouched — this must not evict frames that are fine.
+        let good = std::sync::Arc::new(ExrData::load_layer(&src, 1, 1).unwrap());
+        app.frame_cache.insert(s, 8, good);
+        app.ensure_comp_frame(s, 8, 1);
+        assert!(
+            app.frame_cache.peek(s, 8).is_some(),
+            "the frame answers for AOV 1, so it stays"
+        );
+
+        // A **full** decode that still cannot serve the AOV is left alone: that is
+        // the case the alarm is actually for, and re-decoding it would loop
+        // forever, since the pass does not exist in the file at all.
+        let full = std::sync::Arc::new(ExrData::load(&src).unwrap());
+        app.frame_cache.insert(s, 9, full);
+        app.ensure_comp_frame(s, 9, 99);
+        assert!(
+            app.frame_cache.peek(s, 9).is_some(),
+            "a full frame is never fast-evicted — the failing build must raise it"
+        );
     }
 
     #[test]
