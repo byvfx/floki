@@ -8,8 +8,15 @@
 //! ever**: a repeat pass or a later session loads the proxy from disk (a raw
 //! f16/f32 dump — a memcpy, ~zero decode) instead of re-decoding the source.
 //! Biggest on networked media and repeated review (dailies, shot iteration),
-//! where the re-decode dominates. No open-source player does this (RV, DJV,
-//! tlRender, mrv2, xStudio are all RAM-only) — it is floki's differentiator.
+//! where the re-decode dominates. The property doing the work is **persistence
+//! past the session**: an in-RAM cache, however large, starts cold on every
+//! launch and re-pays the whole decode before the first frame appears.
+//!
+//! The 2026-07 field survey in `docs/perf-roadmap.md` found no open-source
+//! player doing this, which is where that comparison belongs — it is dated and
+//! carries the per-player source reading it rests on. Restating the conclusion
+//! here would age silently: the survey can be re-run, a bare assertion in a
+//! module comment cannot.
 //!
 //! Design (see `docs/perf-roadmap.md`):
 //! - **Auto-invalidation**: mtime + size are part of the key, so a re-rendered
