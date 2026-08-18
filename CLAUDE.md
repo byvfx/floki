@@ -78,7 +78,11 @@ exr = { git = "https://github.com/byvfx/exrs", branch = "miniz-inflate-1.74.1" }
 The branch name carries the upstream version it is rebased onto, so it changes on
 every bump — check `Cargo.toml`/`Cargo.lock` rather than trusting this snippet.
 
-**Why:** stock `exr` decompresses ZIP/PXR24 blocks with `zune-inflate`, which panics
+The fork carries **two independent changes**. Both must survive a rebase.
+
+### 1. `miniz_oxide` instead of `zune-inflate` (why the fork exists)
+
+Stock `exr` decompresses ZIP/PXR24 blocks with `zune-inflate`, which panics
 (`assertion failed: bits_left >= LOOKAHEAD`) on some *valid* streams. The decode runs on
 a detached rayon worker, so the panic hits rayon's `AbortIfPanic` → `process::abort()` —
 an **uncatchable** crash of the whole app. The fork swaps both decompression call sites
@@ -91,6 +95,25 @@ replace the `zune_inflate::DeflateDecoder` / `.decode_zlib()` with
 `miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&data, expected_byte_size)`, then
 drop the `zune-inflate` dep from the fork's `Cargo.toml`.
 
+### 2. `specific_layer(index)` — per-AOV decode (#217)
+
+The high-level API offers exactly `first_valid_layer()` and `all_layers()` and nothing
+between, so there was no way to decode *one named part*. `load_beauty` could accelerate
+part 0 and nothing else, which made inspecting any other AOV fall back to a full
+all-parts decode: **260 ms vs 12 ms** on a 16-part / 421 MB render — in practice not a
+slow pass but a frozen one, since a ~0.3 s decode against a 24 fps clock means the
+awaited frame is always superseded before it lands.
+
+`ReadSpecificLayer` in `src/image/read/layers.rs` is 53 added lines reusing
+`FirstValidLayerReader`, which already carries a `layer_index` and filters every block
+against it — so the saving is genuinely at the block reader: the other parts are never
+decompressed. Consumed by `ExrData::load_layer` / `load_layer_proxy_into`.
+
+Note this only helps **multi-part** files (Karma/Houdini, one AOV per part). Single-part
+files with prefixed channels (Blender) keep every pass in the same blocks, so part
+selection skips nothing — see `ExrApp::single_layer_part`, which refuses the fast path
+there.
+
 **Operational notes:**
 - `Cargo.lock` pins the exact fork commit, so builds are reproducible. CI / fresh clones
   fetch the fork automatically (it is **public** — keep it that way; do not delete or
@@ -98,10 +121,10 @@ drop the `zune-inflate` dep from the fork's `Cargo.toml`.
 
 **Upkeep when bumping `exr`:**
 1. In the `byvfx/exrs` clone, branch `miniz-inflate-<newver>` off the new `vX.Y.Z` tag and
-   rebase (re-apply the two-call-site change if it conflicts), then `git push`.
+   rebase (re-apply **both** changes above if they conflict), then `git push`.
 2. In this repo, point `[patch.crates-io]` at the new branch and `cargo update -p exr` to
    re-pin `Cargo.lock`, then build/test.
-3. **Do not** push the change upstream to `johannesvollmer/exrs` — fork only.
+3. **Do not** push either change upstream to `johannesvollmer/exrs` — fork only.
 
 ## Releasing
 Releases are tag-driven. To cut one: move the `## [Unreleased]` entries in
