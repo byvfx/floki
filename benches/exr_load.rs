@@ -16,6 +16,32 @@ use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use exr::prelude::*;
 use floki::exr_loader::ExrData;
 
+/// Pick a non-beauty AOV that lives **alone in its own part** — the shape
+/// per-AOV decode (#217) accelerates, and the only shape `load_layer` accepts,
+/// since a one-part decode of a multi-pass part cannot say which pass it is.
+///
+/// Returns `(physical_index, logical_index)`, or `None` when the file has no such
+/// pass: a single-part render (Blender-style, every pass in one part) or one whose
+/// every non-beauty part carries several. That is "case not applicable", so the
+/// caller skips the benchmark rather than failing — these fixtures are whatever
+/// real renders happen to be in `$FLOKI_PERF_FIXTURES`.
+fn probe_aov(data: &ExrData) -> Option<(usize, usize)> {
+    data.logical_layers
+        .iter()
+        .enumerate()
+        .find(|(_, ll)| {
+            // Part 0 is beauty's, already covered by `load_beauty`.
+            ll.physical_index != 0
+                && data
+                    .logical_layers
+                    .iter()
+                    .filter(|o| o.physical_index == ll.physical_index)
+                    .count()
+                    == 1
+        })
+        .map(|(logical, ll)| (ll.physical_index, logical))
+}
+
 /// Write a flat RGBA EXR of the given size and compression.
 fn write_rgba(path: &Path, w: usize, h: usize, encoding: Encoding) {
     let mut list = smallvec::SmallVec::new();
@@ -171,6 +197,38 @@ fn bench_local(c: &mut Criterion) {
         group.bench_function(format!("{label}/load_proxy_1024"), |b| {
             b.iter(|| ExrData::load_proxy(std::hint::black_box(path), 1024).unwrap())
         });
+        // #217: the same two paths for a *non-beauty* AOV. Beauty is part 0, which
+        // `first_valid_layer` reaches for free; the question is whether selecting an
+        // arbitrary part is equally cheap, since that is what decides whether
+        // inspecting a pass can play at all.
+        //
+        // The pair comes from a full decode rather than assuming `physical ==
+        // logical`. That assumption holds on the one-AOV-per-part renders this is
+        // aimed at and silently does not on others — and since `load_layer` now
+        // *rejects* a part holding several passes, guessing turns a mismatched
+        // fixture into a panicked benchmark instead of a skipped one.
+        if let Some((phys, logical)) = ExrData::load(path).ok().as_ref().and_then(probe_aov) {
+            group.bench_function(format!("{label}/load_layer_{logical}"), |b| {
+                b.iter(|| ExrData::load_layer(std::hint::black_box(path), phys, logical).unwrap())
+            });
+            // One scratch buffer for the whole benchmark, as the decode worker keeps
+            // one for its whole life (#171). A fresh `Vec` per iteration would time
+            // an allocate-and-zero that production never pays, making this path look
+            // worse than it is.
+            group.bench_function(format!("{label}/load_layer_{logical}_proxy_1024"), |b| {
+                let mut scratch: Vec<f32> = Vec::new();
+                b.iter(|| {
+                    ExrData::load_layer_proxy_into(
+                        std::hint::black_box(path),
+                        phys,
+                        logical,
+                        1024,
+                        &mut scratch,
+                    )
+                    .unwrap()
+                })
+            });
+        }
     }
     group.finish();
 }

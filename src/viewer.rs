@@ -2974,9 +2974,16 @@ impl ExrViewer {
     /// always in range); the clamp only bites a differently-shaped compared source
     /// (#98 Phase 1 / #99). Kept as one helper so the ring's `ensure_layer` key,
     /// the GPU build, and the bind all agree.
+    ///
+    /// A per-AOV decode (#217) answers for its own AOV and nothing else, so it
+    /// short-circuits the clamp: clamping its one-entry table to 0 would ask a
+    /// frame that holds layer 3 for layer 0, `logical_channels` would (correctly)
+    /// refuse, and every build would fail.
     fn t2_layer_for(&self, exr_data: &ExrData) -> usize {
-        self.active_layer
-            .min(exr_data.logical_layers.len().saturating_sub(1))
+        exr_data.only_layer.unwrap_or_else(|| {
+            self.active_layer
+                .min(exr_data.logical_layers.len().saturating_sub(1))
+        })
     }
 
     /// Set the VRAM-budgeted T2 capacity (frames) for `source`. `0` disables
