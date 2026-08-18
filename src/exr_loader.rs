@@ -555,6 +555,25 @@ impl ExrData {
             return None;
         }
 
+        // `only_layer` must agree with the key it was stored under. It is a
+        // disk-sourced index that feeds layer selection — `t2_layer_for` reads it
+        // directly to decide which layer to build — so an entry claiming a pass
+        // other than the one requested would steer that choice with a number
+        // nothing else validates. Every other field here is already treated as
+        // untrusted (bounded allocations, absurd counts rejected, key echoed); this
+        // one was not.
+        //
+        // The writer only ever emits `Some(aov)` for a per-AOV proxy or `None` for
+        // a beauty one, so disagreement is corruption rather than an older shape —
+        // and v1 blobs are already rejected by the version byte, not caught here.
+        let aov_matches = match only_layer {
+            Some(n) => u32::try_from(n).is_ok_and(|n| n == key.aov),
+            None => key.aov == 0,
+        };
+        if !aov_matches {
+            return None;
+        }
+
         let dw = IntegerBounds::new((r.i32()?, r.i32()?), (r.u32()? as usize, r.u32()? as usize));
         let pixel_aspect = r.f32()?;
         let display_size = match r.u8()? {
@@ -1875,6 +1894,55 @@ mod tests {
             ExrData::from_proxy_blob(&blob, &blob_key()).is_none(),
             "nor as the beauty layer"
         );
+    }
+
+    #[test]
+    fn from_proxy_blob_rejects_an_only_layer_that_disagrees_with_the_key() {
+        // `only_layer` comes off disk and feeds layer selection — `t2_layer_for`
+        // reads it directly — so it is exactly the kind of value the rest of this
+        // parser already refuses to take on trust. The writer only ever emits
+        // Some(aov) for a per-AOV proxy or None for a beauty one, so a blob whose
+        // key echo passes but whose only_layer disagrees is corrupt or tampered.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multipart.exr");
+        write_multipart_exr(&path);
+        let key = crate::proxy_cache::ProxyKey {
+            aov: 1,
+            ..blob_key()
+        };
+        let mut scratch = Vec::new();
+        let good = ExrData::load_layer_proxy_into(&path, 1, 1, 8, &mut scratch)
+            .unwrap()
+            .write_proxy_blob(&key);
+        assert!(ExrData::from_proxy_blob(&good, &key).is_some(), "sanity");
+
+        // The only_layer field sits right after magic(4) + version(1) + flags(1),
+        // as a presence byte then a u32. Forge a disagreeing index, leaving the
+        // echoed key tuple — the check that already existed — intact.
+        let at = PROXY_BLOB_MAGIC.len() + 2;
+        assert_eq!(good[at], 1, "expected a present only_layer tag");
+        let mut forged = good.clone();
+        forged[at + 1..at + 5].copy_from_slice(&7u32.to_le_bytes());
+        assert!(
+            ExrData::from_proxy_blob(&forged, &key).is_none(),
+            "only_layer 7 under a key for AOV 1 is not a hit"
+        );
+
+        // Absent where the key names a real AOV is equally wrong: it would restore
+        // as a beauty proxy and answer for layer 0.
+        let mut absent = good.clone();
+        absent[at] = 0;
+        assert!(
+            ExrData::from_proxy_blob(&absent, &key).is_none(),
+            "a per-AOV key must not accept a blob claiming no layer"
+        );
+
+        // And the beauty case still round-trips: only_layer None under aov 0.
+        let beauty_key = blob_key();
+        let beauty = ExrData::load_proxy(&path, 8).unwrap();
+        assert_eq!(beauty.only_layer, None);
+        let blob = beauty.write_proxy_blob(&beauty_key);
+        assert!(ExrData::from_proxy_blob(&blob, &beauty_key).is_some());
     }
 
     #[test]
