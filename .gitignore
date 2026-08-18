@@ -16,7 +16,7 @@
 soak-logs/
 
 # Local agent guidance / runtime (not versioned)
-CLAUDE.md
+# CLAUDE.md is tracked — it is shared project guidance, not per-machine state.
 docs/review/
 .pi/
 
