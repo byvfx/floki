@@ -3183,12 +3183,44 @@ impl ExrApp {
     /// to the next frame once its absolute deadline (`anchor + n·period`) passes —
     /// drift-free pacing. Decode-bound playback (stutter) naturally drops the
     /// effective fps: the next request waits for the previous frame to land.
+    /// Ask the UI for another frame after `after` (#149).
+    ///
+    /// **This and [`Self::request_repaint`] are the playback engine's entire
+    /// on-thread dependency on the UI framework.** The engine — `pump_*`, `tick_*`, `playback_*`,
+    /// `apply_load_result`, `invalidate_inflight` — is otherwise egui-free, so this
+    /// are the seam the Qt port (#44) re-points: the engine ships unchanged and only
+    /// these two bodies change. The one other touchpoint is off-thread, where the decode
+    /// worker and the LUT/scan loads wake the UI through a **cloned** `repaint_ctx`
+    /// (they outlive the borrow, so they cannot come through here).
+    ///
+    /// Deliberately reads `repaint_ctx` rather than taking a context parameter.
+    /// Threading `&egui::Context` through the engine put the framework in the
+    /// *signatures* of functions that never used it for anything else, which made
+    /// the boundary look bigger than it is — and forced headless tests to construct
+    /// a `Context` purely to satisfy the type.
+    ///
+    /// A `None` context is a no-op, which is the headless case: the same tolerance
+    /// the decode-worker wake already relies on.
+    /// Ask the UI for another frame, now. See [`Self::request_repaint_after`] for
+    /// why these two are the boundary.
+    fn request_repaint(&self) {
+        if let Some(ctx) = &self.repaint_ctx {
+            ctx.request_repaint();
+        }
+    }
+
+    fn request_repaint_after(&self, after: std::time::Duration) {
+        if let Some(ctx) = &self.repaint_ctx {
+            ctx.request_repaint_after(after);
+        }
+    }
+
     /// Drive eager precache (#56, step 4) while idle. `pump_decode` already fills
     /// the whole budget when `precache` is on (playing or not), and chains itself
     /// from `apply_load_result` as each frame lands; this kicks that chain when
     /// the app is otherwise idle (paused) and keeps the frame loop alive until the
     /// resident span covers the budget. A no-op once the range is fully cached.
-    fn tick_precache(&mut self, ctx: &egui::Context) {
+    fn tick_precache(&mut self) {
         if !self.precache || !self.playback.is_active() || self.precache_filled {
             return;
         }
@@ -3202,11 +3234,11 @@ impl ExrApp {
         if self.inflight.is_empty() || self.frame_cache.len() >= self.frame_cache_cap {
             self.precache_filled = true;
         } else {
-            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            self.request_repaint_after(std::time::Duration::from_millis(16));
         }
     }
 
-    fn tick_playback(&mut self, ctx: &egui::Context) {
+    fn tick_playback(&mut self) {
         use crate::playback::{Pacing, PlayState};
         if !self.playback.is_active() || self.playback.state != PlayState::Playing {
             return;
@@ -3235,7 +3267,7 @@ impl ExrApp {
                 (anchor + period * self.playback.frames_since_anchor).saturating_duration_since(now)
             })
         };
-        ctx.request_repaint_after(wait);
+        self.request_repaint_after(wait);
     }
 
     /// Stutter pacing: advance only when the playhead frame is ready (not awaiting
@@ -3790,9 +3822,7 @@ impl ExrApp {
                         // painted yet, and under load frequently never is — the
                         // playhead has moved on by the time it lands (#204).
                         // `ensure_comp_frame` records the swap that actually shows it.
-                        if let Some(ctx) = &self.repaint_ctx {
-                            ctx.request_repaint();
-                        }
+                        self.request_repaint();
                     }
                     self.error_msg = None;
                 }
@@ -4134,10 +4164,10 @@ impl eframe::App for ExrApp {
         // viewer sees them, then run the frame clock. Both are no-ops unless a
         // sequence is loaded, so single-image behavior is unchanged.
         self.handle_playback_keys(ui.ctx());
-        self.tick_playback(ui.ctx());
+        self.tick_playback();
         // Eager precache (#56, step 4): fill the in/out range while idle when the
         // user has enabled it. No-op unless precache is on and a sequence loaded.
-        self.tick_precache(ui.ctx());
+        self.tick_precache();
         // Pick up frames a render writes while we're open (#101); no-op unless the
         // user enabled Watch and a sequence is loaded.
         self.tick_render_watch(ui.ctx());
@@ -11605,14 +11635,13 @@ mod tests {
                 std::sync::Arc::new(ExrData::load(&f1).unwrap()),
             );
         }
-        let ctx = egui::Context::default();
-        app.tick_precache(&ctx);
+        app.tick_precache();
         assert!(
             app.precache_filled,
             "latches once the range is fully resident"
         );
         // Latched: a second tick submits nothing.
-        app.tick_precache(&ctx);
+        app.tick_precache();
         assert!(app.inflight.is_empty(), "no churn while latched");
 
         // A scrub (playhead move) clears the latch so the new window refills.
@@ -11653,9 +11682,7 @@ mod tests {
             app.frame_cache_cap,
             "cache at capacity"
         );
-
-        let ctx = egui::Context::default();
-        app.tick_precache(&ctx);
+        app.tick_precache();
         assert!(
             app.precache_filled,
             "latches when the budget is full even though the range isn't fully resident"
