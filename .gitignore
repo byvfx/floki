@@ -3,6 +3,13 @@
 # macOS Finder metadata
 .DS_Store
 
+# Official OpenEXR test-image corpus, cloned locally (~500 MB on disk). Its own
+# upstream repo (AcademySoftwareFoundation/openexr-images, BSD-3-Clause) — not
+# vendored, so it is ignored wholesale rather than relying on the *.exr rule:
+# the Damaged/ fuzz corpus deliberately does NOT use a .exr extension, and would
+# otherwise be committable. See TESTING.md.
+assets/openexr-images/
+
 # EXR test assets / renders (large binaries)
 *.exr
 # ...except the tiny committed DWA decode fixtures (<1 KB each): exrs can decode

@@ -44,3 +44,49 @@ CI runs all three in a `Test & Lint` job that **gates** the build/release matrix
 - **The `channel_mode` encoding has one source of truth:**
   `ChannelMode::as_u32` in `src/viewer.rs`. `gpu/shader.wgsl` must match it; a
   test in `gpu/mod.rs` locks the values.
+
+## OpenEXR reference corpus (local, not committed)
+
+The official test images from <https://openexr.com/en/latest/test_images/> — the
+canonical set every EXR reader is expected to survive. Cloned locally rather than
+vendored; ~500 MB on disk, gitignored wholesale:
+
+```bash
+git clone --depth 1 https://github.com/AcademySoftwareFoundation/openexr-images.git assets/openexr-images
+```
+
+97 `.exr` files across 11 categories, plus a 186-file damaged corpus. BSD-3-Clause
+(ILM 2004). Nothing in the suite depends on it — it is a manual bench, and the
+committed fixtures in `tests/fixtures/` stay the CI-gated ones.
+
+What each category is worth *here*, as opposed to in general:
+
+| Category | Why it matters to floki |
+|---|---|
+| `Damaged/` | 186 fuzz crashers (ASAN heap-OOB, SIGSEGV, truncation) that broke OpenEXR. Directly on point: the `byvfx/exrs` fork exists because a decompressor **panicked**, and on a rayon worker that is an uncatchable `process::abort()`. `ExrData::load`'s `catch_unwind` has never been tried against real malformed input. Note these deliberately have **no `.exr` extension** — they are not valid files. |
+| `TestImages/` | NaN, infinity and denormalized pixel values — the tone-map, histogram and pixel-readout edge cases. |
+| `MultiView/`, `v2/` | Multi-part and multi-view files: the shape `specific_layer` / `single_layer_part` (#217) reasons about, from a source other than one studio's renders. |
+| `MultiResolution/` | Mip/ripmapped EXRs. `largest_resolution_level()` is asserted everywhere; this is what proves it. Also the reduced-res read mrv2 has and floki does not (see `docs/perf-roadmap.md`). |
+| `DisplayWindow/` | Data vs display window mismatches — the geometry the viewport frames by, and the geometry `write_proxy_blob` explicitly preserves (#163). |
+| `Chromaticities/`, `LuminanceChroma/` | Colour path. `LuminanceChroma` is subsampled Y/RY/BY, which floki has never been tested against and may not handle at all. |
+| `ScanLines/`, `Tiles/` | Scanline vs tiled layout across compression types. |
+
+**`Beachball/` is the #217 test case**, and better than the studio renders it was
+built against, because it is a controlled pair:
+
+| | frames | layout |
+|---|---|---|
+| `multipart.0001–0008.exr` | 8 | 10 parts, **one** logical layer each |
+| `singlepart.0001–0008.exr` | 8 | **1** part, the same 10 passes as channel prefixes |
+
+Identical content, both playable sequences, differing only on the axis the scope
+limit is about. `single_layer_part` must take the fast path on every AOV of the
+first and refuse every non-zero AOV of the second — with the picture identical
+either way, just slower. Independent of any one studio's naming, which the
+`byvfx` fixtures are not.
+
+A caveat on what this corpus does *not* cover: no DWAA/DWAB anywhere in it, so it
+says nothing about the codec `docs/perf/dwa-arm-decode-investigation.md` is about.
+It does hit ZIP1/ZIP16 and PXR24 heavily, which are exactly the two call sites the
+`byvfx/exrs` fork patches — so it exercises the fork's changed paths, just not the
+ARM question.
