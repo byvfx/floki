@@ -12,6 +12,13 @@ on:
       - 'docs/**'
       - 'assets/**'
       - 'LICENSE'
+      # Cannot affect a cargo build: nothing here runs `cargo package`/`publish`,
+      # which is the only part of the toolchain that reads .gitignore. Without it
+      # listed, a docs change that also touches .gitignore builds the whole matrix
+      # (PRs #220 and #224 each did, for a .md plus one .gitignore line).
+      # `.gitmodules` is deliberately NOT here: it defines the vendored OCIO
+      # submodule the vendored-build jobs check out.
+      - '.gitignore'
     tags:
       - 'v*'
   pull_request:
@@ -21,6 +28,7 @@ on:
       - 'docs/**'
       - 'assets/**'
       - 'LICENSE'
+      - '.gitignore'   # see the note on the push trigger above
   workflow_dispatch:
 
 env:
