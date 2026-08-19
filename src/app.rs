@@ -3179,19 +3179,25 @@ impl ExrApp {
         }
     }
 
-    /// Per-frame playback clock. While playing and no decode is in flight, advance
-    /// to the next frame once its absolute deadline (`anchor + n·period`) passes —
-    /// drift-free pacing. Decode-bound playback (stutter) naturally drops the
-    /// effective fps: the next request waits for the previous frame to land.
+    /// Ask the UI for another frame, now (#149).
+    ///
+    /// The immediate half of the seam described on [`Self::request_repaint_after`].
+    fn request_repaint(&self) {
+        if let Some(ctx) = &self.repaint_ctx {
+            ctx.request_repaint();
+        }
+    }
+
     /// Ask the UI for another frame after `after` (#149).
     ///
     /// **This and [`Self::request_repaint`] are the playback engine's entire
-    /// on-thread dependency on the UI framework.** The engine — `pump_*`, `tick_*`, `playback_*`,
-    /// `apply_load_result`, `invalidate_inflight` — is otherwise egui-free, so this
-    /// are the seam the Qt port (#44) re-points: the engine ships unchanged and only
-    /// these two bodies change. The one other touchpoint is off-thread, where the decode
-    /// worker and the LUT/scan loads wake the UI through a **cloned** `repaint_ctx`
-    /// (they outlive the borrow, so they cannot come through here).
+    /// on-thread dependency on the UI framework.** The engine — `pump_*`, `tick_*`,
+    /// `playback_*`, `apply_load_result`, `invalidate_inflight` — is otherwise
+    /// egui-free, so these two are the seam the Qt port (#44) re-points: the engine
+    /// ships unchanged and only these bodies change. The one other touchpoint is
+    /// off-thread, where the decode worker and the LUT/scan loads wake the UI
+    /// through a **cloned** `repaint_ctx` (they outlive the borrow, so they cannot
+    /// come through here).
     ///
     /// Deliberately reads `repaint_ctx` rather than taking a context parameter.
     /// Threading `&egui::Context` through the engine put the framework in the
@@ -3201,14 +3207,6 @@ impl ExrApp {
     ///
     /// A `None` context is a no-op, which is the headless case: the same tolerance
     /// the decode-worker wake already relies on.
-    /// Ask the UI for another frame, now. See [`Self::request_repaint_after`] for
-    /// why these two are the boundary.
-    fn request_repaint(&self) {
-        if let Some(ctx) = &self.repaint_ctx {
-            ctx.request_repaint();
-        }
-    }
-
     fn request_repaint_after(&self, after: std::time::Duration) {
         if let Some(ctx) = &self.repaint_ctx {
             ctx.request_repaint_after(after);
@@ -3238,6 +3236,10 @@ impl ExrApp {
         }
     }
 
+    /// Per-frame playback clock. While playing and no decode is in flight, advance
+    /// to the next frame once its absolute deadline (`anchor + n·period`) passes —
+    /// drift-free pacing. Decode-bound playback (stutter) naturally drops the
+    /// effective fps: the next request waits for the previous frame to land.
     fn tick_playback(&mut self) {
         use crate::playback::{Pacing, PlayState};
         if !self.playback.is_active() || self.playback.state != PlayState::Playing {
