@@ -90,3 +90,40 @@ says nothing about the codec `docs/perf/dwa-arm-decode-investigation.md` is abou
 It does hit ZIP1/ZIP16 and PXR24 heavily, which are exactly the two call sites the
 `byvfx/exrs` fork patches — so it exercises the fork's changed paths, just not the
 ARM question.
+
+### Beachball soak results (2026-08-18, #217 merged)
+
+Three 12 s soaks, comp layer on the named AOV, **proxy off** so the only cheap
+path is `load_beauty`/`load_layer`:
+
+| footage | AOV | build failures | `soft=` playing | settles |
+|---|---|---|---|---|
+| `multipart` | 1 — `depth_left` | 0 | **1** | `s2:8full` |
+| `multipart` | 7 — `disparityL` | 0 | **1** | `s2:8full` |
+| `singlepart` | 1 | 0 | **0** | `s2:8full` |
+
+Why that is decisive rather than merely green. With the proxy off, `soft=1` means
+a *partial* decode is on screen. A `load_beauty` frame carries only logical layer
+0, and `resolve_logical` is strict — it returns `None` for any other index — so
+such a frame would have failed every build. Zero failures at AOV 1 and 7 therefore
+means the partial frame genuinely carried those layers, which only `load_layer`
+produces. `singlepart` sitting at `soft=0` throughout is the scope limit working:
+same passes, one part, so the gate refuses and takes the full decode.
+
+AOV **7** is checked deliberately. Index 1 is the weakest possible test of an
+index remap, since 0-vs-1 confusions pass by luck; 7 is a high index *and* a
+2-channel `x/y` vector pass, where 1 is a single `Z` channel.
+
+**The fps figures in these runs mean nothing.** Every configuration held ~24–26
+fps including `singlepart`, because a 2.9 MB F16 frame decodes trivially and the
+full-decode path is indistinguishable from the fast one at that size. This is a
+correctness bench; the perf case stays a real render, where the same refusal is
+the difference between playing and freezing.
+
+**AOV indices do not correspond between the two files.** `multipart` takes its
+layer order from part order (`rgba_right`, `depth_left`, `forward_left`, …);
+`singlepart` takes it from channel-prefix grouping (root `RGBA`, `Z`,
+`disparityL`, `disparityR`, `forward.left`, …, `left`), so index *n* is a
+different pass in each, and most names differ too (`depth_left` vs `left.Z`).
+Compare across the pair **by name, not by index** — `disparityL` / `disparityR`
+are named identically in both and are the clean cross-file pair.
