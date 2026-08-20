@@ -22,6 +22,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer falls back to hardcoded absolute paths when given no arguments.
 
 ### Fixed
+- **Playback caches far more of the sequence, and pressing Play no longer shrinks
+  the lookahead.** The prefetch window was clamped to a 16-frame constant while
+  playing but took the whole RAM budget while idle, so starting playback *cut* the
+  read-ahead — on a six-layer stack from 20 frames per layer to 2, with the
+  read-behind window collapsing to nothing so a backwards scrub during play always
+  missed. The constant was sized for an era when the cache cap was frozen at 8 and
+  never bound on anything; both paths now take the same figure, sized from the
+  measured RAM budget and the in/out range.
 - **The measured-fps readout no longer reads 0.0 during playback.** It was only
   updated from the primary slot, which stopped decoding when open/drop became "add
   a layer" in 1.12.0 — so the transport driven by a comp layer was never paced.
