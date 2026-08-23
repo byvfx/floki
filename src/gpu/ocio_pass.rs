@@ -1041,12 +1041,18 @@ mod metal_tests {
                 return;
             }
         };
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        let (device, queue) = match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+
             label: Some("ocio-test-device"),
             required_features: wgpu::Features::FLOAT32_FILTERABLE,
             ..Default::default()
-        }))
-        .expect("request_device");
+        })) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("request_device failed (FLOAT32_FILTERABLE unavailable?): {e}; skipping");
+            return;
+        }
+    };
 
         let cfg = floki_ocio::OcioConfig::load(floki_ocio::ConfigSource::BuiltIn("ocio://default"))
             .expect("load default config");
@@ -1158,12 +1164,18 @@ mod metal_tests {
                 return;
             }
         };
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        let (device, queue) = match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+
             label: Some("blit-test-device"),
             required_features: wgpu::Features::FLOAT32_FILTERABLE,
             ..Default::default()
-        }))
-        .expect("request_device");
+        })) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("request_device failed (FLOAT32_FILTERABLE unavailable?): {e}; skipping");
+            return;
+        }
+    };
 
         let output_format = wgpu::TextureFormat::Rgba8Unorm;
         let gpu = GpuState::new(&device, &queue, output_format);
@@ -1524,12 +1536,18 @@ mod metal_tests {
                 return;
             }
         };
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        let (device, queue) = match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+
             label: Some("accumulate-test-device"),
             required_features: wgpu::Features::FLOAT32_FILTERABLE,
             ..Default::default()
-        }))
-        .expect("request_device");
+        })) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("request_device failed (FLOAT32_FILTERABLE unavailable?): {e}; skipping");
+            return;
+        }
+    };
 
         // Rgba8Unorm surface format is irrelevant here — we only drive `pipeline_linear`
         // (Rgba16Float offscreen) and reuse GpuState's real bind-group layouts, ring
@@ -1851,12 +1869,18 @@ mod metal_tests {
                 return;
             }
         };
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        let (device, queue) = match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+
             label: Some("accumulate-parity-device"),
             required_features: wgpu::Features::FLOAT32_FILTERABLE,
             ..Default::default()
-        }))
-        .expect("request_device");
+        })) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("request_device failed (FLOAT32_FILTERABLE unavailable?): {e}; skipping");
+            return;
+        }
+    };
         let gpu = GpuState::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
 
         // 4x2 screen; the image occupies the RIGHT half (off-origin, so screen-normalized
@@ -2147,12 +2171,18 @@ mod metal_tests {
                 return;
             }
         };
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        let (device, queue) = match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+
             label: Some("display-encode-test-device"),
             required_features: wgpu::Features::FLOAT32_FILTERABLE,
             ..Default::default()
-        }))
-        .expect("request_device");
+        })) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("request_device failed (FLOAT32_FILTERABLE unavailable?): {e}; skipping");
+            return;
+        }
+    };
         let gpu = GpuState::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
 
         let extent = wgpu::Extent3d {
