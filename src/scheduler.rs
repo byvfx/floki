@@ -347,6 +347,23 @@ mod tests {
     }
 
     #[test]
+    fn a_span_bounded_window_wraps_once_but_never_laps() {
+        // The invariant `ExrApp::prefetch_depth` relies on when it bounds the
+        // window by `out - in` (#207). Wrapping itself is fine and expected —
+        // from the out point, the frames after the wrap are the next ones to be
+        // displayed. What the bound buys is that the walk never laps: at
+        // `decode_ahead == span` it visits every *other* frame exactly once, so
+        // it cannot come back around and re-reach frames it already listed.
+        let r = resident(&[]);
+        let got = want_list(10, 1, 10, Direction::Forward, LoopMode::Loop, &r, 9, 0);
+        assert_eq!(got, vec![10, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        let mut seen = got.clone();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), got.len(), "no frame listed twice");
+    }
+
+    #[test]
     fn next_want_fetches_behind_only_when_ahead_is_satisfied() {
         // Forward window fully resident → the nearest cold behind frame is next.
         let set = resident(&[5, 6, 7]);

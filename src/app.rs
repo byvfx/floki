@@ -1914,12 +1914,40 @@ impl ExrApp {
     }
 
     /// The total prefetch window around the playhead (ahead + the #169
-    /// read-behind reservation, split in [`Self::next_want`]) — bounded by
-    /// the T1 ring (`min(configured, max_t1 − 1)`, tying #57 back-pressure to
-    /// the #56 budget) and a hard cap so a huge sequence can't queue the world.
+    /// read-behind reservation, split in [`Self::next_want`]) — bounded by the
+    /// T1 ring (`max_t1 − 1`, tying #57 back-pressure to the #56 budget) and by
+    /// the transport range, so a huge sequence can't queue the world.
+    ///
+    /// This is the **single** window figure: playing and idle precache both ask
+    /// for it (#207). They used to disagree — idle took the whole budget while
+    /// playing was clamped to a `MAX_PREFETCH = 16` constant — so pressing Play
+    /// *shrank* the lookahead, which is backwards: play is when read-ahead
+    /// matters most. The constant was picked while `frame_cache_cap` was frozen at
+    /// its constructed default of 8 (#199), where `min(7, 16)` never bound on
+    /// anything. Once the cap became a real measured budget the constant became
+    /// the binding constraint instead of memory: on a 6-layer stack at `cap = 121`
+    /// it cut the per-source window from 20 frames to 2, and since
+    /// [`crate::scheduler::read_behind`] floors to zero below a depth of 4, the
+    /// RV-style lookback window silently stopped existing along with it.
+    ///
+    /// Deepening the window does **not** deepen decode concurrency: `pump_decode`
+    /// still submits one job at a time across all sources and returns early while
+    /// anything is in flight. It changes which frame the single worker picks next,
+    /// not how many run — so it does not reopen the #204 finding that decoding
+    /// faster than frames can be painted *lowers* the displayed rate.
     fn prefetch_depth(&self) -> usize {
-        const MAX_PREFETCH: usize = 16;
-        self.frame_cache_cap.saturating_sub(1).min(MAX_PREFETCH)
+        // Never walk more positions than the range holds. Past the loop wrap
+        // `want_list` only re-lists frames already on the list, so the extra
+        // positions are pure iteration — and this is what bounds the window on a
+        // short range now that the constant is gone: an 8-frame Beachball against
+        // a 734-frame budget walks 7 positions, not 733.
+        let span = usize::try_from(
+            self.playback
+                .out_point
+                .saturating_sub(self.playback.in_point),
+        )
+        .unwrap_or(usize::MAX);
+        self.frame_cache_cap.saturating_sub(1).min(span)
     }
 
     /// The source id of the **primary** compare slot (A) — `SourceId(0)`. The
@@ -2528,24 +2556,33 @@ impl ExrApp {
         }
         // Depth priority:
         // - **Playing** → the sliding prefetch window ahead of the playhead, even
-        //   with precache on. Whole-budget depth here is actively harmful when the
-        //   range exceeds the budget: `next_want` loop-wraps to the far side and
-        //   the single worker burns its bandwidth decoding frames *behind* the
-        //   playhead (evict-churn) instead of the ones just ahead, so play goes
-        //   decode-bound and stalls.
-        // - **Idle + precache, not yet filled** (#56, step 4) → fill the whole
-        //   budget so the range goes as resident as it fits, for instant scrubbing.
+        //   with precache on.
+        // - **Idle + precache, not yet filled** (#56, step 4) → the same window, so
+        //   the range goes as resident as it fits for instant scrubbing.
         //   Gated on `!precache_filled`: once latched (cache full / nothing more
-        //   fits), a whole-budget window keeps asking for far frames that
-        //   `evict_to` immediately drops — and because `apply_load_result` re-pumps
-        //   after every result, that decode→evict churn runs forever while idle,
-        //   independent of the `tick_precache` latch. A `pending` playhead still
-        //   gets through at depth 0 (its P1 slot in `next_want`).
+        //   fits), the window keeps asking for far frames that `evict_to`
+        //   immediately drops — and because `apply_load_result` re-pumps after every
+        //   result, that decode→evict churn runs forever while idle, independent of
+        //   the `tick_precache` latch. A `pending` playhead still gets through at
+        //   depth 0 (its P1 slot in `next_want`).
         // - **Idle otherwise** → just the playhead.
-        let full_depth = if self.playback.is_playing() {
+        //
+        // The two used to take *different* figures — playing the `MAX_PREFETCH`-
+        // clamped one, idle the raw budget — which is what #207 is about; they now
+        // share [`Self::prefetch_depth`]. The old note here warned that a whole-
+        // budget window while playing loop-wraps to the far side and burns the
+        // single worker on frames *behind* the playhead.
+        //
+        // The walk still wraps — with the playhead near the out point and Loop or
+        // PingPong on, it must, and should: after the wrap come the frames about to
+        // be displayed. What the span bound in `prefetch_depth` removes is the
+        // *second* lap. At `depth <= out - in` the walk covers at most every other
+        // frame in the range exactly once, so it can never lap around to re-list a
+        // frame, and the frames it reaches "behind" the playhead in frame-number
+        // terms are ahead of it in play order — fetched last, since `want_list`
+        // orders nearest-first.
+        let full_depth = if self.playback.is_playing() || (self.precache && !self.precache_filled) {
             self.prefetch_depth()
-        } else if self.precache && !self.precache_filled {
-            self.frame_cache_cap.saturating_sub(1)
         } else {
             0
         };
@@ -4479,7 +4516,9 @@ impl ExrApp {
             "evt={evt} state={state:?} frame={frame} epoch={epoch} pacing={pacing:?} \
              loop={loop_mode:?} dir={dir:?} in={in_pt} out={out_pt} \
              pending={pending} loading_a={loading_a} inflight={inflight:?} \
-             clock=s{clock_id} followers=[{followers}] nsrc={nsrc} stale={stale} soft={soft} hidden={hidden} \
+             clock=s{clock_id} followers=[{followers}] nsrc={nsrc} \
+             win={win_full}/{win_src}+{win_behind} \
+             stale={stale} soft={soft} hidden={hidden} \
              texb_n={texb_n} texb_tot={texb_tot:.1} texb_alloc={texb_alloc:.1} \
              texb_pack={texb_pack:.1} texb_write={texb_write:.1} texb_bind={texb_bind:.1} \
              texb_max={texb_max:.1} texb_mb={texb_mb:.1} texq={texq} \
@@ -4506,6 +4545,13 @@ impl ExrApp {
             loading_a = self.loading_a,
             clock_id = clock.0,
             nsrc = self.n_active_sources(),
+            // The prefetch window, total and per-source (#207). `t1=` alone can't
+            // answer whether the window is the constraint — the ring read
+            // `121/121` while only ~18 frames were actively wanted — so the figure
+            // the scheduler actually uses is logged rather than inferred.
+            win_full = self.prefetch_depth(),
+            win_src = self.prefetch_depth() / self.n_active_sources(),
+            win_behind = self.read_behind_depth(),
             stale = stale,
             soft = soft,
             hidden = hidden,
@@ -12048,6 +12094,87 @@ mod tests {
             app.playback.current_frame, 1,
             "playhead unmoved — only the clock advances it, not prefetch"
         );
+    }
+
+    // --- Prefetch window sizing (#207/#216) ----------------------------------
+
+    #[test]
+    fn play_does_not_shrink_the_prefetch_window() {
+        // The #207 defect in one assertion: the window used to be the whole budget
+        // while idle and `min(budget, MAX_PREFETCH = 16)` once playing, so pressing
+        // Play *shrank* the lookahead — backwards, since play is when read-ahead
+        // matters most. Both states must now read the same figure.
+        let dir = tempfile::tempdir().unwrap();
+        touch_sequence(dir.path(), 300);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&dir.path().join("s.0001.exr"));
+        app.frame_cache_cap = 121; // a realistic measured budget (#199)
+
+        let idle = app.prefetch_depth();
+        app.playback_toggle();
+        assert!(app.playback.is_playing());
+        assert_eq!(
+            app.prefetch_depth(),
+            idle,
+            "the window must not depend on whether the transport is running"
+        );
+    }
+
+    #[test]
+    fn prefetch_window_scales_with_the_budget_past_the_old_constant() {
+        // `MAX_PREFETCH = 16` was chosen while `frame_cache_cap` was frozen at its
+        // constructed default of 8 (#199), where it never bound. With a real budget
+        // it became the binding constraint instead of memory: 121 slots yielded a
+        // 16-frame window, and 2 frames per source across a 6-layer stack.
+        let dir = tempfile::tempdir().unwrap();
+        touch_sequence(dir.path(), 300);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&dir.path().join("s.0001.exr"));
+        app.playback_toggle();
+
+        app.frame_cache_cap = 121;
+        assert_eq!(app.prefetch_depth(), 120, "the budget sizes the window");
+
+        // And the lookback window (#169) comes back with it. `read_behind` floors to
+        // zero below a depth of 4, so at 6 sources the old 16-frame window left
+        // `16 / 6 = 2` each and no read-behind at all — scrubbing backwards during
+        // play always missed. This is the arithmetic that fixes that, without
+        // touching `read_behind` itself.
+        let per_source = app.prefetch_depth() / 6;
+        assert_eq!(per_source, 20);
+        assert!(
+            crate::scheduler::read_behind(per_source) > 0,
+            "a 6-layer stack keeps a lookback window"
+        );
+    }
+
+    #[test]
+    fn prefetch_window_never_walks_past_the_range() {
+        // What bounds the window on a short range now that the constant is gone.
+        // Past the loop wrap `want_list` only re-lists frames already on the list,
+        // so walking further is pure iteration: an 8-frame Beachball against a
+        // 734-frame budget must walk 7 positions, not 733.
+        let dir = tempfile::tempdir().unwrap();
+        touch_sequence(dir.path(), 8);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&dir.path().join("s.0001.exr"));
+        app.playback_toggle();
+        app.frame_cache_cap = 734;
+
+        assert_eq!((app.playback.in_point, app.playback.out_point), (1, 8));
+        assert_eq!(
+            app.prefetch_depth(),
+            7,
+            "bounded by the span, not the budget"
+        );
+
+        // Trimming the range tightens it further — the in/out points are the range,
+        // not the file count.
+        app.playback_scrub_to(3);
+        app.playback_set_in();
+        app.playback_scrub_to(5);
+        app.playback_set_out();
+        assert_eq!(app.prefetch_depth(), 2, "a 3-frame trim walks 2 positions");
     }
 
     #[test]
