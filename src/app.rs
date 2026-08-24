@@ -2571,9 +2571,16 @@ impl ExrApp {
         // clamped one, idle the raw budget — which is what #207 is about; they now
         // share [`Self::prefetch_depth`]. The old note here warned that a whole-
         // budget window while playing loop-wraps to the far side and burns the
-        // single worker on frames *behind* the playhead. That is now structurally
-        // impossible rather than merely avoided: `prefetch_depth` is bounded by the
-        // range span, so the walk can never reach the wrap in the first place.
+        // single worker on frames *behind* the playhead.
+        //
+        // The walk still wraps — with the playhead near the out point and Loop or
+        // PingPong on, it must, and should: after the wrap come the frames about to
+        // be displayed. What the span bound in `prefetch_depth` removes is the
+        // *second* lap. At `depth <= out - in` the walk covers at most every other
+        // frame in the range exactly once, so it can never lap around to re-list a
+        // frame, and the frames it reaches "behind" the playhead in frame-number
+        // terms are ahead of it in play order — fetched last, since `want_list`
+        // orders nearest-first.
         let full_depth = if self.playback.is_playing() || (self.precache && !self.precache_filled) {
             self.prefetch_depth()
         } else {
