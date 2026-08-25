@@ -97,6 +97,14 @@ Two rules keep the selection safe:
 2. **Every fallback chain ends at `frame_bytes`**, never at something smaller. An unmeasured cheap
    fidelity yields a cap that is too *small* — wasteful, and self-correcting on the next decode —
    rather than one too large.
+3. **What the pump asks for is only a prediction of what lands (#233).** The worker's cheap decodes
+   each have an `or_else` that falls back to something dearer, up to a full all-parts `load`, so a
+   job budgeted as a 9 MB proxy can return a 1035 MB frame. That fallback is correct — slow beats a
+   frozen layer (#213) — but it means the requested fidelity is not evidence of the delivered one.
+   The worker reports it (`LoadResult::fell_back`, a fidelity-rank comparison of what was asked
+   against what came back), and while the clock source's last decode fell back, sizing uses
+   `frame_bytes` regardless of what was requested. One-directional by the same rule as (2): the
+   override may only make the divisor *dearer*, and it clears the moment a cheap decode succeeds.
 
 A fidelity change is safe without any re-measure: the cap recomputes every tick, and `tick_budgets`
 force-evicts in the same tick when the ring exceeds it (#146), so beauty → full raises the divisor,
