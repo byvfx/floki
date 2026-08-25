@@ -515,8 +515,9 @@ pub struct ExrApp {
     /// (`budget::max_t1`) each status tick once a frame's size is measured.
     #[serde(skip)]
     frame_cache_cap: usize,
-    /// One frame's measured `approx_bytes()`, captured on the first decode (a
-    /// sequence is homogeneous). Sizes the cache budget.
+    /// One **full** frame's measured `approx_bytes()`, captured on the first full
+    /// decode (a sequence is homogeneous at a given fidelity). Sizes the cache
+    /// budget when full frames are what the pump is issuing.
     #[serde(skip)]
     frame_bytes: Option<usize>,
     /// One **proxy** frame's measured `approx_bytes()` (#94), captured on the first
@@ -524,6 +525,16 @@ pub struct ExrApp {
     /// frames fit instead of ~16 full ones.
     #[serde(skip)]
     proxy_bytes: Option<usize>,
+    /// One **beauty-only** frame's measured `approx_bytes()` (#230) — the third
+    /// fidelity, and the one that had no latch at all.
+    ///
+    /// Without it, `beauty_preview` playback (proxy off) cached beauty-only frames
+    /// while sizing the ring off a full 23-part decode: measured `t1=23/23` and
+    /// `evict=726` in 45 s on a 1035 MB/frame Karma render against a 24 GB budget,
+    /// a ~10x under-use of the configured budget on exactly the footage where cache
+    /// depth matters most. Read through [`Self::sizing_frame_bytes`].
+    #[serde(skip)]
+    beauty_bytes: Option<usize>,
     /// Sequence frame numbers submitted to the worker but not yet returned (#57).
     /// Bounds decode-ahead concurrency and prevents re-requesting an in-flight
     /// frame; cleared on every seek so superseded decodes can't be miscounted.
@@ -1020,6 +1031,7 @@ impl Default for ExrApp {
             frame_cache_cap: 8,
             frame_bytes: None,
             proxy_bytes: None,
+            beauty_bytes: None,
             inflight: std::collections::HashSet::new(),
             followers: std::collections::BTreeMap::new(),
             epoch_signal: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -2034,6 +2046,7 @@ impl ExrApp {
         self.transport_source = source;
         self.frame_bytes = None;
         self.proxy_bytes = None;
+        self.beauty_bytes = None;
     }
 
     /// The *active* followers — those with a detected sequence (the N-source
@@ -2522,6 +2535,47 @@ impl ExrApp {
 
     fn decode_proxy_target(&self, frame: u32) -> Option<usize> {
         self.decode_proxy_target_at(frame, self.playback.current_frame)
+    }
+
+    /// What one **newly decoded** frame will cost, at the fidelity the decode pump
+    /// is currently issuing — the divisor the T1 cap is computed from (#230).
+    ///
+    /// #215's lesson generalised: sizing must be gated on the *same* condition the
+    /// decode path uses, or the ring fills with full frames under a cheap-sized cap
+    /// and the failure mode flips from wasteful to OOM. So this asks `submit_seq`'s
+    /// own predicates rather than restating them. The gate it replaces —
+    /// `proxy_enabled && is_active() && viewer.active_layer == 0` — claimed in its
+    /// comment to be that same condition, and had silently stopped being it at
+    /// #213/#217, which moved the decode path onto `displayed_aov` /
+    /// `cheap_decode_layer` (the whole comp stack, not the viewer's layer).
+    ///
+    /// Probed one frame off the playhead because **prefetch is what fills the
+    /// ring**: the cheap gates differ from the settled playhead only by
+    /// `frame != playhead` (`wants_cheap_decode_at`), so this answers "what does the
+    /// next prefetch cost" — the marginal frame the cap is counting. While playing
+    /// or scrubbing the probe is irrelevant (those short-circuit true), so it only
+    /// matters for the settled-precache case, where the playhead is deliberately
+    /// full and everything around it is not.
+    ///
+    /// Every fallback chain ends at `frame_bytes`, never at something smaller: a
+    /// cheap mode whose bytes have not been measured yet errs conservative — a cap
+    /// that is too small, which is merely wasteful — instead of toward OOM.
+    fn sizing_frame_bytes(&self) -> Option<usize> {
+        // The **clock source**, matching `apply_load_result`'s latch condition
+        // (`res.source == self.clock_source()`) exactly. Probing `A_SOURCE` would
+        // read a different source's gate than the one whose bytes were measured:
+        // under `comp_drives_transport` slot A never decodes at all, and
+        // `displayed_aov(A_SOURCE)` then falls through to `viewer.active_layer` —
+        // reintroducing the very predicate #213/#217 moved the decode path off.
+        let src = self.clock_source();
+        let probe = self.source_playhead(src).wrapping_add(1);
+        if self.decode_proxy_target_for(src, probe).is_some() {
+            return self.proxy_bytes.or(self.frame_bytes);
+        }
+        if self.decode_beauty_only_for(src, probe) {
+            return self.beauty_bytes.or(self.frame_bytes);
+        }
+        self.frame_bytes
     }
 
     /// Per-source counterpart of [`Self::decode_proxy_target`] (#99). The primary
@@ -3527,24 +3581,14 @@ impl ExrApp {
         let sample = self.resource_monitor.sample(&gpu.render_state().device);
         self.dbg_last_sample = Some(sample); // stash for the status bar + debug overlay
 
-        // T1: recomputed each tick; shrinks under other memory pressure.
-        // While scrub proxies are actually being produced (#94) the resident
-        // frames are tiny downsampled proxies, so size the cap off proxy bytes —
-        // hundreds fit instead of the ~16 that full 178 MB frames allow. Gated on
-        // the SAME condition proxies decode under (`proxy_enabled` + beauty layer):
-        // on a non-beauty AOV the ring fills with *full* frames, so a proxy-sized
-        // cap would over-count and risk OOM. Falls back to full-frame bytes
-        // otherwise (or when proxy_bytes hasn't been measured yet).
-        let proxying =
-            self.proxy_enabled && self.playback.is_active() && self.viewer.active_layer == 0;
-        let sizing_bytes = if proxying {
-            self.proxy_bytes.or(self.frame_bytes)
-        } else {
-            self.frame_bytes
-        };
-        if let Some(bytes) = sizing_bytes {
-            let cache_bytes = self.frame_cache.len() as u64 * bytes as u64;
-            let auto = crate::budget::t1_capacity(&sample, bytes, cache_bytes);
+        // T1: recomputed each tick; shrinks under other memory pressure. The
+        // divisor is what one *new* frame costs at the fidelity the pump is
+        // currently issuing ([`Self::sizing_frame_bytes`]); the resident side is
+        // the ring's own measured bytes rather than `len * divisor` — with a
+        // heterogeneous ring that synthesized figure put the same possibly-wrong
+        // scalar on both sides of the budget at once (#230).
+        if let Some(bytes) = self.sizing_frame_bytes() {
+            let auto = crate::budget::t1_capacity(&sample, bytes, self.frame_cache.bytes());
             // A user-assigned RAM budget (if any) caps the auto figure —
             // never raises it — then floor at 2 so playback still runs.
             self.frame_cache_cap =
@@ -3793,6 +3837,12 @@ impl ExrApp {
                     // on real footage) and the #146 pressure shrink unable to fire.
                     // With slot A driving, `clock_source()` *is* `A_SOURCE`, so the
                     // A/B behaviour is unchanged.
+                    // One branch per fidelity, in `submit_seq`'s own precedence
+                    // (proxy over beauty over full) so the latch a decode writes is
+                    // the latch `sizing_frame_bytes` will read back for it. The two
+                    // used to be a two-way `if`, which left a plain beauty-only frame
+                    // matching *neither* arm: it filled the ring and sized nothing
+                    // (#230).
                     if res.source == self.clock_source() {
                         if arc.proxy {
                             // **Most recent, not first.** `get_or_insert` latched
@@ -3805,7 +3855,15 @@ impl ExrApp {
                             // `t1=278/55314`, a cap 34x too large, where eviction by
                             // count can never fire before RAM runs out.
                             self.proxy_bytes = Some(arc.approx_bytes());
-                        } else if !arc.beauty_only {
+                        } else if arc.beauty_only {
+                            // Most-recent, not first, for the proxy reason amplified
+                            // by #217: a beauty-only decode now carries whichever
+                            // single AOV is on screen (`aov_layer` in `submit_seq`),
+                            // so its size changes with the displayed pass. A
+                            // `get_or_insert` would pin the first AOV's size for the
+                            // rest of the session.
+                            self.beauty_bytes = Some(arc.approx_bytes());
+                        } else {
                             self.frame_bytes.get_or_insert_with(|| arc.approx_bytes());
                         }
                     }
@@ -4002,8 +4060,11 @@ impl ExrApp {
         // shared `Arc`), so the cache already accounts for slot A — don't also add
         // `exr_data`, which would double-count it.
         if self.playback.is_active() {
-            self.frame_bytes
-                .map_or(0, |b| self.frame_cache.len() as u64 * b as u64)
+            // The ring's own measurement (#230). This used to be
+            // `len * frame_bytes`, which reported every beauty-only or proxy frame
+            // as a full one — on a 1 GB/frame render that overstated tracked RAM by
+            // an order of magnitude in exactly the mode playback runs in.
+            self.frame_cache.bytes()
         } else {
             self.exr_data
                 .as_ref()
@@ -4524,7 +4585,8 @@ impl ExrApp {
              texb_max={texb_max:.1} texb_mb={texb_mb:.1} texq={texq} \
              worker={worker} submit_age={submit_age:.2} last_decode={last_decode:.2} \
              precache={precache}/{precache_filled} \
-             t1={t1_len}/{t1_cap} frame_bytes={frame_bytes} t2={t2_len}/{t2_cap} \
+             t1={t1_len}/{t1_cap} frame_bytes={frame_bytes} \
+             size_bytes={size_bytes} t1_bytes={t1_bytes} t2={t2_len}/{t2_cap} \
              evict={evict} drop_epoch={drop_epoch} run_dropped={run_dropped} run_held={run_held} \
              fps={fps:.1}/{fps_target:.0} ft_n={ft_n} \
              p50={p50:.1} p95={p95:.1} p99={p99:.1} ft_max={pmax:.1} \
@@ -4567,6 +4629,17 @@ impl ExrApp {
             frame_bytes = self
                 .frame_bytes
                 .map_or_else(|| "none".to_string(), |b| b.to_string()),
+            // The two figures the cap is *actually* computed from (#230). Without
+            // them the trace could not distinguish "the budget is small" from "the
+            // budget is being divided by the wrong frame": `frame_bytes` read
+            // 1035 MB while the ring held ~80 MB beauty-only frames, and nothing in
+            // the line said so. `size_bytes` is the divisor for the fidelity the
+            // pump is issuing; `t1_bytes` is what the ring measurably holds — so
+            // `t1_bytes / t1` against `size_bytes` is a direct sanity check.
+            size_bytes = self
+                .sizing_frame_bytes()
+                .map_or_else(|| "none".to_string(), |b| b.to_string()),
+            t1_bytes = self.frame_cache.bytes(),
             t2_len = self.viewer.t2_len(Self::A_SOURCE),
             t2_cap = self.viewer.t2_cap(Self::A_SOURCE),
             evict = self.dbg_evictions,
@@ -5319,7 +5392,11 @@ impl ExrApp {
         let t1_cap = self.frame_cache_cap;
         let t2_len = self.viewer.t2_len(Self::A_SOURCE);
         let t2_cap = self.viewer.t2_cap(Self::A_SOURCE);
-        let frame_bytes = self.frame_bytes;
+        // The divisor the cap is actually computed from, and what the ring measurably
+        // holds (#230) — not the raw `frame_bytes` latch, which is only one of three
+        // fidelities and is the wrong one during beauty/proxy playback.
+        let sizing_bytes = self.sizing_frame_bytes();
+        let t1_bytes = self.frame_cache.bytes();
         // The comp path holds one texture per source, rebuilt on the UI thread by
         // `ensure_comp_frame` — with T2 structurally off there (every ring call site
         // passes `A_SOURCE`), this is the VRAM the player actually occupies (#100).
@@ -5411,16 +5488,32 @@ impl ExrApp {
                         ui.end_row();
 
                         ui.label("T1 (CPU)");
-                        // Sizing provenance, not just occupancy: `frame_bytes` is
-                        // seeded only from a *primary* decode, so with the comp
-                        // stack driving the transport it is never measured and the
+                        // Sizing provenance, not just occupancy: the sizing latches
+                        // are seeded only from a *primary* decode, so with the comp
+                        // stack driving the transport none is ever measured and the
                         // cap sits frozen at its constructed default (#100). Say so
                         // in the row rather than presenting 8/8 as a live budget.
-                        let t1_sizing = frame_bytes.map_or_else(
+                        //
+                        // Held vs. sizing are shown side by side because they answer
+                        // different questions and used to be the same number (#230):
+                        // a held/frame far below the sizing figure is the ring being
+                        // budgeted for frames it isn't holding.
+                        let t1_sizing = sizing_bytes.map_or_else(
                             || "cap frozen (no sizing decode)".to_string(),
-                            |b| format!("~{}/frame", fmt_bytes(b as u64)),
+                            |b| format!("sizing ~{}/frame", fmt_bytes(b as u64)),
                         );
-                        ui.label(format!("{t1_len} / {t1_cap} frames  ·  {t1_sizing}"));
+                        let t1_held = if t1_len == 0 {
+                            "held —".to_string()
+                        } else {
+                            format!(
+                                "held {} (~{}/frame)",
+                                fmt_bytes(t1_bytes),
+                                fmt_bytes(t1_bytes / t1_len as u64)
+                            )
+                        };
+                        ui.label(format!(
+                            "{t1_len} / {t1_cap} frames  ·  {t1_sizing}  ·  {t1_held}"
+                        ));
                         ui.end_row();
 
                         // Scrub proxy (#94): whether it's on, the size knob, and the
@@ -9014,6 +9107,154 @@ mod tests {
         );
     }
 
+    // --- #230: which fidelity's bytes size the T1 cap ------------------------
+
+    #[test]
+    fn a_beauty_only_frame_latches_its_own_size() {
+        // The defect in one assertion. The latch was a two-way `if` —
+        // `arc.proxy` -> `proxy_bytes`, `!arc.beauty_only` -> `frame_bytes` — so a
+        // plain beauty-only frame matched *neither* arm. With `beauty_preview` on
+        // and `proxy_enabled` off, playback then cached beauty-only frames while
+        // sizing the ring off a full all-parts decode: `t1=23/23`, `evict=726` in
+        // 45 s on a 1035 MB/frame render against a 24 GB budget.
+        let (_dir, paths) = write_sequence(5);
+        let mut app = ExrApp::default();
+        app.add_comp_source(paths[0].clone());
+        let source = crate::layer::SourceId(COMP_SOURCE_BASE);
+        app.frame_bytes = None; // the open seeded it; start from unmeasured
+        app.beauty_bytes = None;
+
+        app.playback_step(1);
+        deliver_source_frame_as(&mut app, source, &paths[1], 2, false, true);
+
+        let expected = ExrData::load(&paths[1]).unwrap().approx_bytes();
+        assert_eq!(
+            app.beauty_bytes,
+            Some(expected),
+            "a beauty-only frame sizes the beauty latch"
+        );
+        assert_eq!(
+            app.frame_bytes, None,
+            "and must not masquerade as a full frame — it carries one layer"
+        );
+    }
+
+    /// A playing slot-A sequence with the cheap-decode AOV gate satisfied — the
+    /// state `sizing_frame_bytes` is read in. Latches are set to distinct
+    /// sentinels so each assertion names exactly one of them.
+    fn app_playing_with_all_three_latches() -> (tempfile::TempDir, ExrApp) {
+        let dir = tempfile::tempdir().unwrap();
+        touch_sequence(dir.path(), 50);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&dir.path().join("s.0001.exr"));
+        app.playback_toggle();
+        assert!(app.playback.is_playing());
+        app.frame_bytes = Some(1_000_000);
+        app.beauty_bytes = Some(80_000);
+        app.proxy_bytes = Some(9_000);
+        (dir, app)
+    }
+
+    #[test]
+    fn sizing_bytes_follow_the_fidelity_the_pump_is_issuing() {
+        let (_dir, mut app) = app_playing_with_all_three_latches();
+
+        // Proxy outranks beauty, exactly as `submit_seq` resolves the two: the
+        // scrub proxy is what actually lands in the ring when both are enabled.
+        assert!(app.proxy_enabled && app.beauty_preview);
+        assert_eq!(app.sizing_frame_bytes(), Some(9_000));
+
+        // Proxy off, beauty on — the configuration this machine runs, and the one
+        // that was sizing off `frame_bytes`.
+        app.proxy_enabled = false;
+        assert_eq!(app.sizing_frame_bytes(), Some(80_000));
+
+        // Both cheap modes off: full frames land, so full bytes size the ring.
+        app.beauty_preview = false;
+        assert_eq!(app.sizing_frame_bytes(), Some(1_000_000));
+    }
+
+    #[test]
+    fn an_unmeasured_cheap_mode_falls_back_to_full_bytes() {
+        // Every fallback chain ends at `frame_bytes`, never at something smaller.
+        // A cheap mode whose bytes haven't been measured yet must err toward a cap
+        // that is too *small* — merely wasteful — not toward one too large, which
+        // is #215's OOM direction.
+        let (_dir, mut app) = app_playing_with_all_three_latches();
+        app.proxy_enabled = false;
+        app.beauty_bytes = None;
+        assert_eq!(
+            app.sizing_frame_bytes(),
+            Some(1_000_000),
+            "unmeasured beauty falls back to full, not to the proxy figure"
+        );
+
+        app.proxy_enabled = true;
+        app.proxy_bytes = None;
+        assert_eq!(app.sizing_frame_bytes(), Some(1_000_000));
+
+        app.frame_bytes = None;
+        assert_eq!(
+            app.sizing_frame_bytes(),
+            None,
+            "nothing measured at all -> no cap computed, as before"
+        );
+    }
+
+    #[test]
+    fn a_settled_ring_with_precache_off_sizes_off_full_frames() {
+        // Not playing, not scrubbing, no precache: `wants_cheap_decode_at` is false
+        // for every frame, so every decode is full and the divisor must be too.
+        let (_dir, mut app) = app_playing_with_all_three_latches();
+        app.playback_stop();
+        app.precache = false;
+        assert!(!app.playback.is_playing() && !app.scrub_active);
+        assert_eq!(app.sizing_frame_bytes(), Some(1_000_000));
+
+        // With precache back on the ring *is* filled by cheap prefetch frames even
+        // while settled, so the cheap figure is the honest one.
+        app.precache = true;
+        assert_eq!(app.sizing_frame_bytes(), Some(9_000));
+    }
+
+    #[test]
+    fn sizing_refuses_the_cheap_figure_when_the_aov_needs_a_full_decode() {
+        // The gate this replaced asked `viewer.active_layer == 0`, which stopped
+        // tracking the decode path at #213/#217 — those moved it onto
+        // `displayed_aov` over the whole comp stack. Sharing the predicate is the
+        // point: a non-zero AOV whose part holds several passes can't be served by
+        // a one-layer decode, so full frames land and full bytes must size them.
+        let (_dir, mut app) = app_playing_with_all_three_latches();
+        assert_eq!(app.sizing_frame_bytes(), Some(9_000), "AOV 0: cheap");
+
+        app.viewer.active_layer = 3; // no layer table -> `single_layer_part` refuses
+        assert!(!app.cheap_decode_fits_aov(ExrApp::A_SOURCE));
+        assert_eq!(
+            app.sizing_frame_bytes(),
+            Some(1_000_000),
+            "no cheap decode can represent this AOV, so none may size the ring"
+        );
+    }
+
+    #[test]
+    fn repointing_the_transport_drops_every_measured_size() {
+        // `frame_bytes` is a one-shot latch, so a re-point to a different-resolution
+        // source would otherwise size the ring off the old one forever. The beauty
+        // latch joins the other two rather than surviving the switch.
+        let mut app = ExrApp {
+            frame_bytes: Some(1),
+            proxy_bytes: Some(2),
+            beauty_bytes: Some(3),
+            ..ExrApp::default()
+        };
+        app.set_transport_source(Some(crate::layer::SourceId(COMP_SOURCE_BASE)));
+        assert_eq!(
+            (app.frame_bytes, app.proxy_bytes, app.beauty_bytes),
+            (None, None, None),
+            "all three measured sizes are dropped with the transport"
+        );
+    }
+
     #[test]
     fn stutter_holds_while_the_clock_source_frame_is_undecoded() {
         // Stutter's contract is "play every frame; drop the effective fps rather than
@@ -10915,6 +11156,44 @@ mod tests {
             app.cheap_decode_layer(s),
             None,
             "a hidden layer on another AOV would freeze the moment it was shown"
+        );
+    }
+
+    #[test]
+    fn sizing_asks_the_clock_source_not_slot_a() {
+        // The latch measures frames from `clock_source()`, so the gate must read
+        // that same source's fidelity. Probing `A_SOURCE` instead would consult a
+        // source that, under `comp_drives_transport`, never decodes at all — and
+        // `displayed_aov(A_SOURCE)` then falls through to `viewer.active_layer`,
+        // reintroducing the exact predicate #213/#217 moved the decode path off.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("karma.exr");
+        write_one_aov_per_part_exr(&src, 4096, 2048, 4);
+        let mut app = ExrApp::default();
+        let (s, _lid, _f) = playing_with_one_layer_on(&mut app, dir.path(), &src, 1);
+        app.set_transport_source(Some(s));
+        assert_eq!(app.clock_source(), s, "the comp source drives the clock");
+        app.frame_bytes = Some(1_000_000);
+        app.beauty_bytes = Some(80_000);
+        app.proxy_bytes = Some(9_000);
+
+        // One layer, one AOV, its own part: cheap, and the proxy figure sizes it.
+        assert_eq!(app.sizing_frame_bytes(), Some(9_000));
+
+        // A second layer on the same source at a different pass: no one-layer
+        // decode serves both, so full frames land and full bytes must size them.
+        // Slot A's gate is untouched by this and would still answer "cheap".
+        app.comp_stack
+            .push_image("l2", s, 2, crate::layer::Trim::full(1, 3));
+        assert_eq!(app.cheap_decode_layer(s), None);
+        assert!(
+            app.decode_proxy_target_for(ExrApp::A_SOURCE, 2).is_some(),
+            "slot A still reports cheap — which is why the probed source matters"
+        );
+        assert_eq!(
+            app.sizing_frame_bytes(),
+            Some(1_000_000),
+            "the clock source needs full frames, so full bytes size the ring"
         );
     }
 

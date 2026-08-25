@@ -22,6 +22,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer falls back to hardcoded absolute paths when given no arguments.
 
 ### Fixed
+- **The RAM budget is no longer ~10x under-used on heavy multi-part renders.** The
+  cache cap was sized by dividing the budget by a *full* frame's measured size, but
+  the frames playback actually holds are cheaper: with beauty preview on, a
+  beauty-only decode carries one pass, not all 23 parts. Beauty-only frames matched
+  neither arm of the two-way sizing latch, so they filled the ring while sizing
+  nothing — a 40-frame Karma render (1035 MB/frame, 24 GB budget) held 23 frames of
+  maybe 80 MB each and evicted 726 times in 45 seconds. There is now a size latch
+  per fidelity, picked by asking the decode path's own predicates which one it is
+  issuing, so the divisor matches what lands in the ring. The prefetch window is
+  derived from the cap, so it widens with it.
+- **Resident cache bytes are measured rather than assumed.** The ring reported its
+  size as "frame count x one frame's bytes", which counts every proxy or
+  beauty-only frame as a full one — so the same wrong figure sat on both sides of
+  the budget, and the status bar's tracked-memory readout overstated RAM by an
+  order of magnitude during playback. The cache now keeps a live sum of what it is
+  holding.
 - **Playback caches far more of the sequence, and pressing Play no longer shrinks
   the lookahead.** The prefetch window was clamped to a 16-frame constant while
   playing but took the whole RAM budget while idle, so starting playback *cut* the

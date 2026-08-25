@@ -215,8 +215,13 @@ Ideas worth keeping but explicitly *not* on the critical path. Recorded so they 
    approximation? (Start with `—`/"playing"; revisit if a live-ish readout during play is wanted.)
 2. **#94 proxy persistence:** in-memory T0 ring first, or go straight to the on-disk cache? (Lean
    in-memory first; disk cache is the bigger, separable follow-on.)
-3. **Heterogeneous-frame budget:** re-measure `approx_bytes` on first >N% deviation vs. log-and-accept?
-   (Decide during #100 once real footage shows whether it actually varies.)
+3. ~~**Heterogeneous-frame budget:** re-measure `approx_bytes` on first >N% deviation vs.
+   log-and-accept?~~ **Settled by #230 — neither.** Real footage does vary, and not by drift: the
+   ring holds *three* fidelities at once (beauty-only or proxy while moving, full after each settle
+   upgrade at the same key), so a deviation threshold on one scalar has nothing stable to compare
+   against. Split the question instead — measure the resident set (`FrameCache::bytes()`), latch the
+   marginal cost per fidelity (`ExrApp::sizing_frame_bytes`). See
+   [memory-contract](memory-contract.md#cpu-ram-budget--binds-t0--t1).
 4. **Dedicated decode rayon pool:** still a measure-first lever (out of scope unless #100 shows
    UI-thread starvation).
 

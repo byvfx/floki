@@ -28,6 +28,10 @@ struct Entry {
     data: Arc<ExrData>,
     /// Monotonic access stamp for the LRU tiebreak.
     last_used: u64,
+    /// This frame's `approx_bytes()`, **snapshotted at insert** rather than
+    /// recomputed on demand, so the running sum in [`FrameCache::bytes`] can
+    /// never drift from what was actually added.
+    bytes: usize,
 }
 
 /// A byte-budgeted ring of decoded frames.
@@ -35,6 +39,16 @@ struct Entry {
 pub struct FrameCache {
     entries: HashMap<(SourceId, u32), Entry>,
     tick: u64,
+    /// Live sum of every resident entry's `bytes` (#230).
+    ///
+    /// The T1 budget used to *synthesize* this figure at the call site as
+    /// `len * frame_bytes` — the same scalar it then divided by — so one
+    /// mis-measured scalar was wrong on both sides of the budget at once. The
+    /// ring is genuinely heterogeneous: playback fills it with beauty-only or
+    /// proxy frames and each settle upgrade replaces one with a full frame at
+    /// the same key, so no single scalar describes the resident set. Measuring
+    /// it costs one add per mutation.
+    bytes: u64,
 }
 
 impl FrameCache {
@@ -46,6 +60,14 @@ impl FrameCache {
     #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Total resident bytes across every source (#230) — the measured figure the
+    /// T1 budget adds back to free RAM so capacity doesn't chase the cache's own
+    /// growth (`budget::t1_capacity`).
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        self.bytes
     }
 
     /// API completeness alongside [`FrameCache::len`] (and keeps
@@ -82,13 +104,23 @@ impl FrameCache {
     /// call [`FrameCache::evict_to`] afterward to enforce the budget.
     pub fn insert(&mut self, source: impl Into<SourceId>, frame: u32, data: Arc<ExrData>) {
         self.tick += 1;
-        self.entries.insert(
+        let bytes = data.approx_bytes();
+        let replaced = self.entries.insert(
             (source.into(), frame),
             Entry {
                 data,
                 last_used: self.tick,
+                bytes,
             },
         );
+        // Replacement is the common case here, not the rare one: the settle
+        // upgrade swaps a beauty/proxy frame for a full one at the *same* key.
+        // Crediting the new bytes without debiting the old leaks the difference
+        // once per upgrade, which on a played-through range is every frame.
+        self.bytes = self
+            .bytes
+            .saturating_sub(replaced.map_or(0, |e| e.bytes as u64))
+            .saturating_add(bytes as u64);
     }
 
     /// Resident frame numbers for a source, **without allocating** — for callers
@@ -118,6 +150,7 @@ impl FrameCache {
 
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.bytes = 0;
     }
 
     /// Drop every frame of one source, keeping the others. Used when locked-step B
@@ -125,14 +158,28 @@ impl FrameCache {
     /// numbers) can't hit a stale entry.
     pub fn clear_slot(&mut self, source: impl Into<SourceId>) {
         let source = source.into();
-        self.entries.retain(|(s, _), _| *s != source);
+        let mut freed = 0u64;
+        self.entries.retain(|(s, _), e| {
+            let keep = *s != source;
+            if !keep {
+                freed = freed.saturating_add(e.bytes as u64);
+            }
+            keep
+        });
+        self.bytes = self.bytes.saturating_sub(freed);
     }
 
     /// Drop a single frame, returning whether it was resident. Used by the
     /// render-watch (#101) when a frame is re-rendered or removed on disk, so the
     /// stale pixels don't survive in the ring.
     pub fn remove(&mut self, source: impl Into<SourceId>, frame: u32) -> bool {
-        self.entries.remove(&(source.into(), frame)).is_some()
+        match self.entries.remove(&(source.into(), frame)) {
+            Some(e) => {
+                self.bytes = self.bytes.saturating_sub(e.bytes as u64);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Evict frames until at most `capacity` remain (capacity is floored at 1),
@@ -178,7 +225,9 @@ impl FrameCache {
                 read_behind,
             ) {
                 Some(victim) => {
-                    self.entries.remove(&victim);
+                    if let Some(e) = self.entries.remove(&victim) {
+                        self.bytes = self.bytes.saturating_sub(e.bytes as u64);
+                    }
                     evicted += 1;
                 }
                 // Only the protected active frame(s) remain — stop.
@@ -637,5 +686,108 @@ mod tests {
             !c.contains(s2, 8) || !c.contains(s2, 12),
             "a far frame of the third source is evicted by its own distance"
         );
+    }
+
+    // --- #230: measured resident bytes -------------------------------------
+    //
+    // The T1 budget used to synthesize the ring's resident bytes at the call
+    // site as `len * frame_bytes`, so it reported a beauty-only or proxy frame
+    // as costing a full one. These pin the real sum across every mutation.
+
+    /// A **bigger** full frame (4x4 rather than 2x2), so a replacement at the
+    /// same key changes the resident total — this is the settle upgrade's shape.
+    fn big_frame() -> Arc<ExrData> {
+        use exr::prelude::*;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.exr");
+        let mut list = smallvec::SmallVec::new();
+        for name in ["R", "G", "B", "A"] {
+            list.push(AnyChannel::new(
+                Text::from(name),
+                FlatSamples::F32(vec![0.0; 16]),
+            ));
+        }
+        let layer = Layer::new(
+            (4, 4),
+            LayerAttributes::default(),
+            Encoding::FAST_LOSSLESS,
+            AnyChannels::sort(list),
+        );
+        Image::from_layer(layer).write().to_file(&path).unwrap();
+        Arc::new(ExrData::load(&path).unwrap())
+    }
+
+    #[test]
+    fn bytes_sums_what_is_actually_resident() {
+        let mut c = FrameCache::new();
+        assert_eq!(c.bytes(), 0, "empty ring holds nothing");
+
+        let small = frame().approx_bytes() as u64;
+        let big = big_frame().approx_bytes() as u64;
+        assert!(
+            big > small,
+            "fixtures must differ or the test proves nothing"
+        );
+
+        c.insert(A, 1, frame());
+        c.insert(A, 2, big_frame());
+        assert_eq!(
+            c.bytes(),
+            small + big,
+            "a mixed ring sums its members, not len * one scalar"
+        );
+        // The figure `len * scalar` would have produced for the same ring, off by
+        // the whole spread between the two fidelities.
+        assert_ne!(c.bytes(), c.len() as u64 * small);
+    }
+
+    #[test]
+    fn replacing_a_frame_debits_the_one_it_replaced() {
+        // The settle upgrade (#94/#56) writes a full frame over a beauty/proxy
+        // frame at the *same* key. Crediting the new bytes without debiting the
+        // old leaks the difference once per upgraded frame — i.e. every frame of
+        // a played-through range.
+        let mut c = FrameCache::new();
+        c.insert(A, 1, proxy_frame());
+        let proxy = c.bytes();
+        c.insert(A, 1, big_frame());
+        assert_eq!(c.len(), 1, "still one frame");
+        assert_eq!(
+            c.bytes(),
+            big_frame().approx_bytes() as u64,
+            "the replaced frame's bytes are debited, not stacked"
+        );
+        assert!(c.bytes() > proxy);
+    }
+
+    #[test]
+    fn every_removal_path_returns_the_bytes() {
+        let mut c = FrameCache::new();
+
+        // remove()
+        c.insert(A, 1, frame());
+        assert!(c.remove(A, 1));
+        assert_eq!(c.bytes(), 0, "remove");
+        assert!(!c.remove(A, 1), "a miss removes nothing...");
+        assert_eq!(c.bytes(), 0, "...and debits nothing");
+
+        // evict_to()
+        fill(&mut c, A, &[1, 2, 3, 4]);
+        let each = frame().approx_bytes() as u64;
+        assert_eq!(c.bytes(), 4 * each);
+        c.evict_to(2, &[(A, 1)], A, Direction::Forward, true, None, 0);
+        assert_eq!(c.len(), 2);
+        assert_eq!(c.bytes(), 2 * each, "eviction");
+
+        // clear_slot() — only the named source's bytes go
+        c.clear();
+        c.insert(A, 1, frame());
+        c.insert(B, 1, big_frame());
+        c.clear_slot(B);
+        assert_eq!(c.bytes(), each, "clear_slot debits only that source");
+
+        // clear()
+        c.clear();
+        assert_eq!(c.bytes(), 0, "clear");
     }
 }
