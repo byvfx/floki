@@ -2664,8 +2664,19 @@ impl ExrApp {
         // Without this the cap stays sized for 9 MB proxies while 1035 MB full
         // frames land, and `prefetch_depth` — `cap - 1` — sends the scheduler
         // fetching far into a ring that evicts each arrival on contact.
+        //
+        // **Dearest measured, not `frame_bytes` outright.** A fallback is not
+        // always all the way to full: a proxy job whose fast read fails returns a
+        // *beauty* frame, which latches `beauty_bytes` and leaves `frame_bytes`
+        // `None` if no full decode has happened yet. Returning `frame_bytes`
+        // there hands `tick_budgets` a `None`, which skips its entire T1 branch —
+        // cap frozen at its constructed 8, no budget check, and the #146 pressure
+        // shrink unable to fire. Falling through to the dearest figure that *has*
+        // been measured keeps the override's one-directional guarantee (every arm
+        // is >= what the requested-mode chains below would return) without the
+        // hole.
         if self.decode_fell_back {
-            return self.frame_bytes;
+            return self.frame_bytes.or(self.beauty_bytes).or(self.proxy_bytes);
         }
         let src = self.clock_source();
         let probe = self.source_playhead(src).wrapping_add(1);
@@ -9524,6 +9535,61 @@ mod tests {
         assert!(app.decode_fell_back);
         app.set_transport_source(Some(crate::layer::SourceId(COMP_SOURCE_BASE)));
         assert!(!app.decode_fell_back, "dropped with the other sizing state");
+    }
+
+    #[test]
+    fn a_partial_fallback_still_sizes_off_something() {
+        // A fallback is not always all the way to full. A proxy job whose fast
+        // read fails returns a *beauty* frame — dearer than asked, so `fell_back`,
+        // but it latches `beauty_bytes` and leaves `frame_bytes` unmeasured. An
+        // override that reached straight for `frame_bytes` returned `None` here,
+        // and `tick_budgets` skips its whole T1 branch on `None`: cap frozen at
+        // its constructed 8, no budget check, #146's pressure shrink dead.
+        let (_dir, paths) = write_sequence(2);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&paths[0]);
+        app.playback_toggle();
+
+        // The frame that *lands* is beauty-only — dearer than the proxy asked
+        // for, so `fell_back`, but it latches `beauty_bytes`, not `frame_bytes`.
+        let mut data = ExrData::load(&paths[1]).unwrap();
+        data.beauty_only = true;
+        app.apply_load_result(LoadResult {
+            source: ExrApp::A_SOURCE,
+            seq_frame: true,
+            frame: 2,
+            epoch: app.playback.epoch,
+            open_gen: 0,
+            fell_back: true,
+            result: Ok(data),
+        });
+        assert!(app.decode_fell_back);
+        assert_eq!(app.frame_bytes, None, "no full decode has happened yet");
+        let beauty = app.beauty_bytes.expect("the landed frame latched beauty");
+
+        // A definitively cheaper proxy figure, so the comparison below is real.
+        app.proxy_bytes = Some(beauty / 2);
+        assert_eq!(
+            app.sizing_frame_bytes(),
+            Some(beauty),
+            "falls through to the dearest measured figure, never to None"
+        );
+
+        // Still one-directional: the beauty figure is dearer than the proxy one
+        // the request alone would have picked, so the cap only shrank.
+        app.decode_fell_back = false;
+        assert_eq!(app.sizing_frame_bytes(), Some(beauty / 2));
+        assert!(
+            beauty / 2 < beauty,
+            "the override was the dearer of the two"
+        );
+
+        // And with nothing at all measured it is `None` exactly as before — that
+        // is the honest "no sizing decode yet" state, not a hole.
+        app.decode_fell_back = true;
+        app.beauty_bytes = None;
+        app.proxy_bytes = None;
+        assert_eq!(app.sizing_frame_bytes(), None);
     }
 
     #[test]
