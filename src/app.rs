@@ -3080,7 +3080,7 @@ impl ExrApp {
         if !self.playback.is_active() {
             return;
         }
-        self.playback.state = crate::playback::PlayState::Paused;
+        self.playback.pause();
         let (lo, hi) = (self.playback.in_point, self.playback.out_point);
         let next = (i64::from(self.playback.current_frame) + i64::from(delta))
             .clamp(i64::from(lo), i64::from(hi)) as u32;
@@ -3105,7 +3105,7 @@ impl ExrApp {
         if !self.playback.is_active() {
             return;
         }
-        self.playback.state = crate::playback::PlayState::Paused;
+        self.playback.pause();
         let next = frame.clamp(self.playback.in_point, self.playback.out_point);
         // A held-but-stationary drag re-lands on the current frame every UI
         // frame (`dragged()` is true even with zero pointer movement). Re-running
@@ -3211,7 +3211,7 @@ impl ExrApp {
             return;
         }
         if self.playback.state == PlayState::Playing {
-            self.playback.state = PlayState::Paused;
+            self.playback.pause();
             self.settle_to_full();
         } else {
             // Fresh play run → reset the HUD's dropped/held counters (#172), and
@@ -3479,7 +3479,6 @@ impl ExrApp {
     /// this advances smoothly; when decode falls behind it holds, dropping the
     /// effective fps without skipping frames. A review tool's default.
     fn tick_stutter(&mut self, period: std::time::Duration) {
-        use crate::playback::PlayState;
         if self.transport_awaiting() {
             return; // still waiting on the current frame — hold.
         }
@@ -3504,7 +3503,7 @@ impl ExrApp {
                 self.playback.frames_since_anchor = 0;
             }
         } else {
-            self.playback.state = PlayState::Paused;
+            self.playback.pause();
             self.settle_to_full();
         }
     }
@@ -3516,7 +3515,6 @@ impl ExrApp {
     /// frames at a steady wall-clock rate instead of a slowing stutter. A hard
     /// per-tick cap re-anchors after a long stall so the catch-up can't spiral.
     fn tick_drop_frames(&mut self, period: std::time::Duration) {
-        use crate::playback::PlayState;
         // Cap the catch-up burst (e.g. after the window was backgrounded): beyond
         // this many frames in one tick, re-anchor to now and move on.
         const MAX_SKIP: u32 = 240;
@@ -3555,7 +3553,7 @@ impl ExrApp {
             self.request_sequence_frame(self.playback.current_frame);
         }
         if hit_boundary {
-            self.playback.state = PlayState::Paused;
+            self.playback.pause();
             self.settle_to_full();
         }
     }
@@ -9031,8 +9029,14 @@ mod tests {
         );
         assert_eq!(app.clock_source(), source);
 
+        // Playing, not stepping. Pacing measures the *clock's* rate, so a stepped
+        // frame is deliberately not a frame time (#236) — the interval between two
+        // steps is however long the user looked at the first one. What is under
+        // test here is that a comp source's `note_display` reaches the transport
+        // at all, which the play path exercises just as well.
+        app.playback_toggle();
+        assert!(app.playback.is_playing());
         for frame in 2..=5u32 {
-            app.playback_step(1);
             app.note_display(source, frame);
         }
 

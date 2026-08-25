@@ -282,6 +282,24 @@ impl Playback {
         self.last_shown_frame = None;
     }
 
+    /// Halt the clock without leaving sequence mode — the mirror of
+    /// [`Self::start_playing`], and the counterpart [`Self::stop`] is for a full
+    /// reset.
+    ///
+    /// Exists because pause was the one transport transition with no method: five
+    /// call sites assigned `state = Paused` directly, and every one of them
+    /// therefore skipped the shown-frame bookkeeping that `start_playing` does.
+    /// A pause, a long idle, then a step filed the whole idle span as one frame
+    /// time — 20.5 s and 27.2 s samples observed in a single session (#236).
+    ///
+    /// `measured_fps` is deliberately *not* cleared: it reads as the rate of the
+    /// run just paused, which is what the HUD should show. `stop` clears it.
+    pub fn pause(&mut self) {
+        self.state = PlayState::Paused;
+        self.last_shown = None;
+        self.last_shown_frame = None;
+    }
+
     /// Stop the clock and reset the pacing measurement. The smoothed
     /// `measured_fps` reflects the *last* playback, so it's cleared here — a
     /// stopped transport reads `0.0` rather than a stale rate. The caller sets the
@@ -362,6 +380,16 @@ impl Playback {
             return;
         }
         self.last_shown_frame = Some(frame);
+        // Only *playback* is measured (#236). Both figures below describe the
+        // clock's pacing, so an interval recorded while the clock isn't running
+        // has no meaning — and a paused one is unbounded, being however long the
+        // user looked at the frame. `pause` clearing `last_shown` already stops
+        // the known paths; this is the invariant stated where the measurement
+        // happens, so a pause path added later can't reopen it.
+        if !matches!(self.state, PlayState::Playing) {
+            self.last_shown = Some(now);
+            return;
+        }
         if let Some(prev) = self.last_shown {
             let dt = now.duration_since(prev).as_secs_f32();
             if dt > 0.0 {
@@ -437,10 +465,14 @@ mod tests {
 
     /// Feed the ring a run of exact intervals, bypassing the wall clock. Each call
     /// uses a distinct frame number so the per-frame dedupe never suppresses one.
+    ///
+    /// Starts the clock first: only playback is measured (#236), so a run fed to a
+    /// stopped transport would record nothing at all.
     fn shown_after(pb: &mut Playback, gaps_ms: &[u64]) {
         let base = Instant::now();
         let mut t = base;
         let mut frame = 0u32;
+        pb.start_playing(t);
         pb.note_shown(t, frame);
         for ms in gaps_ms {
             t += Duration::from_millis(*ms);
@@ -458,6 +490,7 @@ mod tests {
         // display shows a given frame once, so the repeat is never new information.
         let mut pb = Playback::default();
         let t = Instant::now();
+        pb.start_playing(t); // only playback is measured (#236)
         pb.note_shown(t, 1);
         pb.note_shown(t + Duration::from_millis(40), 2);
         assert_eq!(pb.frame_time_samples(), 1);
@@ -507,12 +540,90 @@ mod tests {
     }
 
     #[test]
+    fn pausing_then_stepping_after_an_idle_does_not_record_the_gap() {
+        // #236, found dogfooding. `start_playing` nulls the shown marker so the
+        // idle *before* Play isn't filed as a frame time — but pause had no
+        // method at all, five call sites assigned `state = Paused` raw, and none
+        // did the same. Pause, look at the frame for twenty seconds, step: the
+        // whole idle span landed in the ring as one sample. Observed at 20567 ms
+        // and 27220 ms in a single session, against a real worst frame of ~55 ms.
+        let mut pb = Playback::default();
+        let t = Instant::now();
+        pb.start_playing(t);
+        pb.note_shown(t, 1);
+        pb.note_shown(t + Duration::from_millis(40), 2);
+        assert_eq!(pb.frame_time_samples(), 1);
+        let (_, _, _, max) = pb.frame_time_pcts().unwrap();
+        assert!((max - 40.0).abs() < 1.0, "got {max}");
+
+        // Pause, a long look, then step to the next frame.
+        pb.pause();
+        pb.note_shown(t + Duration::from_secs(20), 3);
+        assert_eq!(
+            pb.frame_time_samples(),
+            1,
+            "the idle span while paused is not a frame time"
+        );
+        let (_, _, _, max) = pb.frame_time_pcts().unwrap();
+        assert!((max - 40.0).abs() < 1.0, "tail unpoisoned, got {max}");
+
+        // Stepping *again* after another long look is equally not a frame time —
+        // every step re-enters pause, so no paused interval is ever recorded.
+        pb.note_shown(t + Duration::from_secs(40), 4);
+        assert_eq!(pb.frame_time_samples(), 1);
+    }
+
+    #[test]
+    fn only_playback_is_measured() {
+        // The invariant stated where the measurement happens, so a pause path
+        // added later cannot reopen #236 the way the five raw assignments did.
+        // Both figures describe the clock's pacing, so neither means anything
+        // while the clock is not running.
+        let t = Instant::now();
+        for state in [PlayState::Stopped, PlayState::Paused] {
+            let mut pb = Playback {
+                state,
+                ..Playback::default()
+            };
+            pb.note_shown(t, 1);
+            pb.note_shown(t + Duration::from_millis(40), 2);
+            assert_eq!(
+                pb.frame_time_samples(),
+                0,
+                "{state:?}: the clock is not running, so there is no frame time"
+            );
+            assert_eq!(pb.measured_fps, 0.0, "{state:?}: nor a rate");
+        }
+    }
+
+    #[test]
+    fn pausing_keeps_the_rate_of_the_run_it_paused() {
+        // `measured_fps` is deliberately not cleared on pause: the HUD should read
+        // the rate of the run just paused, not zero. `stop` is the one that resets.
+        let mut pb = Playback::default();
+        let t = Instant::now();
+        pb.start_playing(t);
+        for (i, ms) in [0u64, 40, 80, 120].iter().enumerate() {
+            pb.note_shown(t + Duration::from_millis(*ms), i as u32 + 1);
+        }
+        let playing_fps = pb.measured_fps;
+        assert!(playing_fps > 0.0);
+
+        pb.pause();
+        assert_eq!(pb.measured_fps, playing_fps, "pause holds the rate");
+        pb.stop();
+        assert_eq!(pb.measured_fps, 0.0, "stop resets it");
+    }
+
+    #[test]
     fn note_shown_records_a_frame_shown_again_after_a_loop() {
+        // (Playing throughout — only playback is measured, #236.)
         // The dedupe is against the *immediately* preceding frame, not a history:
         // looping back onto a frame is a real display event and must count, or a
         // short in/out range would stop being measured entirely.
         let mut pb = Playback::default();
         let t = Instant::now();
+        pb.start_playing(t);
         pb.note_shown(t, 1);
         pb.note_shown(t + Duration::from_millis(40), 2);
         pb.note_shown(t + Duration::from_millis(80), 1);

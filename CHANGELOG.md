@@ -22,6 +22,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer falls back to hardcoded absolute paths when given no arguments.
 
 ### Fixed
+- **Pausing no longer corrupts the frame-time percentiles.** The p99 / max figures
+  measure the gap between displayed frames, and pausing left that measurement
+  running — so pausing, studying a frame, then stepping filed the whole idle span
+  as a single frame time. A 20-second look became a "20,000 ms frame" that
+  dominated p99 and max for the next 240 frames, reporting a 27-second worst case
+  for a session whose real worst frame was 55 ms. Only playback is measured now.
 - **A cheap decode that quietly turns into an expensive one is now visible, and
   budgeted for.** When a proxy or single-pass decode can't be produced for a file,
   the worker falls back to a full all-parts decode so the layer never freezes —
