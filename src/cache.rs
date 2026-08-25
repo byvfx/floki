@@ -3,8 +3,9 @@
 //! Holds decoded frames as `Arc<ExrData>` keyed by `(SourceId, frame number)`, so
 //! a frame can be the active image (T3) and stay resident (T1) at once without
 //! cloning its pixel buffers, and a scrub-back or loop replay is an instant cache
-//! hit instead of a re-decode. Bounded by a frame-count capacity derived from the
-//! RAM budget (`crate::budget::max_t1`); eviction is **directional-ring + LRU**:
+//! hit instead of a re-decode. Bounded by a [`Bound`] — a byte ceiling and a
+//! frame count, both derived from the one RAM budget
+//! (`crate::budget::t1_budget_bytes`); eviction is **directional-ring + LRU**:
 //! during linear play drop frames behind the playhead first (measured around the
 //! loop when `LoopMode::Loop` wraps, #140) — except a small **read-behind
 //! window** of just-shown frames (#169, matching the scheduler's reservation) —
@@ -23,6 +24,55 @@ use std::sync::Arc;
 use crate::exr_loader::ExrData;
 use crate::layer::SourceId;
 use crate::playback::Direction;
+
+/// What the ring is held under (#232): a byte ceiling and a frame count,
+/// enforced together by [`FrameCache::evict_to`] — whichever binds first.
+///
+/// **Bytes are the authority.** The budget is expressed in bytes and the ring's
+/// residency is measured in bytes (#230), so a count alone can only approximate
+/// it, and does so badly on a mixed ring: playback's beauty-only frames and the
+/// full frame at each settled playhead differ by ~18x on a heavy multi-part
+/// render, so `frames × one frame's size` is wrong by whatever the mix happens to
+/// be. `frames` is carried alongside rather than dropped because the decode
+/// scheduler needs a count — it sizes the #207 prefetch window — and because it
+/// keeps entry count bounded when `approx_bytes` (pixel buffers only, a
+/// documented lower bound) understates a frame's true cost.
+///
+/// Both are derived from one byte budget via `budget::frames_in`, so they state
+/// the same limit in two units rather than two limits that can drift.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Bound {
+    pub frames: usize,
+    pub bytes: u64,
+}
+
+impl Bound {
+    #[must_use]
+    pub fn new(frames: usize, bytes: u64) -> Self {
+        Self { frames, bytes }
+    }
+
+    /// A count-only bound — for tests exercising the *policy* (which frame is
+    /// picked) rather than the budget (how many are kept).
+    #[cfg(test)]
+    #[must_use]
+    pub fn frames(frames: usize) -> Self {
+        Self {
+            frames,
+            bytes: u64::MAX,
+        }
+    }
+
+    /// A byte-only bound, for the same reason in the other unit.
+    #[cfg(test)]
+    #[must_use]
+    pub fn bytes(bytes: u64) -> Self {
+        Self {
+            frames: usize::MAX,
+            bytes,
+        }
+    }
+}
 
 struct Entry {
     data: Arc<ExrData>,
@@ -64,7 +114,7 @@ impl FrameCache {
 
     /// Total resident bytes across every source (#230) — the measured figure the
     /// T1 budget adds back to free RAM so capacity doesn't chase the cache's own
-    /// growth (`budget::t1_capacity`).
+    /// growth (`budget::t1_budget_bytes`).
     #[must_use]
     pub fn bytes(&self) -> u64 {
         self.bytes
@@ -182,10 +232,16 @@ impl FrameCache {
         }
     }
 
-    /// Evict frames until at most `capacity` remain (capacity is floored at 1),
-    /// protecting each source's on-screen frame in `playheads` (every
-    /// `(source, playhead)` pair is kept). Victim selection is the directional-ring
-    /// + LRU policy in [`FrameCache::pick_victim`].
+    /// Evict frames until the ring fits `bound` — **both** its frame count and its
+    /// byte ceiling, whichever binds first — protecting each source's on-screen
+    /// frame in `playheads` (every `(source, playhead)` pair is kept). Victim
+    /// selection is the directional-ring + LRU policy in
+    /// [`FrameCache::pick_victim`], unchanged by which bound is doing the binding.
+    ///
+    /// The protected playheads outrank both bounds: when only they remain,
+    /// `pick_victim` returns `None` and this stops, over budget. That is the
+    /// memory contract's degradation, not a leak — a ring that evicted the frame
+    /// on screen would decode it again immediately.
     ///
     /// `primary` is the source whose playhead drives the *directional* policy
     /// (loop-wrap distance, behind-bias, read-behind carve-out); every other
@@ -205,7 +261,7 @@ impl FrameCache {
     #[allow(clippy::too_many_arguments)]
     pub fn evict_to(
         &mut self,
-        capacity: usize,
+        bound: Bound,
         playheads: &[(SourceId, u32)],
         primary: SourceId,
         direction: Direction,
@@ -213,9 +269,9 @@ impl FrameCache {
         loop_wrap: Option<(u32, u32)>,
         read_behind: usize,
     ) -> usize {
-        let cap = capacity.max(1);
+        let cap = bound.frames.max(1);
         let mut evicted = 0;
-        while self.entries.len() > cap {
+        while self.entries.len() > cap || self.bytes > bound.bytes {
             match self.pick_victim(
                 playheads,
                 primary,
@@ -449,7 +505,15 @@ mod tests {
         let mut c = FrameCache::new();
         fill(&mut c, SourceId(0), &[10, 11, 12]);
         // Capacity 1 with playhead on 11: everything else goes, 11 stays.
-        c.evict_to(1, &[(A, 11)], A, Direction::Forward, true, None, 0);
+        c.evict_to(
+            Bound::frames(1),
+            &[(A, 11)],
+            A,
+            Direction::Forward,
+            true,
+            None,
+            0,
+        );
         assert_eq!(c.len(), 1);
         assert!(c.contains(SourceId(0), 11), "active frame is never evicted");
     }
@@ -461,7 +525,15 @@ mod tests {
         let mut c = FrameCache::new();
         fill(&mut c, SourceId(0), &[3, 4, 5, 6]);
         fill(&mut c, SourceId(1), &[103, 104, 105, 106]);
-        c.evict_to(2, &[(A, 5), (B, 105)], A, Direction::Forward, true, None, 0);
+        c.evict_to(
+            Bound::frames(2),
+            &[(A, 5), (B, 105)],
+            A,
+            Direction::Forward,
+            true,
+            None,
+            0,
+        );
         assert_eq!(c.len(), 2, "everything but the two playheads is evicted");
         assert!(c.contains(SourceId(0), 5), "A playhead protected");
         assert!(c.contains(SourceId(1), 105), "B playhead protected");
@@ -475,7 +547,15 @@ mod tests {
         // Trim to 3: the two behind frames (furthest first: 3 then 4) are dropped.
         // The returned count (used by the #100 debug overlay) reflects that.
         assert_eq!(
-            c.evict_to(3, &[(A, 5)], A, Direction::Forward, true, None, 0),
+            c.evict_to(
+                Bound::frames(3),
+                &[(A, 5)],
+                A,
+                Direction::Forward,
+                true,
+                None,
+                0
+            ),
             2,
             "evicted count"
         );
@@ -495,7 +575,15 @@ mod tests {
         let mut c = FrameCache::new();
         // All ahead of playhead 5.
         fill(&mut c, SourceId(0), &[5, 6, 7, 8]);
-        c.evict_to(2, &[(A, 5)], A, Direction::Forward, true, None, 0);
+        c.evict_to(
+            Bound::frames(2),
+            &[(A, 5)],
+            A,
+            Direction::Forward,
+            true,
+            None,
+            0,
+        );
         // Keep playhead + nearest ahead; drop the furthest-ahead (8 then 7).
         assert!(c.contains(SourceId(0), 5) && c.contains(SourceId(0), 6));
         assert!(!c.contains(SourceId(0), 7) && !c.contains(SourceId(0), 8));
@@ -506,7 +594,15 @@ mod tests {
         let mut c = FrameCache::new();
         // Playhead 5, playing in reverse: 6,7 are "behind", 3,4 ahead.
         fill(&mut c, SourceId(0), &[3, 4, 5, 6, 7]);
-        c.evict_to(3, &[(A, 5)], A, Direction::Reverse, true, None, 0);
+        c.evict_to(
+            Bound::frames(3),
+            &[(A, 5)],
+            A,
+            Direction::Reverse,
+            true,
+            None,
+            0,
+        );
         assert!(c.contains(SourceId(0), 5));
         assert!(
             c.contains(SourceId(0), 3) && c.contains(SourceId(0), 4),
@@ -523,7 +619,15 @@ mod tests {
         let mut c = FrameCache::new();
         // Playhead 5; not playing -> bidirectional distance.
         fill(&mut c, SourceId(0), &[1, 4, 5, 6, 9]);
-        c.evict_to(3, &[(A, 5)], A, Direction::Forward, false, None, 0);
+        c.evict_to(
+            Bound::frames(3),
+            &[(A, 5)],
+            A,
+            Direction::Forward,
+            false,
+            None,
+            0,
+        );
         // Furthest from 5 are 1 (dist 4) and 9 (dist 4); both dropped.
         assert!(c.contains(SourceId(0), 5));
         assert!(
@@ -544,7 +648,15 @@ mod tests {
         c.insert(SourceId(0), 4, frame()); // inserted earlier
         c.insert(SourceId(0), 6, frame()); // inserted later
         c.get(SourceId(0), 6); // touch 6 so 4 is least-recently-used
-        c.evict_to(2, &[(A, 5)], A, Direction::Forward, false, None, 0);
+        c.evict_to(
+            Bound::frames(2),
+            &[(A, 5)],
+            A,
+            Direction::Forward,
+            false,
+            None,
+            0,
+        );
         assert!(c.contains(SourceId(0), 6), "recently used survives the tie");
         assert!(!c.contains(SourceId(0), 4), "LRU loses the tie");
     }
@@ -561,7 +673,15 @@ mod tests {
         // Loop [1,10], playhead 9 forward. Wrapped prefetch 1,2 has landed;
         // 7,8 were just shown. Ring distances from 9: 10→1, 1→2, 2→3, 7→8, 8→9.
         fill(&mut c, SourceId(0), &[7, 8, 9, 10, 1, 2]);
-        c.evict_to(4, &[(A, 9)], A, Direction::Forward, true, Some((1, 10)), 0);
+        c.evict_to(
+            Bound::frames(4),
+            &[(A, 9)],
+            A,
+            Direction::Forward,
+            true,
+            Some((1, 10)),
+            0,
+        );
         assert!(c.contains(SourceId(0), 9), "playhead protected");
         assert!(
             c.contains(SourceId(0), 10) && c.contains(SourceId(0), 1) && c.contains(SourceId(0), 2),
@@ -580,7 +700,15 @@ mod tests {
         let mut c = FrameCache::new();
         // Loop [1,10], playhead 2 reverse. Prefetch 1,10,9 (wrapping); 3,4 just shown.
         fill(&mut c, SourceId(0), &[4, 3, 2, 1, 10, 9]);
-        c.evict_to(4, &[(A, 2)], A, Direction::Reverse, true, Some((1, 10)), 0);
+        c.evict_to(
+            Bound::frames(4),
+            &[(A, 2)],
+            A,
+            Direction::Reverse,
+            true,
+            Some((1, 10)),
+            0,
+        );
         assert!(c.contains(SourceId(0), 2), "playhead protected");
         assert!(
             c.contains(SourceId(0), 1) && c.contains(SourceId(0), 10) && c.contains(SourceId(0), 9),
@@ -599,7 +727,15 @@ mod tests {
         let mut c = FrameCache::new();
         // Loop trimmed to [1,10]; frame 12 is a leftover from the old range.
         fill(&mut c, SourceId(0), &[12, 8, 9, 10, 1]);
-        c.evict_to(4, &[(A, 9)], A, Direction::Forward, true, Some((1, 10)), 0);
+        c.evict_to(
+            Bound::frames(4),
+            &[(A, 9)],
+            A,
+            Direction::Forward,
+            true,
+            Some((1, 10)),
+            0,
+        );
         assert!(
             !c.contains(SourceId(0), 12),
             "out-of-range leftover evicted before any in-range frame"
@@ -618,7 +754,15 @@ mod tests {
         let mut c = FrameCache::new();
         // Playhead 10 forward, window 2: 9,8 reserved; 7 beyond the window.
         fill(&mut c, SourceId(0), &[7, 8, 9, 10, 11, 12, 13]);
-        c.evict_to(5, &[(A, 10)], A, Direction::Forward, true, None, 2);
+        c.evict_to(
+            Bound::frames(5),
+            &[(A, 10)],
+            A,
+            Direction::Forward,
+            true,
+            None,
+            2,
+        );
         assert!(
             !c.contains(SourceId(0), 7),
             "beyond the window: biased, evicted first"
@@ -646,7 +790,15 @@ mod tests {
         // Loop [1,10], playhead 9 forward, window 1: 8 reserved; 7 beyond it.
         // Ring ranks: 10→1, 1→2, 8→back 1 (carve-out), 7→fwd 8.
         fill(&mut c, SourceId(0), &[7, 8, 9, 10, 1]);
-        c.evict_to(3, &[(A, 9)], A, Direction::Forward, true, Some((1, 10)), 1);
+        c.evict_to(
+            Bound::frames(3),
+            &[(A, 9)],
+            A,
+            Direction::Forward,
+            true,
+            Some((1, 10)),
+            1,
+        );
         assert!(c.contains(SourceId(0), 9), "playhead protected");
         assert!(
             c.contains(SourceId(0), 8),
@@ -676,7 +828,15 @@ mod tests {
         }
         // Primary A on 5 (protected); source 2's playhead is 10. Squeeze to 3:
         // keep A/5 + s2/10 + the nearest s2 frame; drop s2's furthest (12 or 8).
-        c.evict_to(3, &[(A, 5), (s2, 10)], A, Direction::Forward, true, None, 0);
+        c.evict_to(
+            Bound::frames(3),
+            &[(A, 5), (s2, 10)],
+            A,
+            Direction::Forward,
+            true,
+            None,
+            0,
+        );
         assert_eq!(c.len(), 3);
         assert!(c.contains(SourceId(0), 5), "primary playhead protected");
         assert!(c.contains(s2, 10), "third source's playhead protected");
@@ -775,7 +935,15 @@ mod tests {
         fill(&mut c, A, &[1, 2, 3, 4]);
         let each = frame().approx_bytes() as u64;
         assert_eq!(c.bytes(), 4 * each);
-        c.evict_to(2, &[(A, 1)], A, Direction::Forward, true, None, 0);
+        c.evict_to(
+            Bound::frames(2),
+            &[(A, 1)],
+            A,
+            Direction::Forward,
+            true,
+            None,
+            0,
+        );
         assert_eq!(c.len(), 2);
         assert_eq!(c.bytes(), 2 * each, "eviction");
 
@@ -789,5 +957,99 @@ mod tests {
         // clear()
         c.clear();
         assert_eq!(c.bytes(), 0, "clear");
+    }
+
+    // --- #232: the byte bound ------------------------------------------------
+
+    #[test]
+    fn the_byte_bound_evicts_when_the_count_alone_would_not() {
+        // The defect: eviction was count-only against a budget expressed in bytes.
+        // A ring comfortably under its frame count can still be over the budget it
+        // is meant to enforce, and nothing brought it back down.
+        let each = frame().approx_bytes() as u64;
+        let mut c = FrameCache::new();
+        fill(&mut c, A, &[1, 2, 3, 4, 5]);
+        assert_eq!(c.bytes(), 5 * each);
+
+        // Frames say "room for 100"; bytes say "room for 3".
+        let bound = Bound::new(100, 3 * each);
+        let evicted = c.evict_to(bound, &[(A, 1)], A, Direction::Forward, true, None, 0);
+        assert_eq!(evicted, 2);
+        assert_eq!(c.len(), 3, "the byte bound bound it, not the count");
+        assert!(c.bytes() <= bound.bytes);
+        assert!(c.contains(A, 1), "the playhead is still protected");
+    }
+
+    #[test]
+    fn one_dear_frame_displaces_several_cheap_ones() {
+        // Why a count can't stand in for bytes: the settle upgrade replaces a
+        // cheap frame with a full one at the same key, so the ring's cost changes
+        // while its *length* does not. Only a byte bound notices.
+        let small = frame().approx_bytes() as u64;
+        let big = big_frame().approx_bytes() as u64;
+        assert!(big > small);
+
+        let mut c = FrameCache::new();
+        fill(&mut c, A, &[1, 2, 3, 4]);
+        let budget = c.bytes(); // exactly fits four cheap frames
+        c.insert(A, 1, big_frame()); // frame 1 settles to full fidelity
+        assert_eq!(c.len(), 4, "length unchanged — a count sees nothing");
+        assert!(c.bytes() > budget, "but the ring is now over budget");
+
+        c.evict_to(
+            Bound::new(100, budget),
+            &[(A, 1)],
+            A,
+            Direction::Forward,
+            true,
+            None,
+            0,
+        );
+        assert!(c.bytes() <= budget);
+        assert!(c.contains(A, 1), "the upgraded playhead frame stays");
+        // It cost (big - small) more, so the cheap frames it displaced are however
+        // many that difference buys.
+        assert_eq!(c.len(), 4 - ((big - small).div_ceil(small)) as usize);
+    }
+
+    #[test]
+    fn the_protected_playhead_outranks_the_byte_bound() {
+        // Degradation, not a leak: a ring holding only the frames on screen has
+        // nothing left it may evict, so it stops over budget rather than dropping
+        // the frame being displayed (which it would decode again immediately).
+        let mut c = FrameCache::new();
+        c.insert(A, 5, frame());
+        c.insert(B, 105, frame());
+        let evicted = c.evict_to(
+            Bound::bytes(1), // a budget nothing could satisfy
+            &[(A, 5), (B, 105)],
+            A,
+            Direction::Forward,
+            true,
+            None,
+            0,
+        );
+        assert_eq!(evicted, 0);
+        assert_eq!(c.len(), 2, "both playheads survive an impossible budget");
+        assert!(c.bytes() > 1, "and the ring reports itself honestly over");
+    }
+
+    #[test]
+    fn the_count_still_binds_when_frames_are_cheaper_than_budgeted() {
+        // Both bounds are live; the more conservative one wins. Frames cheaper
+        // than the sizing figure leave bytes slack, so the count binds — which is
+        // the pre-#232 behaviour, preserved.
+        let mut c = FrameCache::new();
+        fill(&mut c, A, &[1, 2, 3, 4, 5]);
+        c.evict_to(
+            Bound::new(2, u64::MAX),
+            &[(A, 1)],
+            A,
+            Direction::Forward,
+            true,
+            None,
+            0,
+        );
+        assert_eq!(c.len(), 2, "the count bound it, not the bytes");
     }
 }

@@ -512,9 +512,19 @@ pub struct ExrApp {
     #[serde(skip)]
     prefetcher: crate::prefetch::Prefetcher,
     /// Resident-frame budget for `frame_cache`, recomputed from the RAM budget
-    /// (`budget::max_t1`) each status tick once a frame's size is measured.
+    /// (`budget::frames_in` of the byte budget) each status tick once a frame's
+    /// size is measured.
     #[serde(skip)]
     frame_cache_cap: usize,
+    /// The T1 **byte** ceiling the ring is evicted to (#232), recomputed each
+    /// status tick from `budget::t1_budget_bytes`.
+    ///
+    /// This is the authoritative bound; `frame_cache_cap` is `frames_in` of it,
+    /// carried because the decode scheduler needs a count. Eviction was
+    /// count-only until #232, which is exact only while every resident frame is
+    /// the same size — and #230 established that they are not.
+    #[serde(skip)]
+    frame_cache_budget: u64,
     /// One **full** frame's measured `approx_bytes()`, captured on the first full
     /// decode (a sequence is homogeneous at a given fidelity). Sizes the cache
     /// budget when full frames are what the pump is issuing.
@@ -1027,8 +1037,12 @@ impl Default for ExrApp {
             frame_cache: crate::cache::FrameCache::new(),
             prefetcher: crate::prefetch::Prefetcher::default(),
             // Conservative starting budget until the first frame is measured and
-            // `budget::max_t1` recomputes it from a slice of free RAM.
+            // `budget::t1_budget_bytes` recomputes it from a slice of free RAM.
             frame_cache_cap: 8,
+            // Unbounded until a decode measures a frame and `tick_budgets` sizes
+            // it — matching `frame_cache_cap`'s placeholder, which is likewise not
+            // a real budget until then.
+            frame_cache_budget: u64::MAX,
             frame_bytes: None,
             proxy_bytes: None,
             beauty_bytes: None,
@@ -1927,7 +1941,7 @@ impl ExrApp {
 
     /// The total prefetch window around the playhead (ahead + the #169
     /// read-behind reservation, split in [`Self::next_want`]) — bounded by the
-    /// T1 ring (`max_t1 − 1`, tying #57 back-pressure to the #56 budget) and by
+    /// T1 ring (`frame_cache_cap − 1`, tying #57 back-pressure to the #56 budget) and by
     /// the transport range, so a huge sequence can't queue the world.
     ///
     /// This is the **single** window figure: playing and idle precache both ask
@@ -2117,6 +2131,26 @@ impl ExrApp {
     /// window the scheduler maintains: a larger value would protect frames the
     /// pump can't fit and the two would churn. Zero while not playing —
     /// paused/scrub eviction is bidirectional-distance and needs no carve-out.
+    /// The bound T1 eviction enforces (#232): the byte ceiling, plus the frame
+    /// count derived from it. One place, so the two `evict_to` call sites — the
+    /// #146 pressure shrink and the post-insert trim — can't be given different
+    /// budgets.
+    fn cache_bound(&self) -> crate::cache::Bound {
+        crate::cache::Bound::new(self.frame_cache_cap, self.frame_cache_budget)
+    }
+
+    /// Whether the ring has taken all the budget allows, in either unit — the
+    /// precache latch and the pump's back-pressure check.
+    ///
+    /// Both units matter: with the count alone, a ring full of frames dearer than
+    /// the sizing figure sits under `cap` while over budget, so precache never
+    /// latches and churns decode -> evict forever. That is the same failure the
+    /// count check was added to fix (#56), in the other unit.
+    fn cache_is_full(&self) -> bool {
+        self.frame_cache.len() >= self.frame_cache_cap
+            || self.frame_cache.bytes() >= self.frame_cache_budget
+    }
+
     fn read_behind_depth(&self) -> usize {
         if !self.playback.is_playing() {
             return 0;
@@ -3320,7 +3354,7 @@ impl ExrApp {
         // budget: there `next_want` always finds a non-resident frame (it loop-
         // wraps to the far side), so `inflight` is never empty and the old
         // nothing-wanted latch never fired — precache churned decode→evict forever.
-        if self.inflight.is_empty() || self.frame_cache.len() >= self.frame_cache_cap {
+        if self.inflight.is_empty() || self.cache_is_full() {
             self.precache_filled = true;
         } else {
             self.request_repaint_after(std::time::Duration::from_millis(16));
@@ -3588,22 +3622,31 @@ impl ExrApp {
         // heterogeneous ring that synthesized figure put the same possibly-wrong
         // scalar on both sides of the budget at once (#230).
         if let Some(bytes) = self.sizing_frame_bytes() {
-            let auto = crate::budget::t1_capacity(&sample, bytes, self.frame_cache.bytes());
-            // A user-assigned RAM budget (if any) caps the auto figure —
-            // never raises it — then floor at 2 so playback still runs.
-            self.frame_cache_cap =
-                crate::budget::apply_user_ram_cap(auto, self.ram_budget_bytes(), bytes).max(2);
+            // One byte budget, stated in two units (#232). The user's RAM setting
+            // is folded in as a ceiling, never an override. Both are floored at two
+            // frames' worth so playback still double-buffers when the budget says
+            // fewer would fit — the floor is a deliberate override of the budget,
+            // so it has to apply in bytes too or the byte bound would undo it.
+            let budget = crate::budget::t1_budget_bytes(
+                &sample,
+                self.frame_cache.bytes(),
+                self.ram_budget_bytes(),
+            );
+            self.frame_cache_budget = budget.max((bytes as u64).saturating_mul(2));
+            self.frame_cache_cap = crate::budget::frames_in(self.frame_cache_budget, bytes).max(2);
             // Enforce a shrink now, not on the next decode: eviction otherwise
             // only runs on insert, so with precache latched (nothing in flight)
             // external memory pressure lowered the cap while the ring kept every
             // frame indefinitely — the memory contract's live-pressure
             // degradation never fired (#146).
-            if self.frame_cache.len() > self.frame_cache_cap {
+            if self.frame_cache.len() > self.frame_cache_cap
+                || self.frame_cache.bytes() > self.frame_cache_budget
+            {
                 let loop_wrap = (self.playback.loop_mode == crate::playback::LoopMode::Loop)
                     .then_some((self.playback.in_point, self.playback.out_point));
                 let playheads = self.cache_playheads();
                 self.dbg_evictions = self.dbg_evictions.saturating_add(self.frame_cache.evict_to(
-                    self.frame_cache_cap,
+                    self.cache_bound(),
                     &playheads,
                     Self::A_SOURCE,
                     self.playback.direction,
@@ -3887,7 +3930,7 @@ impl ExrApp {
                     let playheads = self.cache_playheads();
                     self.dbg_evictions =
                         self.dbg_evictions.saturating_add(self.frame_cache.evict_to(
-                            self.frame_cache_cap,
+                            self.cache_bound(),
                             &playheads,
                             Self::A_SOURCE,
                             self.playback.direction,
@@ -4586,7 +4629,8 @@ impl ExrApp {
              worker={worker} submit_age={submit_age:.2} last_decode={last_decode:.2} \
              precache={precache}/{precache_filled} \
              t1={t1_len}/{t1_cap} frame_bytes={frame_bytes} \
-             size_bytes={size_bytes} t1_bytes={t1_bytes} t2={t2_len}/{t2_cap} \
+             size_bytes={size_bytes} t1_bytes={t1_bytes}/{t1_budget} \
+             t2={t2_len}/{t2_cap} \
              evict={evict} drop_epoch={drop_epoch} run_dropped={run_dropped} run_held={run_held} \
              fps={fps:.1}/{fps_target:.0} ft_n={ft_n} \
              p50={p50:.1} p95={p95:.1} p99={p99:.1} ft_max={pmax:.1} \
@@ -4640,6 +4684,10 @@ impl ExrApp {
                 .sizing_frame_bytes()
                 .map_or_else(|| "none".to_string(), |b| b.to_string()),
             t1_bytes = self.frame_cache.bytes(),
+            // The bound eviction actually enforces (#232). `t1_bytes` up against
+            // this while `t1` sits well under `t1_cap` is the byte bound binding —
+            // the case a count-only evictor could not see at all.
+            t1_budget = self.frame_cache_budget,
             t2_len = self.viewer.t2_len(Self::A_SOURCE),
             t2_cap = self.viewer.t2_cap(Self::A_SOURCE),
             evict = self.dbg_evictions,
@@ -5397,6 +5445,7 @@ impl ExrApp {
         // fidelities and is the wrong one during beauty/proxy playback.
         let sizing_bytes = self.sizing_frame_bytes();
         let t1_bytes = self.frame_cache.bytes();
+        let t1_budget = self.frame_cache_budget;
         // The comp path holds one texture per source, rebuilt on the UI thread by
         // `ensure_comp_frame` — with T2 structurally off there (every ring call site
         // passes `A_SOURCE`), this is the VRAM the player actually occupies (#100).
@@ -5502,12 +5551,16 @@ impl ExrApp {
                             || "cap frozen (no sizing decode)".to_string(),
                             |b| format!("sizing ~{}/frame", fmt_bytes(b as u64)),
                         );
+                        // Held is shown against the byte budget, not bare (#232):
+                        // that pair is the bound eviction enforces, and the ring can
+                        // be up against it while the frame count still looks roomy.
                         let t1_held = if t1_len == 0 {
                             "held —".to_string()
                         } else {
                             format!(
-                                "held {} (~{}/frame)",
+                                "held {} / {} (~{}/frame)",
                                 fmt_bytes(t1_bytes),
+                                fmt_bytes(t1_budget),
                                 fmt_bytes(t1_bytes / t1_len as u64)
                             )
                         };
@@ -9252,6 +9305,55 @@ mod tests {
             (app.frame_bytes, app.proxy_bytes, app.beauty_bytes),
             (None, None, None),
             "all three measured sizes are dropped with the transport"
+        );
+    }
+
+    #[test]
+    fn the_cache_reads_full_on_either_bound() {
+        // #232: `precache_filled` and the pump's back-pressure both ask this. With
+        // the count alone, a ring of frames dearer than the sizing figure sits
+        // under `cap` while over budget — precache never latches and churns
+        // decode -> evict forever, which is the exact failure the count check was
+        // added to fix (#56), in the other unit.
+        let (_dir, paths) = write_sequence(3);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&paths[0]);
+        for (i, p) in paths.iter().enumerate() {
+            let data = std::sync::Arc::new(ExrData::load(p).unwrap());
+            app.frame_cache.insert(ExrApp::A_SOURCE, i as u32 + 1, data);
+        }
+        let resident = app.frame_cache.bytes();
+        assert!(resident > 0 && app.frame_cache.len() == 3);
+
+        app.frame_cache_cap = 100;
+        app.frame_cache_budget = resident * 2;
+        assert!(!app.cache_is_full(), "room by both bounds");
+
+        // Room by count (3 of 100), out of room by bytes.
+        app.frame_cache_budget = resident;
+        assert!(
+            app.cache_is_full(),
+            "a ring up against its byte budget is full however few frames it holds"
+        );
+
+        // And the count still latches on its own when bytes are slack.
+        app.frame_cache_budget = u64::MAX;
+        app.frame_cache_cap = 0;
+        assert!(app.cache_is_full());
+    }
+
+    #[test]
+    fn the_evict_bound_states_one_budget_in_two_units() {
+        // Both `evict_to` call sites go through `cache_bound`, so the #146 pressure
+        // shrink and the post-insert trim can't be handed different budgets.
+        let app = ExrApp {
+            frame_cache_cap: 424,
+            frame_cache_budget: 24_000_000_000,
+            ..ExrApp::default()
+        };
+        assert_eq!(
+            app.cache_bound(),
+            crate::cache::Bound::new(424, 24_000_000_000)
         );
     }
 

@@ -14,7 +14,7 @@ pub mod exr_loader;
 
 mod annotation;
 mod background;
-// Pure ring-cache budget math (#56): `t1_capacity` sizes the T1 ring,
+// Pure ring-cache budget math (#56): `t1_budget_bytes` sizes the T1 ring,
 // `frames_for(vram_available(..))` the T2 pre-upload ring — split across the A
 // and B rings in locked-step compare (#166; both live in `tick_budgets`).
 mod budget;

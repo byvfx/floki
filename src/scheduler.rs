@@ -16,7 +16,7 @@
 //! and requesting the frame; it isn't part of the prefetch want-list.)
 //!
 //! Back-pressure is the cache budget: the caller passes
-//! `decode_ahead + read_behind = min(configured, max_t1 - 1)` (split via
+//! `decode_ahead + read_behind = min(configured, t1_cap - 1)` (split via
 //! [`read_behind`], OpenRV's `-lookback` model), so a want-list never asks for
 //! more than the T1 ring can hold (this ties #57 to #56) — the eviction policy
 //! (`FrameCache::pick_victim`) protects the same behind window it fetches, so

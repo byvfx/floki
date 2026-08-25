@@ -44,13 +44,30 @@ From `sysinfo` `sys_total` / `sys_used` in `Sample`, against **`ExrData::approx_
 (sum of physical channel buffers × sample size).
 
 ```
-ram_budget = (sys_total − sys_used + cache_bytes) × free_pct   # a slice of *free* RAM, not of total
-max_t1     = floor(ram_budget / sizing_bytes)
+ram_budget = min((sys_total − sys_used + cache_bytes) × free_pct, user_budget)   # bytes
+t1_cap     = floor(ram_budget / sizing_bytes)                                    # frames
 ```
 
 Sized from *free* RAM (not `total × headroom − used`) on purpose: when other apps hold most of the
 machine, a total-based ceiling collapses the ring to near-zero even with tens of GB physically free.
 A free-relative slice keeps a usable read-ahead window and shrinks smoothly under external pressure.
+
+**`ram_budget` is the bound; `t1_cap` is derived from it (#232).** Eviction enforces both, whichever
+binds first, but they are one budget stated in two units — `budget::frames_in` is the only conversion
+— so they cannot drift. Eviction was count-only until #232, which is exact only while every resident
+frame is the same size, and #230 established that they are not: a count cannot see the settle upgrade
+replacing a 57 MB beauty frame with a 1035 MB full one at the same key, because the ring's *length*
+does not change. The count is carried alongside because the decode scheduler needs one
+(`prefetch_depth`), and because `approx_bytes` counts pixel buffers only — a documented lower bound —
+so an entry-count ceiling still backstops a frame whose true cost is understated.
+
+Both are floored at two frames' worth, so playback still double-buffers when the budget says fewer
+would fit. That floor is a deliberate override of the budget, which is why it applies in bytes too —
+a byte bound honouring only the raw budget would undo it.
+
+**The protected playheads outrank both bounds.** When only the frames on screen remain, `pick_victim`
+returns `None` and eviction stops, over budget. That is this contract's degradation, not a leak: a
+ring that evicted the displayed frame would decode it again immediately.
 
 **The two figures are asymmetric on purpose (#230).** They answer different questions, so neither
 one scalar nor one measurement serves both:
@@ -61,7 +78,8 @@ one scalar nor one measurement serves both:
   genuinely heterogeneous — playback fills it with beauty-only or proxy frames and each settle
   upgrade replaces one with a full frame at the same key — so no single scalar describes it. It was
   synthesized as `len × sizing_bytes` until #230, which put the same possibly-wrong scalar on both
-  sides of the budget at once.
+  sides of the budget at once. Since #232 it is also the left-hand side of the eviction test, so the
+  figure the budget is computed from and the figure eviction enforces against are the same one.
 - `sizing_bytes` — what one *newly decoded* frame will cost. A **latch**, because a frame that does
   not exist yet cannot be measured: one per fidelity (`frame_bytes` / `beauty_bytes` /
   `proxy_bytes`), selected by `ExrApp::sizing_frame_bytes` in the decode path's own precedence,

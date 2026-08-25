@@ -77,64 +77,40 @@ pub fn frames_for(available: u64, width: usize, height: usize) -> usize {
     usize::try_from(available / per_frame).unwrap_or(usize::MAX)
 }
 
-/// Max number of T1 CPU frames (full `ExrData`, all layers) that fit a
-/// [`RAM_FREE_PCT`] slice of *currently-free* system RAM, given one frame's
-/// measured size (`ExrData::approx_bytes()`). Sequences are homogeneous, so a
-/// single measurement sizes the ring.
+/// The T1 **byte** budget: how many bytes the ring may hold (#232).
 ///
-/// Free RAM is `sys_total - sys_used`; claiming a fraction of it (rather than a
-/// fraction of *total* minus used) keeps the ring usable when external apps hold
-/// most of the machine — see [`RAM_FREE_PCT`] for why.
+/// This is the primary figure — the one eviction enforces — and every T1 frame
+/// count is derived from it via [`frames_in`], so a count and a byte bound can
+/// never disagree about the same budget.
 ///
-/// Returns `0` if not even one frame fits (caller refuses sequence mode and
-/// shows a single frame — see the memory contract).
+/// `cache_bytes` (the ring's measured residency, #230) is added back to free RAM
+/// so the budget does not chase its own tail as the ring fills, while still
+/// shrinking when *other* memory pressure rises. Recompute periodically.
+///
+/// `user_budget` is a **ceiling, not an override**: the result is the smaller of
+/// the free-RAM slice and the user's setting, so a generous setting can never
+/// push the ring past free RAM and risk an OOM, while a small one deliberately
+/// constrains it — useful for capping RAM on a shared workstation and for
+/// dogfooding the eviction/degradation paths on a machine (e.g. Apple unified
+/// memory) that otherwise never feels the pressure.
 #[must_use]
-pub fn max_t1(sample: &Sample, frame_bytes: usize) -> usize {
+pub fn t1_budget_bytes(sample: &Sample, cache_bytes: u64, user_budget: Option<u64>) -> u64 {
+    let free = sample
+        .sys_total
+        .saturating_sub(sample.sys_used.saturating_sub(cache_bytes));
+    let available = with_headroom(free, RAM_FREE_PCT);
+    user_budget.map_or(available, |u| available.min(u))
+}
+
+/// Whole frames of `frame_bytes` that fit in a byte budget. `0` for a degenerate
+/// frame size, and `0` when not even one fits (the caller refuses sequence mode
+/// and shows a single frame — see the memory contract).
+#[must_use]
+pub fn frames_in(budget_bytes: u64, frame_bytes: usize) -> usize {
     if frame_bytes == 0 {
         return 0;
     }
-    let free = sample.sys_total.saturating_sub(sample.sys_used);
-    let available = with_headroom(free, RAM_FREE_PCT);
-    usize::try_from(available / frame_bytes as u64).unwrap_or(usize::MAX)
-}
-
-/// Total T1 ring capacity (frames) for a live cache: like [`max_t1`] but counts
-/// the cache's own resident bytes (`cache_bytes`) as *not* using budget, so the
-/// figure is the total the ring may hold rather than how many more would fit.
-/// This keeps the capacity stable as the ring fills (otherwise `sys_used` would
-/// include the cache and the budget would chase its own tail), while still
-/// shrinking when *other* memory pressure rises. Recompute periodically.
-#[must_use]
-pub fn t1_capacity(sample: &Sample, frame_bytes: usize, cache_bytes: u64) -> usize {
-    let adjusted = Sample {
-        sys_used: sample.sys_used.saturating_sub(cache_bytes),
-        ..*sample
-    };
-    max_t1(&adjusted, frame_bytes)
-}
-
-/// Cap an auto-derived T1 frame count by an optional **user-assigned RAM budget**
-/// (bytes). The user budget is a *ceiling*, not an override: the effective cap is
-/// the smaller of the auto (free-RAM) figure and what the user budget affords, so
-/// a generous setting can never push the ring past free RAM and risk an OOM,
-/// while a small setting deliberately constrains it — useful for capping RAM on a
-/// shared workstation and for dogfooding the eviction/degradation paths on a
-/// machine (e.g. Apple unified memory) that otherwise never feels the pressure.
-///
-/// `None` (or a zero/degenerate frame size) leaves the auto figure untouched.
-#[must_use]
-pub fn apply_user_ram_cap(
-    auto_frames: usize,
-    user_budget: Option<u64>,
-    frame_bytes: usize,
-) -> usize {
-    match user_budget {
-        Some(budget) if frame_bytes > 0 => {
-            let user_frames = usize::try_from(budget / frame_bytes as u64).unwrap_or(usize::MAX);
-            auto_frames.min(user_frames)
-        }
-        _ => auto_frames,
-    }
+    usize::try_from(budget_bytes / frame_bytes as u64).unwrap_or(usize::MAX)
 }
 
 #[cfg(test)]
@@ -225,15 +201,15 @@ mod tests {
     }
 
     #[test]
-    fn max_t1_takes_a_slice_of_free_ram() {
+    fn t1_budget_takes_a_slice_of_free_ram() {
         // 20 GB total, 4 GB used -> 16 GB free; 60% of free = 9.6 GB;
         // 1 GB/frame -> 9 frames.
         let s = sample(20_000_000_000, 4_000_000_000, None, None);
-        assert_eq!(max_t1(&s, 1_000_000_000), 9);
+        assert_eq!(frames_in(t1_budget_bytes(&s, 0, None), 1_000_000_000), 9);
     }
 
     #[test]
-    fn max_t1_sizes_from_free_ram_not_a_total_ceiling() {
+    fn t1_budget_sizes_from_free_ram_not_a_total_ceiling() {
         // Regression for the loaded-workstation cliff: 128 GB machine with
         // ~89.7 GB held by *other* apps still has ~38.2 GB physically free.
         // The old "70% of total - used" model returned ~0 here (89.7 GB is past
@@ -241,56 +217,65 @@ mod tests {
         // Sizing from free RAM keeps a real read-ahead window: 38.2 GB free *
         // 60% = 22.92 GB; 1.3 GB/frame -> 17 frames.
         let s = sample(127_900_000_000, 89_700_000_000, None, None);
-        assert_eq!(max_t1(&s, 1_300_000_000), 17);
+        assert_eq!(frames_in(t1_budget_bytes(&s, 0, None), 1_300_000_000), 17);
     }
 
     #[test]
-    fn t1_capacity_is_stable_as_the_cache_fills() {
+    fn t1_budget_is_stable_as_the_cache_fills() {
         // 20 GB total; 1 GB/frame. With 2 GB of *other* usage, free is 18 GB
         // (the cache's own bytes are added back so they don't count against it);
         // 60% of 18 GB = 10.8 GB -> 10 frames — unchanged whether the cache
         // currently holds 0 or 5 of those frames.
         let frame = 1_000_000_000usize;
         let empty = sample(20_000_000_000, 2_000_000_000, None, None);
-        assert_eq!(t1_capacity(&empty, frame, 0), 10);
+        assert_eq!(frames_in(t1_budget_bytes(&empty, 0, None), frame), 10);
         let half_full = sample(20_000_000_000, 2_000_000_000 + 5 * frame as u64, None, None);
         assert_eq!(
-            t1_capacity(&half_full, frame, 5 * frame as u64),
+            frames_in(t1_budget_bytes(&half_full, 5 * frame as u64, None), frame),
             10,
             "capacity doesn't chase the cache's own growth"
         );
     }
 
     #[test]
-    fn max_t1_zero_when_nothing_fits() {
+    fn t1_budget_holds_nothing_when_nothing_fits() {
         // Almost no free RAM: 0.5 GB free, 60% = 0.3 GB < one 1 GB frame -> 0.
         let s = sample(20_000_000_000, 19_500_000_000, None, None);
-        assert_eq!(max_t1(&s, 1_000_000_000), 0);
+        assert_eq!(frames_in(t1_budget_bytes(&s, 0, None), 1_000_000_000), 0);
         // Degenerate frame size.
         let s2 = sample(20_000_000_000, 0, None, None);
-        assert_eq!(max_t1(&s2, 0), 0);
+        assert_eq!(frames_in(t1_budget_bytes(&s2, 0, None), 0), 0);
     }
 
     #[test]
     fn user_ram_cap_is_a_ceiling_never_an_override() {
-        let frame = 1_000_000_000usize; // 1 GB/frame
-        // A small user budget deliberately constrains a generous auto figure:
-        // 4 GB / 1 GB = 4 frames < the 30 the machine could hold.
+        // 20 GB total, 2 GB used → 60% of 18 GB free = 10.8 GB auto.
+        let s = sample(20_000_000_000, 2_000_000_000, None, None);
+        let auto = t1_budget_bytes(&s, 0, None);
+        assert_eq!(auto, 10_800_000_000);
+
+        // A small user budget deliberately constrains the auto figure.
         assert_eq!(
-            apply_user_ram_cap(30, Some(4_000_000_000), frame),
-            4,
+            t1_budget_bytes(&s, 0, Some(4_000_000_000)),
+            4_000_000_000,
             "user budget caps below the auto figure"
         );
-        // A generous user budget can't push *past* the auto (free-RAM) figure —
-        // that's what protects against OOM.
+        // A generous one can't push *past* it — that's what protects against OOM.
         assert_eq!(
-            apply_user_ram_cap(10, Some(64_000_000_000), frame),
-            10,
+            t1_budget_bytes(&s, 0, Some(64_000_000_000)),
+            auto,
             "user budget never exceeds the auto free-RAM cap"
         );
         // No user budget → auto untouched.
-        assert_eq!(apply_user_ram_cap(12, None, frame), 12);
-        // Degenerate frame size → auto untouched (no divide).
-        assert_eq!(apply_user_ram_cap(12, Some(4_000_000_000), 0), 12);
+        assert_eq!(t1_budget_bytes(&s, 0, None), auto);
+    }
+
+    #[test]
+    fn frames_in_is_the_only_bytes_to_count_conversion() {
+        // #232: every T1 frame count is this function over a byte budget, so a
+        // count and a byte bound derived from the same budget cannot disagree.
+        assert_eq!(frames_in(10_800_000_000, 1_000_000_000), 10);
+        assert_eq!(frames_in(999, 1_000), 0, "not even one fits");
+        assert_eq!(frames_in(1_000, 0), 0, "degenerate frame size, no divide");
     }
 }
