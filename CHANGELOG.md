@@ -22,6 +22,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer falls back to hardcoded absolute paths when given no arguments.
 
 ### Fixed
+- **The frame cache is now held to its byte budget, not just a frame count.**
+  Eviction counted frames while the budget it enforced was measured in bytes —
+  exact only while every resident frame is the same size, which playback's frames
+  are not: a settled frame upgraded from a 57 MB beauty decode to a 1035 MB full
+  one changes the ring's cost without changing its length, so a count-based
+  evictor saw nothing to do. The ring is now bounded by both, whichever binds
+  first, from one budget stated in two units. The playing debug row and the
+  playback trace show resident bytes against the budget so the byte bound binding
+  is visible rather than inferred.
 - **The RAM budget is no longer ~10x under-used on heavy multi-part renders.** The
   cache cap was sized by dividing the budget by a *full* frame's measured size, but
   the frames playback actually holds are cheaper: with beauty preview on, a
