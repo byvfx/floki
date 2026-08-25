@@ -40,18 +40,49 @@ max_t2       = floor(budget / per_frame_t2)
 Off-Metal, `recommendedMaxWorkingSetSize` is `None` → use a conservative fixed/config cap.
 
 ### CPU RAM budget — binds T0 + T1
-From `sysinfo` `sys_total` / `sys_used` in `Sample`. Requires a new **`ExrData::approx_bytes()`**
-(sum of physical channel buffers × sample size) — no per-frame accounting exists today.
+From `sysinfo` `sys_total` / `sys_used` in `Sample`, against **`ExrData::approx_bytes()`**
+(sum of physical channel buffers × sample size).
 
 ```
-ram_budget = (sys_total − sys_used) × free_pct   # a slice of *free* RAM, not of total
-max_t1     = floor(ram_budget / measured_t1)     # measure measured_t1 once on the first real frame;
-                                                 # sequences are homogeneous
+ram_budget = (sys_total − sys_used + cache_bytes) × free_pct   # a slice of *free* RAM, not of total
+max_t1     = floor(ram_budget / sizing_bytes)
 ```
 
 Sized from *free* RAM (not `total × headroom − used`) on purpose: when other apps hold most of the
 machine, a total-based ceiling collapses the ring to near-zero even with tens of GB physically free.
 A free-relative slice keeps a usable read-ahead window and shrinks smoothly under external pressure.
+
+**The two figures are asymmetric on purpose (#230).** They answer different questions, so neither
+one scalar nor one measurement serves both:
+
+- `cache_bytes` — what the ring *is holding*. A **measurement**: `FrameCache::bytes()`, the live sum
+  of each resident entry's `approx_bytes()` snapshotted at insert. It is added back to free RAM so
+  capacity does not chase the cache's own growth. It has to be measured because the ring is
+  genuinely heterogeneous — playback fills it with beauty-only or proxy frames and each settle
+  upgrade replaces one with a full frame at the same key — so no single scalar describes it. It was
+  synthesized as `len × sizing_bytes` until #230, which put the same possibly-wrong scalar on both
+  sides of the budget at once.
+- `sizing_bytes` — what one *newly decoded* frame will cost. A **latch**, because a frame that does
+  not exist yet cannot be measured: one per fidelity (`frame_bytes` / `beauty_bytes` /
+  `proxy_bytes`), selected by `ExrApp::sizing_frame_bytes` in the decode path's own precedence,
+  proxy over beauty over full. Sequences are homogeneous *at a given fidelity*, which is what makes
+  a latch sound here; they are not homogeneous across fidelities, which is what made a single
+  `frame_bytes` wrong.
+
+Two rules keep the selection safe:
+
+1. **Gate on the same predicate the decode path uses**, never a restatement of it —
+   `sizing_frame_bytes` calls `decode_proxy_target_for` / `decode_beauty_only_for` directly. A
+   sizing gate that drifts from the decode gate fills the ring with full frames under a cheap-sized
+   cap: #215's OOM direction. The gate #230 replaced had drifted exactly that way, still asking
+   `viewer.active_layer` after #213/#217 moved the decode path onto `displayed_aov`.
+2. **Every fallback chain ends at `frame_bytes`**, never at something smaller. An unmeasured cheap
+   fidelity yields a cap that is too *small* — wasteful, and self-correcting on the next decode —
+   rather than one too large.
+
+A fidelity change is safe without any re-measure: the cap recomputes every tick, and `tick_budgets`
+force-evicts in the same tick when the ring exceeds it (#146), so beauty → full raises the divisor,
+drops the cap, and shrinks the ring together.
 
 ## Windows differ — T1 vs T2
 
