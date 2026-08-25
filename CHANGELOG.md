@@ -22,6 +22,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer falls back to hardcoded absolute paths when given no arguments.
 
 ### Fixed
+- **A cheap decode that quietly turns into an expensive one is now visible, and
+  budgeted for.** When a proxy or single-pass decode can't be produced for a file,
+  the worker falls back to a full all-parts decode so the layer never freezes —
+  correct, but silent: nothing distinguished "this footage plays cheap" from
+  "every cheap decode is failing and we are quietly decoding everything," and the
+  cache stayed sized for 9 MB proxies while 1035 MB frames landed, sending the
+  prefetch window far into a ring that evicted each arrival on contact. Fallbacks
+  are now counted in the playback trace and the debug overlay, and while the cheap
+  path is failing the cache sizes off full frames instead. The override only ever
+  makes the cache *smaller*, and clears as soon as a cheap decode succeeds.
 - **The frame cache is now held to its byte budget, not just a frame count.**
   Eviction counted frames while the budget it enforced was measured in bytes —
   exact only while every resident frame is the same size, which playback's frames

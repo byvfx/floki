@@ -29,6 +29,22 @@ impl From<ThemeChoice> for egui::ThemePreference {
 /// A stale result from a superseded request is discarded; which field is the
 /// supersession key depends on the request kind: a **seq-frame** by `epoch`
 /// (#57) and an explicit open by `open_gen` (#109).
+/// How expensive a decode is, cheapest first: proxy < beauty-only < full (#233).
+///
+/// A proxy carries `beauty_only` too (it is a downsampled beauty decode), so the
+/// proxy test has to come first. Ordering these is what lets a **fallback** — the
+/// worker returning something dearer than the job asked for — be told apart from
+/// a decode that simply is what was requested.
+fn fidelity_rank(proxy: bool, beauty_only: bool) -> u8 {
+    if proxy {
+        0
+    } else if beauty_only {
+        1
+    } else {
+        2
+    }
+}
+
 struct LoadResult {
     /// Which source this decode is for (#99 unification): the A/B compare slots are
     /// `ExrApp::{A,B}_SOURCE` (`SourceId` 0/1). For an explicit open it selects
@@ -48,6 +64,14 @@ struct LoadResult {
     /// supersession key for the open. Unused for seq-frames (epoch-keyed) and B
     /// (its `b.loaded_file` is stable, still path-keyed).
     open_gen: u64,
+    /// The worker returned a decode **dearer than this job asked for** (#233):
+    /// a cheap decode's `or_else` fallback fired, most consequentially all the way
+    /// to a full all-parts `load`.
+    ///
+    /// The worker is the only place both halves are known — the job's requested
+    /// fidelity and what actually came back — so it reports rather than the UI
+    /// re-deriving it from state that may have moved on since submit.
+    fell_back: bool,
     result: Result<ExrData, String>,
 }
 
@@ -587,6 +611,20 @@ pub struct ExrApp {
     dbg_evictions: u64,
     #[serde(skip)]
     dbg_dropped_epoch: u64,
+    /// Cumulative cheap decodes the worker had to satisfy with something dearer
+    /// (#233) — see `LoadResult::fell_back`.
+    ///
+    /// A silent mode until now: nothing distinguished "this footage plays cheap"
+    /// from "every cheap decode is failing and we are quietly decoding full",
+    /// because the fallback is *correct* behaviour (slow beats stuck, #213) and
+    /// left no trace. Counting it is most of the fix.
+    #[serde(skip)]
+    dbg_fallbacks: u64,
+    /// Whether the clock source's most recent sequence decode fell back. Makes
+    /// [`Self::sizing_frame_bytes`] size off full frames while a cheap path is
+    /// failing, instead of off the fidelity that was merely *asked* for.
+    #[serde(skip)]
+    decode_fell_back: bool,
     /// Frames the pacer skipped (DropFrames) or held-late (Stutter) during the
     /// current play run (#172), for the HUD + debug overlay. Reset when play
     /// (re)starts. `dbg_dropped_epoch` above is unrelated (stale-decode discards).
@@ -1053,6 +1091,8 @@ impl Default for ExrApp {
             show_playback_hud: false,
             dbg_last_sample: None,
             dbg_evictions: 0,
+            dbg_fallbacks: 0,
+            decode_fell_back: false,
             dbg_dropped_epoch: 0,
             run_dropped: 0,
             run_held: 0,
@@ -1591,6 +1631,7 @@ impl ExrApp {
         // Reset the debug-overlay counters so each opened sequence's soak run
         // starts clean (#100).
         self.dbg_evictions = 0;
+        self.dbg_fallbacks = 0;
         self.dbg_dropped_epoch = 0;
         // A different sequence reuses frame numbers, so drop the T2 GPU ring too
         // (and reset the on-screen frame; the first show re-sets it).
@@ -1778,12 +1819,22 @@ impl ExrApp {
                         },
                         None => ExrData::load(&job.path),
                     };
+                    // Did an `or_else` above fire? Compare what came back against
+                    // what was asked for (#233). Every fallback here is deliberate
+                    // — slow beats stuck — but it was also *silent*, and a job
+                    // budgeted as a 9 MB proxy that returns a 1035 MB full frame is
+                    // an 18x mis-budget the caller had no way to see.
+                    let requested = fidelity_rank(job.proxy_target.is_some(), job.beauty_only);
+                    let fell_back = result
+                        .as_ref()
+                        .is_ok_and(|d| fidelity_rank(d.proxy, d.beauty_only) > requested);
                     let _ = result_tx.send(LoadMsg::Loaded(Box::new(LoadResult {
                         source: job.source,
                         seq_frame: job.seq_frame,
                         frame: job.frame,
                         epoch: job.epoch,
                         open_gen: job.open_gen,
+                        fell_back,
                         result,
                     })));
                     wake_ui();
@@ -2061,6 +2112,7 @@ impl ExrApp {
         self.frame_bytes = None;
         self.proxy_bytes = None;
         self.beauty_bytes = None;
+        self.decode_fell_back = false;
     }
 
     /// The *active* followers — those with a detected sequence (the N-source
@@ -2601,6 +2653,31 @@ impl ExrApp {
         // under `comp_drives_transport` slot A never decodes at all, and
         // `displayed_aov(A_SOURCE)` then falls through to `viewer.active_layer` —
         // reintroducing the very predicate #213/#217 moved the decode path off.
+        // What the pump *asks* for is only a prediction of what lands. When the
+        // last decode fell back (#233), size off full frames: the cheap path is
+        // failing for this footage, so full frames are what the ring is actually
+        // taking. Deliberately one-directional — this can only make the divisor
+        // *dearer* and so the cap smaller, which is the safe error (#215's OOM is
+        // the other one) — and self-clearing, since the next cheap decode that
+        // succeeds resets it.
+        //
+        // Without this the cap stays sized for 9 MB proxies while 1035 MB full
+        // frames land, and `prefetch_depth` — `cap - 1` — sends the scheduler
+        // fetching far into a ring that evicts each arrival on contact.
+        //
+        // **Dearest measured, not `frame_bytes` outright.** A fallback is not
+        // always all the way to full: a proxy job whose fast read fails returns a
+        // *beauty* frame, which latches `beauty_bytes` and leaves `frame_bytes`
+        // `None` if no full decode has happened yet. Returning `frame_bytes`
+        // there hands `tick_budgets` a `None`, which skips its entire T1 branch —
+        // cap frozen at its constructed 8, no budget check, and the #146 pressure
+        // shrink unable to fire. Falling through to the dearest figure that *has*
+        // been measured keeps the override's one-directional guarantee (every arm
+        // is >= what the requested-mode chains below would return) without the
+        // hole.
+        if self.decode_fell_back {
+            return self.frame_bytes.or(self.beauty_bytes).or(self.proxy_bytes);
+        }
         let src = self.clock_source();
         let probe = self.source_playhead(src).wrapping_add(1);
         if self.decode_proxy_target_for(src, probe).is_some() {
@@ -3886,6 +3963,16 @@ impl ExrApp {
                     // used to be a two-way `if`, which left a plain beauty-only frame
                     // matching *neither* arm: it filled the ring and sized nothing
                     // (#230).
+                    // A cheap decode the worker had to satisfy with something dearer
+                    // (#233). Counted for every source — a frozen follower is worth
+                    // seeing — but only the clock source's result steers sizing,
+                    // matching which decodes the latches below are measured from.
+                    if res.fell_back {
+                        self.dbg_fallbacks = self.dbg_fallbacks.saturating_add(1);
+                    }
+                    if res.seq_frame && res.source == self.clock_source() {
+                        self.decode_fell_back = res.fell_back;
+                    }
                     if res.source == self.clock_source() {
                         if arc.proxy {
                             // **Most recent, not first.** `get_or_insert` latched
@@ -4631,7 +4718,7 @@ impl ExrApp {
              t1={t1_len}/{t1_cap} frame_bytes={frame_bytes} \
              size_bytes={size_bytes} t1_bytes={t1_bytes}/{t1_budget} \
              t2={t2_len}/{t2_cap} \
-             evict={evict} drop_epoch={drop_epoch} run_dropped={run_dropped} run_held={run_held} \
+             evict={evict} fallback={fallback} drop_epoch={drop_epoch} run_dropped={run_dropped} run_held={run_held} \
              fps={fps:.1}/{fps_target:.0} ft_n={ft_n} \
              p50={p50:.1} p95={p95:.1} p99={p99:.1} ft_max={pmax:.1} \
              ram={ram_used}/{ram_total} vram={vram_used}/{vram_budget}",
@@ -4691,6 +4778,10 @@ impl ExrApp {
             t2_len = self.viewer.t2_len(Self::A_SOURCE),
             t2_cap = self.viewer.t2_cap(Self::A_SOURCE),
             evict = self.dbg_evictions,
+            // Cheap decodes satisfied with something dearer (#233). Climbing while
+            // `soft=1` means the fidelity the trace reports asking for is not the
+            // fidelity being delivered — the one state this line could not show.
+            fallback = self.dbg_fallbacks,
             drop_epoch = self.dbg_dropped_epoch,
             run_dropped = self.run_dropped,
             run_held = self.run_held,
@@ -5446,6 +5537,7 @@ impl ExrApp {
         let sizing_bytes = self.sizing_frame_bytes();
         let t1_bytes = self.frame_cache.bytes();
         let t1_budget = self.frame_cache_budget;
+        let (dbg_fallbacks, decode_fell_back) = (self.dbg_fallbacks, self.decode_fell_back);
         // The comp path holds one texture per source, rebuilt on the UI thread by
         // `ensure_comp_frame` — with T2 structurally off there (every ring call site
         // passes `A_SOURCE`), this is the VRAM the player actually occupies (#100).
@@ -5583,6 +5675,26 @@ impl ExrApp {
                             "off".to_string()
                         };
                         ui.label(px);
+                        ui.end_row();
+
+                        // Cheap decodes the worker had to satisfy with something
+                        // dearer (#233). The fallback is correct — slow beats a
+                        // frozen layer (#213) — but it was invisible, and it is the
+                        // difference between "this footage plays cheap" and "every
+                        // cheap decode is failing and we are quietly decoding full".
+                        ui.label("fallbacks");
+                        ui.label(if dbg_fallbacks == 0 {
+                            "none — decodes are the fidelity asked for".to_string()
+                        } else {
+                            format!(
+                                "{dbg_fallbacks} · sizing off {}",
+                                if decode_fell_back {
+                                    "full frames (last decode fell back)"
+                                } else {
+                                    "the requested fidelity (last decode was clean)"
+                                }
+                            )
+                        });
                         ui.end_row();
 
                         // Labelled A-only because it *is* A-only: every ring call
@@ -8890,6 +9002,7 @@ mod tests {
             frame,
             epoch: app.playback.epoch,
             open_gen: 0,
+            fell_back: false,
             result: Ok(data),
         });
     }
@@ -9007,6 +9120,7 @@ mod tests {
                 frame,
                 epoch: app.playback.epoch,
                 open_gen: 0,
+                fell_back: false,
                 result: Err("stub".to_string()),
             });
         }
@@ -9125,6 +9239,7 @@ mod tests {
             frame,
             epoch: app.playback.epoch,
             open_gen: 0,
+            fell_back: false,
             result: Ok(data),
         });
     }
@@ -9306,6 +9421,175 @@ mod tests {
             (None, None, None),
             "all three measured sizes are dropped with the transport"
         );
+    }
+
+    // --- #233: cheap decodes satisfied with something dearer ------------------
+
+    #[test]
+    fn fidelity_rank_orders_the_three_decode_modes() {
+        // A proxy carries `beauty_only` too — it is a downsampled beauty decode —
+        // so the proxy test has to come first or every proxy would rank as beauty
+        // and a genuine proxy -> beauty fallback would read as clean.
+        assert_eq!(fidelity_rank(true, true), 0, "proxy");
+        assert_eq!(fidelity_rank(false, true), 1, "beauty-only");
+        assert_eq!(fidelity_rank(false, false), 2, "full");
+        assert!(fidelity_rank(false, false) > fidelity_rank(false, true));
+        assert!(fidelity_rank(false, true) > fidelity_rank(true, true));
+        // #217's per-AOV decode sets `beauty_only`, so a *successful* one-layer
+        // decode of a non-beauty pass ranks cheap and is never a false fallback.
+        assert_eq!(fidelity_rank(false, true), 1);
+    }
+
+    /// Deliver a frame that reports whether the worker had to fall back.
+    fn deliver_frame_falling_back(
+        app: &mut ExrApp,
+        path: &std::path::Path,
+        frame: u32,
+        fell_back: bool,
+    ) {
+        app.apply_load_result(LoadResult {
+            source: ExrApp::A_SOURCE,
+            seq_frame: true,
+            frame,
+            epoch: app.playback.epoch,
+            open_gen: 0,
+            fell_back,
+            result: Ok(ExrData::load(path).unwrap()),
+        });
+    }
+
+    #[test]
+    fn a_fallback_is_counted_and_steers_sizing_to_full_frames() {
+        // The silent mode: the fallback is deliberate (slow beats stuck, #213) but
+        // left no trace, so a run where every cheap decode failed looked identical
+        // to one where the footage simply plays cheap — while the cap stayed sized
+        // for 9 MB proxies as 1035 MB frames landed.
+        let (_dir, paths) = write_sequence(3);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&paths[0]);
+        app.playback_toggle();
+        app.frame_bytes = Some(1_000_000);
+        app.beauty_bytes = Some(80_000);
+        app.proxy_bytes = Some(9_000);
+        assert_eq!(app.dbg_fallbacks, 0);
+        assert_eq!(
+            app.sizing_frame_bytes(),
+            Some(9_000),
+            "a clean proxy run sizes off proxy bytes"
+        );
+
+        deliver_frame_falling_back(&mut app, &paths[1], 2, true);
+        assert_eq!(app.dbg_fallbacks, 1, "counted");
+        assert_eq!(
+            app.sizing_frame_bytes(),
+            Some(1_000_000),
+            "a failing cheap path sizes off what actually lands"
+        );
+
+        // Self-clearing: the divisor is not latched to the bad news forever.
+        deliver_frame_falling_back(&mut app, &paths[2], 3, false);
+        assert_eq!(app.dbg_fallbacks, 1, "the counter is cumulative");
+        assert_eq!(
+            app.sizing_frame_bytes(),
+            Some(9_000),
+            "a clean decode restores the requested fidelity's figure"
+        );
+    }
+
+    #[test]
+    fn the_fallback_override_can_only_shrink_the_cap() {
+        // One-directional on purpose. Sizing too *small* is merely wasteful and
+        // self-corrects; sizing too large is #215's OOM direction, so the override
+        // is only ever allowed to move the divisor dearer.
+        let (_dir, paths) = write_sequence(2);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&paths[0]);
+        app.playback_toggle();
+        app.frame_bytes = Some(1_000_000);
+        app.beauty_bytes = Some(80_000);
+        app.proxy_bytes = Some(9_000);
+
+        for (requested, label) in [(true, "proxy"), (false, "beauty")] {
+            app.proxy_enabled = requested;
+            let clean = app.sizing_frame_bytes().unwrap();
+            deliver_frame_falling_back(&mut app, &paths[1], 2, true);
+            let after = app.sizing_frame_bytes().unwrap();
+            assert!(
+                after >= clean,
+                "{label}: the override must never pick a cheaper figure ({after} < {clean})"
+            );
+            assert_eq!(after, 1_000_000);
+            deliver_frame_falling_back(&mut app, &paths[1], 2, false);
+        }
+    }
+
+    #[test]
+    fn repointing_the_transport_forgets_a_stale_fallback() {
+        // `decode_fell_back` describes one source's decode path. Carrying it to a
+        // different sequence would size the new one off full frames on evidence
+        // that says nothing about it.
+        let (_dir, paths) = write_sequence(2);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&paths[0]);
+        deliver_frame_falling_back(&mut app, &paths[1], 2, true);
+        assert!(app.decode_fell_back);
+        app.set_transport_source(Some(crate::layer::SourceId(COMP_SOURCE_BASE)));
+        assert!(!app.decode_fell_back, "dropped with the other sizing state");
+    }
+
+    #[test]
+    fn a_partial_fallback_still_sizes_off_something() {
+        // A fallback is not always all the way to full. A proxy job whose fast
+        // read fails returns a *beauty* frame — dearer than asked, so `fell_back`,
+        // but it latches `beauty_bytes` and leaves `frame_bytes` unmeasured. An
+        // override that reached straight for `frame_bytes` returned `None` here,
+        // and `tick_budgets` skips its whole T1 branch on `None`: cap frozen at
+        // its constructed 8, no budget check, #146's pressure shrink dead.
+        let (_dir, paths) = write_sequence(2);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&paths[0]);
+        app.playback_toggle();
+
+        // The frame that *lands* is beauty-only — dearer than the proxy asked
+        // for, so `fell_back`, but it latches `beauty_bytes`, not `frame_bytes`.
+        let mut data = ExrData::load(&paths[1]).unwrap();
+        data.beauty_only = true;
+        app.apply_load_result(LoadResult {
+            source: ExrApp::A_SOURCE,
+            seq_frame: true,
+            frame: 2,
+            epoch: app.playback.epoch,
+            open_gen: 0,
+            fell_back: true,
+            result: Ok(data),
+        });
+        assert!(app.decode_fell_back);
+        assert_eq!(app.frame_bytes, None, "no full decode has happened yet");
+        let beauty = app.beauty_bytes.expect("the landed frame latched beauty");
+
+        // A definitively cheaper proxy figure, so the comparison below is real.
+        app.proxy_bytes = Some(beauty / 2);
+        assert_eq!(
+            app.sizing_frame_bytes(),
+            Some(beauty),
+            "falls through to the dearest measured figure, never to None"
+        );
+
+        // Still one-directional: the beauty figure is dearer than the proxy one
+        // the request alone would have picked, so the cap only shrank.
+        app.decode_fell_back = false;
+        assert_eq!(app.sizing_frame_bytes(), Some(beauty / 2));
+        assert!(
+            beauty / 2 < beauty,
+            "the override was the dearer of the two"
+        );
+
+        // And with nothing at all measured it is `None` exactly as before — that
+        // is the honest "no sizing decode yet" state, not a hole.
+        app.decode_fell_back = true;
+        app.beauty_bytes = None;
+        app.proxy_bytes = None;
+        assert_eq!(app.sizing_frame_bytes(), None);
     }
 
     #[test]
@@ -9698,6 +9982,7 @@ mod tests {
             frame: 0,
             epoch: 0,
             open_gen: 1, // the older, superseded open
+            fell_back: false,
             result: Err("boom".to_string()),
         });
 
@@ -9742,6 +10027,7 @@ mod tests {
             frame: 0,
             epoch: 0,
             open_gen: 5, // still the current open
+            fell_back: false,
             result: Ok(data),
         });
 
@@ -9768,6 +10054,7 @@ mod tests {
             frame: 0,
             epoch: 0,
             open_gen: 0,
+            fell_back: false,
             result: Err("bad exr".to_string()),
         });
 
@@ -10429,6 +10716,7 @@ mod tests {
             frame: 3,
             epoch: app.playback.epoch,
             open_gen: 0,
+            fell_back: false,
             result: Err("truncated exr".to_string()),
         });
         assert_eq!(app.playback.pending, None);
@@ -10469,6 +10757,7 @@ mod tests {
             frame: 2,
             epoch: app.playback.epoch,
             open_gen: 0,
+            fell_back: false,
             result: Ok(data2),
         });
 
@@ -11891,6 +12180,7 @@ mod tests {
             frame: 2,
             epoch: live_epoch.wrapping_sub(1),
             open_gen: 0,
+            fell_back: false,
             result: Ok(ExrData::load(&f1).unwrap()),
         });
         assert_eq!(
@@ -11916,6 +12206,7 @@ mod tests {
             frame: 2,
             epoch: live_epoch,
             open_gen: 0,
+            fell_back: false,
             result: Ok(ExrData::load(&f1).unwrap()),
         });
         assert!(
@@ -12204,6 +12495,7 @@ mod tests {
             frame: 1,
             epoch: app.playback.epoch,
             open_gen: 0,
+            fell_back: false,
             result: Ok(full),
         });
         assert_eq!(
@@ -12364,6 +12656,7 @@ mod tests {
             frame,
             epoch: app.playback.epoch,
             open_gen: 0,
+            fell_back: false,
             result: Ok(data),
         });
     }
@@ -12423,6 +12716,7 @@ mod tests {
             frame: 2,
             epoch: stale_epoch,
             open_gen: 0,
+            fell_back: false,
             result: Ok(data2),
         });
         assert!(

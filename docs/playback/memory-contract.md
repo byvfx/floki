@@ -87,7 +87,7 @@ one scalar nor one measurement serves both:
   a latch sound here; they are not homogeneous across fidelities, which is what made a single
   `frame_bytes` wrong.
 
-Two rules keep the selection safe:
+Three rules keep the selection safe:
 
 1. **Gate on the same predicate the decode path uses**, never a restatement of it —
    `sizing_frame_bytes` calls `decode_proxy_target_for` / `decode_beauty_only_for` directly. A
@@ -97,6 +97,19 @@ Two rules keep the selection safe:
 2. **Every fallback chain ends at `frame_bytes`**, never at something smaller. An unmeasured cheap
    fidelity yields a cap that is too *small* — wasteful, and self-correcting on the next decode —
    rather than one too large.
+3. **What the pump asks for is only a prediction of what lands (#233).** The worker's cheap decodes
+   each have an `or_else` that falls back to something dearer, up to a full all-parts `load`, so a
+   job budgeted as a 9 MB proxy can return a 1035 MB frame. That fallback is correct — slow beats a
+   frozen layer (#213) — but it means the requested fidelity is not evidence of the delivered one.
+   The worker reports it (`LoadResult::fell_back`, a fidelity-rank comparison of what was asked
+   against what came back), and while the clock source's last decode fell back, sizing ignores the
+   requested mode and takes the **dearest measured** figure — `frame_bytes`, else `beauty_bytes`,
+   else `proxy_bytes`. Dearest *measured* rather than `frame_bytes` outright because a fallback is
+   not always all the way to full: a proxy job whose fast read fails returns a beauty frame, which
+   latches `beauty_bytes` and can leave `frame_bytes` unmeasured — and a `None` there would send
+   `tick_budgets` past its whole T1 branch, per (2). One-directional by the same rule as (2): every
+   arm is at least what the requested-mode chain would return, so the override may only make the
+   divisor *dearer*, and it clears the moment a cheap decode succeeds.
 
 A fidelity change is safe without any re-measure: the cap recomputes every tick, and `tick_budgets`
 force-evicts in the same tick when the ring exceeds it (#146), so beauty → full raises the divisor,
