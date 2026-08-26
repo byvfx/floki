@@ -261,6 +261,14 @@ pub struct CompDraw {
     pub blend: BlendMode,
     /// Layer opacity in `[0, 1]`.
     pub opacity: f32,
+    /// This layer's own header pixel aspect ratio.
+    ///
+    /// Not used for placement — every layer is drawn into the one `image_rect`,
+    /// unsqueezed by the *bottom* layer's PAR (#194 / #179). Carried so the
+    /// `evt=layer_geom` trace can say what each layer's aspect actually is next to
+    /// the rect it was given, which is how #254 becomes visible in a log rather than
+    /// in a screenshot.
+    pub par: f32,
 }
 
 /// The right-hand pane of a comp Side-by-Side (#99 Slice 2a). A compare shows the two
@@ -1081,6 +1089,9 @@ pub struct ExrViewer {
     /// with [`pick_comp_side`] so the pixel readout samples the pane under the cursor
     /// rather than always reporting the composite. Transient.
     pub last_image_rect_b: Option<egui::Rect>,
+    /// Last `evt=layer_geom` line emitted, so the per-layer geometry trace fires on
+    /// change instead of every frame (#254). Runtime-only.
+    dbg_layer_geom: Option<String>,
 
     /// `(wipe_center, wipe_angle)` when the last comp frame drew a Wipe (#99 Slice 2b);
     /// `None` otherwise. Wipe overlays both layers in one rect, so the pixel readout
@@ -1166,6 +1177,7 @@ impl Default for ExrViewer {
             last_canvas_rect: None,
             last_image_rect: None,
             last_image_rect_b: None,
+            dbg_layer_geom: None,
             last_wipe: None,
             last_blink_b: None,
             annotations: Vec::new(),
@@ -2626,7 +2638,29 @@ impl ExrViewer {
             draws
         };
         let n = stack_draws.len();
+        // Per-layer resolved geometry, logged on change. The playback trace describes
+        // decode and residency but has never said a word about *where* each layer
+        // landed, so a placement bug could only be investigated by measuring the
+        // picture in a screenshot — which is how #254 was found, and how long it took
+        // to characterize.
+        //
+        // Signature-gated rather than throttled: geometry is static while nothing
+        // moves, so "log when it differs" is silent in the steady state and immediate
+        // on the frame that changes. Formatting is skipped entirely unless the target
+        // is enabled, so this costs a bool check in a normal run.
+        let debug_geom = log::log_enabled!(target: "floki::playback", log::Level::Debug);
+        let mut geom: Vec<String> = Vec::new();
         for (i, d) in stack_draws.iter().enumerate() {
+            if debug_geom {
+                // `rect` is `image_rect` for every layer — that is the behaviour, not
+                // an omission. Printing it per layer beside that layer's own `par` is
+                // the point: a `par=2.000` layer handed the same rect as a `par=1.000`
+                // one is #254, stated in one line.
+                geom.push(format!(
+                    "l{i}:par={:.3},x=[{:.0},{:.0}],y=[{:.0},{:.0}]",
+                    d.par, image_rect.min.x, image_rect.max.x, image_rect.min.y, image_rect.max.y,
+                ));
+            }
             let (is_composite, is_top) = comp_layer_flags(i, n);
             // Neutralize the global view ops on every layer but the top, so exposure
             // / channel isolation apply once to the finished composite (PR-A.4).
@@ -2651,6 +2685,32 @@ impl ExrViewer {
         }
         ctx.neutral_view_ops.set(false);
         ctx.blend_override.set(None);
+        if debug_geom {
+            // `canvas` is the rect every layer shares; `disp` is the display window the
+            // overscan gate and the background gradient key off. Both are here because
+            // a layer drawn outside either one is exactly the class of bug this line
+            // exists to catch — and on #254 they turned out to be different bugs.
+            let line = format!(
+                "evt=layer_geom n={} base_par={:.3} par={:.3} canvas=[{:.0},{:.0}]x[{:.0},{:.0}] \
+                 disp=[{:.0},{:.0}]x[{:.0},{:.0}] {}",
+                n,
+                base_par,
+                par,
+                image_rect.min.x,
+                image_rect.max.x,
+                image_rect.min.y,
+                image_rect.max.y,
+                disp_rect.min.x,
+                disp_rect.max.x,
+                disp_rect.min.y,
+                disp_rect.max.y,
+                geom.join(" "),
+            );
+            if self.dbg_layer_geom.as_deref() != Some(line.as_str()) {
+                log::debug!(target: "floki::playback", "{line}");
+                self.dbg_layer_geom = Some(line);
+            }
+        }
 
         // Annotation overlay + the in-place text field (#45 / #99 Slice 3d). Drawn here
         // rather than at the end of the function so the Diff path — which emits an
