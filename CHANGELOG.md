@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Duplicate layer.** A second layer on the same source, from the layer's context
+  menu — retime it, re-trim it, or point it at a different pass independently. It
+  shares the original's decoded source, so it costs no decode, no extra cache
+  residency, and no extra share of the decode worker.
 - **Frame-time percentiles.** The playback debug overlay reports p50 / p95 / p99 /
   max frame time over the last 240 shown frames, alongside the existing smoothed
   fps. The smoothed number has a ~5-frame time constant, so it hides exactly the
@@ -22,6 +26,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer falls back to hardcoded absolute paths when given no arguments.
 
 ### Fixed
+- **Opening a file that is already open no longer adds an invisible duplicate.** The
+  copy landed exactly on top of the original, so the picture did not change — but it
+  cost a full decode, another decode follower dividing the single worker, and another
+  share of the RAM budget. A stack could grow every session with nothing to show for
+  it and no clue why the app was getting slower; five launches on one file took a
+  stack from one layer to six. Opening a path already in the stack now selects that
+  layer instead, and two saved layers on one path share a single source when restored
+  — which also collapses stacks that accumulated copies before this fix. Deliberate
+  duplication is the new Duplicate layer action.
 - **The timeline's cache bar shows the cache again.** The green fill marking which
   frames are resident read *slot A* unconditionally — and since opening a file means
   adding a layer, the comp stack drives the transport and slot A decodes nothing. The
