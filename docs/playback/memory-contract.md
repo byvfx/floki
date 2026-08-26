@@ -34,7 +34,7 @@ budget       = recommendedMaxWorkingSetSize × headroom − baseline_vram
 per_frame_t2 = w × h × 16            # 16 B/px: conservatively budgets for Rgba32Float.
                                      # f16 sources upload as Rgba16Float (8 B/px), so the
                                      # ring stays well under the real VRAM cost (#142).
-max_t2       = floor(budget / per_frame_t2)
+t2_cap       = floor(budget / per_frame_t2)
 ```
 
 Off-Metal, `recommendedMaxWorkingSetSize` is `None` → use a conservative fixed/config cap.

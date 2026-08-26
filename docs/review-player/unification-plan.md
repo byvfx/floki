@@ -62,7 +62,7 @@ Confirmed by code audit:
   already source-agnostic.
 - All of `src/layer.rs` — `composite_at`, `Trim::source_frame`, `Step`/`Draw`,
   `LayerSource`, stable `LayerId`/`SourceId`. Nothing capped at 2.
-- `src/budget.rs` — frame-count math is slot-agnostic (only its *input* `frame_bytes` is
+- `src/budget.rs` — the budget math is slot-agnostic (only its *input* `frame_bytes` is
   measured from Slot A today).
 
 ## Two semantic decisions to lock first
