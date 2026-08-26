@@ -120,17 +120,38 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     );
 
     let pos = positions[vertex_index];
-    
-    // Map 0..1 to rect_min..rect_max
-    let screen_pos = mix(uniforms.rect_min, uniforms.rect_max, pos);
-    
+
+    // An accumulate fold (#257) spans the WHOLE screen rather than just this
+    // layer's rect. Each fold is its own render pass over a full-target `Clear`,
+    // so a quad covering only the layer would leave the sentinel everywhere else
+    // and the composite would end up clipped to the topmost layer's rect —
+    // erasing the layers below it. Spanning the screen lets the fragment stage
+    // pass the prior accumulation through untouched outside this layer, so the
+    // union of the stack survives. Every other draw keeps its own rect: they
+    // either own the whole target or are placed independently.
+    let is_accum = uniforms.composite_accum == 1u;
+
+    // Map 0..1 to rect_min..rect_max (or to the full screen for an accumulate fold)
+    let screen_pos = select(
+        mix(uniforms.rect_min, uniforms.rect_max, pos),
+        pos * uniforms.screen_size,
+        is_accum,
+    );
+
     // Map screen_pos to clip space (-1..1)
     let clip_x = (screen_pos.x / uniforms.screen_size.x) * 2.0 - 1.0;
     let clip_y = 1.0 - (screen_pos.y / uniforms.screen_size.y) * 2.0;
 
+    // `uv` stays image-local in both cases — the layer's rect is where uv is 0..1,
+    // so a full-screen fold reads outside that range exactly where it misses the
+    // layer. The mapping is affine in screen space, so interpolating it across the
+    // larger quad is exact. Non-accumulate draws take `pos` verbatim rather than
+    // the algebraically-equal unmix, to keep that path bit-for-bit unchanged.
+    let span = max(uniforms.rect_max - uniforms.rect_min, vec2<f32>(1e-6, 1e-6));
+
     var out: VertexOutput;
     out.position = vec4<f32>(clip_x, clip_y, 0.0, 1.0);
-    out.uv = vec2<f32>(pos.x, pos.y);
+    out.uv = select(pos, (screen_pos - uniforms.rect_min) / span, is_accum);
     return out;
 }
 
@@ -186,6 +207,21 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             uniforms.composite_accum == 1u,
         );
         color_b = textureSample(tex_b, samp_b, b_uv);
+    }
+
+    // The prior accumulation exactly as pass 1 left it, kept before the sentinel
+    // is normalized below — the pass-through at the end of this function must
+    // re-emit it verbatim, α<0 included, or "no image" would decay into "black
+    // image" and the background would stop showing through.
+    let accum_prev = color_b;
+
+    // Pass 1 clears to α=−1, the "no image here" sentinel the blit keys off. When
+    // folding, treat it as fully transparent black: a layer extending past the
+    // accumulation beneath it must composite over the background, and a negative
+    // alpha would otherwise drive the blend to a bogus coverage (an aa=0.5 layer
+    // over α=−1 lands on α=0 — fully background, when half the layer should show).
+    if uniforms.composite_accum == 1u && color_b.a < 0.0 {
+        color_b = vec4<f32>(0.0);
     }
 
     // Per-layer opacity for the Layers-panel accumulate composite (#99 PR-B.4):
@@ -387,5 +423,18 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // checker + overscan dim (in the blit pass) have a coverage/alpha signal. The
     // opacity/overscan dim is applied post-OCIO in that case, not here.
     let out_a = select(eff_opacity, a, uniforms.skip_checker == 1u);
-    return vec4<f32>(r, g, b, out_a);
+    var result = vec4<f32>(r, g, b, out_a);
+
+    // #257: outside this layer's rect an accumulate fold contributes nothing, so
+    // re-emit the accumulation below it verbatim. Written as a `select` on the
+    // final value rather than an early `return`: the condition is per-fragment,
+    // and a non-uniform return would put every later `textureSample` (LUT,
+    // colormap) in non-uniform control flow, which WGSL rejects. The discarded
+    // work is a handful of ALU ops — the display chain is already neutralized on
+    // this path (`srgb=0`, `gamma=1`, `enable_lut=0`; see `DrawCtx::draw`).
+    if uniforms.composite_accum == 1u {
+        let outside = any(in.uv < vec2<f32>(0.0)) || any(in.uv > vec2<f32>(1.0));
+        result = select(result, accum_prev, outside);
+    }
+    return result;
 }

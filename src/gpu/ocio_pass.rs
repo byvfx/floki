@@ -720,9 +720,13 @@ impl eframe::egui_wgpu::CallbackTrait for OcioCallback {
                 // tex_b sampling). Parity `start=(N-1)%2` lands the final accumulation in
                 // `scene_view`, so pass 2 + the blit are untouched.
                 //
-                // Correct while all layers share one image rect (today's A/B compare); a
-                // layer smaller than the frame would clear the accumulation outside its rect
-                // — differing per-layer rects land with the N-way panel (PR-B).
+                // Per-layer rects are safe here (#257). Each fold is its own pass over a
+                // full-target `Clear`, so a quad covering only the layer would leave the
+                // sentinel everywhere else and clip the composite to the topmost layer's
+                // rect. `vs_main` spans an accumulate fold across the whole screen and
+                // `fs_main` re-emits the prior accumulation outside the layer, so the
+                // union of the stack survives the clear. Keep those two in lockstep with
+                // this loop: the clear below is only sound because the fold is full-screen.
                 let n = self.draws.len();
                 let start = (n - 1) % 2;
                 let scene_views = [&targets.scene_view, &targets.scene_view_b];

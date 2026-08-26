@@ -2650,15 +2650,24 @@ impl ExrViewer {
         // is enabled, so this costs a bool check in a normal run.
         let debug_geom = log::log_enabled!(target: "floki::playback", log::Level::Debug);
         let mut geom: Vec<String> = Vec::new();
+        // The union of the layer rects, which is what the display stage must cover
+        // (#257). Kept as a running fold rather than derived from `image_rect` so it
+        // stays correct the moment layers stop sharing one rect.
+        let mut union_rect: Option<egui::Rect> = None;
         for (i, d) in stack_draws.iter().enumerate() {
+            // Every layer still draws at `image_rect`; per-layer placement is #254.
+            // This binding is the seam that lands it — the accumulate and the display
+            // stage below no longer assume the rects coincide, so #254 only has to
+            // compute a rect here.
+            let layer_rect = image_rect;
+            union_rect = Some(union_rect.map_or(layer_rect, |u| u.union(layer_rect)));
             if debug_geom {
-                // `rect` is `image_rect` for every layer — that is the behaviour, not
-                // an omission. Printing it per layer beside that layer's own `par` is
-                // the point: a `par=2.000` layer handed the same rect as a `par=1.000`
-                // one is #254, stated in one line.
+                // Printing each layer's own rect beside its own `par` is the point:
+                // a `par=2.000` layer handed the same rect as a `par=1.000` one is
+                // #254, stated in one line.
                 geom.push(format!(
                     "l{i}:par={:.3},x=[{:.0},{:.0}],y=[{:.0},{:.0}]",
-                    d.par, image_rect.min.x, image_rect.max.x, image_rect.min.y, image_rect.max.y,
+                    d.par, layer_rect.min.x, layer_rect.max.x, layer_rect.min.y, layer_rect.max.y,
                 ));
             }
             let (is_composite, is_top) = comp_layer_flags(i, n);
@@ -2677,7 +2686,7 @@ impl ExrViewer {
                 d.bind_group.clone(),
                 None,
                 rect,
-                image_rect,
+                layer_rect,
                 false, // is_diff
                 is_composite,
                 d.opacity,
@@ -2690,9 +2699,14 @@ impl ExrViewer {
             // overscan gate and the background gradient key off. Both are here because
             // a layer drawn outside either one is exactly the class of bug this line
             // exists to catch — and on #254 they turned out to be different bugs.
+            // `union` is what the display stage is scissored to (#257) — the region
+            // the composite can actually reach. A layer rect outside it is the
+            // black-outside-disp bug, now visible in the log rather than only in a
+            // screenshot.
+            let u = union_rect.unwrap_or(image_rect);
             let line = format!(
                 "evt=layer_geom n={} base_par={:.3} par={:.3} canvas=[{:.0},{:.0}]x[{:.0},{:.0}] \
-                 disp=[{:.0},{:.0}]x[{:.0},{:.0}] {}",
+                 disp=[{:.0},{:.0}]x[{:.0},{:.0}] union=[{:.0},{:.0}]x[{:.0},{:.0}] {}",
                 n,
                 base_par,
                 par,
@@ -2704,6 +2718,10 @@ impl ExrViewer {
                 disp_rect.max.x,
                 disp_rect.min.y,
                 disp_rect.max.y,
+                u.min.x,
+                u.max.x,
+                u.min.y,
+                u.max.y,
                 geom.join(" "),
             );
             if self.dbg_layer_geom.as_deref() != Some(line.as_str()) {
@@ -2793,12 +2811,20 @@ impl ExrViewer {
                 .wrapping_mul(0x100000001b3);
         // Side-by-Side spans the canvas with two panes, so the display transform runs
         // unscissored rather than over just the composite's rect (the A/B path does the
-        // same); otherwise scissor to the single image region.
+        // same); otherwise scissor to the drawn image region.
+        //
+        // That region is the UNION of the layer rects, not the base layer's (#257). The
+        // display stage clears to transparent and only writes inside the scissor, so a
+        // layer reaching past the base rect would otherwise be accumulated correctly and
+        // then dropped on the floor — black, exactly like the accumulate clip this pairs
+        // with. Fixing one without the other fixes nothing. Falls back to `image_rect`
+        // when no layer accumulated (Wipe / Diff / Blink-B took their own path).
+        let scissor_rect = union_rect.unwrap_or(image_rect);
         let scissor_pts = (!is_sbs).then_some([
-            image_rect.min.x,
-            image_rect.min.y,
-            image_rect.max.x,
-            image_rect.max.y,
+            scissor_rect.min.x,
+            scissor_rect.min.y,
+            scissor_rect.max.x,
+            scissor_rect.max.y,
         ]);
         let callback = crate::gpu::ocio_pass::OcioCallback {
             draws: ocio_draws,
