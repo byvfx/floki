@@ -1656,17 +1656,105 @@ impl ExrApp {
         }
     }
 
+    /// The layer already drawing `path`, if the stack has one (#242).
+    ///
+    /// Matches on the `CompSource` path rather than the layer name, which the user
+    /// can rename. The first match wins; with re-open focusing instead of adding,
+    /// the only way to get two layers on one path is [`Self::duplicate_comp_layer`],
+    /// and either of that pair is a correct answer to "where is this file".
+    fn layer_for_path(&self, path: &Path) -> Option<crate::layer::LayerId> {
+        self.comp_stack.iter().find_map(|l| match &l.source {
+            crate::layer::LayerSource::Image { source, .. }
+                if self
+                    .comp_sources
+                    .get(source)
+                    .is_some_and(|cs| cs.path == path) =>
+            {
+                Some(l.id)
+            }
+            _ => None,
+        })
+    }
+
     /// Bring a file into the stack as a new layer — the unified open/drop entry
     /// (#99 R4). Records recent files, ensures the Layers panel is visible, then
     /// decodes + adds the layer via [`Self::add_comp_source`] (a synchronous
     /// decode: it promotes slot A to a base track on the first add, drives the
     /// transport for the first sequence, and caps at [`COMP_LAYER_CAP`]).
+    ///
+    /// **A path already in the stack is focused, not added again** (#242). Opening
+    /// a file means "show me this", and it is already shown; adding a second copy
+    /// stacked exactly on the first is invisible — the picture does not change —
+    /// while costing a full synchronous decode, another decode follower dividing
+    /// the single worker's turns, and another share of the T1 budget via
+    /// `n_active_sources`. That made a stack grow silently across sessions and the
+    /// app get slower with no apparent cause. Deliberate duplication is
+    /// [`Self::duplicate_comp_layer`], which is explicit, instant, and shares the
+    /// already-decoded source.
+    ///
+    /// Recent files are still recorded, and the panel still shown: the user asked
+    /// for this file, and both are true whether or not a layer had to be created.
     fn open_layer(&mut self, path: PathBuf) {
         self.recent_files.retain(|p| p != &path);
         self.recent_files.insert(0, path.clone());
         self.recent_files.truncate(10);
         self.show_layers_panel = true;
+        if let Some(id) = self.layer_for_path(&path) {
+            log::debug!(
+                target: "floki::playback",
+                "open: {} is already {id:?} — focusing it", path.display()
+            );
+            self.selected_comp_layer = Some(id);
+            self.error_msg = None;
+            return;
+        }
         self.add_comp_source(path);
+    }
+
+    /// Add a second layer drawing the same source as `id`, and make it current
+    /// (#242) — the explicit way to get what re-opening a file used to do by
+    /// accident.
+    ///
+    /// Costs no decode: the copy shares the original's `SourceId`, so the pixels it
+    /// needs are the pixels already cached under that key. It is a second view of
+    /// one source — retime it, re-trim it, or point it at another AOV — rather than
+    /// a second copy of the footage.
+    ///
+    /// Named `foo.exr (2)`, counting the layers already on that source, so the pair
+    /// is distinguishable in the panel where two identical names would not be. The
+    /// user can rename it; nothing keys off the name.
+    fn duplicate_comp_layer(&mut self, id: crate::layer::LayerId) {
+        if self.comp_stack.len() >= COMP_LAYER_CAP {
+            self.error_msg = Some(format!(
+                "Layer limit reached ({COMP_LAYER_CAP}) — remove a layer to add more."
+            ));
+            return;
+        }
+        let Some(src) = self.comp_stack.get(id).and_then(|l| match &l.source {
+            crate::layer::LayerSource::Image { source, .. } => Some(*source),
+            crate::layer::LayerSource::Adjustment => None,
+        }) else {
+            return;
+        };
+        let n = self
+            .comp_stack
+            .iter()
+            .filter(|l| {
+                matches!(&l.source, crate::layer::LayerSource::Image { source, .. } if *source == src)
+            })
+            .count();
+        let Some(new_id) = self.comp_stack.duplicate(id) else {
+            return;
+        };
+        if let Some(l) = self.comp_stack.get_mut(new_id) {
+            let base = l
+                .name
+                .rsplit_once(" (")
+                .map_or(l.name.as_str(), |(stem, _)| stem)
+                .to_string();
+            l.name = format!("{base} ({})", n + 1);
+        }
+        self.selected_comp_layer = Some(new_id);
     }
 
     /// Open a path given on the command line, through the **same entry as
@@ -6964,10 +7052,43 @@ impl ExrApp {
             if !entry.path.is_file() {
                 continue;
             }
-            self.add_comp_source(entry.path);
-            // `add_comp_source` pushes on top and selects it, so the just-added layer
-            // is the last one; a rejected add (cap / decode failure) leaves the stack
-            // unchanged and there is nothing to configure.
+            // Two persisted layers on one path share a source rather than decoding it
+            // twice (#242). That is what a duplicate *is* in a live session
+            // (`duplicate_comp_layer` clones the layer against the same `SourceId`),
+            // so restoring one as two independent sources would silently undo the
+            // sharing on the next launch — the same double-decode, one restart later.
+            //
+            // It also repairs stacks built before the fix: a session that accumulated
+            // N copies of a path by re-opening it collapses to one source and one
+            // decode on load, instead of paying for N.
+            //
+            // `push_image`'s trim is a placeholder — the entry's own trim is applied
+            // below, like every other field.
+            let before = self.comp_stack.len();
+            if let Some(existing) = self.layer_for_path(&entry.path) {
+                let Some((source, trim)) =
+                    self.comp_stack.get(existing).and_then(|l| match &l.source {
+                        crate::layer::LayerSource::Image { source, .. } => Some((*source, l.trim)),
+                        crate::layer::LayerSource::Adjustment => None,
+                    })
+                else {
+                    continue;
+                };
+                self.comp_stack
+                    .push_image(entry.name.clone(), source, entry.aov, trim);
+            } else {
+                self.add_comp_source(entry.path);
+            }
+            // A rejected add (cap reached / decode failure) leaves the stack
+            // unchanged — so `iter().last()` is then the *previous* layer, and
+            // configuring it would overwrite a successfully restored layer's name,
+            // blend, trim and AOV with this entry's. Length is the reliable "did
+            // anything land" test; the id alone can't tell.
+            if self.comp_stack.len() == before {
+                continue;
+            }
+            // The just-restored layer is the last one either way: `add_comp_source`
+            // and `push_image` both push on top.
             let Some(id) = self.comp_stack.iter().last().map(|l| l.id) else {
                 continue;
             };
@@ -7883,6 +8004,7 @@ impl ExrApp {
             let count = rows.len();
             let solo_active = self.comp_stack.solo_active();
             let mut remove: Option<crate::layer::LayerId> = None;
+            let mut duplicate: Option<crate::layer::LayerId> = None;
             let mut reorder: Option<(crate::layer::LayerId, usize)> = None;
             // A time-offset edit re-maps a layer's source frame, so re-request the
             // comp followers after the loop (the pump fetches the newly-needed frame).
@@ -8009,6 +8131,20 @@ impl ExrApp {
                     // The base track (the opened plate) isn't removed here — its
                     // close path is revived in the render-retire step (#99 R3); the
                     // File ▸ Close Image A menu that closed it was removed in R4.
+                    // A second view of the same source (#242) — no decode, since the
+                    // copy shares the original's `SourceId`. This is the explicit
+                    // route to what re-opening a file used to do by accident.
+                    if ui
+                        .button("⧉  Duplicate layer")
+                        .on_hover_text(
+                            "Add another layer on the same source — retime or \
+                             re-trim it independently. Costs no decode.",
+                        )
+                        .clicked()
+                    {
+                        duplicate = Some(row.id);
+                        ui.close();
+                    }
                     if !row.is_base && ui.button("✕  Remove layer").clicked() {
                         remove = Some(row.id);
                         ui.close();
@@ -8221,6 +8357,9 @@ impl ExrApp {
             // Apply the structural edits after the loop (each restructures the Vec).
             if let Some((id, to)) = reorder {
                 self.comp_stack.move_to(id, to);
+            }
+            if let Some(id) = duplicate {
+                self.duplicate_comp_layer(id);
             }
             if let Some(id) = remove {
                 self.remove_comp_layer(id);
@@ -10567,6 +10706,132 @@ mod tests {
         assert!(
             app.persisted_layers.is_empty(),
             "the replayed list is consumed, so a later save re-derives it from the stack"
+        );
+    }
+
+    #[test]
+    fn reopening_a_loaded_path_focuses_its_layer_instead_of_duplicating() {
+        // #242: opening a path already in the stack appended a second layer stacked
+        // exactly on the first — invisible (the picture is identical) but costing a
+        // full synchronous decode, another decode follower dividing the single
+        // worker, and another share of the T1 budget. Five relaunches on one file
+        // took a stack from 1 layer to 6.
+        let (_dir, paths) = write_sequence(3);
+        let mut app = ExrApp::default();
+        app.open_layer(paths[0].clone());
+        let before = app.comp_stack.len();
+        let id = app.comp_stack.iter().next().map(|l| l.id).unwrap();
+        app.selected_comp_layer = None;
+
+        app.open_layer(paths[0].clone());
+
+        assert_eq!(app.comp_stack.len(), before, "no second layer was added");
+        assert_eq!(
+            app.selected_comp_layer,
+            Some(id),
+            "the existing layer is focused instead — 'open' means 'show me this'"
+        );
+        assert_eq!(
+            app.recent_files.first(),
+            Some(&paths[0]),
+            "the user still asked for this file, so it is still a recent file"
+        );
+    }
+
+    #[test]
+    fn duplicating_a_layer_shares_its_source_and_costs_no_decode() {
+        // The explicit route to what re-opening used to do by accident — and the
+        // difference that matters: the copy references the *same* `SourceId`, so its
+        // pixels are the ones already cached under that key. A second decode, a
+        // second follower and a second T1 share are exactly what #242 was about.
+        let (_dir, paths) = write_sequence(3);
+        let mut app = ExrApp::default();
+        app.open_layer(paths[0].clone());
+        let id = app.comp_stack.iter().next().map(|l| l.id).unwrap();
+        let sources_before = app.comp_sources.len();
+        let followers_before = app.followers.len();
+
+        app.duplicate_comp_layer(id);
+
+        assert_eq!(app.comp_stack.len(), 2, "a second layer exists");
+        assert_eq!(
+            app.comp_sources.len(),
+            sources_before,
+            "but no second source was decoded"
+        );
+        assert_eq!(
+            app.followers.len(),
+            followers_before,
+            "and no second decode follower divides the worker"
+        );
+        let names: Vec<&str> = app.comp_stack.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(
+            names[1],
+            format!("{} (2)", names[0]).as_str(),
+            "the copy is distinguishable in the panel, and sits directly above"
+        );
+    }
+
+    #[test]
+    fn removing_one_of_a_duplicated_pair_keeps_the_source_alive() {
+        // `remove_comp_layer` frees a source when its last layer goes. With a
+        // duplicate sharing the `SourceId`, freeing on the first removal would pull
+        // the cache, the follower and the upload gate out from under the survivor.
+        let (_dir, paths) = write_sequence(3);
+        let mut app = ExrApp::default();
+        app.open_layer(paths[0].clone());
+        let id = app.comp_stack.iter().next().map(|l| l.id).unwrap();
+        app.duplicate_comp_layer(id);
+        let source = crate::layer::SourceId(COMP_SOURCE_BASE);
+
+        app.remove_comp_layer(id);
+
+        assert_eq!(app.comp_stack.len(), 1, "the copy survives");
+        assert!(
+            app.comp_sources.contains_key(&source),
+            "and its source with it — the last reference has not gone"
+        );
+        assert!(
+            app.followers.contains_key(&source),
+            "including the decode follower the survivor still needs"
+        );
+    }
+
+    #[test]
+    fn restoring_two_layers_on_one_path_shares_a_single_source() {
+        // A duplicate is one source and two layers in a live session, so restoring it
+        // as two independent sources would silently undo the sharing on the next
+        // launch — the same double-decode #242 is about, one restart later. This also
+        // repairs stacks built before the fix: N accumulated copies collapse to one
+        // source and one decode on load.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("plate.exr");
+        write_rgba_exr(&f);
+
+        let mut app = ExrApp {
+            persisted_layers: vec![
+                LayerPersist {
+                    path: f.clone(),
+                    name: "plate.exr".into(),
+                    ..Default::default()
+                },
+                LayerPersist {
+                    path: f.clone(),
+                    name: "plate.exr (2)".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        app.restore_comp_layers();
+
+        assert_eq!(app.comp_stack.len(), 2, "both layers restored");
+        assert_eq!(app.comp_sources.len(), 1, "sharing one decoded source");
+        let names: Vec<&str> = app.comp_stack.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["plate.exr", "plate.exr (2)"],
+            "each layer keeps its own persisted name"
         );
     }
 

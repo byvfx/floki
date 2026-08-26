@@ -290,6 +290,34 @@ impl LayerStack {
         id
     }
 
+    /// Clone the layer `id`, inserting the copy **directly above** it, and return
+    /// the new layer's id. `None` if `id` isn't in the stack.
+    ///
+    /// The copy carries everything the original has except its identity: the same
+    /// source and AOV, and the same transform / blend / opacity / enabled / solo /
+    /// trim. Sharing the `SourceId` is the point — the pixels are already decoded
+    /// and cached under that key, so a duplicate costs no decode, no extra ring
+    /// residency, and no extra `CompSource`. It is a second *view* of one source,
+    /// which is what makes it useful: the copy is then retimed, re-trimmed, or
+    /// pointed at another AOV independently.
+    ///
+    /// Directly above rather than on top: a duplicate lands adjacent to what it was
+    /// copied from, so the stack reads as a pair. On top would put it somewhere the
+    /// user has to go looking for on a deep stack.
+    ///
+    /// The name is the caller's problem — the stack has no naming policy, and
+    /// [`ExrApp::duplicate_comp_layer`] is where "(2)" is decided (#242).
+    pub fn duplicate(&mut self, id: LayerId) -> Option<LayerId> {
+        let at = self.layers.iter().position(|l| l.id == id)?;
+        let new_id = self.alloc_id();
+        let copy = Layer {
+            id: new_id,
+            ..self.layers[at].clone()
+        };
+        self.layers.insert(at + 1, copy);
+        Some(new_id)
+    }
+
     /// Append an adjustment layer on top, returning its stable [`LayerId`].
     #[allow(dead_code)] // adjustment-layer constructor; landed ahead of #102
     pub fn push_adjustment(&mut self, name: impl Into<String>) -> LayerId {
