@@ -1129,6 +1129,9 @@ pub struct ExrViewer {
     /// [`relative_unsqueeze`] to recover the rect that layer actually drew at, which
     /// the pixel readout needs to normalize against. Runtime-only.
     pub last_base_par: f32,
+    /// Last `evt=layer_geom` line emitted, so the per-layer geometry trace fires on
+    /// change instead of every frame (#254). Runtime-only.
+    dbg_layer_geom: Option<String>,
 
     /// `(wipe_center, wipe_angle)` when the last comp frame drew a Wipe (#99 Slice 2b);
     /// `None` otherwise. Wipe overlays both layers in one rect, so the pixel readout
@@ -1215,6 +1218,7 @@ impl Default for ExrViewer {
             last_image_rect: None,
             last_image_rect_b: None,
             last_base_par: 1.0,
+            dbg_layer_geom: None,
             last_wipe: None,
             last_blink_b: None,
             annotations: Vec::new(),
@@ -2684,11 +2688,28 @@ impl ExrViewer {
         // together and the manual override — which scales the canvas — does not
         // squeeze the other layers by its inverse.
         let base_u = self.sanitize_unsqueeze(base_par);
+        // Per-layer resolved geometry, logged on change (#254). The playback trace
+        // describes decode and residency but has never said a word about *where*
+        // each layer landed, so a placement bug could only be diagnosed by measuring
+        // pixels in a screenshot. Signature-gated rather than throttled: geometry is
+        // static while nothing moves, so "log when it differs" is silent in the
+        // steady state and immediate on the frame that matters.
+        let mut geom: Vec<String> = Vec::new();
+        let debug_geom = log::log_enabled!(target: "floki::playback", log::Level::Debug);
         for (i, d) in stack_draws.iter().enumerate() {
-            let layer_rect = layer_draw_rect(
-                image_rect,
-                relative_unsqueeze(self.sanitize_unsqueeze(d.par), base_u),
-            );
+            let rel = relative_unsqueeze(self.sanitize_unsqueeze(d.par), base_u);
+            let layer_rect = layer_draw_rect(image_rect, rel);
+            if debug_geom {
+                geom.push(format!(
+                    "l{i}:par={:.3},rel={:.3},x=[{:.0},{:.0}],y=[{:.0},{:.0}]",
+                    d.par,
+                    rel,
+                    layer_rect.min.x,
+                    layer_rect.max.x,
+                    layer_rect.min.y,
+                    layer_rect.max.y,
+                ));
+            }
             let (is_composite, is_top) = comp_layer_flags(i, n);
             // Neutralize the global view ops on every layer but the top, so exposure
             // / channel isolation apply once to the finished composite (PR-A.4).
@@ -2713,6 +2734,32 @@ impl ExrViewer {
         }
         ctx.neutral_view_ops.set(false);
         ctx.blend_override.set(None);
+        if debug_geom {
+            // `canvas` is the rect every layer used to share; `disp` is the display
+            // window the overscan gate and the background gradient are keyed on —
+            // both are here because a layer drawn outside either one is exactly the
+            // class of bug this line exists to catch.
+            let line = format!(
+                "evt=layer_geom n={} base_par={:.3} par={:.3} canvas=[{:.0},{:.0}]x[{:.0},{:.0}] \
+                 disp=[{:.0},{:.0}]x[{:.0},{:.0}] {}",
+                n,
+                base_par,
+                par,
+                image_rect.min.x,
+                image_rect.max.x,
+                image_rect.min.y,
+                image_rect.max.y,
+                disp_rect.min.x,
+                disp_rect.max.x,
+                disp_rect.min.y,
+                disp_rect.max.y,
+                geom.join(" "),
+            );
+            if self.dbg_layer_geom.as_deref() != Some(line.as_str()) {
+                log::debug!(target: "floki::playback", "{line}");
+                self.dbg_layer_geom = Some(line);
+            }
+        }
 
         // Annotation overlay + the in-place text field (#45 / #99 Slice 3d). Drawn here
         // rather than at the end of the function so the Diff path — which emits an
