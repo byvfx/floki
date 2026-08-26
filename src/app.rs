@@ -1656,6 +1656,29 @@ impl ExrApp {
         }
     }
 
+    /// Whether two paths name the same file on disk.
+    ///
+    /// Cheap comparison first, then `canonicalize` — the same file reaches the app
+    /// spelled differently all the time: a relative path on the command line versus
+    /// the absolute one a file picker returns, `..` segments, or Windows' `/` and
+    /// `\` mixed in a dropped path. Raw `PathBuf` equality misses every one of
+    /// those, which would silently reintroduce the duplicate decode #242 removes.
+    ///
+    /// Deliberately used **only for comparison**, never to rewrite what is stored.
+    /// On Windows `canonicalize` returns a `\\?\`-prefixed UNC path, which would
+    /// leak into layer names, the recent-files menu and `app.ron` if it were
+    /// adopted as the path of record.
+    ///
+    /// Falls back to raw inequality when either side cannot be resolved (a deleted
+    /// or unreachable file): unknown is not the same as equal.
+    fn same_file(a: &Path, b: &Path) -> bool {
+        a == b
+            || match (a.canonicalize(), b.canonicalize()) {
+                (Ok(x), Ok(y)) => x == y,
+                _ => false,
+            }
+    }
+
     /// The layer already drawing `path`, if the stack has one (#242).
     ///
     /// Matches on the `CompSource` path rather than the layer name, which the user
@@ -1668,7 +1691,7 @@ impl ExrApp {
                 if self
                     .comp_sources
                     .get(source)
-                    .is_some_and(|cs| cs.path == path) =>
+                    .is_some_and(|cs| Self::same_file(&cs.path, path)) =>
             {
                 Some(l.id)
             }
@@ -1695,7 +1718,9 @@ impl ExrApp {
     /// Recent files are still recorded, and the panel still shown: the user asked
     /// for this file, and both are true whether or not a layer had to be created.
     fn open_layer(&mut self, path: PathBuf) {
-        self.recent_files.retain(|p| p != &path);
+        // Same-file, not same-spelling (#242 review): otherwise the relative and
+        // absolute forms of one file both sit in the menu as separate entries.
+        self.recent_files.retain(|p| !Self::same_file(p, &path));
         self.recent_files.insert(0, path.clone());
         self.recent_files.truncate(10);
         self.show_layers_panel = true;
@@ -1723,6 +1748,15 @@ impl ExrApp {
     /// Named `foo.exr (2)`, counting the layers already on that source, so the pair
     /// is distinguishable in the panel where two identical names would not be. The
     /// user can rename it; nothing keys off the name.
+    ///
+    /// **The slot-A base track cannot be duplicated** (#242 review). It is the sole
+    /// layer allowed to reference `A_SOURCE` — [`Self::base_layer_id`] resolves it
+    /// with a `find_map` on exactly that assumption, and
+    /// [`Self::remove_base_layer`]'s teardown is written for one. It also would not
+    /// survive a restart: [`Self::comp_layers_persist`] skips `A_SOURCE` layers
+    /// (slot A is restored through its own path, not the layer list), so the copy
+    /// would vanish on the next launch having quietly broken the invariant in the
+    /// meantime.
     fn duplicate_comp_layer(&mut self, id: crate::layer::LayerId) {
         if self.comp_stack.len() >= COMP_LAYER_CAP {
             self.error_msg = Some(format!(
@@ -1736,6 +1770,9 @@ impl ExrApp {
         }) else {
             return;
         };
+        if src == Self::A_SOURCE {
+            return;
+        }
         let n = self
             .comp_stack
             .iter()
@@ -1747,9 +1784,17 @@ impl ExrApp {
             return;
         };
         if let Some(l) = self.comp_stack.get_mut(new_id) {
+            // Re-number an existing `(N)` rather than stacking suffixes, but only
+            // when the tail really is one (#242 review). A bare `rsplit_once(" (")`
+            // treats any parenthesis as the marker, so `plate (final).exr` would be
+            // truncated to `plate` — losing the part of the name that identified it.
             let base = l
                 .name
                 .rsplit_once(" (")
+                .filter(|(_, tail)| {
+                    tail.strip_suffix(')')
+                        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                })
                 .map_or(l.name.as_str(), |(stem, _)| stem)
                 .to_string();
             l.name = format!("{base} ({})", n + 1);
@@ -8134,13 +8179,19 @@ impl ExrApp {
                     // A second view of the same source (#242) — no decode, since the
                     // copy shares the original's `SourceId`. This is the explicit
                     // route to what re-opening a file used to do by accident.
-                    if ui
-                        .button("⧉  Duplicate layer")
-                        .on_hover_text(
-                            "Add another layer on the same source — retime or \
-                             re-trim it independently. Costs no decode.",
-                        )
-                        .clicked()
+                    //
+                    // Not offered for the base track: it is the sole layer allowed to
+                    // reference `A_SOURCE`, and a copy would not persist. Absent
+                    // rather than disabled, matching how Remove layer treats the same
+                    // row — a control the base track never has.
+                    if !row.is_base
+                        && ui
+                            .button("⧉  Duplicate layer")
+                            .on_hover_text(
+                                "Add another layer on the same source — retime or \
+                                 re-trim it independently. Costs no decode.",
+                            )
+                            .clicked()
                     {
                         duplicate = Some(row.id);
                         ui.close();
@@ -10769,6 +10820,89 @@ mod tests {
             names[1],
             format!("{} (2)", names[0]).as_str(),
             "the copy is distinguishable in the panel, and sits directly above"
+        );
+    }
+
+    #[test]
+    fn the_base_track_cannot_be_duplicated() {
+        // #242 review: slot A is the sole layer allowed to reference `A_SOURCE` —
+        // `base_layer_id` resolves it with a `find_map` on that assumption — and
+        // `comp_layers_persist` skips `A_SOURCE` layers, so a copy would silently
+        // vanish on the next launch having broken the invariant in the meantime.
+        let (_dir, mut app) = app_with_open_a_still();
+        let base = app.base_layer_id().expect("slot A is the base track");
+        let before = app.comp_stack.len();
+
+        app.duplicate_comp_layer(base);
+
+        assert_eq!(app.comp_stack.len(), before, "the base track is not copied");
+        assert_eq!(
+            app.comp_stack
+                .iter()
+                .filter(|l| matches!(
+                    l.source,
+                    crate::layer::LayerSource::Image { source, .. } if source == ExrApp::A_SOURCE
+                ))
+                .count(),
+            1,
+            "exactly one layer references A_SOURCE, as base_layer_id assumes"
+        );
+    }
+
+    #[test]
+    fn duplicate_naming_only_renumbers_a_real_numeric_suffix() {
+        // #242 review: a bare `rsplit_once(" (")` treats any parenthesis as the
+        // copy marker, so `plate (final).exr` would be truncated to `plate` —
+        // dropping the part of the name that identified it.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("plate (final).exr");
+        write_rgba_exr(&f);
+        let mut app = ExrApp::default();
+        app.open_layer(f);
+        let id = app.comp_stack.iter().next().map(|l| l.id).unwrap();
+
+        app.duplicate_comp_layer(id);
+
+        let names: Vec<&str> = app.comp_stack.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["plate (final).exr", "plate (final).exr (2)"],
+            "a non-numeric parenthetical is part of the name, not a copy marker"
+        );
+    }
+
+    #[test]
+    fn reopening_the_same_file_by_a_different_path_spelling_still_focuses() {
+        // #242 review: raw `PathBuf` equality misses the same file spelled two ways
+        // — a relative path on the command line versus the absolute one a picker
+        // returns — which would silently reintroduce the duplicate decode.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("plate.exr");
+        write_rgba_exr(&f);
+        let mut app = ExrApp::default();
+        app.open_layer(f.clone());
+        let before = app.comp_stack.len();
+        let id = app.comp_stack.iter().next().map(|l| l.id).unwrap();
+        app.selected_comp_layer = None;
+
+        // The same file reached via a `..` round trip — a different `PathBuf`,
+        // the same bytes on disk.
+        let indirect = dir.path().join("sub").join("..").join("plate.exr");
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        assert_ne!(indirect, f, "the two spellings really do differ");
+
+        app.open_layer(indirect);
+
+        assert_eq!(app.comp_stack.len(), before, "no duplicate was added");
+        assert_eq!(
+            app.selected_comp_layer,
+            Some(id),
+            "the existing layer is focused, whichever spelling asked for it"
+        );
+        assert_eq!(
+            app.recent_files.len(),
+            1,
+            "and the two spellings are one recent-files entry, not two"
         );
     }
 
