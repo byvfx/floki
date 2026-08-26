@@ -8494,6 +8494,7 @@ impl ExrApp {
                 bind_group,
                 blend: d.blend,
                 opacity: d.opacity,
+                par: cs.exr_data.image.attributes.pixel_aspect,
             });
         }
 
@@ -8538,6 +8539,7 @@ impl ExrApp {
                     bind_group: cs.bind_group.clone()?,
                     blend: d.blend,
                     opacity: d.opacity,
+                    par: cs.exr_data.image.attributes.pixel_aspect,
                 },
                 tex_size: egui::vec2(cs.size.0.max(1) as f32, cs.size.1.max(1) as f32),
                 par: cs.exr_data.image.attributes.pixel_aspect,
@@ -8563,6 +8565,7 @@ impl ExrApp {
                         bind_group,
                         blend: a.blend,
                         opacity: a.opacity,
+                        par: cs.exr_data.image.attributes.pixel_aspect,
                     }];
                     base_size = cs.size;
                     base_par = cs.exr_data.image.attributes.pixel_aspect;
