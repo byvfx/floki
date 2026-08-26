@@ -22,6 +22,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer falls back to hardcoded absolute paths when given no arguments.
 
 ### Fixed
+- **Pausing a comp layer no longer throws away the read-ahead.** Settling asked
+  whether *slot A* was holding a full-fidelity frame — but with a comp layer
+  driving the transport, slot A decodes nothing, so the answer was "no" on every
+  pause, including pauses on a frame that was already final. That took the
+  re-decode branch, which supersedes every decode in flight and resets the
+  precache, so pausing dumped exactly the read-ahead that pausing is the moment to
+  keep, and the cache refilled from scratch. The question is now asked of the
+  source actually driving the clock.
 - **Pausing no longer corrupts the frame-time percentiles.** The p99 / max figures
   measure the gap between displayed frames, and pausing left that measurement
   running — so pausing, studying a frame, then stepping filed the whole idle span
