@@ -65,7 +65,8 @@ Each phase ships independently; no phase regresses single-image.
 
 - **Phase 0 — Accounting + ownership prep** (pure, low risk; first).
   `ExrData::approx_bytes()`; move `exr_data: Option<ExrData>` → `Option<Arc<ExrData>>`; budget-math
-  module (`max_t1`/`max_t2`). All unit-tested, no GPU/UI.
+  module (`budget.rs`). All unit-tested, no GPU/UI. (The T1 half was reworked in #230/#232 —
+  the budget is a byte figure, `t1_budget_bytes`, and frame counts derive from it via `frames_in`.)
 - **Phase 1 — Sequence detection** (`src/sequence.rs`, pure, no GPU; zero risk).
   Frame parsing / grouping / numeric sort / hole detection. Tempfile-unit-tested. No UI yet.
 - **Phase 2 — Manual transport over on-demand decode** (shippable, slow).

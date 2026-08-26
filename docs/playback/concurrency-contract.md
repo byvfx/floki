@@ -45,11 +45,24 @@ Inputs: `playhead + direction + resident set + budget` → an **ordered want-lis
 The scheduler never requests a frame that wouldn't fit the **T1 budget**:
 
 ```
-decode_ahead = min(configured, max_t1 − 1)
+prefetch_depth = min(t1_cap − 1, out_point − in_point)      # ExrApp::prefetch_depth
+decode_ahead   = prefetch_depth / active_sources            # split per source (#99)
+read_behind    = scheduler::read_behind(decode_ahead)       # reserved out of it (#169)
 ```
 
 Ring full ahead of the playhead → "nothing to do," the worker idles. There is **no separate bounded
 queue** — the budget *is* the bound. This ties #57 directly to #56.
+
+Two corrections to earlier drafts of this line, both load-bearing:
+
+- **There is no `configured` ceiling.** A `MAX_PREFETCH = 16` constant used to clamp this while
+  playing but not while idle, so pressing Play *shrank* the lookahead — 20 frames per layer down to
+  2 on a six-layer stack, with the read-behind window collapsing to nothing. Removed in #207; the
+  budget and the trimmed range are the only bounds now.
+- **`t1_cap` is derived, not primary.** Since #232 the T1 budget is a byte figure
+  (`budget::t1_budget_bytes`) and the frame count is `budget::frames_in` of it. Eviction enforces
+  both. See [memory-contract](memory-contract.md) — the window is downstream of the cap, so
+  anything that mis-sizes the cap mis-sizes the window with it (which is exactly what #230 did).
 
 ## Epoch counter — required; path-check is insufficient
 

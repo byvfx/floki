@@ -16,6 +16,22 @@ cargo clippy               # Required; fix all warnings before committing
 cargo test                 # Run tests
 ```
 
+**On Windows, go through `scripts\run-windows.ps1` instead.** The `shaderc`/OCIO build
+scripts need cmake + ninja + python, which on a typical dev box are bundled inside
+Visual Studio and Anaconda rather than on `PATH` — so a bare `cargo build` dies with
+`couldn't find required command: "cmake"`. The wrapper imports `vcvars64`, puts those
+on `PATH`, points at the vcpkg OCIO, then shells out to cargo:
+
+```powershell
+scripts\run-windows.ps1 run          # cargo run --release
+scripts\run-windows.ps1 test         # fmt --check + clippy -D warnings + test --all-targets (the CI gate)
+scripts\run-windows.ps1 build        # cargo build --release
+scripts\run-windows.ps1 soak -- <file.exr>   # #100 playback capture; see docs/playback/soak-checklist.md
+```
+
+The app must be **closed** before building — a running instance holds `floki.exe` and
+the link step fails with `Access is denied. (os error 5)`.
+
 Logging is via `env_logger` to stderr; filter with the `floki=` target prefix to silence wgpu/eframe noise:
 
 ```powershell
@@ -33,6 +49,14 @@ device in tests (`viewer::ui` takes `render_state: Option<&RenderState>` — pas
 inline `#[cfg(test)]` modules. Tone/color math lives in `render_math.rs`; the
 `channel_mode` integer encoding's single source of truth is `ChannelMode::as_u32`
 (`viewer.rs`), mirrored by `gpu/shader.wgsl`.
+
+**The test suite cannot see everything.** `tick_budgets` early-returns without a GPU
+device, so the cap arithmetic is unreachable under the GPU-free convention — test the
+pure helpers (`sizing_frame_bytes`, `cache_is_full`, `budget::*`) instead. And the
+soak harness (`run-windows.ps1 soak`) auto-plays and never idles, so anything whose
+trigger is *human timing* is invisible to both: #236 (a pause filed the whole idle
+span as one frame time) survived 360 passing tests and a dozen clean soak runs. For
+playback changes, a real interactive session is a merge gate, not a formality.
 
 ### Auxiliary binaries (`src/bin/`)
 - `cargo run --bin convert_dir -- <input_dir> [output_dir]` — headless batch channel-rename converter (wraps `tools::run_conversion_task`).
@@ -55,6 +79,47 @@ Three things must stay in lockstep when touching rendering:
 
 ### LogicalLayer regrouping (non-obvious, key domain concept)
 `exr_loader.rs` defines `LogicalLayer`, which regroups a physical EXR layer's flat channel list into displayable passes by **dotted-name prefix** (`diffuse.R`/`diffuse.G` → pass `diffuse`). This exists because Blender writes every render pass into a *single* EXR part as channel-name prefixes (`ViewLayer.Combined.R`, ...), which the `exr` crate surfaces as one unnamed layer. Without this regrouping the passes are invisible. R/G/B/A slot indices are resolved at load time so rendering never re-matches names.
+
+### Playback cache & memory budget (the subtlest subsystem — read the contract first)
+Sequence playback holds decoded frames in a byte-budgeted ring (`cache.rs`), sized by
+`budget.rs` from a live memory sample and filled by a single decode worker
+(`scheduler.rs` + `app.rs::pump_decode`). **Before changing anything here, read
+`docs/playback/memory-contract.md`** — the arithmetic looks simple and has been got
+wrong four separate times (#215, #230, #232, #233).
+
+The model, in one paragraph: `budget::t1_budget_bytes` is the single source of truth
+— a slice of *free* RAM (not total), with the ring's own residency added back so it
+doesn't chase its own tail, and the user's RAM setting folded in as a ceiling.
+`budget::frames_in` is the **only** bytes→count conversion, so the byte bound and the
+frame count can't drift. Eviction (`FrameCache::evict_to`) enforces both via
+`cache::Bound`, whichever binds first. The ring is genuinely heterogeneous — playback
+caches beauty-only or proxy frames while each settle upgrade replaces one with a full
+frame at the same key — so `FrameCache::bytes()` measures real residency rather than
+assuming `len × one frame's size`.
+
+Three invariants, each of which has already been violated at least once:
+
+1. **Sizing must gate on the same predicate the decode path uses, never a restatement
+   of it.** `ExrApp::sizing_frame_bytes` calls `decode_proxy_target_for` /
+   `decode_beauty_only_for` directly, on the **clock source**. A gate that drifts from
+   the decode path fills the ring with full frames under a cheap-sized cap — the OOM
+   direction. It has drifted twice (#213/#217 moved the decode path onto
+   `displayed_aov` while the sizing gate still asked `viewer.active_layer`).
+2. **Every sizing fallback chain ends at the dearest measured figure, never smaller,
+   and never at `None`.** Too-small caps are merely wasteful and self-correct; too
+   large risks OOM; `None` makes `tick_budgets` skip its whole T1 branch, freezing the
+   cap at its constructed default with no budget check at all.
+3. **Protected playheads outrank both eviction bounds.** When only the frames on
+   screen remain, `pick_victim` returns `None` and eviction stops *over budget*. That
+   is the contract's degradation, not a leak.
+
+`frame_cache_cap` is not just an eviction bound — it also sizes the prefetch window
+(`prefetch_depth` = `min(cap - 1, span)`) and the read-behind reservation, so
+mis-sizing the cap mis-schedules decoding too. Instrumentation: the 1 Hz
+`floki::playback` trace carries `t1=`, `size_bytes=`, `t1_bytes=<resident>/<budget>`,
+`evict=`, `fallback=`; the debug overlay shows the same. Frame-time percentiles are
+recorded **only while `PlayState::Playing`** (#236) — an interval measured while the
+clock is stopped is user-thinking-time, not a hitch.
 
 ### State & persistence
 `ExrApp` derives serde `(default)`. Fields that should persist across sessions (recent files, LUT path, `enable_lut`, OCIO path) are plain fields; all transient/runtime state (loaded data, GPU handles, conversion progress, window-open flags) is marked `#[serde(skip)]`. Persistence is handled by `eframe` storage. Image B (reference image) is reset whenever Image A changes.

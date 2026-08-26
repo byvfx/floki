@@ -4,6 +4,11 @@
 > the remaining work — gap-closing, real-footage validation (#100), and the feature follow-ons —
 > so it doesn't drift. Builds on the [memory](memory-contract.md) (#56), [concurrency](concurrency-contract.md)
 > (#57), and [sequence-playback](sequence-playback.md) (#7) contracts.
+>
+> **Naming note:** prose below written before #232 refers to `max_t1`. That function is gone —
+> the T1 budget is now a byte figure (`budget::t1_budget_bytes`) with frame counts derived via
+> `budget::frames_in`. Those passages are kept as written because they record what was found and
+> fixed at the time; see [memory-contract](memory-contract.md) for the current model.
 
 ## Where playback actually stands
 
@@ -16,7 +21,7 @@ hardening a working sequence player. Verified present and matching the contracts
 | `Playback` state machine (state / direction / loop / trim / epoch / serde split) | DONE | `src/playback.rs` |
 | Drift-corrected frame clock; stutter (default) + drop-frames pacing | DONE | `app.rs` `tick_playback` |
 | T1 ring cache `(Slot, frame) → Arc<ExrData>`, directional-ring + LRU eviction | DONE | `src/cache.rs` |
-| Budget math (`approx_bytes`, `max_t1`/`max_t2`, VRAM/RAM headroom, off-Metal fixed cap) | DONE | `src/budget.rs` |
+| Budget math (`approx_bytes`, `t1_budget_bytes`/`frames_in`/`vram_available`, headroom, off-Metal fixed cap) | DONE | `src/budget.rs` |
 | Pure scheduler want-list (P0/P1/P2, back-pressure = T1 budget) | DONE | `src/scheduler.rs` |
 | Single-worker decode-ahead + epoch supersession (`pump_decode`/`pump_t2`) | DONE | `app.rs` |
 | Transport UI (timeline w/ holes, in/out, play/step/reverse/loop, fps, T2 kill-switch) | DONE | `app.rs` `draw_transport_bar` |
@@ -68,7 +73,7 @@ Validation is mostly a *soak*, but unproductive without instrumentation first. T
 shipped (#128); the soak is now a runnable checklist: **[soak-checklist.md](soak-checklist.md)**.
 
 - **Instrumentation:** a toggleable cache-state debug overlay — T1/T2 residency counts, the live
-  `max_t1`/`max_t2` caps and the budget inputs, measured-vs-target fps, evictions/sec, dropped-epoch
+  T1/T2 caps and the budget inputs, measured-vs-target fps, evictions/sec, dropped-epoch
   count, in-flight frame. Makes the soak observable instead of guesswork.
 - **Soak matrix:** 2K/4K multi-AOV sequences × {loop, ping-pong, scrub, stutter, drop-frames, in/out
   trim, A/B-hold} on **Metal (Mac)** and **off-Metal fixed-cap (Windows)**.
@@ -156,7 +161,7 @@ result above, but for the *whole* range rather than a window).
 - **Cache-fill indicator:** the classic colored bar under the scrubber showing per-frame residency
   (T1 / T2), filling as it caches. User-facing transport feature; the #128 debug overlay already has
   the residency data, this surfaces it on the timeline.
-- **Budget-bounded, honestly:** if the range exceeds `max_t1`, precache fills to the cap and the bar
+- **Budget-bounded, honestly:** if the range exceeds the T1 budget, precache fills to the cap and the bar
   shows the resident span — it does not pretend to hold what won't fit. This is precisely why the
   budget fix and **beauty-only decode (step 3)** matter: together they decide how much of a shot
   actually fits in RAM, i.e. how much of the bar can go green.
