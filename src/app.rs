@@ -3244,33 +3244,53 @@ impl ExrApp {
     ///   prefetch (so its now-stale result can't clear the awaited upgrade) and
     ///   re-decode the playhead in full. A beauty-only frame stays on screen
     ///   instantly while the full frame decodes; sampling re-enables when it lands.
+    ///
+    /// The fullness question is asked of the **clock source**, not of `A_SOURCE`
+    /// unconditionally (#201). Under `comp_drives_transport` slot A holds no cached
+    /// frames at all, so the A-keyed test answered "not full" on every settle and
+    /// the comp path took the re-decode branch every time — dumping the entire
+    /// in-flight prefetch backlog (`invalidate_inflight` also resets
+    /// `precache_filled`) on a pause where the displayed frame was already final,
+    /// then re-requesting a slot-A frame that has nothing to decode. Same
+    /// `A_SOURCE`-keyed blind spot as #199/#200.
     fn settle_to_full(&mut self) {
         if !self.playback.is_active() {
             return;
         }
-        let a_frame = self.playback.current_frame;
-        let a_full = self
+        let clock = self.clock_source();
+        let frame = self.source_playhead(clock);
+        let clock_full = self
             .frame_cache
-            .peek(Self::A_SOURCE, a_frame)
+            .peek(clock, frame)
             .is_some_and(|d| !d.beauty_only && !d.proxy);
-        if a_full {
-            // A is full-res and displayed; no A decode will land to trigger it,
-            // so refresh the contact sheet now (frozen during play, #144).
+        if clock_full {
+            // The clock source is full-res and displayed; no decode of its will land
+            // to trigger it, so refresh the contact sheet now (frozen during play,
+            // #144).
             self.viewer.invalidate_active_thumbnails();
         } else {
             // Supersede in-flight beauty prefetch, then re-request the playhead at
             // full fidelity (`request_*` upgrades a beauty ring hit; #7).
             // Already-full frames need nothing — the slot-B re-sync that used to run
             // in that case went with the locked-step B path (#99 Slice 3h.2).
+            //
+            // The supersede is **not** slot-A-only: a follower's in-flight cheap
+            // prefetch for the settled frame lands on `res.frame ==
+            // source_playhead(source)` and clears that follower's `pending`, which
+            // is exactly the awaited upgrade `settle_followers_to_full` is about to
+            // set — symptom 1 of #201 by another route. The comp path got this for
+            // free while it was falling into the A branch on every settle; keep it
+            // once the branch is properly gated. The A re-request itself stays
+            // gated, since off the A path it decodes nothing.
             self.invalidate_inflight();
-            self.request_sequence_frame(a_frame);
+            if clock == Self::A_SOURCE {
+                self.request_sequence_frame(frame);
+            }
         }
-        // Always, even when A needed nothing (#212). This used to sit after an
-        // `if a_full { return }`, so slot A being full skipped the comp layers
-        // entirely — and A is full on the classic transport path, which is exactly
-        // where a comp stack can also be present. The comp-driven case has nothing
-        // cached for A, so `a_full` is false there and the bug never showed in the
-        // soak or the tests written against it.
+        // Always, even when the clock source needed nothing (#212). This used to sit
+        // after an `if a_full { return }`, so slot A being full skipped the comp
+        // layers entirely — and A is full on the classic transport path, which is
+        // exactly where a comp stack can also be present.
         self.settle_followers_to_full();
     }
 
@@ -9215,10 +9235,9 @@ mod tests {
     // --- #100 comp-path pins ---------------------------------------------------
     //
     // Each of these asserts the behaviour the comp path *should* have. All are
-    // GPU-free. The sizing (#199) and Stutter-hold (#200) pins are live — they now
-    // guard the fix. The two INV-SAMPLE pins (#201) stay `#[ignore]`d against their
-    // open issue so CI is green while the repro is permanent; that fix's diff is
-    // `-#[ignore]` plus the change.
+    // GPU-free, and all are live — the sizing (#199), Stutter-hold (#200) and
+    // INV-SAMPLE (#201) fixes have all landed, so each pin now guards its fix
+    // rather than documenting an open bug.
     //
     // Common root cause: when the comp stack drives the transport, the primary slot
     // (`A_SOURCE`) never decodes, and every transport-level gate keyed on it goes
@@ -9680,13 +9699,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "#201: request_comp_frame is fidelity-blind — it tests residency only, \
-                so a proxy-resident frame counts as satisfied and never upgrades"]
     fn settling_upgrades_a_proxy_comp_frame_to_full() {
         // INV-SAMPLE (#7): on settle the displayed frame must be full-fidelity, or the
         // readout and AOV switcher see a frame that doesn't carry every channel. The
-        // slot-A path computes this explicitly (`needs_full`); the comp path has no
-        // equivalent, so the blurry frame stays up indefinitely.
+        // slot-A path computes this explicitly (`needs_full`); `request_comp_frame`
+        // grew the same fidelity test in #212, and this holds it there — a residency-
+        // only predicate counts a proxy as satisfied and the blurry frame stays up
+        // indefinitely.
         let (_dir, paths) = write_sequence(5);
         let mut app = ExrApp::default();
         app.add_comp_source(paths[0].clone());
@@ -9710,20 +9729,22 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "#201: same fix site — settle_to_full evaluates fullness against \
-                A_SOURCE, which holds no data once the comp stack drives the clock"]
     fn settling_on_a_full_comp_frame_requests_nothing() {
         // The other half of the settle contract, and what makes the check above a real
         // fidelity test rather than an unconditional re-request: an already-full frame
-        // needs no decode. Today this "passes" for the wrong reason (the path is blind
-        // and always clears `pending`), so it is only meaningful paired with the proxy
-        // case above.
+        // needs no decode. Only meaningful paired with the proxy case above — a blind
+        // path that always cleared `pending` would "pass" this one on its own.
         //
-        // NOTE: the contact-sheet half of #201 — `invalidate_active_thumbnails` being
-        // unreachable because `a_full` is always false — is not pinned here. The
+        // NOTE: the contact-sheet half of #201 is *not* pinned here, and turned out
+        // not to be the bug the issue describes. `invalidate_active_thumbnails` was
+        // genuinely unreachable on the comp path (fixed above — the fullness test is
+        // keyed on the clock source now), but the sheet it would refresh bakes from
+        // `CompSource::exr_data`, which `full_layer_table` (#217) deliberately pins to
+        // the open-time decode and never replaces. So the sheet is frozen on frame one
+        // by construction, and the invalidation re-bakes identical pixels. Tracked
+        // separately; it also needs a `gui_tests`-level test either way, since the
         // thumbnail vector holds `egui::TextureHandle`s that cannot be constructed
-        // without a device, so it is unobservable under the GPU-free convention and
-        // needs a `gui_tests`-level test instead.
+        // without a device.
         let (_dir, paths) = write_sequence(5);
         let mut app = ExrApp::default();
         app.add_comp_source(paths[0].clone());
@@ -9739,6 +9760,51 @@ mod tests {
             app.followers.get(&source).unwrap().pending,
             None,
             "an already-full frame needs no re-decode on settle"
+        );
+    }
+
+    #[test]
+    fn settling_on_a_full_comp_frame_keeps_the_prefetch_backlog() {
+        // The cost side of the same `A_SOURCE`-keyed test (#201). `settle_to_full`
+        // asked whether *slot A* was full, and under `comp_drives_transport` slot A
+        // has nothing cached, so the answer was "no" on every settle — including the
+        // settles where the displayed frame was already final. That took the
+        // re-decode branch, and `invalidate_inflight` does not discriminate: it bumps
+        // the epoch (superseding every worker job in flight, for every source),
+        // clears each follower's `inflight`, and drops `precache_filled`. So pausing
+        // on a fully-decoded frame threw away the read-ahead that pause is exactly
+        // when you want kept, and the ring had to refill from scratch.
+        //
+        // Pinned on the epoch rather than on cache contents: the epoch *is* the
+        // supersession mechanism (`apply_load_result` drops any result whose epoch no
+        // longer matches), so it is what says the in-flight work survived.
+        let (_dir, paths) = write_sequence(5);
+        let mut app = ExrApp::default();
+        app.add_comp_source(paths[0].clone());
+        let source = crate::layer::SourceId(COMP_SOURCE_BASE);
+
+        app.playback.state = PlayState::Playing;
+        app.playback_step(1);
+        deliver_source_frame(&mut app, source, &paths[1], 2); // the playhead, full
+
+        // Read-ahead in flight for the frames after it, and the precache satisfied.
+        app.followers.get_mut(&source).unwrap().inflight.insert(3);
+        app.precache_filled = true;
+        let epoch = app.playback.epoch;
+
+        app.playback_stop();
+
+        assert_eq!(
+            app.playback.epoch, epoch,
+            "settling on a final frame must not supersede in-flight decodes"
+        );
+        assert!(
+            app.followers.get(&source).unwrap().inflight.contains(&3),
+            "nor drop the read-ahead already submitted for the frames after it"
+        );
+        assert!(
+            app.precache_filled,
+            "nor force the precache window to refill from scratch"
         );
     }
 
