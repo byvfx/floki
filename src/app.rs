@@ -2259,6 +2259,64 @@ impl ExrApp {
         }
     }
 
+    /// The `Trim::offset` of the layer drawing `source` — how far that source's
+    /// own frame numbering is shifted from the global timeline (`source = global +
+    /// offset`), so a source frame maps back with `global = source - offset`.
+    ///
+    /// `0` for slot A (the master transport is the global numbering by definition)
+    /// and for a source no layer draws. A source backing more than one layer is
+    /// answered by the first, which is exact while the Add flow makes one source
+    /// per file — the same assumption [`Self::ensure_comp_aov`] already documents.
+    fn source_trim_offset(&self, source: crate::layer::SourceId) -> i64 {
+        if source == Self::A_SOURCE {
+            return 0;
+        }
+        self.comp_stack
+            .iter()
+            .find_map(|l| match &l.source {
+                crate::layer::LayerSource::Image { source: s, .. } if *s == source => {
+                    Some(l.trim.offset)
+                }
+                _ => None,
+            })
+            .unwrap_or(0)
+    }
+
+    /// Resident frames for the ruler's cache-fill bar (#245), in **global**
+    /// timeline numbers and clipped to `[in_pt, out_pt]` — as
+    /// `(resident, full_fidelity)`, the two tones the bar shades.
+    ///
+    /// Keyed on [`Self::clock_source`], not `A_SOURCE`. The bar used to read slot A
+    /// unconditionally, and under `comp_drives_transport` slot A holds no frames at
+    /// all — so the bar was empty on the default path however full the ring was,
+    /// reading as "the precache isn't working" on a session with hundreds of
+    /// resident frames. Same `A_SOURCE`-keyed blind spot as #199/#200/#201, in the
+    /// UI this time. With slot A driving, `clock_source()` *is* `A_SOURCE`, so the
+    /// classic path is unchanged.
+    ///
+    /// The trim mapping matters as soon as the answer isn't slot A: a follower's
+    /// ring is keyed by its **own** frame numbers, and a retimed layer's frame 12
+    /// is not global frame 12. Painting them unmapped would put the fill under the
+    /// wrong part of the ruler — subtly, and only for retimed layers.
+    fn cache_bar_frames(&self, in_pt: u32, out_pt: u32) -> (Vec<u32>, Vec<u32>) {
+        let source = self.clock_source();
+        let offset = self.source_trim_offset(source);
+        let to_global = |f: u32| {
+            let g = i64::from(f).saturating_sub(offset);
+            (g >= i64::from(in_pt) && g <= i64::from(out_pt)).then_some(g as u32)
+        };
+        (
+            self.frame_cache
+                .resident_frames(source)
+                .filter_map(to_global)
+                .collect(),
+            self.frame_cache
+                .resident_full_frames(source)
+                .filter_map(to_global)
+                .collect(),
+        )
+    }
+
     /// Per-source counterpart of [`Self::decode_beauty_only`] (#99): the
     /// settled-precache "keep the playhead full" exception measures against the
     /// source's own current frame (its numbers live in its own range, not A's), so
@@ -6265,19 +6323,11 @@ impl ExrApp {
                     painter.rect_filled(seg, 0.0, color);
                 });
             };
-            // only the trimmed range is the precache target
-            let in_range = |f: u32| f >= in_pt && f <= out_pt;
-            let mut resident: Vec<u32> = self
-                .frame_cache
-                .resident_frames(Self::A_SOURCE)
-                .filter(|&f| in_range(f))
-                .collect();
+            // The clock source's ring, in global numbers and clipped to the trimmed
+            // range (the precache target) — see `cache_bar_frames` for why it is not
+            // `A_SOURCE` (#245).
+            let (mut resident, mut full) = self.cache_bar_frames(in_pt, out_pt);
             paint_runs(&mut resident, CACHE_PROXY_FILL);
-            let mut full: Vec<u32> = self
-                .frame_cache
-                .resident_full_frames(Self::A_SOURCE)
-                .filter(|&f| in_range(f))
-                .collect();
             paint_runs(&mut full, CACHE_FULL_FILL);
             // Holes: distinct vertical marks across the full span.
             if let Some(seq) = self.playback.sequence.as_ref() {
@@ -9805,6 +9855,91 @@ mod tests {
         assert!(
             app.precache_filled,
             "nor force the precache window to refill from scratch"
+        );
+    }
+
+    #[test]
+    fn the_cache_bar_reads_the_clock_source_not_slot_a() {
+        // #245: the ruler's cache-fill bar read `resident_frames(A_SOURCE)`
+        // unconditionally. Under `comp_drives_transport` slot A never decodes, so
+        // the bar was empty on the default path however full the ring actually was
+        // — which reads as "the precache isn't working" on a session holding
+        // hundreds of frames. Same `A_SOURCE`-keyed blind spot as #199/#200/#201.
+        let (_dir, paths) = write_sequence(5);
+        let mut app = ExrApp::default();
+        app.add_comp_source(paths[0].clone());
+        let source = crate::layer::SourceId(COMP_SOURCE_BASE);
+        assert!(app.comp_drives_transport(), "the comp stack owns the clock");
+
+        deliver_source_frame(&mut app, source, &paths[1], 2);
+        deliver_source_frame(&mut app, source, &paths[2], 3);
+
+        assert!(
+            app.frame_cache.resident_frames(ExrApp::A_SOURCE).count() == 0,
+            "slot A holds nothing on the comp path — the premise of the bug"
+        );
+        let (mut resident, mut full) = app.cache_bar_frames(1, 5);
+        resident.sort_unstable();
+        full.sort_unstable();
+        assert!(
+            resident.contains(&2) && resident.contains(&3),
+            "the bar must show the clock source's ring, got {resident:?}"
+        );
+        assert_eq!(full, resident, "full decodes shade as full");
+    }
+
+    #[test]
+    fn the_cache_bar_maps_a_retimed_layer_into_global_frames() {
+        // A follower's ring is keyed by its *own* frame numbers. With a trim offset
+        // (`source = global + offset`) painting them unmapped would put the fill
+        // under the wrong part of the ruler — wrong only for retimed layers, and
+        // quietly.
+        let (_dir, paths) = write_sequence(5);
+        let mut app = ExrApp::default();
+        app.add_comp_source(paths[0].clone());
+        let source = crate::layer::SourceId(COMP_SOURCE_BASE);
+        let layer = app.comp_stack.iter().next().map(|l| l.id).unwrap();
+        // Source frame 3 now sits at global frame 1.
+        app.comp_stack.get_mut(layer).unwrap().trim.offset = 2;
+
+        deliver_source_frame(&mut app, source, &paths[2], 3);
+
+        let (resident, _) = app.cache_bar_frames(1, 5);
+        assert_eq!(
+            resident,
+            vec![1],
+            "source frame 3 at offset 2 paints at global frame 1"
+        );
+    }
+
+    #[test]
+    fn the_cache_bar_separates_cheap_frames_from_full_ones_and_clips_to_the_range() {
+        // The bar is two-tone (#172): every resident frame in the base shade, the
+        // full-fidelity ones brighter. A proxy must appear in the first and not the
+        // second, or a ring full of scrub proxies would read as fully cached.
+        let (_dir, paths) = write_sequence(5);
+        let mut app = ExrApp::default();
+        // Frame 1 is already resident and full: `add_comp_source` decodes the opened
+        // frame synchronously and seeds the ring with it for an instant first hit.
+        app.add_comp_source(paths[0].clone());
+        let source = crate::layer::SourceId(COMP_SOURCE_BASE);
+
+        deliver_source_frame(&mut app, source, &paths[1], 2); // full
+        deliver_source_frame_as(&mut app, source, &paths[2], 3, true, true); // proxy
+        deliver_source_frame(&mut app, source, &paths[4], 5); // full, outside the clip below
+
+        let (mut resident, mut full) = app.cache_bar_frames(1, 4);
+        resident.sort_unstable();
+        full.sort_unstable();
+        assert_eq!(
+            resident,
+            vec![1, 2, 3],
+            "frame 5 is outside [1, 4] and clipped"
+        );
+        assert_eq!(
+            full,
+            vec![1, 2],
+            "frame 3 is resident but a proxy, so it never shades as full"
         );
     }
 

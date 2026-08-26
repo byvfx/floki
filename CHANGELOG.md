@@ -22,6 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer falls back to hardcoded absolute paths when given no arguments.
 
 ### Fixed
+- **The timeline's cache bar shows the cache again.** The green fill marking which
+  frames are resident read *slot A* unconditionally — and since opening a file means
+  adding a layer, the comp stack drives the transport and slot A decodes nothing. The
+  bar sat empty however full the ring actually was, which reads as "the precache isn't
+  working" on a session holding hundreds of frames. It now reads the source actually
+  driving the clock, mapped through that layer's retime so the fill lands under the
+  right part of the ruler rather than under the layer's own frame numbers.
 - **Pausing a comp layer no longer throws away the read-ahead.** Settling asked
   whether *slot A* was holding a full-fidelity frame — but with a comp layer
   driving the transport, slot A decodes nothing, so the answer was "no" on every
