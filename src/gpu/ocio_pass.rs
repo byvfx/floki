@@ -1172,12 +1172,19 @@ mod metal_tests {
 mod device_tests {
     use super::*;
 
-    // Validates the OCIO blit pipeline (new bind-group layout + BLIT_SHADER) compiles and
-    // runs on the platform GPU, and that its three behaviors are correct: the negative-alpha
-    // sentinel means "no image" (transparent), opaque pixels pass the OCIO display color
-    // through, and transparent-but-covered pixels show the display-space checker.
-    #[test]
-    fn blit_coverage_and_checker_on_device() {
+    /// A GPU device for the tests below, or `None` when this machine can't give one —
+    /// in which case the caller returns and the test is a no-op.
+    ///
+    /// There are **two** ways to come up short and both must skip rather than fail.
+    /// The obvious one is a runner with no adapter. The one that actually bit when
+    /// these tests were ungated (#259) is a runner whose adapter is *software*:
+    /// `Test & Lint` is ubuntu-latest, which has llvmpipe, so an adapter-only guard
+    /// sails straight past and then panics in `request_device` — llvmpipe has no
+    /// `FLOAT32_FILTERABLE`, which `GpuState` requires for the f32 3D LUT.
+    ///
+    /// One helper rather than a copy per test: five hand-rolled guards is how the
+    /// second condition came to be missing from all of them at once.
+    fn test_device(label: &'static str) -> Option<(wgpu::Device, wgpu::Queue)> {
         let instance =
             wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let adapter = match pollster::block_on(
@@ -1185,16 +1192,32 @@ mod device_tests {
         ) {
             Ok(a) => a,
             Err(_) => {
-                eprintln!("no GPU adapter available; skipping on-device blit test");
-                return;
+                eprintln!("no GPU adapter available; skipping {label}");
+                return None;
             }
         };
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("blit-test-device"),
+        match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some(label),
             required_features: wgpu::Features::FLOAT32_FILTERABLE,
             ..Default::default()
-        }))
-        .expect("request_device");
+        })) {
+            Ok(dq) => Some(dq),
+            Err(e) => {
+                eprintln!("GPU lacks FLOAT32_FILTERABLE ({e:?}); skipping {label}");
+                None
+            }
+        }
+    }
+
+    // Validates the OCIO blit pipeline (new bind-group layout + BLIT_SHADER) compiles and
+    // runs on the platform GPU, and that its three behaviors are correct: the negative-alpha
+    // sentinel means "no image" (transparent), opaque pixels pass the OCIO display color
+    // through, and transparent-but-covered pixels show the display-space checker.
+    #[test]
+    fn blit_coverage_and_checker_on_device() {
+        let Some((device, queue)) = test_device("blit-test-device") else {
+            return;
+        };
 
         let output_format = wgpu::TextureFormat::Rgba8Unorm;
         let gpu = GpuState::new(&device, &queue, output_format);
@@ -1548,23 +1571,9 @@ mod device_tests {
     // once Multiply/Screen are in the stack.
     #[test]
     fn accumulate_composite_on_device() {
-        let instance =
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-        let adapter = match pollster::block_on(
-            instance.request_adapter(&wgpu::RequestAdapterOptions::default()),
-        ) {
-            Ok(a) => a,
-            Err(_) => {
-                eprintln!("no GPU adapter available; skipping on-device accumulate test");
-                return;
-            }
+        let Some((device, queue)) = test_device("accumulate-test-device") else {
+            return;
         };
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("accumulate-test-device"),
-            required_features: wgpu::Features::FLOAT32_FILTERABLE,
-            ..Default::default()
-        }))
-        .expect("request_device");
 
         // Rgba8Unorm surface format is irrelevant here — we only drive `pipeline_linear`
         // (Rgba16Float offscreen) and reuse GpuState's real bind-group layouts, ring
@@ -1875,23 +1884,9 @@ mod device_tests {
     // region equals the CPU A-over-B×2^EV reference (so it can't pass by both being blank).
     #[test]
     fn accumulate_matches_single_pass_composite_on_device() {
-        let instance =
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-        let adapter = match pollster::block_on(
-            instance.request_adapter(&wgpu::RequestAdapterOptions::default()),
-        ) {
-            Ok(a) => a,
-            Err(_) => {
-                eprintln!("no GPU adapter available; skipping on-device accumulate-parity test");
-                return;
-            }
+        let Some((device, queue)) = test_device("accumulate-parity-device") else {
+            return;
         };
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("accumulate-parity-device"),
-            required_features: wgpu::Features::FLOAT32_FILTERABLE,
-            ..Default::default()
-        }))
-        .expect("request_device");
         let gpu = GpuState::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
 
         // 4x2 screen; the image occupies the RIGHT half (off-origin, so screen-normalized
@@ -2171,23 +2166,9 @@ mod device_tests {
     // sRGB(0.5 linear) ≈ 0.7353 → 187/255; alpha carries through.
     #[test]
     fn display_encode_srgb_on_device() {
-        let instance =
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-        let adapter = match pollster::block_on(
-            instance.request_adapter(&wgpu::RequestAdapterOptions::default()),
-        ) {
-            Ok(a) => a,
-            Err(_) => {
-                eprintln!("no GPU adapter available; skipping display-encode test");
-                return;
-            }
+        let Some((device, queue)) = test_device("display-encode-test-device") else {
+            return;
         };
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("display-encode-test-device"),
-            required_features: wgpu::Features::FLOAT32_FILTERABLE,
-            ..Default::default()
-        }))
-        .expect("request_device");
         let gpu = GpuState::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
 
         let extent = wgpu::Extent3d {
@@ -2324,23 +2305,9 @@ mod device_tests {
     // as the a=-1 "no image" sentinel — the black-outside-disp bug, in miniature.
     #[test]
     fn accumulate_preserves_the_union_of_disjoint_layer_rects() {
-        let instance =
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-        let adapter = match pollster::block_on(
-            instance.request_adapter(&wgpu::RequestAdapterOptions::default()),
-        ) {
-            Ok(a) => a,
-            Err(_) => {
-                eprintln!("no GPU adapter available; skipping on-device union test");
-                return;
-            }
+        let Some((device, queue)) = test_device("union-test-device") else {
+            return;
         };
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("union-test-device"),
-            required_features: wgpu::Features::FLOAT32_FILTERABLE,
-            ..Default::default()
-        }))
-        .expect("request_device");
         let gpu = GpuState::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
 
         let (w, h) = (4u32, 1u32);
