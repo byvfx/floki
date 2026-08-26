@@ -261,14 +261,14 @@ pub struct CompDraw {
     pub blend: BlendMode,
     /// Layer opacity in `[0, 1]`.
     pub opacity: f32,
-    /// This layer's own header pixel aspect ratio.
-    ///
-    /// Not used for placement — every layer is drawn into the one `image_rect`,
-    /// unsqueezed by the *bottom* layer's PAR (#194 / #179). Carried so the
-    /// `evt=layer_geom` trace can say what each layer's aspect actually is next to
-    /// the rect it was given, which is how #254 becomes visible in a log rather than
-    /// in a screenshot.
+    /// This layer's own header pixel aspect ratio, used for its own unsqueeze (#254).
     pub par: f32,
+    /// This layer's own full-res pixel dimensions, so it can be placed at its own
+    /// display size rather than stretched to the bottom layer's rect (#254). Same
+    /// role `CompSideB::tex_size` has played for the Side-by-Side pane since #99 —
+    /// that pane was the only place in the composite where a layer kept its own
+    /// geometry, and it is the model this generalizes to N layers.
+    pub tex_size: egui::Vec2,
 }
 
 /// The right-hand pane of a comp Side-by-Side (#99 Slice 2a). A compare shows the two
@@ -278,12 +278,12 @@ pub struct CompDraw {
 /// single placed overlay draw.
 pub(crate) struct CompSideB {
     /// The layer's texture + blend/opacity, resolved exactly like a `CompDraw`.
+    ///
+    /// Its `tex_size` / `par` are the pane's own geometry. They used to be duplicated
+    /// onto this struct because `CompDraw` had no geometry of its own; #254 gave every
+    /// layer the same two fields, so the copies would only be a way for the pane and
+    /// the layer to disagree.
     pub draw: CompDraw,
-    /// The layer's own full-res pixel dimensions, so its pane keeps its own aspect
-    /// instead of being stretched to the composite's canvas.
-    pub tex_size: egui::Vec2,
-    /// The layer's own header pixel aspect, for its own anamorphic unsqueeze.
-    pub par: f32,
 }
 
 /// Where each compare pane lands on screen, per arrangement (#99 Slice 2a/2b).
@@ -349,6 +349,30 @@ pub(crate) fn comp_pane_layout(
             }
         }
     }
+}
+
+/// Where one composite layer lands on screen (#254): its own pixel dimensions at its
+/// own effective pixel aspect, centred on the canvas.
+///
+/// The composite used to resolve a single PAR and stretch every layer to the bottom
+/// layer's rect, so an anamorphic plate over a square previs was squeezed back to 1:1.
+/// This is the same rule [`side_by_side_layout`] has always applied to its second pane
+/// — `tex_size * scale * its own par` — generalized from two panes to N layers.
+///
+/// `eff_par` is the layer's effective pixel aspect (see `ExrViewer::unsqueeze_factor`:
+/// the manual override if set, else the header PAR, gated on the unsqueeze toggle).
+/// Centred rather than offset because `Layer::transform`'s canvas-space offset is still
+/// ignored by the renderer; honouring it is a separate change. Pure.
+pub(crate) fn comp_layer_rect(
+    canvas_center: egui::Pos2,
+    scale: f32,
+    tex_size: egui::Vec2,
+    eff_par: f32,
+) -> egui::Rect {
+    egui::Rect::from_center_size(
+        canvas_center,
+        egui::vec2(tex_size.x * scale * eff_par, tex_size.y * scale),
+    )
 }
 
 /// Which pane a blink compare shows at `time` (seconds), and when it next flips
@@ -2510,11 +2534,11 @@ impl ExrViewer {
         // same); framing on first paint fits the *unsqueezed* base layer extents.
         // Side-by-Side lays the composite and the current layer out horizontally, so the
         // first-paint fit must span both or the second pane spills off-screen.
-        let par_b = side_b.as_ref().map(|b| self.unsqueeze_factor(b.par));
+        let par_b = side_b.as_ref().map(|b| self.unsqueeze_factor(b.draw.par));
         let fit_b = side_b
             .as_ref()
             .zip(par_b)
-            .map(|(b, pb)| egui::vec2(b.tex_size.x * pb, b.tex_size.y));
+            .map(|(b, pb)| egui::vec2(b.draw.tex_size.x * pb, b.draw.tex_size.y));
         self.handle_canvas_interaction(
             ui,
             rect,
@@ -2531,7 +2555,10 @@ impl ExrViewer {
             self.translation,
             self.scale,
             image_size,
-            side_b.as_ref().zip(par_b).map(|(b, pb)| (b.tex_size, pb)),
+            side_b
+                .as_ref()
+                .zip(par_b)
+                .map(|(b, pb)| (b.draw.tex_size, pb)),
             self.normalize_side_by_side,
         );
         let image_rect = panes.image_rect;
@@ -2633,12 +2660,22 @@ impl ExrViewer {
         if blink_b == Some(true)
             && let Some(b) = side_b.as_ref()
         {
+            // Pane B at its own display size (#254), like every other layer. Pane A is
+            // the accumulate fold below, which already places itself, so both phases of
+            // the blink now hold their own aspect instead of the B phase snapping to
+            // the canvas the A phase happened to set.
+            let rect_b = comp_layer_rect(
+                image_rect.center(),
+                self.scale,
+                b.draw.tex_size,
+                self.unsqueeze_factor(b.draw.par),
+            );
             ctx.draw(
                 &painter,
                 b.draw.bind_group.clone(),
                 None,
                 rect,
-                image_rect,
+                rect_b,
                 false, // is_diff
                 false, // is_composite
                 b.draw.opacity,
@@ -2671,19 +2708,31 @@ impl ExrViewer {
         // stays correct the moment layers stop sharing one rect.
         let mut union_rect: Option<egui::Rect> = None;
         for (i, d) in stack_draws.iter().enumerate() {
-            // Every layer still draws at `image_rect`; per-layer placement is #254.
-            // This binding is the seam that lands it — the accumulate and the display
-            // stage below no longer assume the rects coincide, so #254 only has to
-            // compute a rect here.
-            let layer_rect = image_rect;
+            // Each layer at its own display size (#254), centred on the canvas — the
+            // composite no longer resolves one pixel aspect and stretches everything
+            // to the bottom layer's rect. This generalizes what `side_by_side_layout`
+            // has always done for its second pane (`tex_size * scale * its own par`)
+            // from two panes to N layers.
+            //
+            // Centring, not offsetting: `Layer::transform` carries a canvas-space
+            // offset and is still ignored by the renderer, so honouring it is a
+            // separate change. Every layer shares a centre until then.
+            let layer_par = self.unsqueeze_factor(d.par);
+            let layer_rect =
+                comp_layer_rect(image_rect.center(), self.scale, d.tex_size, layer_par);
             union_rect = Some(union_rect.map_or(layer_rect, |u| u.union(layer_rect)));
             if debug_geom {
                 // Printing each layer's own rect beside its own `par` is the point:
                 // a `par=2.000` layer handed the same rect as a `par=1.000` one is
                 // #254, stated in one line.
                 geom.push(format!(
-                    "l{i}:par={:.3},x=[{:.0},{:.0}],y=[{:.0},{:.0}]",
-                    d.par, layer_rect.min.x, layer_rect.max.x, layer_rect.min.y, layer_rect.max.y,
+                    "l{i}:par={:.3},eff={:.3},x=[{:.0},{:.0}],y=[{:.0},{:.0}]",
+                    d.par,
+                    layer_par,
+                    layer_rect.min.x,
+                    layer_rect.max.x,
+                    layer_rect.min.y,
+                    layer_rect.max.y,
                 ));
             }
             // The fold must cover this layer *and* everything already accumulated
@@ -2804,9 +2853,15 @@ impl ExrViewer {
             }
             _ => Vec::new(),
         };
+        // The region the display stage covers: the panes plus whatever the layers
+        // actually reach (#254 — a layer can now be wider than the canvas). `disp_rect`
+        // alone would clip the background gradient's normalization to the base layer
+        // in Stacked; `union_rect` alone would drop pane B in Side-by-Side, where the
+        // union only spans the stack draws. Both, so neither case loses.
+        let covered = disp_rect.union(union_rect.unwrap_or(disp_rect));
         let blit_uniforms = crate::gpu::BlitUniforms {
-            display_min: [disp_rect.min.x, disp_rect.min.y],
-            display_max: [disp_rect.max.x, disp_rect.max.y],
+            display_min: [covered.min.x, covered.min.y],
+            display_max: [covered.max.x, covered.max.y],
             screen_size: [content.width(), content.height()],
             overscan_factor: 1.0,
             bg_mode: self.prefs.background.mode.as_u32() as f32,
@@ -3653,6 +3708,47 @@ mod gui_tests {
             (true, true),
             "top blends + view ops"
         );
+    }
+
+    #[test]
+    fn comp_layer_rect_gives_each_layer_its_own_display_aspect() {
+        use super::comp_layer_rect;
+        let center = egui::pos2(500.0, 300.0);
+
+        // The #254 case: a 2:1 anamorphic plate (PAR 2.0) and a square-pixel previs of
+        // the same pixel dimensions, in one stack. The plate must be twice as wide on
+        // screen. Before this, both got the bottom layer's rect and the plate was
+        // squeezed back to 1:1.
+        let tex = egui::vec2(1000.0, 500.0);
+        let plate = comp_layer_rect(center, 1.0, tex, 2.0);
+        let previs = comp_layer_rect(center, 1.0, tex, 1.0);
+        assert_eq!(plate.width(), 2000.0, "PAR 2.0 doubles the on-screen width");
+        assert_eq!(previs.width(), 1000.0, "PAR 1.0 is a no-op");
+        assert_eq!(
+            plate.height(),
+            previs.height(),
+            "the unsqueeze is horizontal only — height never changes"
+        );
+
+        // Concentric, so the composite stays registered about the canvas centre and
+        // the wider layer overhangs symmetrically rather than shifting the picture.
+        assert_eq!(plate.center(), previs.center());
+        assert_eq!(plate.center(), center);
+
+        // Zoom multiplies both axes; the aspect ratio is scale-invariant.
+        let zoomed = comp_layer_rect(center, 0.25, tex, 2.0);
+        assert_eq!(zoomed.width(), 500.0);
+        assert_eq!(zoomed.height(), 125.0);
+        assert!(
+            (zoomed.width() / zoomed.height() - plate.width() / plate.height()).abs() < 1e-6,
+            "display aspect must not depend on zoom"
+        );
+
+        // Layers of *different* pixel dimensions keep their own size too — placement
+        // reads the layer's texture, never the canvas.
+        let small = comp_layer_rect(center, 1.0, egui::vec2(200.0, 100.0), 1.0);
+        assert_eq!(small.width(), 200.0);
+        assert_eq!(small.height(), 100.0);
     }
 
     #[test]
