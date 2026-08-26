@@ -1209,10 +1209,16 @@ mod device_tests {
         }
     }
 
-    // Validates the OCIO blit pipeline (new bind-group layout + BLIT_SHADER) compiles and
-    // runs on the platform GPU, and that its three behaviors are correct: the negative-alpha
-    // sentinel means "no image" (transparent), opaque pixels pass the OCIO display color
-    // through, and transparent-but-covered pixels show the display-space checker.
+    // Validates the blit pipeline (`GpuState::blit_pipeline` + `BLIT_SHADER`, and its
+    // bind-group layout) compiles and runs on the platform GPU, and that its three
+    // behaviors are correct: the negative-alpha sentinel means "no image" (transparent),
+    // opaque pixels pass the display color through, and transparent-but-covered pixels
+    // show the display-space checker.
+    //
+    // The blit is the last stage of the OCIO *path*, but it needs no OCIO config: it
+    // garnishes whatever the display stage produced, which is the OCIO transform when
+    // OCIO is on and the sRGB display-encode when it is off. Hence `device_tests` rather
+    // than `metal_tests` — a GPU is required, an OCIO build is not.
     #[test]
     fn blit_coverage_and_checker_on_device() {
         let Some((device, queue)) = test_device("blit-test-device") else {
