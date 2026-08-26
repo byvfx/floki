@@ -2688,14 +2688,22 @@ impl ExrViewer {
         // together and the manual override — which scales the canvas — does not
         // squeeze the other layers by its inverse.
         let base_u = self.sanitize_unsqueeze(base_par);
-        // Per-layer resolved geometry, logged on change (#254). The playback trace
-        // describes decode and residency but has never said a word about *where*
-        // each layer landed, so a placement bug could only be diagnosed by measuring
-        // pixels in a screenshot. Signature-gated rather than throttled: geometry is
-        // static while nothing moves, so "log when it differs" is silent in the
-        // steady state and immediate on the frame that matters.
-        let mut geom: Vec<String> = Vec::new();
+        // Per-layer resolved geometry, logged on change. The playback trace describes
+        // decode and residency but has never said a word about *where* each layer
+        // landed, so a placement bug could only be investigated by measuring the
+        // picture in a screenshot — which is how #254 was found, and how long it took
+        // to characterize.
+        //
+        // Signature-gated rather than throttled: geometry is static while nothing
+        // moves, so "log when it differs" is silent in the steady state and immediate
+        // on the frame that changes. Formatting is skipped entirely unless the target
+        // is enabled, so this costs a bool check in a normal run.
+        //
+        // `rel` is carried alongside `par` because on this path the two differ: the
+        // rect a layer was handed is the canvas scaled by that ratio, and reading
+        // them together is what says whether the correction landed.
         let debug_geom = log::log_enabled!(target: "floki::playback", log::Level::Debug);
+        let mut geom: Vec<String> = Vec::new();
         for (i, d) in stack_draws.iter().enumerate() {
             let rel = relative_unsqueeze(self.sanitize_unsqueeze(d.par), base_u);
             let layer_rect = layer_draw_rect(image_rect, rel);
@@ -2736,9 +2744,10 @@ impl ExrViewer {
         ctx.blend_override.set(None);
         if debug_geom {
             // `canvas` is the rect every layer used to share; `disp` is the display
-            // window the overscan gate and the background gradient are keyed on —
-            // both are here because a layer drawn outside either one is exactly the
-            // class of bug this line exists to catch.
+            // window the overscan gate and the background gradient key off. Both are
+            // here because a layer drawn outside either one is exactly the class of
+            // bug this line exists to catch — and on #254 they turned out to be two
+            // different bugs.
             let line = format!(
                 "evt=layer_geom n={} base_par={:.3} par={:.3} canvas=[{:.0},{:.0}]x[{:.0},{:.0}] \
                  disp=[{:.0},{:.0}]x[{:.0},{:.0}] {}",
