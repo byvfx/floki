@@ -8494,6 +8494,7 @@ impl ExrApp {
                 bind_group,
                 blend: d.blend,
                 opacity: d.opacity,
+                par: cs.exr_data.image.attributes.pixel_aspect,
             });
         }
 
@@ -8538,6 +8539,9 @@ impl ExrApp {
                     bind_group: cs.bind_group.clone()?,
                     blend: d.blend,
                     opacity: d.opacity,
+                    // Pane B is placed by `CompSideB::par` below, not through the
+                    // accumulate loop's relative correction — carried for consistency.
+                    par: cs.exr_data.image.attributes.pixel_aspect,
                 },
                 tex_size: egui::vec2(cs.size.0.max(1) as f32, cs.size.1.max(1) as f32),
                 par: cs.exr_data.image.attributes.pixel_aspect,
@@ -8563,6 +8567,9 @@ impl ExrApp {
                         bind_group,
                         blend: a.blend,
                         opacity: a.opacity,
+                        // Pane A *is* the base in a compare, so its relative
+                        // correction is 1 by construction — same PAR both sides.
+                        par: cs.exr_data.image.attributes.pixel_aspect,
                     }];
                     base_size = cs.size;
                     base_par = cs.exr_data.image.attributes.pixel_aspect;
@@ -8685,16 +8692,35 @@ impl ExrApp {
         {
             self.comp_readout = Some(b);
         }
+        // The `bool` is "this pane went through the accumulate loop's per-layer
+        // unsqueeze" (#254). Only pane A does: pane B is placed by `CompSideB::par`,
+        // already at its own aspect, and Wipe binds both layers to pane A's rect
+        // without a per-layer correction. Applying the ratio there would
+        // double-correct.
         let side = match picked {
-            Some(crate::viewer::CompSide::A) => rect_a.map(|ir| (ir, &top)),
+            Some(crate::viewer::CompSide::A) => rect_a.map(|ir| (ir, &top, true)),
             // Side-by-Side gives pane B its own rect; Wipe overlays both layers in
             // pane A's rect, so B is sampled against that one.
-            Some(crate::viewer::CompSide::B) => rect_b.or(rect_a).map(|ir| (ir, &side_b)),
+            Some(crate::viewer::CompSide::B) => rect_b.or(rect_a).map(|ir| (ir, &side_b, false)),
             None => None,
         };
         let sampled = match (side, hover) {
-            (Some((ir, Some((exr, aov)))), Some(pos)) => {
+            (Some((ir, Some((exr, aov)), relative)), Some(pos)) => {
                 let size = exr.logical_size(*aov).unwrap_or((0, 0));
+                // Sample against the rect this layer actually drew at. The canvas is
+                // unsqueezed for the base layer, so a differently-squeezed layer sits
+                // in a horizontally scaled rect — normalizing across the canvas
+                // instead would slide the readout off the cursor by that ratio.
+                let ir = if relative {
+                    let rel = crate::viewer::relative_unsqueeze(
+                        self.viewer
+                            .sanitize_unsqueeze(exr.image.attributes.pixel_aspect),
+                        self.viewer.sanitize_unsqueeze(self.viewer.last_base_par),
+                    );
+                    crate::viewer::layer_draw_rect(ir, rel)
+                } else {
+                    ir
+                };
                 comp_hover_pixel(pos, ir, size)
                     .map(|(x, y)| (x, y, self.viewer.sample_pixel(exr, *aov, x, y)))
             }

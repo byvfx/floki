@@ -26,6 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer falls back to hardcoded absolute paths when given no arguments.
 
 ### Fixed
+- **An anamorphic layer is unsqueezed even when the rest of the stack is square.**
+  The composite resolved one pixel aspect for the whole canvas, from the bottom
+  layer — so a squeezed plate dropped onto a square stack stayed squeezed, and a
+  square layer over an anamorphic base was stretched to match it. Each layer now
+  displays at its own aspect, and the pixel readout follows. The Custom factor
+  control still scales the canvas as a whole; it no longer squeezes every other
+  layer by the inverse when used to correct one.
 - **Opening a file that is already open no longer adds an invisible duplicate.** The
   copy landed exactly on top of the original, so the picture did not change — but it
   cost a full decode, another decode follower dividing the single worker, and another

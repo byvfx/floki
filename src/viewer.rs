@@ -261,6 +261,49 @@ pub struct CompDraw {
     pub blend: BlendMode,
     /// Layer opacity in `[0, 1]`.
     pub opacity: f32,
+    /// This layer's own header pixel aspect ratio (#254).
+    ///
+    /// The composite used to unsqueeze once, for the whole canvas, from the bottom
+    /// layer's PAR — so an anamorphic plate dropped onto a square stack stayed
+    /// squeezed, and a square layer over an anamorphic base was stretched. Each
+    /// layer now carries its own, and [`relative_unsqueeze`] turns the pair into the
+    /// extra horizontal scale that layer needs relative to the canvas.
+    pub par: f32,
+}
+
+/// The horizontal scale a layer needs *relative to the canvas*, so it displays at
+/// its own aspect inside a composite unsqueezed for the base layer (#254).
+///
+/// Both PARs go through the same gate, so the anamorphic toggle switches the whole
+/// thing off together (`1.0 / 1.0`) rather than leaving layers half-corrected.
+///
+/// Deliberately a **ratio of header PARs**, with the manual override excluded. The
+/// override is a global "this footage's header is wrong" knob applied to the canvas
+/// as a whole; folding it in here would make correcting one layer squeeze every
+/// other layer by the inverse, which is the failure mode the A/B path already avoids
+/// by unsqueezing pane B from its own header (`sanitize_unsqueeze`, #179).
+///
+/// Guards a zero/degenerate base: an unusable ratio is no correction, never a
+/// collapsed or infinite rect.
+pub(crate) fn relative_unsqueeze(layer: f32, base: f32) -> f32 {
+    if base.is_finite() && base > 0.0 && layer.is_finite() && layer > 0.0 {
+        layer / base
+    } else {
+        1.0
+    }
+}
+
+/// A layer's draw rect inside the composite: `image_rect` scaled horizontally about
+/// its own centre by `rel` (#254). Identity when `rel` is 1, which is every layer of
+/// a uniform-PAR stack — so the common case is bit-for-bit what it was.
+pub(crate) fn layer_draw_rect(image_rect: egui::Rect, rel: f32) -> egui::Rect {
+    if !rel.is_finite() || (rel - 1.0).abs() < f32::EPSILON {
+        return image_rect;
+    }
+    egui::Rect::from_center_size(
+        image_rect.center(),
+        egui::vec2(image_rect.width() * rel, image_rect.height()),
+    )
 }
 
 /// The right-hand pane of a comp Side-by-Side (#99 Slice 2a). A compare shows the two
@@ -1081,6 +1124,11 @@ pub struct ExrViewer {
     /// with [`pick_comp_side`] so the pixel readout samples the pane under the cursor
     /// rather than always reporting the composite. Transient.
     pub last_image_rect_b: Option<egui::Rect>,
+    /// The pixel aspect the composite canvas was last unsqueezed for — the bottom
+    /// drawable layer's header PAR (#254). Paired with a layer's own PAR by
+    /// [`relative_unsqueeze`] to recover the rect that layer actually drew at, which
+    /// the pixel readout needs to normalize against. Runtime-only.
+    pub last_base_par: f32,
 
     /// `(wipe_center, wipe_angle)` when the last comp frame drew a Wipe (#99 Slice 2b);
     /// `None` otherwise. Wipe overlays both layers in one rect, so the pixel readout
@@ -1166,6 +1214,7 @@ impl Default for ExrViewer {
             last_canvas_rect: None,
             last_image_rect: None,
             last_image_rect_b: None,
+            last_base_par: 1.0,
             last_wipe: None,
             last_blink_b: None,
             annotations: Vec::new(),
@@ -1872,7 +1921,7 @@ impl ExrViewer {
     /// malformed/absent header PAR must not collapse the image to a near-zero
     /// width, and the reciprocal used in screen↔image coordinate mapping must stay
     /// finite.
-    fn sanitize_unsqueeze(&self, factor: f32) -> f32 {
+    pub(crate) fn sanitize_unsqueeze(&self, factor: f32) -> f32 {
         if !self.prefs.anamorphic_unsqueeze {
             return 1.0;
         }
@@ -2475,6 +2524,9 @@ impl ExrViewer {
         // cursor→pixel readout (`comp_hover_pixel` on `last_image_rect`) stays correct
         // with no extra term.
         let par = self.unsqueeze_factor(base_par);
+        // What the canvas was unsqueezed for, so the readout can recover each layer's
+        // own rect (#254). Stored raw — the sanitize/ratio happens at the comparison.
+        self.last_base_par = base_par;
 
         let (rect, response) =
             ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
@@ -2626,7 +2678,17 @@ impl ExrViewer {
             draws
         };
         let n = stack_draws.len();
+        // The canvas is unsqueezed for the base layer, so a layer whose own PAR
+        // differs needs the remaining ratio applied to its rect (#254). Computed from
+        // sanitized *header* PARs, so the anamorphic toggle turns the whole thing off
+        // together and the manual override — which scales the canvas — does not
+        // squeeze the other layers by its inverse.
+        let base_u = self.sanitize_unsqueeze(base_par);
         for (i, d) in stack_draws.iter().enumerate() {
+            let layer_rect = layer_draw_rect(
+                image_rect,
+                relative_unsqueeze(self.sanitize_unsqueeze(d.par), base_u),
+            );
             let (is_composite, is_top) = comp_layer_flags(i, n);
             // Neutralize the global view ops on every layer but the top, so exposure
             // / channel isolation apply once to the finished composite (PR-A.4).
@@ -2643,7 +2705,7 @@ impl ExrViewer {
                 d.bind_group.clone(),
                 None,
                 rect,
-                image_rect,
+                layer_rect,
                 false, // is_diff
                 is_composite,
                 d.opacity,
@@ -3885,6 +3947,99 @@ mod gui_tests {
         assert!(
             (f.y - 1080.0).abs() < 0.01,
             "equal heights when normalized {f:?}"
+        );
+    }
+
+    #[test]
+    fn relative_unsqueeze_is_the_ratio_and_degrades_to_no_correction() {
+        use super::relative_unsqueeze;
+        // An anamorphic layer over a square base needs its full squeeze applied; a
+        // square layer over an anamorphic base needs the inverse, or the base's
+        // canvas stretch would smear it.
+        assert_eq!(relative_unsqueeze(2.0, 1.0), 2.0);
+        assert_eq!(relative_unsqueeze(1.0, 2.0), 0.5);
+        // Matching PARs — the overwhelmingly common stack — must be exactly 1, so
+        // `layer_draw_rect` returns the canvas rect untouched.
+        assert_eq!(relative_unsqueeze(2.0, 2.0), 1.0);
+        assert_eq!(relative_unsqueeze(1.0, 1.0), 1.0);
+        // Degenerate inputs are no correction, never a collapsed or infinite rect.
+        for (l, b) in [
+            (1.0, 0.0),
+            (0.0, 1.0),
+            (1.0, -2.0),
+            (-2.0, 1.0),
+            (f32::NAN, 1.0),
+            (1.0, f32::NAN),
+            (f32::INFINITY, 1.0),
+        ] {
+            assert_eq!(relative_unsqueeze(l, b), 1.0, "layer {l}, base {b}");
+        }
+    }
+
+    #[test]
+    fn layer_draw_rect_scales_width_about_the_centre_only() {
+        use super::layer_draw_rect;
+        let r = egui::Rect::from_center_size(egui::pos2(100.0, 50.0), egui::vec2(200.0, 100.0));
+
+        // Identity at 1 — bit-for-bit the canvas rect, which is what keeps a
+        // uniform-PAR stack rendering exactly as it did before #254.
+        assert_eq!(layer_draw_rect(r, 1.0), r);
+        assert_eq!(layer_draw_rect(r, f32::NAN), r);
+
+        let wide = layer_draw_rect(r, 2.0);
+        assert_eq!(wide.width(), 400.0, "width takes the whole correction");
+        assert_eq!(wide.height(), 100.0, "height is never touched");
+        assert_eq!(wide.center(), r.center(), "and it grows about the centre");
+
+        let narrow = layer_draw_rect(r, 0.5);
+        assert_eq!(narrow.width(), 100.0);
+        assert_eq!(narrow.center(), r.center());
+    }
+
+    #[test]
+    fn the_anamorphic_toggle_disables_the_per_layer_correction_too() {
+        use super::{layer_draw_rect, relative_unsqueeze};
+        // With unsqueeze off, both PARs sanitize to 1.0, so the ratio is 1 and every
+        // layer draws at the canvas rect — squeezed, which is what the toggle means.
+        // A half-applied correction (canvas square, layers still stretched) would be
+        // worse than either consistent state.
+        let mut v = ExrViewer::default();
+        assert!(v.prefs.anamorphic_unsqueeze, "unsqueeze is on by default");
+        v.prefs.anamorphic_unsqueeze = false;
+        let rel = relative_unsqueeze(v.sanitize_unsqueeze(2.0), v.sanitize_unsqueeze(1.0));
+        assert_eq!(rel, 1.0);
+        let r = egui::Rect::from_center_size(egui::pos2(0.0, 0.0), egui::vec2(10.0, 10.0));
+        assert_eq!(layer_draw_rect(r, rel), r);
+
+        // Back on, the anamorphic layer is corrected relative to the square base.
+        v.prefs.anamorphic_unsqueeze = true;
+        assert_eq!(
+            relative_unsqueeze(v.sanitize_unsqueeze(2.0), v.sanitize_unsqueeze(1.0)),
+            2.0
+        );
+    }
+
+    #[test]
+    fn the_manual_override_does_not_squeeze_the_other_layers() {
+        use super::relative_unsqueeze;
+        // The override is a global "this header is wrong" knob and scales the whole
+        // canvas through `unsqueeze_factor`. The per-layer ratio is computed from
+        // headers only, so correcting one layer must not squeeze every other layer by
+        // the inverse — the same trap the A/B path avoids by unsqueezing pane B from
+        // its own header (#179).
+        let v = ExrViewer {
+            pixel_aspect_override: Some(1.33),
+            ..Default::default()
+        };
+        assert_eq!(
+            v.unsqueeze_factor(2.0),
+            1.33,
+            "the canvas takes the override"
+        );
+        assert_eq!(
+            relative_unsqueeze(v.sanitize_unsqueeze(2.0), v.sanitize_unsqueeze(2.0)),
+            1.0,
+            "but two same-PAR layers stay uncorrected relative to each other"
         );
     }
 
