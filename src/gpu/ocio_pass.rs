@@ -1472,6 +1472,10 @@ mod metal_tests {
             wipe_center: [0.0, 0.0],
             display_min: rect_min,
             display_max: rect_max,
+            // These tests fold layers that all share one rect, so the fold quad is
+            // that rect — the same geometry the accumulate used before #257.
+            fold_min: rect_min,
+            fold_max: rect_max,
             exposure,
             gamma: 1.0,
             diff_multiplier: 1.0,

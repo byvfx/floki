@@ -278,6 +278,10 @@ fn uniforms_for(tone: &ThumbnailTone, out_w: usize, out_h: usize) -> crate::gpu:
         // Whole target counts as "inside" — no overscan dim on thumbnails.
         display_min: [0.0, 0.0],
         display_max: [out_w as f32, out_h as f32],
+        // Not an accumulate fold (composite_accum == 0), so this is unread; equal to
+        // the rect so the vertex math is the plain placed quad either way.
+        fold_min: [0.0, 0.0],
+        fold_max: [out_w as f32, out_h as f32],
         exposure: tone.exposure,
         gamma: tone.gamma,
         diff_multiplier: 0.0,

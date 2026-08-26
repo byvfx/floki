@@ -732,6 +732,12 @@ struct DrawCtx<'a> {
     /// overrides `u.blend_mode` for the next draw; `None` (every A/B path) keeps the
     /// base uniform's blend.
     blend_override: std::cell::Cell<Option<BlendMode>>,
+    /// The screen-space quad the next **accumulate fold** rasterizes (#257) — the
+    /// running union of the layer rects. A fold clears the whole target, so it must
+    /// cover everything the accumulation below it occupies, but no more. `None`
+    /// (every path but the layer-stack loop) falls back to the draw's own rect,
+    /// which is the pre-#257 geometry.
+    fold_rect: std::cell::Cell<Option<egui::Rect>>,
     /// Running FNV-1a hash of everything affecting the OCIO render, so the
     /// display transform is skipped on repaints that change nothing.
     ocio_sig: std::cell::Cell<u64>,
@@ -758,6 +764,11 @@ impl DrawCtx<'_> {
         let mut u = self.uniform_data;
         u.rect_min = [target_rect.min.x, target_rect.min.y];
         u.rect_max = [target_rect.max.x, target_rect.max.y];
+        // Only an accumulate fold reads this (see the `Uniforms::fold_*` docs); every
+        // other draw gets its own rect, making the vertex math the plain placed quad.
+        let fold = self.fold_rect.get().unwrap_or(target_rect);
+        u.fold_min = [fold.min.x, fold.min.y];
+        u.fold_max = [fold.max.x, fold.max.y];
         u.is_diff_mode = if is_diff { 1 } else { 0 };
         u.is_composite = if is_composite { 1 } else { 0 };
         u.opacity = opacity;
@@ -2363,6 +2374,10 @@ impl ExrViewer {
             screen_size,
             display_min: [disp_rect.min.x, disp_rect.min.y],
             display_max: [disp_rect.max.x, disp_rect.max.y],
+            // Overridden per draw by `DrawCtx::draw`; equal to the image rect here so
+            // any draw that doesn't set a fold quad rasterizes exactly its own rect.
+            fold_min: [image_rect.min.x, image_rect.min.y],
+            fold_max: [image_rect.max.x, image_rect.max.y],
             exposure: self.exposure,
             gamma: self.gamma,
             diff_multiplier: self.diff_multiplier,
@@ -2570,6 +2585,7 @@ impl ExrViewer {
             overscan_factor: std::cell::Cell::new(1.0f32),
             neutral_view_ops: std::cell::Cell::new(false),
             blend_override: std::cell::Cell::new(None),
+            fold_rect: std::cell::Cell::new(None),
             ocio_sig: std::cell::Cell::new(0xcbf29ce484222325u64),
             ocio_draws: std::cell::RefCell::new(Vec::new()),
         };
@@ -2670,6 +2686,12 @@ impl ExrViewer {
                     d.par, layer_rect.min.x, layer_rect.max.x, layer_rect.min.y, layer_rect.max.y,
                 ));
             }
+            // The fold must cover this layer *and* everything already accumulated
+            // beneath it — its pass clears the whole target, so a pixel it skips is
+            // lost. `union_rect` is exactly that, and it already includes
+            // `layer_rect`. While the layers share a rect this equals the draw's own
+            // rect, so the rasterized area is unchanged from before #257.
+            ctx.fold_rect.set(union_rect);
             let (is_composite, is_top) = comp_layer_flags(i, n);
             // Neutralize the global view ops on every layer but the top, so exposure
             // / channel isolation apply once to the finished composite (PR-A.4).
@@ -2694,6 +2716,9 @@ impl ExrViewer {
         }
         ctx.neutral_view_ops.set(false);
         ctx.blend_override.set(None);
+        // The Side-by-Side overlay below is a placed copy, not a fold — clear the hint
+        // so it rasterizes its own pane rect rather than the composite's union.
+        ctx.fold_rect.set(None);
         if debug_geom {
             // `canvas` is the rect every layer shares; `disp` is the display window the
             // overscan gate and the background gradient key off. Both are here because
