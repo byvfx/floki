@@ -14,6 +14,13 @@ struct Uniforms {
     // lockstep with `Uniforms` in src/gpu/mod.rs.
     display_min: vec2<f32>,
     display_max: vec2<f32>,
+    // The screen-space quad an accumulate fold rasterizes (#257). `rect_min`/
+    // `rect_max` stay the layer's own rect and define the uv mapping; this is the
+    // running union of the layer rects, which is everything the accumulation below
+    // occupies. Ignored unless composite_accum == 1, and set equal to rect_min/max
+    // on every other draw. Keep in lockstep with `Uniforms` in src/gpu/mod.rs.
+    fold_min: vec2<f32>,
+    fold_max: vec2<f32>,
     // 4-byte aligned fields
     exposure: f32,
     gamma: f32,
@@ -120,17 +127,47 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     );
 
     let pos = positions[vertex_index];
-    
-    // Map 0..1 to rect_min..rect_max
-    let screen_pos = mix(uniforms.rect_min, uniforms.rect_max, pos);
-    
+
+    // An accumulate fold (#257) rasterizes `fold_min..fold_max` — the running union
+    // of the layer rects — rather than just this layer's rect. Each fold is its own
+    // render pass over a full-target `Clear`, so a quad covering only the layer
+    // would leave the sentinel everywhere else and the composite would end up
+    // clipped to the topmost layer's rect, erasing the layers below it. Covering
+    // the union instead lets the fragment stage pass the prior accumulation through
+    // untouched outside this layer, so the whole stack survives.
+    //
+    // The union, not the screen: outside it nothing has been drawn, so rasterizing
+    // there would discard exactly what it computed. That matters because this path
+    // is shared with the A/B composite under OCIO, where a full-screen fold would
+    // enlarge the rasterized area of an existing draw every frame. With the union
+    // the quad is unchanged whenever the layers share a rect, which is every case
+    // until per-layer placement (#254) lands.
+    //
+    // Every other draw sets `fold_*` equal to `rect_*`, so this is one `select`,
+    // not a second geometry path.
+    let is_accum = uniforms.composite_accum == 1u;
+
+    // Map 0..1 to rect_min..rect_max (or to the fold quad for an accumulate fold)
+    let screen_pos = select(
+        mix(uniforms.rect_min, uniforms.rect_max, pos),
+        mix(uniforms.fold_min, uniforms.fold_max, pos),
+        is_accum,
+    );
+
     // Map screen_pos to clip space (-1..1)
     let clip_x = (screen_pos.x / uniforms.screen_size.x) * 2.0 - 1.0;
     let clip_y = 1.0 - (screen_pos.y / uniforms.screen_size.y) * 2.0;
 
+    // `uv` stays image-local in both cases — the layer's rect is where uv is 0..1,
+    // so a full-screen fold reads outside that range exactly where it misses the
+    // layer. The mapping is affine in screen space, so interpolating it across the
+    // larger quad is exact. Non-accumulate draws take `pos` verbatim rather than
+    // the algebraically-equal unmix, to keep that path bit-for-bit unchanged.
+    let span = max(uniforms.rect_max - uniforms.rect_min, vec2<f32>(1e-6, 1e-6));
+
     var out: VertexOutput;
     out.position = vec4<f32>(clip_x, clip_y, 0.0, 1.0);
-    out.uv = vec2<f32>(pos.x, pos.y);
+    out.uv = select(pos, (screen_pos - uniforms.rect_min) / span, is_accum);
     return out;
 }
 
@@ -186,6 +223,21 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             uniforms.composite_accum == 1u,
         );
         color_b = textureSample(tex_b, samp_b, b_uv);
+    }
+
+    // The prior accumulation exactly as pass 1 left it, kept before the sentinel
+    // is normalized below — the pass-through at the end of this function must
+    // re-emit it verbatim, α<0 included, or "no image" would decay into "black
+    // image" and the background would stop showing through.
+    let accum_prev = color_b;
+
+    // Pass 1 clears to α=−1, the "no image here" sentinel the blit keys off. When
+    // folding, treat it as fully transparent black: a layer extending past the
+    // accumulation beneath it must composite over the background, and a negative
+    // alpha would otherwise drive the blend to a bogus coverage (an aa=0.5 layer
+    // over α=−1 lands on α=0 — fully background, when half the layer should show).
+    if uniforms.composite_accum == 1u && color_b.a < 0.0 {
+        color_b = vec4<f32>(0.0);
     }
 
     // Per-layer opacity for the Layers-panel accumulate composite (#99 PR-B.4):
@@ -387,5 +439,25 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // checker + overscan dim (in the blit pass) have a coverage/alpha signal. The
     // opacity/overscan dim is applied post-OCIO in that case, not here.
     let out_a = select(eff_opacity, a, uniforms.skip_checker == 1u);
-    return vec4<f32>(r, g, b, out_a);
+    var result = vec4<f32>(r, g, b, out_a);
+
+    // #257: outside this layer's rect an accumulate fold contributes nothing, so
+    // re-emit the accumulation below it verbatim. Written as a `select` on the
+    // final value rather than an early `return`: the condition is per-fragment,
+    // and a non-uniform return would put every later `textureSample` (LUT,
+    // colormap) in non-uniform control flow, which WGSL rejects.
+    //
+    // These fragments therefore run the whole function before discarding it: the
+    // `tex_a` fetch above, the blend, and the view ops — not just ALU. Three things
+    // keep that acceptable. The fold quad is the union of the layer rects, not the
+    // screen, so this region is only ever the gap between one layer and the stack's
+    // extent (empty whenever the layers share a rect). Those `tex_a` fetches are
+    // outside 0..1 and clamp to the same edge texels, so they stay cache-resident.
+    // And the display chain is already neutralized here (`srgb=0`, `gamma=1`,
+    // `enable_lut=0`; see `DrawCtx::draw`), so the tail is genuinely just ALU.
+    if uniforms.composite_accum == 1u {
+        let outside = any(in.uv < vec2<f32>(0.0)) || any(in.uv > vec2<f32>(1.0));
+        result = select(result, accum_prev, outside);
+    }
+    return result;
 }

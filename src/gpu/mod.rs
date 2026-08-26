@@ -23,6 +23,16 @@ pub struct Uniforms {
     /// (whole image at dim opacity + display window redrawn at full).
     pub display_min: [f32; 2],
     pub display_max: [f32; 2],
+    /// The screen-space quad an **accumulate fold** rasterizes (#257), as opposed
+    /// to `rect_min`/`rect_max`, which stay the layer's own rect and define the uv
+    /// mapping. A fold must cover everything the accumulation below it occupies —
+    /// its own pass clears the whole target, so any pixel it skips is lost — but it
+    /// need not cover more, so this is the running union of the layer rects, not
+    /// the screen. Ignored unless `composite_accum == 1`; set equal to
+    /// `rect_min`/`rect_max` on every other draw, which makes the vertex math
+    /// identical to a plain placed quad. Keep in lockstep with `shader.wgsl`.
+    pub fold_min: [f32; 2],
+    pub fold_max: [f32; 2],
     // 4-byte aligned fields
     pub exposure: f32,
     pub gamma: f32,
@@ -1103,7 +1113,7 @@ mod tests {
             "Uniforms size ({size}) must be a multiple of 16"
         );
         assert_eq!(
-            size, 208,
+            size, 224,
             "Uniforms layout changed — update shader.wgsl to match"
         );
     }
@@ -1134,6 +1144,8 @@ mod tests {
             screen_size: [800.0, 600.0],
             display_min: [1.0, 2.0],
             display_max: [3.0, 4.0],
+            fold_min: [-2.0, -3.0],
+            fold_max: [9.0, 8.0],
             exposure: 1.5,
             gamma: 2.2,
             diff_multiplier: 4.0,
