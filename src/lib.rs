@@ -11,6 +11,8 @@
 
 pub mod app;
 pub mod exr_loader;
+// Startup GPU probe (#247) is reached from the binary via `floki::gpu::…`.
+pub mod gpu;
 
 mod annotation;
 mod background;
@@ -21,7 +23,6 @@ mod budget;
 // T1 ring cache for sequence playback (#56).
 mod cache;
 mod color;
-mod gpu;
 mod gradient;
 // Comp layer model — the review-player spine (#103), consumed by the viewer via
 // the render program (#114); N-way compare (#104) extends it.

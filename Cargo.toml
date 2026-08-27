@@ -51,12 +51,13 @@ sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 # page cache instead of re-reading through a BufReader. Already resolved in
 # Cargo.lock (transitive), pinned here for direct use.
 memmap2 = "0.9"
+# Block on wgpu async at startup (#247 adapter probe) and in on-device GPU tests.
+pollster = "0.4"
 
 [dev-dependencies]
 tempfile = "3"          # scoped temp dirs/files for test fixtures (auto-cleanup)
 egui_kittest = "0.34"   # headless egui interaction harness (no wgpu/snapshot feature)
 approx = "0.5"          # float-tolerant assertions for color math
-pollster = "0.4"        # block on wgpu async in headless GPU tests
 criterion = "0.5"       # statistical benchmark harness (benches/)
 
 # Native global-cursor query for drag-and-drop A/B routing: winit discards the

@@ -1097,6 +1097,85 @@ impl eframe::egui_wgpu::CallbackTrait for ExrCallback {
     }
 }
 
+/// Feature GpuState needs for the f32 3D LUT (linear sampling). Same bit the app
+/// requires at device creation in `main.rs` and every on-device test requests.
+pub const REQUIRED_DEVICE_FEATURES: wgpu::Features = wgpu::Features::FLOAT32_FILTERABLE;
+
+/// One adapter seen during the startup probe (#247).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdapterSummary {
+    pub name: String,
+    pub backend: String,
+}
+
+/// Result of walking the system's wgpu adapters for [`REQUIRED_DEVICE_FEATURES`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Float32AdapterProbe {
+    /// Every adapter the instance reported (capable or not).
+    pub adapters: Vec<AdapterSummary>,
+    /// First adapter (in wgpu's enumeration order) that exposes FLOAT32_FILTERABLE.
+    pub capable: Option<AdapterSummary>,
+}
+
+/// Enumerate adapters and record which ones can supply FLOAT32_FILTERABLE.
+///
+/// Used by `main` before `eframe::run_native` so a machine without the feature
+/// fails with a readable dialog instead of a silent wgpu/`request_device` death
+/// (#247). Tests use the same feature bit via [`test_device`].
+pub fn probe_float32_filterable_adapters() -> Float32AdapterProbe {
+    let instance =
+        wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    // wgpu 29: enumerate_adapters is async (same runtime as request_adapter).
+    let listed = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
+    let mut adapters = Vec::new();
+    let mut capable = None;
+    for adapter in listed {
+        let info = adapter.get_info();
+        let summary = AdapterSummary {
+            name: info.name.clone(),
+            backend: format!("{:?}", info.backend),
+        };
+        let has = adapter.features().contains(REQUIRED_DEVICE_FEATURES);
+        if has && capable.is_none() {
+            capable = Some(summary.clone());
+        }
+        adapters.push(summary);
+    }
+    Float32AdapterProbe { adapters, capable }
+}
+
+/// Human-readable failure text when no adapter has FLOAT32_FILTERABLE (#247).
+///
+/// Kept pure so unit tests can pin the wording without a GPU.
+pub fn missing_float32_filterable_message(adapters: &[AdapterSummary]) -> String {
+    let mut msg = String::from(
+        "Floki cannot start: no GPU adapter supports FLOAT32_FILTERABLE.\n\
+         \n\
+         Floki needs this wgpu feature to linearly sample its f32 3D OCIO LUT \
+         texture. There is no software fallback for the GPU path.\n\
+         \n",
+    );
+    if adapters.is_empty() {
+        msg.push_str(
+            "No GPU adapters were found at all. If you are on a remote/RDP session, \
+             try a local display or a GPU-capable machine.\n",
+        );
+    } else {
+        msg.push_str("Adapters found:\n");
+        for a in adapters {
+            msg.push_str(&format!(
+                "  • {} ({}) — missing FLOAT32_FILTERABLE\n",
+                a.name, a.backend
+            ));
+        }
+        msg.push_str(
+            "\nTry the discrete GPU if the laptop is on integrated graphics, or \
+             run on a machine with a more recent GPU/driver.\n",
+        );
+    }
+    msg
+}
+
 /// A GPU device for an on-device test, or `None` when this machine can't give one —
 /// in which case the caller returns and the test is a no-op. **Every on-device test
 /// goes through this**; see TESTING.md.
@@ -1129,7 +1208,7 @@ pub(crate) fn test_device(label: &'static str) -> Option<(wgpu::Device, wgpu::Qu
         };
     match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some(label),
-        required_features: wgpu::Features::FLOAT32_FILTERABLE,
+        required_features: REQUIRED_DEVICE_FEATURES,
         ..Default::default()
     })) {
         Ok(dq) => Some(dq),
@@ -1150,6 +1229,36 @@ pub(crate) fn test_device(label: &'static str) -> Option<(wgpu::Device, wgpu::Qu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_float32_message_names_empty_adapter_list() {
+        let msg = missing_float32_filterable_message(&[]);
+        assert!(msg.contains("FLOAT32_FILTERABLE"), "{msg}");
+        assert!(msg.contains("No GPU adapters were found"), "{msg}");
+        assert!(!msg.contains("Adapters found:"), "{msg}");
+    }
+
+    #[test]
+    fn missing_float32_message_lists_each_adapter() {
+        let adapters = vec![
+            AdapterSummary {
+                name: "llvmpipe".into(),
+                backend: "Vulkan".into(),
+            },
+            AdapterSummary {
+                name: "Microsoft Basic Render Driver".into(),
+                backend: "Dx12".into(),
+            },
+        ];
+        let msg = missing_float32_filterable_message(&adapters);
+        assert!(msg.contains("llvmpipe"), "{msg}");
+        assert!(msg.contains("Microsoft Basic Render Driver"), "{msg}");
+        assert!(msg.contains("missing FLOAT32_FILTERABLE"), "{msg}");
+        assert!(
+            msg.contains("discrete GPU") || msg.contains("integrated"),
+            "{msg}"
+        );
+    }
 
     #[test]
     fn uniforms_size_is_16_byte_aligned() {
