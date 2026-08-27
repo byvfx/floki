@@ -340,6 +340,11 @@ struct LayerPersist {
     trim_in: u32,
     trim_out: u32,
     trim_offset: i64,
+    /// The layer's manual pixel-aspect override (#263), or `None` to use its header
+    /// PAR. Persisted because it is a property of *this footage* — the header lies
+    /// the same way every session — unlike the viewer-wide override it replaced,
+    /// which was deliberately session-only when it applied to whatever was on screen.
+    pixel_aspect_override: Option<f32>,
 }
 
 /// Hand-written rather than derived, because `#[serde(default)]` fills **missing**
@@ -359,6 +364,7 @@ impl Default for LayerPersist {
             trim_in: 0,
             trim_out: u32::MAX,
             trim_offset: 0,
+            pixel_aspect_override: None,
         }
     }
 }
@@ -4537,6 +4543,19 @@ fn comp_tex_size(size: (usize, usize)) -> egui::Vec2 {
     egui::vec2(size.0.max(1) as f32, size.1.max(1) as f32)
 }
 
+/// A source's display-window ("format") size, for the resolution readout (#251) and
+/// the Layers panel's per-layer format line.
+///
+/// The **display** window, not the data window: it is the format question a comp TD
+/// asks, and a render with overscan has a larger data window. It is also stable under
+/// proxy decoding — `ExrData::downsampled` preserves `display_window` while `size`
+/// shrinks — which is what keeps the label from flickering to the proxy resolution
+/// during a scrub. Pure.
+fn comp_format_of(exr: &ExrData) -> (usize, usize) {
+    let dw = exr.image.attributes.display_window.size;
+    (dw.x(), dw.y())
+}
+
 /// One named layer's draw in a resolved composite — the `Step::Draw` carrying `layer`,
 /// if that layer is both present at this frame (`composite_at` drops hidden / soloed-out
 /// / trimmed-blank layers) and drawable (per `drawable`). Resolves **both** panes of a
@@ -7077,6 +7096,7 @@ impl ExrApp {
                     trim_in: l.trim.in_point,
                     trim_out: l.trim.out_point,
                     trim_offset: l.trim.offset,
+                    pixel_aspect_override: l.pixel_aspect_override,
                 })
             })
             .collect()
@@ -7160,6 +7180,7 @@ impl ExrApp {
                 out_point: entry.trim_out,
                 offset: entry.trim_offset,
             };
+            layer.pixel_aspect_override = entry.pixel_aspect_override;
         }
         // A skipped/failed entry must not greet the user with a stale error box.
         self.error_msg = None;
@@ -7906,13 +7927,28 @@ impl ExrApp {
                 .on_hover_text(
                     "Stretch non-square-pixel (anamorphic) footage to its display aspect",
                 );
+                // The custom factor edits the **current layer's** override (#263), the
+                // same `Layer::pixel_aspect_override` the Layers panel row edits — two
+                // ways into one value, not two values. It was a single viewer-wide
+                // field until #263, which meant one typed factor discarded every
+                // layer's header aspect and collapsed a mixed-format stack; that field
+                // is gone rather than left behind as a control writing state nothing
+                // reads.
                 let unsqueeze = self.viewer.prefs.anamorphic_unsqueeze;
-                ui.add_enabled_ui(unsqueeze, |ui| {
-                    let mut custom = self.viewer.pixel_aspect_override.is_some();
+                let cur_layer = self.active_comp_layer();
+                let cur_override =
+                    cur_layer.and_then(|id| self.comp_stack.get(id)?.pixel_aspect_override);
+                ui.add_enabled_ui(unsqueeze && cur_layer.is_some(), |ui| {
+                    let mut custom = cur_override.is_some();
                     if ui
                         .checkbox(&mut custom, "Custom factor")
-                        .on_hover_text("Override the header pixel aspect ratio")
+                        .on_hover_text(
+                            "Override the current layer's header pixel aspect ratio. \
+                             Applies to that layer only — set it per layer in the \
+                             Layers panel's ⋮ menu.",
+                        )
                         .changed()
+                        && let Some(l) = cur_layer.and_then(|id| self.comp_stack.get_mut(id))
                     {
                         // Seed from the current layer's header PAR, or a common 2×
                         // squeeze when the header is square/absent.
@@ -7921,10 +7957,20 @@ impl ExrApp {
                         } else {
                             2.0
                         };
-                        self.viewer.pixel_aspect_override = custom.then_some(seed);
+                        l.pixel_aspect_override = custom.then_some(seed);
                     }
-                    if let Some(factor) = self.viewer.pixel_aspect_override.as_mut() {
-                        ui.add(egui::DragValue::new(factor).speed(0.01).range(0.1..=4.0));
+                    if let Some(mut factor) = cur_override {
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut factor)
+                                    .speed(0.01)
+                                    .range(0.1..=4.0),
+                            )
+                            .changed()
+                            && let Some(l) = cur_layer.and_then(|id| self.comp_stack.get_mut(id))
+                        {
+                            l.pixel_aspect_override = Some(factor);
+                        }
                     } else {
                         ui.label(format!("Header PAR: {cur_par}"));
                     }
@@ -8002,6 +8048,13 @@ impl ExrApp {
                 is_base: bool,
                 /// The layer's pixel source, for the per-track cache-fill strip.
                 source: Option<crate::layer::SourceId>,
+                /// Display-window size + header pixel aspect of the layer's source,
+                /// and its manual aspect override (#251 / #263). `None` for a layer
+                /// whose source isn't resolved (adjustment layer, failed decode) —
+                /// the format line and the override control are then both absent.
+                format: Option<(usize, usize)>,
+                header_par: f32,
+                par_override: Option<f32>,
             }
             let rows: Vec<Row> = self
                 .comp_stack
@@ -8037,6 +8090,7 @@ impl ExrApp {
                                 .collect()
                         })
                         .unwrap_or_default();
+                    let cs = source.and_then(|s| self.comp_sources.get(&s));
                     Row {
                         id: l.id,
                         name: l.name.clone(),
@@ -8050,6 +8104,9 @@ impl ExrApp {
                         is_sequence,
                         is_base,
                         source,
+                        format: cs.map(|cs| comp_format_of(&cs.exr_data)),
+                        header_par: cs.map_or(1.0, |cs| cs.exr_data.image.attributes.pixel_aspect),
+                        par_override: l.pixel_aspect_override,
                     }
                 })
                 .collect();
@@ -8125,6 +8182,71 @@ impl ExrApp {
                             l.opacity = opacity;
                         }
                     });
+                    // Format + pixel aspect (#251 / #263). The readout answers "is this
+                    // the right res?" per layer, which is how a mixed-format stack is
+                    // *noticed* — #254 was found by measuring a screenshot because
+                    // nothing in the UI stated either figure.
+                    //
+                    // The override sits directly under the figures it overrides:
+                    // typing a factor is something you do *because* the header PAR
+                    // beside it is wrong, so the two belong in one place.
+                    if let Some((fw, fh)) = row.format {
+                        ui.separator();
+                        ui.label(
+                            egui::RichText::new(format!("{fw}×{fh}  ·  PAR {:.3}", row.header_par))
+                                .weak(),
+                        )
+                        .on_hover_text(
+                            "Display window (format) and header pixel aspect of this \
+                             layer's source",
+                        );
+                        let unsqueeze = self.viewer.prefs.anamorphic_unsqueeze;
+                        ui.add_enabled_ui(unsqueeze, |ui| {
+                            let mut custom = row.par_override.is_some();
+                            if ui
+                                .checkbox(&mut custom, "Custom aspect")
+                                .on_hover_text(
+                                    "Override this layer's header pixel aspect. Applies \
+                                     to this layer only — every other layer keeps its \
+                                     own.",
+                                )
+                                .changed()
+                                && let Some(l) = self.comp_stack.get_mut(row.id)
+                            {
+                                // Seed from this layer's own header PAR, or a common
+                                // 2× squeeze when the header is square/absent — which
+                                // is the case the override exists for.
+                                let seed = if row.header_par > 0.0
+                                    && (row.header_par - 1.0).abs() > f32::EPSILON
+                                {
+                                    row.header_par
+                                } else {
+                                    2.0
+                                };
+                                l.pixel_aspect_override = custom.then_some(seed);
+                            }
+                            if let Some(mut factor) = row.par_override
+                                && ui
+                                    .add(
+                                        egui::DragValue::new(&mut factor)
+                                            .speed(0.01)
+                                            .range(0.1..=4.0),
+                                    )
+                                    .changed()
+                                && let Some(l) = self.comp_stack.get_mut(row.id)
+                            {
+                                l.pixel_aspect_override = Some(factor);
+                            }
+                        });
+                        if !self.viewer.prefs.anamorphic_unsqueeze {
+                            ui.label(
+                                egui::RichText::new("Unsqueeze is off (Display ▾)")
+                                    .weak()
+                                    .italics(),
+                            );
+                        }
+                        ui.separator();
+                    }
                     // AOV picker: which logical layer (pass) of the source to show.
                     // Only for multi-layer EXRs — a single-beauty source has nothing
                     // to choose. Changing it rebuilds the source texture next frame
@@ -8480,9 +8602,14 @@ impl ExrApp {
         // layer defines the shared canvas size.
         let mut draws: Vec<crate::viewer::CompDraw> = Vec::new();
         let mut base_size = (0usize, 0usize);
-        // The bottom drawable layer defines the canvas, so its header pixel aspect
-        // drives the anamorphic unsqueeze for the whole composite (#194 / #179).
+        // The bottom drawable layer defines the canvas, so its **effective** pixel
+        // aspect drives the canvas stretch (#194 / #179). Effective, not header: since
+        // #263 the override is a per-layer value, so the canvas layer's own override
+        // is what shapes the canvas — the same rule every other layer follows.
         let mut base_par = 1.0_f32;
+        // Its display window, for the format readout (#251). Tracked beside the size
+        // so the label always describes the same layer the canvas does.
+        let mut base_format: Option<(usize, usize)> = None;
         for step in &steps {
             let crate::layer::Step::Draw(d) = step else {
                 continue; // Adjustment layers (#102) don't render yet.
@@ -8493,15 +8620,20 @@ impl ExrApp {
             let Some(bind_group) = cs.bind_group.clone() else {
                 continue;
             };
+            // Each layer's own aspect: its manual override if it has one, else this
+            // source's header PAR (#263). Resolved here, where the layer's draw and
+            // its source are both in hand, so the renderer never re-derives it.
+            let eff_par = d.effective_par(cs.exr_data.image.attributes.pixel_aspect);
             if draws.is_empty() {
                 base_size = cs.size;
-                base_par = cs.exr_data.image.attributes.pixel_aspect;
+                base_par = eff_par;
+                base_format = Some(comp_format_of(&cs.exr_data));
             }
             draws.push(crate::viewer::CompDraw {
                 bind_group,
                 blend: d.blend,
                 opacity: d.opacity,
-                par: cs.exr_data.image.attributes.pixel_aspect,
+                eff_par,
                 tex_size: comp_tex_size(cs.size),
             });
         }
@@ -8547,7 +8679,9 @@ impl ExrApp {
                     bind_group: cs.bind_group.clone()?,
                     blend: d.blend,
                     opacity: d.opacity,
-                    par: cs.exr_data.image.attributes.pixel_aspect,
+                    // Pane B unsqueezes from its own layer's override-or-header, so a
+                    // factor typed on pane A never distorts it (#263).
+                    eff_par: d.effective_par(cs.exr_data.image.attributes.pixel_aspect),
                     tex_size: comp_tex_size(cs.size),
                 },
             })
@@ -8568,15 +8702,19 @@ impl ExrApp {
                 if let Some(cs) = self.comp_sources.get(&a.source)
                     && let Some(bind_group) = cs.bind_group.clone()
                 {
+                    let eff_par = a.effective_par(cs.exr_data.image.attributes.pixel_aspect);
                     draws = vec![crate::viewer::CompDraw {
                         bind_group,
                         blend: a.blend,
                         opacity: a.opacity,
-                        par: cs.exr_data.image.attributes.pixel_aspect,
+                        eff_par,
                         tex_size: comp_tex_size(cs.size),
                     }];
                     base_size = cs.size;
-                    base_par = cs.exr_data.image.attributes.pixel_aspect;
+                    base_par = eff_par;
+                    // In a compare, pane A *is* the current layer, so the format
+                    // readout follows it here rather than the composite's canvas.
+                    base_format = Some(comp_format_of(&cs.exr_data));
                 }
                 self.comp_arrangement
             }
@@ -8602,6 +8740,10 @@ impl ExrApp {
             && let Some(gpu) = self.gpu_resources.as_ref()
         {
             let lut = self.lut_bg.clone();
+            // The format readout's subject (#251), mirrored across like the other
+            // per-frame viewer state above. Resolved with `base_size` / `base_par`, so
+            // the label can never name a different layer than the canvas does.
+            self.viewer.comp_format = base_format;
             self.viewer.draw_comp_composite(
                 ui,
                 base_size,
@@ -8868,6 +9010,67 @@ mod tests {
             .write()
             .to_file(path)
             .expect("write rgba exr fixture");
+    }
+
+    /// An **overscanned** RGBA EXR: a `data`×`data` data window inside a
+    /// `disp`×`disp` display window, which is the normal shape of a render and the
+    /// case that separates "format" from "resolution of the pixels".
+    fn write_overscan_exr(path: &std::path::Path, data: usize, disp: usize) {
+        let mut list = smallvec::SmallVec::new();
+        for name in ["R", "G", "B", "A"] {
+            list.push(AnyChannel::new(
+                Text::from(name),
+                FlatSamples::F32(vec![0.5; data * data]),
+            ));
+        }
+        let layer = Layer::new(
+            (data, data),
+            LayerAttributes::default(),
+            Encoding::FAST_LOSSLESS,
+            AnyChannels::sort(list),
+        );
+        let mut image = Image::from_layer(layer);
+        // `from_layer` defaults the display window to the layer's size; the whole
+        // point of this fixture is that they differ.
+        image.attributes.display_window = IntegerBounds::new((0, 0), (disp, disp));
+        image
+            .write()
+            .to_file(path)
+            .expect("write overscan exr fixture");
+    }
+
+    /// The format readout (#251) must report the **display** window, not the data
+    /// window it is drawn over.
+    ///
+    /// These are the same number on most files, which is exactly why this needs a
+    /// test: a version that read the layer size would pass every square-window
+    /// fixture and then quietly report the wrong figure on the renders the readout
+    /// exists for — an overscanned one, where "is this the right format?" is a
+    /// question about the display window alone.
+    #[test]
+    fn the_format_readout_reports_the_display_window_not_the_data_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("overscan.exr");
+        write_overscan_exr(&p, 8, 4);
+        let data = ExrData::load(&p).unwrap();
+
+        // The pixels are 8×8…
+        assert_eq!(data.image.layer_data[0].size.0, 8);
+        assert_eq!(data.image.layer_data[0].size.1, 8);
+        // …but the format is 4×4, and that is what the label says.
+        assert_eq!(comp_format_of(&data), (4, 4));
+
+        // And it survives proxy decoding: `downsampled` shrinks the samples while
+        // preserving `display_window` (asserted directly in `exr_loader`), so the
+        // label does not flicker to the proxy resolution mid-scrub. That property is
+        // the reason this reads the display window rather than the texture size.
+        let mut scratch = Vec::new();
+        let proxy = data.downsampled_into(4, &mut scratch);
+        assert!(
+            proxy.image.layer_data[0].size.0 < 8,
+            "the fixture must actually be downsampled for this to prove anything"
+        );
+        assert_eq!(comp_format_of(&proxy), (4, 4));
     }
 
     /// A multi-pass EXR with `n_passes` logical layers (`pass0`, `pass1`, ...),
