@@ -998,6 +998,11 @@ fn upload_lut(
     (tex, view)
 }
 
+/// On-device tests that genuinely need a live OCIO config, hence the feature gate.
+///
+/// Keep this module to tests that touch `floki_ocio` / `OcioGpuPass`. Anything that
+/// only needs `GpuState`'s own pipelines belongs in [`device_tests`] below, which is
+/// plain `#[cfg(test)]` and so actually runs in CI (#259).
 #[cfg(all(
     test,
     target_os = "macos",
@@ -1144,13 +1149,42 @@ mod metal_tests {
         queue.submit([encoder.finish()]);
         let _ = device.poll(wgpu::PollType::wait_indefinitely());
     }
+}
 
-    // Validates the OCIO blit pipeline (new bind-group layout + BLIT_SHADER) compiles and
-    // runs on the platform GPU, and that its three behaviors are correct: the negative-alpha
-    // sentinel means "no image" (transparent), opaque pixels pass the OCIO display color
-    // through, and transparent-but-covered pixels show the display-space checker.
-    #[test]
-    fn blit_coverage_and_checker_on_device() {
+/// On-device tests that need a GPU but **not** OCIO (#259). They exercise
+/// `GpuState`'s own pipelines — `pipeline_linear`, `display_encode_pipeline`,
+/// `blit_pipeline` — so they are platform-neutral and belong outside the
+/// macOS + OCIO-feature gate on `metal_tests`.
+///
+/// They previously sat inside that module, which meant the accumulate seam — the
+/// highest-risk part of the layer-stack composite, and the thing #257 changes —
+/// was verified only when someone ran `cargo test` on a Mac with an OCIO feature
+/// enabled. `Test & Lint` is `ubuntu-latest` + `--no-default-features`, and the
+/// macOS CI jobs are `cargo build` (plus a `-p floki-ocio` test of a different
+/// crate), so these ran in **zero** CI jobs.
+///
+/// This deliberately breaks the GPU-free convention in TESTING.md, which exists so
+/// the suite runs on headless CI. These stay compatible with that: each returns
+/// early when `request_adapter` finds no GPU, so a runner without one skips them
+/// rather than failing. The trade-off is that a skip reads as a pass — see the
+/// note on #259.
+#[cfg(test)]
+mod device_tests {
+    use super::*;
+
+    /// A GPU device for the tests below, or `None` when this machine can't give one —
+    /// in which case the caller returns and the test is a no-op.
+    ///
+    /// There are **two** ways to come up short and both must skip rather than fail.
+    /// The obvious one is a runner with no adapter. The one that actually bit when
+    /// these tests were ungated (#259) is a runner whose adapter is *software*:
+    /// `Test & Lint` is ubuntu-latest, which has llvmpipe, so an adapter-only guard
+    /// sails straight past and then panics in `request_device` — llvmpipe has no
+    /// `FLOAT32_FILTERABLE`, which `GpuState` requires for the f32 3D LUT.
+    ///
+    /// One helper rather than a copy per test: five hand-rolled guards is how the
+    /// second condition came to be missing from all of them at once.
+    fn test_device(label: &'static str) -> Option<(wgpu::Device, wgpu::Queue)> {
         let instance =
             wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let adapter = match pollster::block_on(
@@ -1158,16 +1192,38 @@ mod metal_tests {
         ) {
             Ok(a) => a,
             Err(_) => {
-                eprintln!("no GPU adapter available; skipping on-device blit test");
-                return;
+                eprintln!("no GPU adapter available; skipping {label}");
+                return None;
             }
         };
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("blit-test-device"),
+        match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some(label),
             required_features: wgpu::Features::FLOAT32_FILTERABLE,
             ..Default::default()
-        }))
-        .expect("request_device");
+        })) {
+            Ok(dq) => Some(dq),
+            Err(e) => {
+                eprintln!("GPU lacks FLOAT32_FILTERABLE ({e:?}); skipping {label}");
+                None
+            }
+        }
+    }
+
+    // Validates the blit pipeline (`GpuState::blit_pipeline` + `BLIT_SHADER`, and its
+    // bind-group layout) compiles and runs on the platform GPU, and that its three
+    // behaviors are correct: the negative-alpha sentinel means "no image" (transparent),
+    // opaque pixels pass the display color through, and transparent-but-covered pixels
+    // show the display-space checker.
+    //
+    // The blit is the last stage of the OCIO *path*, but it needs no OCIO config: it
+    // garnishes whatever the display stage produced, which is the OCIO transform when
+    // OCIO is on and the sRGB display-encode when it is off. Hence `device_tests` rather
+    // than `metal_tests` — a GPU is required, an OCIO build is not.
+    #[test]
+    fn blit_coverage_and_checker_on_device() {
+        let Some((device, queue)) = test_device("blit-test-device") else {
+            return;
+        };
 
         let output_format = wgpu::TextureFormat::Rgba8Unorm;
         let gpu = GpuState::new(&device, &queue, output_format);
@@ -1521,23 +1577,9 @@ mod metal_tests {
     // once Multiply/Screen are in the stack.
     #[test]
     fn accumulate_composite_on_device() {
-        let instance =
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-        let adapter = match pollster::block_on(
-            instance.request_adapter(&wgpu::RequestAdapterOptions::default()),
-        ) {
-            Ok(a) => a,
-            Err(_) => {
-                eprintln!("no GPU adapter available; skipping on-device accumulate test");
-                return;
-            }
+        let Some((device, queue)) = test_device("accumulate-test-device") else {
+            return;
         };
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("accumulate-test-device"),
-            required_features: wgpu::Features::FLOAT32_FILTERABLE,
-            ..Default::default()
-        }))
-        .expect("request_device");
 
         // Rgba8Unorm surface format is irrelevant here — we only drive `pipeline_linear`
         // (Rgba16Float offscreen) and reuse GpuState's real bind-group layouts, ring
@@ -1848,23 +1890,9 @@ mod metal_tests {
     // region equals the CPU A-over-B×2^EV reference (so it can't pass by both being blank).
     #[test]
     fn accumulate_matches_single_pass_composite_on_device() {
-        let instance =
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-        let adapter = match pollster::block_on(
-            instance.request_adapter(&wgpu::RequestAdapterOptions::default()),
-        ) {
-            Ok(a) => a,
-            Err(_) => {
-                eprintln!("no GPU adapter available; skipping on-device accumulate-parity test");
-                return;
-            }
+        let Some((device, queue)) = test_device("accumulate-parity-device") else {
+            return;
         };
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("accumulate-parity-device"),
-            required_features: wgpu::Features::FLOAT32_FILTERABLE,
-            ..Default::default()
-        }))
-        .expect("request_device");
         let gpu = GpuState::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
 
         // 4x2 screen; the image occupies the RIGHT half (off-origin, so screen-normalized
@@ -2144,23 +2172,9 @@ mod metal_tests {
     // sRGB(0.5 linear) ≈ 0.7353 → 187/255; alpha carries through.
     #[test]
     fn display_encode_srgb_on_device() {
-        let instance =
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-        let adapter = match pollster::block_on(
-            instance.request_adapter(&wgpu::RequestAdapterOptions::default()),
-        ) {
-            Ok(a) => a,
-            Err(_) => {
-                eprintln!("no GPU adapter available; skipping display-encode test");
-                return;
-            }
+        let Some((device, queue)) = test_device("display-encode-test-device") else {
+            return;
         };
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("display-encode-test-device"),
-            required_features: wgpu::Features::FLOAT32_FILTERABLE,
-            ..Default::default()
-        }))
-        .expect("request_device");
         let gpu = GpuState::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
 
         let extent = wgpu::Extent3d {
@@ -2281,5 +2295,257 @@ mod metal_tests {
             "sRGB-encoded 0.5 linear should be ~187/255, got {got}"
         );
         assert_eq!(data[3], 255, "alpha carried through");
+    }
+
+    // #257: the accumulate fold must preserve the UNION of the layer rects rather
+    // than clipping the composite to one of them.
+    //
+    // Every other on-device accumulate test runs on a 1x1 target where all layers
+    // share the single pixel, so none of them can observe this — the bug shipped
+    // underneath four passing accumulate tests and was eventually found by measuring
+    // a screenshot. Four pixels is the smallest target that can tell the difference.
+    //
+    // Two disjoint layers on a 4x1 target: opaque red over pixels 0-1, opaque green
+    // over pixels 2-3. Both must survive. Before #257 the top layer's pass cleared
+    // the whole target and its quad covered only pixels 2-3, so pixels 0-1 read back
+    // as the a=-1 "no image" sentinel — the black-outside-disp bug, in miniature.
+    #[test]
+    fn accumulate_preserves_the_union_of_disjoint_layer_rects() {
+        let Some((device, queue)) = test_device("union-test-device") else {
+            return;
+        };
+        let gpu = GpuState::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
+
+        let (w, h) = (4u32, 1u32);
+        let extent = wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        };
+        let one = wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        };
+
+        // (colour, rect_min, rect_max). Each source is 1x1 and uniform, so the sampled
+        // uv only ever decides in/out, never which texel — the assertion is purely
+        // about coverage.
+        let layers: [([f32; 4], [f32; 2], [f32; 2]); 2] = [
+            ([1.0, 0.0, 0.0, 1.0], [0.0, 0.0], [2.0, 1.0]),
+            ([0.0, 1.0, 0.0, 1.0], [2.0, 0.0], [4.0, 1.0]),
+        ];
+
+        let mut src_views = Vec::new();
+        for (rgba, _, _) in &layers {
+            let tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("union-layer-src"),
+                size: one,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba32Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                bytemuck::cast_slice(&rgba[..]),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(16),
+                    rows_per_image: Some(1),
+                },
+                one,
+            );
+            src_views.push(tex.create_view(&wgpu::TextureViewDescriptor::default()));
+        }
+        let src_bgs: Vec<_> = src_views
+            .iter()
+            .map(|view| {
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("union-layer-bg"),
+                    layout: &gpu.bind_group_layout_tex,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(&gpu.sampler),
+                        },
+                    ],
+                })
+            })
+            .collect();
+
+        let make_scene = |label| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: extent,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba16Float,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            })
+        };
+        let scene_texs = [make_scene("union-scene0"), make_scene("union-scene1")];
+        let scene_views = [
+            scene_texs[0].create_view(&wgpu::TextureViewDescriptor::default()),
+            scene_texs[1].create_view(&wgpu::TextureViewDescriptor::default()),
+        ];
+        let scene_bgs = [0usize, 1].map(|i| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("union-scene-bg"),
+                layout: &gpu.bind_group_layout_tex,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&scene_views[i]),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&gpu.sampler),
+                    },
+                ],
+            })
+        });
+
+        // The bottom layer is a plain copy over its own rect. The top layer is the
+        // fold under test: `composite_accum=1`, Over, and a fold quad spanning the
+        // union — which is what lets it re-emit the red half instead of clearing it.
+        let screen = [w as f32, h as f32];
+        let stride = gpu.uniform_stride;
+        for (i, (_, rmin, rmax)) in layers.iter().enumerate() {
+            let is_comp = u32::from(i > 0);
+            let mut u = accum_uniforms(*rmin, *rmax, screen, is_comp, 0, is_comp, 0.0, 1.0);
+            if is_comp == 1 {
+                u.fold_min = [0.0, 0.0];
+                u.fold_max = screen;
+            }
+            queue.write_buffer(
+                &gpu.uniform_buffer,
+                i as u64 * stride as u64,
+                bytemuck::bytes_of(&u),
+            );
+        }
+
+        let clear = wgpu::Operations {
+            load: wgpu::LoadOp::Clear(wgpu::Color {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: -1.0,
+            }),
+            store: wgpu::StoreOp::Store,
+        };
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        for i in 0..layers.len() {
+            let dst = i % 2;
+            let tex_b: &wgpu::BindGroup = if i == 0 {
+                gpu.default_tex_bind_group.as_ref() // unused when is_composite=0
+            } else {
+                &scene_bgs[(i + 1) % 2]
+            };
+            let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("union-accumulate"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &scene_views[dst],
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: clear,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            rp.set_viewport(0.0, 0.0, w as f32, h as f32, 0.0, 1.0);
+            rp.set_pipeline(&gpu.pipeline_linear);
+            rp.set_bind_group(0, &src_bgs[i], &[]);
+            rp.set_bind_group(1, tex_b, &[]);
+            rp.set_bind_group(2, &gpu.uniform_bind_group, &[i as u32 * stride]);
+            rp.set_bind_group(3, gpu.default_lut_bind_group.as_ref(), &[]);
+            rp.draw(0..6, 0..1);
+        }
+
+        let rb = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("union-readback"),
+            size: 256,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &scene_texs[(layers.len() - 1) % 2],
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &rb,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(256),
+                    rows_per_image: Some(1),
+                },
+            },
+            extent,
+        );
+        queue.submit([encoder.finish()]);
+        rb.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+
+        let px: Vec<[f32; 4]> = {
+            let data = rb.slice(..).get_mapped_range();
+            let hs: &[u16] = bytemuck::cast_slice(&data[..32]);
+            (0..4)
+                .map(|p| {
+                    [
+                        f16_to_f32(hs[p * 4]),
+                        f16_to_f32(hs[p * 4 + 1]),
+                        f16_to_f32(hs[p * 4 + 2]),
+                        f16_to_f32(hs[p * 4 + 3]),
+                    ]
+                })
+                .collect()
+        };
+
+        // The regression, stated directly: no pixel may come back as the sentinel.
+        // Pre-#257 pixels 0-1 did, because the top layer's clear wiped them.
+        for (p, v) in px.iter().enumerate() {
+            assert!(
+                v[3] >= 0.0,
+                "pixel {p} kept the a=-1 no-image sentinel — the fold clipped the \
+                 composite to the top layer's rect: {px:?}"
+            );
+        }
+
+        let tol = 0.01;
+        let expect = [
+            [1.0, 0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0, 1.0],
+        ];
+        for (p, (got, want)) in px.iter().zip(expect.iter()).enumerate() {
+            for c in 0..4 {
+                assert!(
+                    (got[c] - want[c]).abs() <= tol,
+                    "pixel {p} channel {c}: got {got:?}, want {want:?} (all: {px:?})"
+                );
+            }
+        }
     }
 }
