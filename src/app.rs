@@ -7684,6 +7684,13 @@ impl ExrApp {
             .and_then(|s| self.comp_sources.get(&s))
             .map(|cs| cs.exr_data.image.attributes.pixel_aspect)
             .unwrap_or(1.0);
+        // …and whether that header actually exists. `cur_par` falls back to 1.0 for a
+        // layer with no resolved source (an adjustment layer, or a decode that
+        // failed), which is indistinguishable from genuinely square footage — so the
+        // aspect override below gates on this instead. Without it the control would
+        // offer to override a header it never read, report "Header PAR: 1" as if it
+        // had, and persist a factor nothing will ever apply.
+        let cur_has_source = source.is_some_and(|s| self.comp_sources.contains_key(&s));
 
         // Wrapped, so a long layer name pushes the trailing controls onto a second line
         // instead of clipping them off the right edge.
@@ -7938,7 +7945,7 @@ impl ExrApp {
                 let cur_layer = self.active_comp_layer();
                 let cur_override =
                     cur_layer.and_then(|id| self.comp_stack.get(id)?.pixel_aspect_override);
-                ui.add_enabled_ui(unsqueeze && cur_layer.is_some(), |ui| {
+                ui.add_enabled_ui(unsqueeze && cur_has_source, |ui| {
                     let mut custom = cur_override.is_some();
                     if ui
                         .checkbox(&mut custom, "Custom factor")
@@ -7959,7 +7966,16 @@ impl ExrApp {
                         };
                         l.pixel_aspect_override = custom.then_some(seed);
                     }
-                    if let Some(mut factor) = cur_override {
+                    // Re-read after the checkbox rather than reusing `cur_override`,
+                    // which was sampled before it. Unticking the box writes `None` to
+                    // the layer, but the stale snapshot still says `Some`, so the drag
+                    // field would linger for one frame showing a value that no longer
+                    // exists — and ticking it on hides the field for a frame instead.
+                    // Reading the model back keeps the two widgets consistent within
+                    // the frame the user clicked.
+                    let shown =
+                        cur_layer.and_then(|id| self.comp_stack.get(id)?.pixel_aspect_override);
+                    if let Some(mut factor) = shown {
                         if ui
                             .add(
                                 egui::DragValue::new(&mut factor)
@@ -8225,7 +8241,16 @@ impl ExrApp {
                                 };
                                 l.pixel_aspect_override = custom.then_some(seed);
                             }
-                            if let Some(mut factor) = row.par_override
+                            // Re-read rather than reusing `row.par_override`, which was
+                            // snapshotted before the loop: unticking the box writes
+                            // `None` to the layer while the snapshot still says `Some`,
+                            // so the drag field would linger a frame past the value it
+                            // edits (and hide for a frame when ticked on).
+                            let shown = self
+                                .comp_stack
+                                .get(row.id)
+                                .and_then(|l| l.pixel_aspect_override);
+                            if let Some(mut factor) = shown
                                 && ui
                                     .add(
                                         egui::DragValue::new(&mut factor)
