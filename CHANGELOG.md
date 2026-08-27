@@ -133,6 +133,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ran in no CI job at all and only ever on one developer's machine. They now run
   anywhere a capable GPU is present and skip cleanly where one isn't, joined by a
   new regression test for the composite clipping fixed above.
+- Every pull request runs CI, including one stacked on another branch. The
+  `pull_request` trigger filtered on the PR's *base*, so a PR opened against a
+  feature branch — the convention here for tooling and chore work — ran no build,
+  no tests and no lint, while GitHub still reported it mergeable. One such PR sat
+  green for three hours and the first run that ever fired on it failed. Retargeting
+  a PR now starts a run as well, which it previously did not, so the recovery is no
+  longer "retarget, then push something to wake it up".
 
 ## [1.12.0] - 2026-08-15
 

@@ -21,8 +21,16 @@ on:
       - '.gitignore'
     tags:
       - 'v*'
+  # Deliberately unfiltered by branch: `branches:` on a `pull_request` trigger
+  # matches the PR's *base*, so `[ "main" ]` meant a PR stacked on a feature
+  # branch — the convention here for tooling/chore work — ran no Build at all
+  # while GitHub still reported it mergeable (#265; #260 spent three hours in
+  # that state, and the first run that ever fired on it failed). `edited` is
+  # listed because retargeting a PR fires only that activity type, which is not
+  # in the default set, so a retargeted PR otherwise stays green-but-untested
+  # until someone pushes; the price is that a title/body edit also starts a run.
   pull_request:
-    branches: [ "main" ]
+    types: [ opened, synchronize, reopened, edited ]
     paths-ignore:
       - '**.md'
       - 'docs/**'
