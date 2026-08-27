@@ -4531,6 +4531,13 @@ fn default_compare_b(
 }
 
 /// One named layer's draw in a resolved composite — the `Step::Draw` carrying `layer`,
+/// A `CompSource`'s pixel dimensions as the float vector the viewer places it with
+/// (#254). Clamped away from zero so a degenerate source can't produce a zero-area
+/// rect and a divide-by-zero in the uv mapping.
+fn comp_tex_size(size: (usize, usize)) -> egui::Vec2 {
+    egui::vec2(size.0.max(1) as f32, size.1.max(1) as f32)
+}
+
 /// if that layer is both present at this frame (`composite_at` drops hidden / soloed-out
 /// / trimmed-blank layers) and drawable (per `drawable`). Resolves **both** panes of a
 /// comp Side-by-Side (#99 Slice 2a), which shows two individual layers rather than the
@@ -8495,6 +8502,7 @@ impl ExrApp {
                 blend: d.blend,
                 opacity: d.opacity,
                 par: cs.exr_data.image.attributes.pixel_aspect,
+                tex_size: comp_tex_size(cs.size),
             });
         }
 
@@ -8540,9 +8548,8 @@ impl ExrApp {
                     blend: d.blend,
                     opacity: d.opacity,
                     par: cs.exr_data.image.attributes.pixel_aspect,
+                    tex_size: comp_tex_size(cs.size),
                 },
-                tex_size: egui::vec2(cs.size.0.max(1) as f32, cs.size.1.max(1) as f32),
-                par: cs.exr_data.image.attributes.pixel_aspect,
             })
         });
         // The compare layer's own pixels, for the per-pane readout.
@@ -8566,6 +8573,7 @@ impl ExrApp {
                         blend: a.blend,
                         opacity: a.opacity,
                         par: cs.exr_data.image.attributes.pixel_aspect,
+                        tex_size: comp_tex_size(cs.size),
                     }];
                     base_size = cs.size;
                     base_par = cs.exr_data.image.attributes.pixel_aspect;
