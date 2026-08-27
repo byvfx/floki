@@ -57,6 +57,12 @@ tempfile = "3"          # scoped temp dirs/files for test fixtures (auto-cleanup
 egui_kittest = "0.34"   # headless egui interaction harness (no wgpu/snapshot feature)
 approx = "0.5"          # float-tolerant assertions for color math
 pollster = "0.4"        # block on wgpu async in headless GPU tests
+# Serializes `ExrApp` in tests so the reset-to-defaults check (#248) compares the
+# *persisted* state rather than a hand-listed set of fields — a field added later
+# and forgotten by the reset then fails the test instead of silently surviving it.
+# Not a new dependency in practice: eframe's persistence already pulls in the same
+# ron 0.12, and a dev-dependency ships nothing.
+ron = "0.12"
 criterion = "0.5"       # statistical benchmark harness (benches/)
 
 # Native global-cursor query for drag-and-drop A/B routing: winit discards the
