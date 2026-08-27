@@ -20,15 +20,15 @@ cargo clippy --all-targets -- -D warnings  # lint gate (warnings are errors)
 ```
 
 CI runs all three in a `Test & Lint` job that **gates** the build/release matrix
-(see `.github/workflows/build.yml`). Every pull request runs it, including one
-stacked on another feature branch — the trigger deliberately carries no `branches:`
-filter, because `branches:` matches a PR's *base* and once meant a stacked PR ran no
-CI at all while still reporting mergeable (#265).
+(see `.github/workflows/build.yml`). Every pull request that touches code runs it,
+**including one stacked on another feature branch** — the trigger deliberately carries
+no `branches:` filter, because `branches:` matches a PR's *base* and once meant a
+stacked PR ran no CI at all while still reporting mergeable (#265).
 
-The one case that legitimately runs **nothing** is a docs-only PR: `paths-ignore`
-skips `**.md`, `docs/**`, `assets/**`, `LICENSE` and `.gitignore`. A green PR with no
-checks at all is expected there — and is worth telling apart from the failure mode in
-#256/#265, where a code PR reported `CLEAN` having run nothing.
+A docs-only PR is the exception, and runs **nothing**: `paths-ignore` skips `**.md`,
+`docs/**`, `assets/**`, `LICENSE` and `.gitignore`. A green PR with no checks at all is
+expected there — and is worth telling apart from the failure mode in #256/#265, where a
+*code* PR reported `CLEAN` having run nothing and looked identical.
 
 ## What is covered
 
