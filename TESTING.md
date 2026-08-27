@@ -1,8 +1,15 @@
 # Testing
 
-Floki ships a **GPU-free** test suite that covers parsing/import logic,
-the batch converter, color/tone math, and headless GUI interaction. Everything
-runs on a plain CI runner — no graphics device, no committed binary fixtures.
+Floki's test suite covers parsing/import logic, the batch converter, color/tone
+math, and headless GUI interaction. It runs on a plain CI runner with no
+committed binary fixtures.
+
+Almost all of it is **GPU-free** — that is the default and the rule for new
+tests. The exception is a small set of **on-device** tests that validate the
+render seams a CPU cannot stand in for (`gpu::ocio_pass::device_tests`,
+`gpu::thumbnail`). Those acquire a real device and **skip** when the runner
+can't provide one, so a GPU-less CI job still goes green; see
+[On-device tests](#on-device-tests).
 
 ## Running the tests
 
@@ -24,7 +31,51 @@ CI runs all three in a `Test & Lint` job that **gates** the build/release matrix
 | `.cube` 3D LUT parser | `src/color/cube.rs` | Valid parse, domain handling, comment skipping, and every error path. |
 | Tone / color math | `src/render_math.rs` | Exposure, gamma, sRGB transfer (round-trips). Shared by the CPU fallback and mirrored by `gpu/shader.wgsl`. |
 | GPU uniform layout | `src/gpu/mod.rs` | `Uniforms` size/alignment + `Pod` round-trip, and the `ChannelMode` → `u32` encoding contract. |
+| Composite layer placement | `src/viewer.rs` (`gui_tests`) | `comp_layer_rect` / `comp_pane_layout` / `side_by_side_layout` — each layer at its own `tex_size × PAR` (#254). Pure, no device. |
+| Render seams (on device) | `src/gpu/ocio_pass.rs` (`device_tests`), `src/gpu/thumbnail.rs` | Accumulate ping-pong blend vs a CPU reference, the layer-rect union (#257), blit coverage/checker, sRGB display-encode. Skips without a capable GPU — see [On-device tests](#on-device-tests). |
 | GUI interaction (headless) | `src/viewer.rs` (`gui_tests`) | Drives `ExrViewer::handle_hotkeys` through `egui_kittest` — channel keys, compare modes, contact-sheet gating, B-image gating. |
+
+## On-device tests
+
+A handful of tests acquire a real GPU. They live in
+`gpu::ocio_pass::device_tests` (the accumulate ping-pong, the blit, the
+sRGB display-encode) and `gpu::thumbnail`. They exist because these are
+render seams with no CPU equivalent to assert against: the ping-pong's
+premultiplied-alpha blend, the α=−1 "no image" sentinel, and whether
+`shader.wgsl` even compiles.
+
+**They skip rather than fail** when the machine can't supply a device, so a
+GPU-less CI runner still goes green. There are **two** ways to come up short
+and both must be checked:
+
+| Condition | Where it bites |
+|---|---|
+| No adapter at all | headless runners with no Vulkan/Metal/DX |
+| An adapter without `FLOAT32_FILTERABLE` | **`Test & Lint` on ubuntu-latest**, which has llvmpipe in software |
+
+The second one is the trap. An adapter *is* found on ubuntu, so an
+adapter-only guard sails past it and then panics in `request_device` —
+`GpuState` requires `FLOAT32_FILTERABLE` for the f32 3D LUT. That is exactly
+how the ungated tests failed CI the first time they ran there.
+
+**Any new on-device test must check both.** `ocio_pass::device_tests::test_device`
+is the reference implementation and the one to call from that module; it is
+module-private, so `gpu::thumbnail`'s two tests currently carry their own inline
+copies of the same two-stage check. Three copies of one guard is the shape that
+let the `FLOAT32_FILTERABLE` condition go missing everywhere at once — prefer
+calling the helper over adding a fourth, and see #266 for hoisting it somewhere
+both modules can reach.
+
+Two consequences worth knowing:
+
+- **A skip reads as a pass.** `Test & Lint` reports these green having run
+  none of them. Treat CI as covering the GPU-free suite only, and a real GPU
+  (any dev machine; macOS for the OCIO ones) as where the render seams are
+  actually verified.
+- **macOS with an OCIO feature runs the most.** `metal_tests` additionally
+  needs `target_os = "macos"` and `system-ocio` or `vendored`, so
+  `cargo test --features vendored` on a Mac is the only configuration that
+  runs every test in the repo.
 
 ## Conventions
 
@@ -32,10 +83,10 @@ CI runs all three in a `Test & Lint` job that **gates** the build/release matrix
   `tools.rs` tests do — do not commit `.exr` binaries (`*.exr` is gitignored;
   the few files under `assets/` are small, deliberately force-added smoke
   fixtures).
-- **No live GPU in tests.** `viewer::ui` already accepts
+- **No live GPU in tests, by default.** `viewer::ui` accepts
   `render_state: Option<&RenderState>`; tests pass `None` and assert on state.
-  Render-only logic that genuinely needs a device is out of scope for the suite
-  and is validated by the build step / manual `cargo run --release`.
+  Reach for an on-device test only when the thing under test *is* the render
+  seam and no CPU stand-in can observe it — see below.
 - **GUI tests target a rendering-free seam.** `ExrViewer::handle_hotkeys` holds
   the keyboard-driven state changes so `egui_kittest` can exercise the real egui
   input pipeline without building the full canvas. This is a binary crate, so

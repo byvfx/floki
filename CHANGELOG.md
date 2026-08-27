@@ -26,6 +26,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer falls back to hardcoded absolute paths when given no arguments.
 
 ### Fixed
+- **Anamorphic layers keep their own aspect in a composite.** The comp resolved one
+  pixel aspect for the whole canvas and stretched every layer to the bottom layer's
+  rect, so a 2:1 anamorphic plate over a square-pixel previs was squeezed back to
+  1:1 — and in a Blink compare the squeeze ran the other way, stretching the previs
+  to the plate. Each layer is now placed at its own pixel dimensions and its own
+  header pixel aspect, so a stack of mismatched formats shows each one at its true
+  display shape. Side-by-Side already did this for its second pane; that is now how
+  every layer is placed. Wipe and Diff still share one rect (they are a single
+  two-input draw) and are tracked separately, as is the pixel-aspect *override*,
+  which is still applied globally rather than per layer.
+- **The composite no longer clips to one layer's rect.** Each layer of the stack is
+  folded in its own render pass over a full-target clear, and the fold covered only
+  that layer — so everything outside the topmost layer's rectangle was left as the
+  "no image" sentinel and rendered black, erasing the layers underneath. Invisible
+  until layers stopped sharing a rectangle, which is exactly what the anamorphic fix
+  above does, so the two had to land together. The fold now spans the union of the
+  layer rects and passes the accumulation below it through untouched, and the
+  display stage is scissored to that same union.
 - **Opening a file that is already open no longer adds an invisible duplicate.** The
   copy landed exactly on top of the original, so the picture did not change — but it
   cost a full decode, another decode follower dividing the single worker, and another
@@ -109,6 +127,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shows whether its cap was sized from a measured frame or is sitting at the
   default, the T2 row is marked as slot-A only, and new `comp tex` and `sources`
   rows show the textures and per-layer decode state the comp path really holds.
+- The GPU render seams are covered by tests again on every platform. Four on-device
+  tests — the accumulate blend against a CPU reference, the blit, the sRGB
+  display-encode — were gated to macOS with an OpenColorIO build, which meant they
+  ran in no CI job at all and only ever on one developer's machine. They now run
+  anywhere a capable GPU is present and skip cleanly where one isn't, joined by a
+  new regression test for the composite clipping fixed above.
 
 ## [1.12.0] - 2026-08-15
 
