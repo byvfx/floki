@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Floki says when it is decode-bound instead of just looking frozen.** When decode
+  can't keep up, the picture stops moving and nothing in the UI said why: the
+  playhead walks on while the displayed frame stays put, which is indistinguishable
+  from a hang. Measured on a 4K, 1.03 GB/frame render with beauty preview off, the
+  playhead covered 30 frames in 40 seconds — 0.75 fps against a target of 24 — and
+  the one number that should have said "slow", the fps readout, said **0.0**. A hint
+  now appears in the transport row after the condition has held for two seconds:
+  `Decode-bound: 691 ms/frame vs 41 ms needed`, sitting immediately beside Beauty
+  preview and Scrub proxy, which are the two settings that fix it. Non-modal, and
+  dismissible until the next seek. It keys off decode turnaround rather than the
+  `stale` counter that looked like the obvious signal — `stale` reaches 2 during
+  perfectly healthy playback, so a hint built on it would cry wolf; turnaround
+  separates cleanly, 30–50 ms healthy against 560–800 ms bound.
 - **Reset settings to defaults**, under Help, in two scopes. Everything meaningful
   persists, so a toggle flipped once stayed flipped across every future session
   whether or not you remembered doing it — and the only cure was knowing that
