@@ -4556,6 +4556,39 @@ fn comp_format_of(exr: &ExrData) -> (usize, usize) {
     (dw.x(), dw.y())
 }
 
+/// The full window geometry of one source's AOV, for the overscan overlay (#251):
+/// display window plus the data window `aov`'s pixels actually cover, with both EXR
+/// origins so the two can be positioned relative to each other.
+///
+/// The data window is **per logical layer**, not per file — `layer_position` and the
+/// size live on the physical layer that `aov` maps to, so a multi-part render whose
+/// AOVs have different bounding boxes reports each one honestly. Falls back to the
+/// display window's own geometry if the AOV can't be resolved, which reads as "no
+/// overscan" and draws nothing rather than boxing a guess. Pure.
+fn comp_window_geometry(exr: &ExrData, aov: usize) -> crate::viewer::CompFormat {
+    let dw = exr.image.attributes.display_window;
+    let disp_pos = (dw.position.x(), dw.position.y());
+    let disp_size = (dw.size.x(), dw.size.y());
+    let phys = exr
+        .logical_layers
+        .get(aov)
+        .and_then(|ll| exr.image.layer_data.get(ll.physical_index));
+    match phys {
+        Some(layer) => crate::viewer::CompFormat {
+            disp_pos,
+            disp_size,
+            data_pos: layer.attributes.layer_position.into(),
+            data_size: layer.size.into(),
+        },
+        None => crate::viewer::CompFormat {
+            disp_pos,
+            disp_size,
+            data_pos: disp_pos,
+            data_size: disp_size,
+        },
+    }
+}
+
 /// One named layer's draw in a resolved composite — the `Step::Draw` carrying `layer`,
 /// if that layer is both present at this frame (`composite_at` drops hidden / soloed-out
 /// / trimmed-blank layers) and drawable (per `drawable`). Resolves **both** panes of a
@@ -7924,6 +7957,21 @@ impl ExrApp {
                 ui.checkbox(&mut self.viewer.show_tooltip, "Show Pixel Tooltip")
                     .on_hover_text("Float the sampled value next to the cursor");
 
+                // Overscan dim (#251), restored with the annotations. Only does
+                // anything on a frame whose data window differs from its display
+                // window; at 1.0 the overscan shows at full strength, at 0.0 it is
+                // hidden entirely and only the orange box marks where it was.
+                ui.separator();
+                ui.label("Overscan Opacity:");
+                ui.add(egui::Slider::new(
+                    &mut self.viewer.overscan_opacity,
+                    0.0..=1.0,
+                ))
+                .on_hover_text(
+                    "How strongly to show pixels outside the display window \
+                     (the format boundary)",
+                );
+
                 ui.separator();
                 // Anamorphic unsqueeze (#179 / #194): the master toggle persists via
                 // `ViewerPrefs`; the optional custom factor overrides the header PAR.
@@ -8632,9 +8680,14 @@ impl ExrApp {
         // #263 the override is a per-layer value, so the canvas layer's own override
         // is what shapes the canvas — the same rule every other layer follows.
         let mut base_par = 1.0_f32;
-        // Its display window, for the format readout (#251). Tracked beside the size
-        // so the label always describes the same layer the canvas does.
-        let mut base_format: Option<(usize, usize)> = None;
+        // Which layer the UI treats as current, for the overlay's bbox half (#251).
+        // Read once: `active_comp_layer` falls back to the top of the stack, so calling
+        // it per draw would be the same answer at more cost.
+        let current_layer = self.active_comp_layer();
+        // Its window geometry — display window plus the AOV's own data window — for
+        // the format readout and the overscan overlay (#251). Tracked beside the size
+        // so both always describe the same layer the canvas does.
+        let mut base_format: Option<crate::viewer::CompFormat> = None;
         for step in &steps {
             let crate::layer::Step::Draw(d) = step else {
                 continue; // Adjustment layers (#102) don't render yet.
@@ -8649,10 +8702,14 @@ impl ExrApp {
             // source's header PAR (#263). Resolved here, where the layer's draw and
             // its source are both in hand, so the renderer never re-derives it.
             let eff_par = d.effective_par(cs.exr_data.image.attributes.pixel_aspect);
+            // Resolved once per layer and shared by the canvas format below and this
+            // draw's `data_pos`: two calls would be two chances to disagree if the
+            // lookup ever grows a fallback.
+            let geom = comp_window_geometry(&cs.exr_data, d.aov);
             if draws.is_empty() {
                 base_size = cs.size;
                 base_par = eff_par;
-                base_format = Some(comp_format_of(&cs.exr_data));
+                base_format = Some(geom);
             }
             draws.push(crate::viewer::CompDraw {
                 bind_group,
@@ -8660,6 +8717,10 @@ impl ExrApp {
                 opacity: d.opacity,
                 eff_par,
                 tex_size: comp_tex_size(cs.size),
+                data_pos: geom.data_pos,
+                // Nuke's "viewed node": the overscan overlay boxes this layer's
+                // bounding box against the canvas layer's format (#251).
+                is_current: Some(d.id) == current_layer,
             });
         }
 
@@ -8708,6 +8769,10 @@ impl ExrApp {
                     // factor typed on pane A never distorts it (#263).
                     eff_par: d.effective_par(cs.exr_data.image.attributes.pixel_aspect),
                     tex_size: comp_tex_size(cs.size),
+                    data_pos: comp_window_geometry(&cs.exr_data, d.aov).data_pos,
+                    // The overlay is suppressed in a compare (two panes, two formats),
+                    // so pane B never needs to be flagged as current.
+                    is_current: false,
                 },
             })
         });
@@ -8728,18 +8793,23 @@ impl ExrApp {
                     && let Some(bind_group) = cs.bind_group.clone()
                 {
                     let eff_par = a.effective_par(cs.exr_data.image.attributes.pixel_aspect);
+                    let geom = comp_window_geometry(&cs.exr_data, a.aov);
                     draws = vec![crate::viewer::CompDraw {
                         bind_group,
                         blend: a.blend,
                         opacity: a.opacity,
                         eff_par,
                         tex_size: comp_tex_size(cs.size),
+                        data_pos: geom.data_pos,
+                        // Pane A of a compare *is* the current layer, though the
+                        // overlay is suppressed there either way.
+                        is_current: true,
                     }];
                     base_size = cs.size;
                     base_par = eff_par;
                     // In a compare, pane A *is* the current layer, so the format
                     // readout follows it here rather than the composite's canvas.
-                    base_format = Some(comp_format_of(&cs.exr_data));
+                    base_format = Some(geom);
                 }
                 self.comp_arrangement
             }

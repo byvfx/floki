@@ -276,6 +276,19 @@ pub struct CompDraw {
     /// that pane was the only place in the composite where a layer kept its own
     /// geometry, and it is the model this generalizes to N layers.
     pub tex_size: egui::Vec2,
+    /// EXR origin of this layer's data window (`layer_position`), so the bbox overlay
+    /// can report where the pixels sit in the file's coordinate space rather than on
+    /// screen (#251). `tex_size` is the matching size.
+    pub data_pos: (i32, i32),
+    /// Whether this is the **current** layer — the `Layer:` selection the AOV
+    /// controls, EXR Info and the pixel readout already act on.
+    ///
+    /// The overscan overlay draws this layer's bounding box, while the white format
+    /// box comes from the canvas layer. That split is Nuke's: the dashed box is the
+    /// viewer's format, the bbox is the viewed node's output, and the two are allowed
+    /// to disagree — a layer whose bbox does not match the shot format is exactly what
+    /// the overlay is for.
+    pub is_current: bool,
 }
 
 /// The right-hand pane of a comp Side-by-Side (#99 Slice 2a). A compare shows the two
@@ -380,6 +393,126 @@ pub(crate) fn comp_layer_rect(
         canvas_center,
         egui::vec2(tex_size.x * scale * eff_par, tex_size.y * scale),
     )
+}
+
+/// The canvas layer's EXR window geometry, for the overscan overlay (#251): the
+/// display window ("format") and the data window the pixels actually cover, both in
+/// native image pixels with their EXR origins.
+///
+/// Carried rather than recomputed because the viewer has no `ExrData` — the comp path
+/// hands it only bind groups and sizes, which is what keeps decode and storage out of
+/// the renderer.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) struct CompFormat {
+    pub disp_pos: (i32, i32),
+    pub disp_size: (usize, usize),
+    pub data_pos: (i32, i32),
+    pub data_size: (usize, usize),
+}
+
+/// Where the display window lands on screen, given where its **data** window landed.
+///
+/// The old A/B path ran this the other way — it centred the display window and offset
+/// the image from it. The comp path centres each layer's *data* window (`comp_layer_rect`,
+/// #254), so the display window is derived from that instead. Same offset, opposite
+/// sign; deriving it this way adds the overlay without moving a single layer.
+///
+/// `view_scale` is the per-axis screen scale `(scale * par, scale)`, so the x term
+/// carries the anamorphic unsqueeze and the box tracks a squeezed image. Pure.
+pub(crate) fn comp_display_rect(
+    layer_rect: egui::Rect,
+    view_scale: egui::Vec2,
+    f: CompFormat,
+) -> egui::Rect {
+    let offset = egui::vec2(
+        (f.disp_pos.0 - f.data_pos.0) as f32 * view_scale.x,
+        (f.disp_pos.1 - f.data_pos.1) as f32 * view_scale.y,
+    );
+    egui::Rect::from_min_size(
+        layer_rect.min + offset,
+        egui::vec2(
+            f.disp_size.0 as f32 * view_scale.x,
+            f.disp_size.1 as f32 * view_scale.y,
+        ),
+    )
+}
+
+/// How far the data window runs past the display window, as pixels per side and as a
+/// percentage of the format (#251).
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub(crate) struct Overscan {
+    /// The data window extends past the display window on at least one side.
+    pub overscanned: bool,
+    /// The data window falls *short* of the display window on at least one side —
+    /// a crop rather than an overscan. Both can be true at once on a data window
+    /// that is offset as well as differently sized.
+    pub cropped: bool,
+    /// Extra width / height as a percentage of the display window, e.g. a
+    /// 2200-wide data window in a 1920 format is `+14.6`. Negative when cropped.
+    pub extra_w_pct: f32,
+    pub extra_h_pct: f32,
+    /// Margin in pixels on each side: how far the data window extends past the
+    /// display window (negative where it falls short).
+    pub left: i32,
+    pub right: i32,
+    pub top: i32,
+    pub bottom: i32,
+}
+
+impl Overscan {
+    /// What the caption calls this window relationship.
+    ///
+    /// Three cases, not two: a data window that is *offset* as well as differently
+    /// sized runs past the format on one side and falls short on another, so both
+    /// flags are set. Labelling that "Overscan" describes half of it and hides the
+    /// half that costs you — a side with no pixels where the format expects them.
+    /// Pure.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match (self.overscanned, self.cropped) {
+            (true, true) => "Overscan + crop",
+            (false, true) => "Crop",
+            // Neither is unreachable from the overlay, which only draws when one of
+            // them holds; name it honestly rather than asserting.
+            _ => "Overscan",
+        }
+    }
+}
+
+/// Measure a layer's overscan (#251).
+///
+/// The percentage is expressed against the **display window**, per axis, as the total
+/// extra across both sides — so a symmetric 140px margin on a 1920 format reads
+/// `+14.6%`, not `+7.3%`. Total rather than per-side because the margins need not be
+/// symmetric (a data window can be offset), and one number per axis that always means
+/// the same thing beats a number that silently assumes symmetry.
+///
+/// A zero-sized display window yields zero percentages rather than a division by zero;
+/// the pixel margins are still reported, since those are well defined regardless. Pure.
+pub(crate) fn overscan_of(f: CompFormat) -> Overscan {
+    let (dw, dh) = (f.disp_size.0 as i64, f.disp_size.1 as i64);
+    let (tw, th) = (f.data_size.0 as i64, f.data_size.1 as i64);
+    let left = i64::from(f.disp_pos.0) - i64::from(f.data_pos.0);
+    let top = i64::from(f.disp_pos.1) - i64::from(f.data_pos.1);
+    let right = (i64::from(f.data_pos.0) + tw) - (i64::from(f.disp_pos.0) + dw);
+    let bottom = (i64::from(f.data_pos.1) + th) - (i64::from(f.disp_pos.1) + dh);
+    let pct = |extra: i64, whole: i64| {
+        if whole > 0 {
+            extra as f32 / whole as f32 * 100.0
+        } else {
+            0.0
+        }
+    };
+    Overscan {
+        overscanned: left > 0 || right > 0 || top > 0 || bottom > 0,
+        cropped: left < 0 || right < 0 || top < 0 || bottom < 0,
+        extra_w_pct: pct(tw - dw, dw),
+        extra_h_pct: pct(th - dh, dh),
+        left: left as i32,
+        right: right as i32,
+        top: top as i32,
+        bottom: bottom as i32,
+    }
 }
 
 /// Which pane a blink compare shows at `time` (seconds), and when it next flips
@@ -1110,7 +1243,17 @@ pub struct ExrViewer {
     /// the label does not flicker to the proxy size on scrub. That detail was in the
     /// original implementation and is the reason this reads the display window rather
     /// than the texture size.
-    pub comp_format: Option<(usize, usize)>,
+    pub(crate) comp_format: Option<CompFormat>,
+    /// Opacity applied to the data-window pixels *outside* the display window — the
+    /// overscan dim (#251). `0.0` hides the overscan entirely, `1.0` shows it at full
+    /// strength (no dim). The GPU side of this never went away: `Uniforms::overscan_factor`
+    /// and its `shader.wgsl` counterpart survived the A/B deletion still implementing
+    /// the dim, pinned to `1.0` at every construction site, so restoring it was
+    /// re-plumbing a value rather than new rendering.
+    ///
+    /// Session-only, matching the original — it is a per-look adjustment rather than a
+    /// standing preference.
+    pub overscan_opacity: f32,
     pub last_hover_pos_img: Option<(usize, usize)>,
     pub last_sampled_val_a: Option<[f32; 4]>,
     /// When set (by the app from `Playback::sampling_suppressed`), the canvas
@@ -1221,6 +1364,7 @@ impl Default for ExrViewer {
             translation: egui::Vec2::ZERO,
             first_frame: true,
             comp_format: None,
+            overscan_opacity: 0.2,
             last_hover_pos_img: None,
             last_sampled_val_a: None,
             suppress_sampling: false,
@@ -2575,7 +2719,28 @@ impl ExrViewer {
             self.normalize_side_by_side,
         );
         let image_rect = panes.image_rect;
-        let disp_rect = panes.disp_rect;
+        // The canvas layer's display window, if it has one distinct from its pixels
+        // (#251). Only in Stacked and only for the canvas layer: the overlay describes
+        // one image's format, and a compare shows two, which is the same reason the
+        // format label is suppressed in Side-by-Side.
+        //
+        // `image_rect` *is* the bottom layer's rect — `comp_layer_rect` centres it on
+        // the canvas at the canvas's own size and PAR, which is how `image_rect` is
+        // built — so the display window is derived from it directly.
+        let canvas_format = self.comp_format.filter(|_| !is_sbs);
+        let disp_rect = match canvas_format {
+            // The dim, the background gradient's normalization and the white format
+            // box all key off the real display window. Where the canvas layer has no
+            // overscan this returns `image_rect` exactly, so nothing changes for the
+            // common case and the shader's dim gate is always inside.
+            Some(f) => comp_display_rect(image_rect, egui::vec2(self.scale * par, self.scale), f),
+            // A compare: two panes, two possible formats. Suppressed for the same
+            // reason the format label is.
+            None => panes.disp_rect,
+        };
+        // Whether the canvas layer has pixels outside its own format — the condition
+        // for the dim to have anything to dim.
+        let canvas_overscanned = canvas_format.is_some_and(|f| overscan_of(f).overscanned);
         self.last_image_rect = Some(image_rect);
         // Per-axis screen scale `(scale * par, scale)`: annotations are stored in
         // *native* image pixels, so dividing by this maps a screen point back and they
@@ -2622,6 +2787,11 @@ impl ExrViewer {
             ocio_active: self.ocio_active,
             force_accumulate: true,
             uniform_offset: std::cell::Cell::new(0u32),
+            // Left inert. The overscan dim (#251) is applied once, in the display
+            // blit — `fs_main`'s `eff_opacity` is discarded for every draw with
+            // `skip_checker == 1`, which is all of the comp layers, and under OCIO the
+            // dim has to happen post-transform anyway. Setting it here as well would
+            // dim twice on any path that honours it *and* reaches the blit.
             overscan_factor: std::cell::Cell::new(1.0f32),
             neutral_view_ops: std::cell::Cell::new(false),
             blend_override: std::cell::Cell::new(None),
@@ -2734,6 +2904,10 @@ impl ExrViewer {
         // is enabled, so this costs a bool check in a normal run.
         let debug_geom = log::log_enabled!(target: "floki::playback", log::Level::Debug);
         let mut geom: Vec<String> = Vec::new();
+        // Rect + data-window geometry of the current layer, and of the canvas layer as
+        // a fallback, both filled in by the loop.
+        let mut current_bbox: Option<(egui::Rect, (i32, i32), egui::Vec2)> = None;
+        let mut canvas_bbox: Option<(egui::Rect, (i32, i32), egui::Vec2)> = None;
         for (i, d) in stack_draws.iter().enumerate() {
             // Each layer at its own display size (#254), centred on the canvas — the
             // composite no longer resolves one pixel aspect and stretches everything
@@ -2748,6 +2922,17 @@ impl ExrViewer {
             let layer_rect =
                 comp_layer_rect(image_rect.center(), self.scale, d.tex_size, layer_par);
             cover(&mut union_rect, layer_rect);
+            // The current layer's placed rect, for the bbox half of the overscan
+            // overlay (#251). Taken here rather than recomputed after the loop so it
+            // is the exact rect this layer was drawn at, not a second derivation of it
+            // that could drift.
+            if d.is_current {
+                current_bbox = Some((layer_rect, d.data_pos, d.tex_size));
+            }
+            // The canvas layer's own rect, as the fallback below.
+            if i == 0 {
+                canvas_bbox = Some((layer_rect, d.data_pos, d.tex_size));
+            }
             if debug_geom {
                 // Printing each layer's own rect beside its own aspect is the point:
                 // a `par=2.000` layer handed the same rect as a `par=1.000` one is
@@ -2854,24 +3039,114 @@ impl ExrViewer {
         // Per-layer formats are in the Layers panel, which is where a mismatch is
         // meant to be compared.
         //
-        // Positioned at the bottom-right of the canvas rect, which on the comp path is
-        // the *data* window (`disp_rect == image_rect` — the stack has no display-window
-        // geometry yet). So on an overscan render the label sits on the data window
-        // while naming the display window's size. The size is the honest answer to
-        // "what format is this"; anchoring it to a drawn display-window box is the
-        // other half of #251, along with the overscan dim and bbox annotations.
+        // Anchored to `disp_rect`, which is now the real display window on an
+        // overscanned render — so the label sits on the box it names.
         //
         // Drawn with the same unclipped painter as the annotations below, and before
         // the early return, so the Diff path gets it too.
-        if let Some((fw, fh)) = self.comp_format
+        if let Some(f) = self.comp_format
             && !is_sbs
         {
+            let (fw, fh) = f.disp_size;
             painter.text(
                 disp_rect.right_bottom() + egui::vec2(0.0, 5.0),
                 egui::Align2::RIGHT_TOP,
                 format!("{fw}x{fh}"),
                 egui::FontId::proportional(12.0),
                 egui::Color32::from_gray(200),
+            );
+        }
+
+        // The overscan / crop overlay (#251), the other half of the readout above: the
+        // white display-window box with its corner coordinates, and the orange
+        // data-window box with how far past the format the pixels actually run.
+        //
+        // Only drawn when the two windows differ — on a render where they agree the
+        // boxes would be one rectangle drawn twice, which is noise. The data window
+        // exceeding the display window is a normal and important property of a render,
+        // and until this there was nothing in the UI that said so: not that a frame has
+        // overscan, nor how much, nor where the format boundary sits.
+        // The two boxes describe different things on purpose (Nuke's split): the white
+        // one is the **canvas layer's** display window — the shot format — and the
+        // orange one is the **current layer's** bounding box. A layer whose bbox does
+        // not match the format is precisely what this is for, so forcing both onto one
+        // layer would hide the case worth seeing.
+        //
+        // The current layer need not be *drawn* — it can be hidden, soloed out, or
+        // trimmed away at this frame — and when it isn't, the overlay falls back to the
+        // canvas layer. Without that fallback the whole overlay vanished whenever the
+        // `Layer:` selection pointed at an invisible layer, taking the format box with
+        // it: a 40%-overscan render on screen with nothing marking its boundary, because
+        // of a selection that wasn't contributing a pixel. The layer you are actually
+        // looking at is the one to describe.
+        let bbox = current_bbox
+            .or(canvas_bbox)
+            .zip(canvas_format)
+            .map(|((r, pos, size), f)| {
+                let combined = CompFormat {
+                    data_pos: pos,
+                    data_size: (size.x as usize, size.y as usize),
+                    ..f
+                };
+                (r, combined, overscan_of(combined))
+            });
+        if let Some((bbox_rect, f, o)) = bbox.filter(|(_, _, o)| o.overscanned || o.cropped) {
+            // Display window: dashed white, the format boundary.
+            draw_dashed_rect(
+                &painter,
+                disp_rect,
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 100),
+                5.0,
+                5.0,
+            );
+            // Its corners in EXR coordinates, so the numbers match what the file says
+            // rather than where it happens to sit on screen.
+            painter.text(
+                disp_rect.left_bottom() + egui::vec2(0.0, 5.0),
+                egui::Align2::LEFT_TOP,
+                format!("{},{}", f.disp_pos.0, f.disp_pos.1),
+                egui::FontId::proportional(12.0),
+                egui::Color32::GRAY,
+            );
+            painter.text(
+                disp_rect.right_top() - egui::vec2(0.0, 5.0),
+                egui::Align2::RIGHT_BOTTOM,
+                format!(
+                    "{},{}",
+                    f.disp_pos.0 + f.disp_size.0 as i32,
+                    f.disp_pos.1 + f.disp_size.1 as i32
+                ),
+                egui::FontId::proportional(12.0),
+                egui::Color32::GRAY,
+            );
+            // Data window: dashed orange, the current layer's actual pixel coverage.
+            let orange = egui::Color32::from_rgb(255, 200, 100);
+            draw_dashed_rect(
+                &painter,
+                bbox_rect,
+                egui::Color32::from_rgba_unmultiplied(255, 200, 100, 180),
+                4.0,
+                4.0,
+            );
+            // Size, origin, and how much of it is overscan. The percentage is the part
+            // that was never there before: pixel dimensions answer "how big", but
+            // "+14.6% × +20.4%" is the figure you actually compare between a plate and
+            // a render, and it is the one a delivery spec is written in.
+            painter.text(
+                bbox_rect.right_bottom() + egui::vec2(5.0, 5.0),
+                egui::Align2::LEFT_TOP,
+                format!(
+                    "{}: {}x{} (pos: {}, {})  {:+.1}% × {:+.1}%",
+                    o.label(),
+                    f.data_size.0,
+                    f.data_size.1,
+                    f.data_pos.0,
+                    f.data_pos.1,
+                    o.extra_w_pct,
+                    o.extra_h_pct,
+                ),
+                egui::FontId::proportional(12.0),
+                orange,
             );
         }
 
@@ -2933,8 +3208,20 @@ impl ExrViewer {
         let blit_uniforms = crate::gpu::BlitUniforms {
             display_min: [covered.min.x, covered.min.y],
             display_max: [covered.max.x, covered.max.y],
+            // The overscan dim (#251) lives *here*, not in `fs_main`: that path
+            // computes an `eff_opacity` from `Uniforms::overscan_factor`, but
+            // `out_a = select(eff_opacity, a, skip_checker == 1u)` discards it for the
+            // comp layers, which all run with `skip_checker == 1`. Under OCIO the dim
+            // has to be applied post-transform anyway, which is why it was put in the
+            // blit — so setting the per-draw factor alone dimmed nothing at all.
+            dim_min: [disp_rect.min.x, disp_rect.min.y],
+            dim_max: [disp_rect.max.x, disp_rect.max.y],
             screen_size: [content.width(), content.height()],
-            overscan_factor: 1.0,
+            overscan_factor: if canvas_overscanned {
+                self.overscan_opacity
+            } else {
+                1.0
+            },
             bg_mode: self.prefs.background.mode.as_u32() as f32,
             bg_checker_size: self.prefs.background.checker_size,
             bg_grad_angle: self.prefs.background.gradient_angle,
@@ -3738,6 +4025,45 @@ fn colored_rgba_label(ui: &mut egui::Ui, prefix: &str, val: [f32; 4]) {
     });
 }
 
+/// Stroke a dashed rectangle. Restored with the overscan overlay (#251) — it went out
+/// with the A/B render path and has no other caller.
+fn draw_dashed_rect(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    color: egui::Color32,
+    dash_length: f32,
+    gap_length: f32,
+) {
+    let draw_line = |start: egui::Pos2, end: egui::Pos2| {
+        let dir = end - start;
+        let len = dir.length();
+        let stride = dash_length + gap_length;
+        // Degenerate edge or non-advancing stride: nothing to draw (and the
+        // latter would otherwise spin forever / divide by zero on `dir_norm`).
+        if len <= f32::EPSILON || stride <= f32::EPSILON {
+            return;
+        }
+        let dir_norm = dir / len;
+        // Derive each dash offset from an integer index rather than accumulating
+        // a float `t += stride`, so rounding error can't drift over a long edge
+        // (and clippy's `while_float` is satisfied). Last index < len by ceil math.
+        let steps = (len / stride).ceil() as usize;
+        for i in 0..steps {
+            let t = i as f32 * stride;
+            let t_end = (t + dash_length).min(len);
+            painter.line_segment(
+                [start + dir_norm * t, start + dir_norm * t_end],
+                (1.0, color),
+            );
+        }
+    };
+
+    draw_line(rect.left_top(), rect.right_top());
+    draw_line(rect.right_top(), rect.right_bottom());
+    draw_line(rect.right_bottom(), rect.left_bottom());
+    draw_line(rect.left_bottom(), rect.left_top());
+}
+
 #[cfg(test)]
 mod gui_tests {
     //! Headless GUI tests via `egui_kittest`, so they run anywhere — no wgpu
@@ -3779,6 +4105,158 @@ mod gui_tests {
             (true, true),
             "top blends + view ops"
         );
+    }
+
+    /// A realistic overscanned render: 1920×1080 format with a 140px margin all
+    /// round, so the data window is 2200×1300 at origin (-140, -110).
+    fn overscan_fixture() -> super::CompFormat {
+        super::CompFormat {
+            disp_pos: (0, 0),
+            disp_size: (1920, 1080),
+            data_pos: (-140, -110),
+            data_size: (2200, 1300),
+        }
+    }
+
+    /// The percentage is against the **display window** and totals both sides, so a
+    /// symmetric 140px margin on a 1920 format reads +14.6%, not +7.3%. Getting this
+    /// backwards would halve every figure and still look plausible, which is why the
+    /// arithmetic is pinned rather than eyeballed on screen.
+    #[test]
+    fn overscan_is_measured_against_the_format_across_both_sides() {
+        let o = super::overscan_of(overscan_fixture());
+        assert!(o.overscanned);
+        assert!(!o.cropped);
+        assert_eq!((o.left, o.right, o.top, o.bottom), (140, 140, 110, 110));
+        // 280 extra px on 1920 = 14.583%, 220 on 1080 = 20.370%.
+        assert!((o.extra_w_pct - 14.583_334).abs() < 1e-3, "{o:?}");
+        assert!((o.extra_h_pct - 20.370_37).abs() < 1e-3, "{o:?}");
+    }
+
+    /// A data window *inside* the display window is a crop, not an overscan, and the
+    /// overlay says so — the original only ever had one word for both, and a cropped
+    /// render labelled "Overscan: …" reads as the opposite of what happened.
+    #[test]
+    fn a_data_window_inside_the_format_reads_as_a_crop() {
+        let o = super::overscan_of(super::CompFormat {
+            disp_pos: (0, 0),
+            disp_size: (1920, 1080),
+            data_pos: (100, 50),
+            data_size: (1000, 500),
+        });
+        assert!(o.cropped);
+        assert!(!o.overscanned);
+        assert!(o.extra_w_pct < 0.0 && o.extra_h_pct < 0.0);
+        // Margins are negative on every side: the pixels fall short all round.
+        assert_eq!((o.left, o.right, o.top, o.bottom), (-100, -820, -50, -530));
+
+        // Equal windows are neither, so the overlay draws nothing — the common case,
+        // where two identical boxes would just be visual noise.
+        let none = super::overscan_of(super::CompFormat {
+            disp_pos: (0, 0),
+            disp_size: (64, 64),
+            data_pos: (0, 0),
+            data_size: (64, 64),
+        });
+        assert!(!none.overscanned && !none.cropped);
+
+        // A degenerate format yields no percentage rather than a division by zero;
+        // the pixel margins are still well defined and still reported.
+        let zero = super::overscan_of(super::CompFormat {
+            disp_pos: (0, 0),
+            disp_size: (0, 0),
+            data_pos: (0, 0),
+            data_size: (8, 8),
+        });
+        assert_eq!((zero.extra_w_pct, zero.extra_h_pct), (0.0, 0.0));
+        assert_eq!((zero.right, zero.bottom), (8, 8));
+    }
+
+    /// A real 40% overscan render (the `redSea` beauty from a dogfood session): 3225×2215
+    /// of pixels in a 2304×1582 format, the data window starting at (-460, -317).
+    ///
+    /// Round numbers on real footage are the useful check here — a 40% overscan should
+    /// read as 40%, and any confusion between "per side" and "across both sides" would
+    /// show up immediately as 20%.
+    #[test]
+    fn a_real_render_reports_its_overscan_as_the_delivery_spec_states_it() {
+        let o = super::overscan_of(super::CompFormat {
+            disp_pos: (0, 0),
+            disp_size: (2304, 1582),
+            data_pos: (-460, -317),
+            data_size: (3225, 2215),
+        });
+        assert!(o.overscanned && !o.cropped);
+        assert!((o.extra_w_pct - 40.0).abs() < 0.05, "{o:?}");
+        assert!((o.extra_h_pct - 40.0).abs() < 0.05, "{o:?}");
+        // Margins are very nearly symmetric, as a render with uniform overscan is.
+        assert_eq!((o.left, o.top), (460, 317));
+        assert_eq!((o.right, o.bottom), (461, 316));
+    }
+
+    /// A data window that is *offset* as well as differently sized overruns the format
+    /// on one side and falls short on another, so it is both overscanned and cropped —
+    /// and the caption has to say so.
+    ///
+    /// The overlay used to pick its word from `overscanned` alone, which named the
+    /// half that costs nothing and hid the half that costs you: a side with no pixels
+    /// where the format expects them, reported as "Overscan".
+    #[test]
+    fn a_window_that_overruns_one_side_and_falls_short_of_another_says_both() {
+        let o = super::overscan_of(super::CompFormat {
+            disp_pos: (0, 0),
+            disp_size: (1920, 1080),
+            // Shifted right and down: pixels past the right/bottom edges, none along
+            // the left/top ones.
+            data_pos: (200, 100),
+            data_size: (1920, 1080),
+        });
+        assert!(o.overscanned, "overruns the right and bottom");
+        assert!(o.cropped, "falls short along the left and top");
+        assert_eq!(o.label(), "Overscan + crop");
+        assert_eq!((o.left, o.top), (-200, -100));
+        assert_eq!((o.right, o.bottom), (200, 100));
+        // Same size as the format, so neither axis gained area — the percentage is
+        // about size and the margins are about placement; a caption showing 0% beside
+        // non-zero margins is correct, not a contradiction.
+        assert_eq!((o.extra_w_pct, o.extra_h_pct), (0.0, 0.0));
+
+        // The single-sided cases keep their plain labels.
+        assert_eq!(super::overscan_of(overscan_fixture()).label(), "Overscan");
+        assert_eq!(
+            super::overscan_of(super::CompFormat {
+                disp_pos: (0, 0),
+                disp_size: (1920, 1080),
+                data_pos: (100, 50),
+                data_size: (1000, 500),
+            })
+            .label(),
+            "Crop"
+        );
+    }
+
+    /// The display-window box is placed from the layer's own rect, so restoring the
+    /// overlay moves nothing: the data window stays exactly where #254 put it.
+    #[test]
+    fn the_display_box_is_positioned_relative_to_the_data_window() {
+        let f = overscan_fixture();
+        // Unzoomed, square pixels: 1px of image is 1px of screen.
+        let layer = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2200.0, 1300.0));
+        let disp = super::comp_display_rect(layer, egui::vec2(1.0, 1.0), f);
+        // The data window starts 140px left and 110px above the format, so the format
+        // box sits that far *inside* the image rect.
+        assert_eq!(disp.min, egui::pos2(140.0, 110.0));
+        assert_eq!(disp.size(), egui::vec2(1920.0, 1080.0));
+        assert!(
+            layer.contains_rect(disp),
+            "an overscanned render's format box lies inside its pixels"
+        );
+
+        // Zoom and the anamorphic unsqueeze both ride on `view_scale`, so the box
+        // tracks a squeezed image instead of drifting off it — x carries the PAR.
+        let disp2 = super::comp_display_rect(layer, egui::vec2(4.0, 2.0), f);
+        assert_eq!(disp2.min, egui::pos2(560.0, 220.0));
+        assert_eq!(disp2.size(), egui::vec2(7680.0, 2160.0));
     }
 
     #[test]
