@@ -441,6 +441,298 @@ impl Playback {
     }
 }
 
+/// One sample of the playback pipeline for [`DecodeBound`] (#249).
+#[derive(Clone, Copy, Debug)]
+pub struct DecodeBoundSample {
+    pub playing: bool,
+    /// Supersession epoch. Bumped on every seek / scrub / direction change, so a
+    /// change restarts the window — which is how scrubbing is excluded without a
+    /// separate "am I scrubbing" flag: dragging the playhead is *expected* to be
+    /// decode-bound and must never raise the hint.
+    pub epoch: u64,
+    /// Turnaround of the last completed sequence decode.
+    pub last_decode: Option<std::time::Duration>,
+    /// One frame's wall clock at the target rate.
+    pub frame_period: std::time::Duration,
+    /// Frames the pacer held late or dropped during this play run — the picture
+    /// failing to keep up, counted. Held *and* dropped because which one grows
+    /// depends on the pacing mode.
+    pub behind: u32,
+}
+
+/// What to tell the user, with the figures that justify it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DecodeBoundHint {
+    pub decode_ms: u32,
+    pub budget_ms: u32,
+}
+
+/// Detects a *sustained* decode-bound transport (#249): playback that presents as
+/// frozen rather than slow, because decode turnaround is many times the frame
+/// period and the displayed frame never advances.
+///
+/// **Keyed on `last_decode`, deliberately not on `stale`.** #249 proposed
+/// `stale > 0` sustained, on the strength of that field's own comment calling it
+/// the headline "is the picture keeping up" number. Measured on a 1.03 GB/frame
+/// render it reaches **2 while playing at 25.6 fps** — comfortably keeping up — so a
+/// hint built on it would fire during healthy playback. `stale` counts sources
+/// painting a frame other than their playhead, and at 24 fps with prefetch in
+/// flight that is momentarily true all the time. It reads well in a trace beside
+/// its neighbours; it is not a predicate.
+///
+/// `last_decode` separates cleanly on the same footage: 0.03–0.05 s healthy against
+/// 0.56–0.80 s bound, with nothing in between. [`BOUND_FACTOR`] sits an order of
+/// magnitude clear of both.
+#[derive(Default, Debug)]
+pub struct DecodeBound {
+    /// When the condition began holding continuously; `None` while it does not.
+    since: Option<std::time::Instant>,
+    /// `behind` when it began, so the hint also requires the count to be *growing*
+    /// — a slow decode that is nonetheless keeping the picture moving is not this.
+    behind_at_start: u32,
+    /// Epoch the window belongs to; a change restarts it.
+    epoch: u64,
+    /// Epoch at which the user dismissed the hint. Any seek re-arms it, so
+    /// dismissal silences the current condition rather than the feature.
+    dismissed_at: Option<u64>,
+}
+
+/// Decode turnaround must exceed this multiple of the frame period. At 24 fps that
+/// is 83 ms, against 30–50 ms measured healthy and 560–800 ms measured bound.
+const BOUND_FACTOR: u32 = 2;
+
+/// How long the condition must hold before the hint appears. A seek or a loop wrap
+/// costs one slow decode; this is about the state that does not recover.
+const HOLD: std::time::Duration = std::time::Duration::from_secs(2);
+
+impl DecodeBound {
+    /// Feed one sample and get the hint to show, if any. `now` is passed in rather
+    /// than read so the whole thing is testable without a clock.
+    pub fn update(
+        &mut self,
+        now: std::time::Instant,
+        s: &DecodeBoundSample,
+    ) -> Option<DecodeBoundHint> {
+        // A seek restarts everything, including a dismissal: the user asked about a
+        // different part of the timeline, and the old verdict no longer applies.
+        if s.epoch != self.epoch {
+            self.epoch = s.epoch;
+            self.since = None;
+            self.dismissed_at = None;
+        }
+        let budget = s.frame_period;
+        let bound = s.playing
+            && !budget.is_zero()
+            && s.last_decode.is_some_and(|d| d > budget * BOUND_FACTOR);
+        if !bound {
+            // Clears immediately rather than lingering: the condition ending is the
+            // good news, and a stale warning is the thing that makes warnings
+            // ignorable. Stopping also lands here, since `playing` goes false —
+            // which matters, because `last_decode` keeps its bound value after a
+            // stopped run and would otherwise pin the hint up forever.
+            self.since = None;
+            return None;
+        }
+        let started = *self.since.get_or_insert_with(|| {
+            self.behind_at_start = s.behind;
+            now
+        });
+        if now.duration_since(started) < HOLD {
+            return None;
+        }
+        // Still falling behind, not merely slow. In the healthy capture this count
+        // rose during spin-up and then flatlined; in the bound one it climbed for
+        // the whole run.
+        if s.behind <= self.behind_at_start {
+            return None;
+        }
+        if self.dismissed_at == Some(s.epoch) {
+            return None;
+        }
+        let ms = |d: std::time::Duration| u32::try_from(d.as_millis()).unwrap_or(u32::MAX);
+        Some(DecodeBoundHint {
+            decode_ms: ms(s.last_decode?),
+            budget_ms: ms(budget),
+        })
+    }
+
+    /// Dismiss the hint for the current condition. Re-armed by the next seek.
+    pub fn dismiss(&mut self) {
+        self.dismissed_at = Some(self.epoch);
+    }
+}
+
+#[cfg(test)]
+mod decode_bound_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// 24 fps.
+    const BUDGET: Duration = Duration::from_micros(41_667);
+
+    /// Measured on redSea (4K, 1.03 GB/frame) with beauty preview and proxy off:
+    /// 560–800 ms turnaround, `run_held` climbing the whole run.
+    fn bound(behind: u32) -> DecodeBoundSample {
+        DecodeBoundSample {
+            playing: true,
+            epoch: 1,
+            last_decode: Some(Duration::from_millis(650)),
+            frame_period: BUDGET,
+            behind,
+        }
+    }
+
+    /// The same footage at defaults: 30–50 ms turnaround, 25.6 fps, `run_held` flat.
+    fn healthy(behind: u32) -> DecodeBoundSample {
+        DecodeBoundSample {
+            playing: true,
+            epoch: 1,
+            last_decode: Some(Duration::from_millis(50)),
+            frame_period: BUDGET,
+            behind,
+        }
+    }
+
+    #[test]
+    fn fires_only_after_the_condition_is_sustained() {
+        let mut d = DecodeBound::default();
+        let t0 = Instant::now();
+
+        // One slow decode is a seek or a loop wrap, not this.
+        assert!(d.update(t0, &bound(0)).is_none());
+        assert!(
+            d.update(t0 + Duration::from_millis(1_500), &bound(30))
+                .is_none()
+        );
+
+        let hint = d
+            .update(t0 + Duration::from_millis(2_100), &bound(60))
+            .expect("sustained past the hold");
+        assert_eq!(hint.decode_ms, 650);
+        assert_eq!(hint.budget_ms, 41);
+    }
+
+    /// The regression this whole detector is shaped around: healthy playback of the
+    /// *same* footage must stay silent, however long it runs. `stale` reached 2 here
+    /// while keeping up at 25.6 fps, which is why it isn't the signal.
+    #[test]
+    fn never_fires_on_healthy_playback() {
+        let mut d = DecodeBound::default();
+        let t0 = Instant::now();
+        for i in 0..60 {
+            let at = t0 + Duration::from_millis(i * 500);
+            // `behind` climbs during spin-up then flatlines, as measured.
+            let behind = if i < 6 { i as u32 * 9 } else { 52 };
+            assert!(
+                d.update(at, &healthy(behind)).is_none(),
+                "healthy playback raised the hint at sample {i}"
+            );
+        }
+    }
+
+    /// A decode slower than the budget that is nonetheless keeping the picture
+    /// moving is slow, not stuck — the hint is about a transport that has stopped
+    /// advancing, and `behind` is what says so.
+    #[test]
+    fn a_slow_decode_that_keeps_up_is_not_decode_bound() {
+        let mut d = DecodeBound::default();
+        let t0 = Instant::now();
+        for i in 0..10 {
+            let at = t0 + Duration::from_millis(i * 500);
+            assert!(
+                d.update(at, &bound(7)).is_none(),
+                "`behind` never grew, so nothing is falling behind"
+            );
+        }
+    }
+
+    /// Stopping must clear it. `last_decode` keeps its bound value after the run
+    /// ends — measured at 0.70 s on a stopped transport — so without the `playing`
+    /// gate the hint would stay up on a stopped app forever.
+    #[test]
+    fn clears_when_playback_stops_even_though_last_decode_is_still_slow() {
+        let mut d = DecodeBound::default();
+        let t0 = Instant::now();
+        d.update(t0, &bound(0));
+        assert!(d.update(t0 + Duration::from_secs(3), &bound(90)).is_some());
+
+        let stopped = DecodeBoundSample {
+            playing: false,
+            ..bound(90)
+        };
+        assert!(d.update(t0 + Duration::from_secs(4), &stopped).is_none());
+        // And it does not come straight back on resume without re-earning the hold.
+        assert!(d.update(t0 + Duration::from_secs(5), &bound(95)).is_none());
+    }
+
+    /// Scrubbing is expected to be decode-bound. A seek bumps the epoch, which
+    /// restarts the window, so dragging the playhead can never accumulate one.
+    #[test]
+    fn a_seek_restarts_the_window() {
+        let mut d = DecodeBound::default();
+        let t0 = Instant::now();
+        d.update(t0, &bound(0));
+        // Two seconds in, still bound — but the user seeked, so the clock restarts.
+        let seeked = DecodeBoundSample {
+            epoch: 2,
+            ..bound(60)
+        };
+        assert!(d.update(t0 + Duration::from_secs(2), &seeked).is_none());
+        // It fires two seconds after the *seek*, not after the original start.
+        let later = DecodeBoundSample {
+            epoch: 2,
+            ..bound(120)
+        };
+        assert!(
+            d.update(t0 + Duration::from_millis(4_100), &later)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn dismissal_holds_until_the_next_seek() {
+        let mut d = DecodeBound::default();
+        let t0 = Instant::now();
+        d.update(t0, &bound(0));
+        assert!(d.update(t0 + Duration::from_secs(3), &bound(90)).is_some());
+
+        d.dismiss();
+        assert!(d.update(t0 + Duration::from_secs(4), &bound(120)).is_none());
+
+        // A seek re-arms: a new part of the timeline is a new question.
+        let seeked = DecodeBoundSample {
+            epoch: 2,
+            ..bound(150)
+        };
+        assert!(d.update(t0 + Duration::from_secs(5), &seeked).is_none());
+        let later = DecodeBoundSample {
+            epoch: 2,
+            ..bound(200)
+        };
+        assert!(d.update(t0 + Duration::from_secs(8), &later).is_some());
+    }
+
+    /// No measurement yet, or a nonsense frame period, must not be read as trouble.
+    #[test]
+    fn is_inert_without_a_usable_measurement() {
+        let mut d = DecodeBound::default();
+        let t0 = Instant::now();
+        let no_decode = DecodeBoundSample {
+            last_decode: None,
+            ..bound(90)
+        };
+        let zero_budget = DecodeBoundSample {
+            frame_period: Duration::ZERO,
+            ..bound(90)
+        };
+        for i in 0..10 {
+            let at = t0 + Duration::from_millis(i * 500);
+            assert!(d.update(at, &no_decode).is_none());
+            assert!(d.update(at, &zero_budget).is_none());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

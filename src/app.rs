@@ -659,6 +659,13 @@ pub struct ExrApp {
     run_dropped: u32,
     #[serde(skip)]
     run_held: u32,
+    /// Sustained-decode-bound detector and its current verdict (#249). When decode
+    /// can't keep up the app presents as frozen rather than slow, and every number
+    /// that says so lives in a debug trace the user has to know to enable.
+    #[serde(skip)]
+    decode_bound: crate::playback::DecodeBound,
+    #[serde(skip)]
+    decode_bound_hint: Option<crate::playback::DecodeBoundHint>,
 
     /// Wall-clock instant the most recent **sequence** decode job was submitted
     /// to the worker. Anchors the decode stall watchdog ([`Self::tick_decode_watchdog`]):
@@ -1117,6 +1124,8 @@ impl Default for ExrApp {
             epoch_signal: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             show_playback_debug: false,
             show_playback_hud: false,
+            decode_bound: crate::playback::DecodeBound::default(),
+            decode_bound_hint: None,
             dbg_last_sample: None,
             dbg_evictions: 0,
             dbg_fallbacks: 0,
@@ -4852,6 +4861,10 @@ impl ExrApp {
         self.tick_decode_watchdog();
         // Once-per-second decode trace for RUST_LOG=floki=debug diagnosis.
         self.trace_playback_state();
+        // …and the user-facing version of the same diagnosis (#249). Sampled here
+        // rather than while drawing, so the hint doesn't depend on which panel got
+        // laid out first and can't be affected by the UI it appears in.
+        self.tick_decode_bound();
         if self.loading_a
             || !self.inflight.is_empty()
             || self
@@ -4958,6 +4971,29 @@ impl ExrApp {
     /// the watchdog's. One line is also emitted on the play→pause/stop transition,
     /// which the `outstanding` early return would otherwise swallow: that is
     /// precisely the moment INV-SAMPLE (#7) is decided.
+    /// Sample the decode-bound detector (#249) and cache its verdict for the
+    /// transport row.
+    ///
+    /// `run_held + run_dropped` rather than either alone: which one grows is the
+    /// pacing mode's business (Stutter holds, DropFrames skips) and the hint is about
+    /// the picture not keeping up either way.
+    fn tick_decode_bound(&mut self) {
+        let fps = self.playback.fps_target;
+        let frame_period = if fps > 0.0 {
+            std::time::Duration::from_secs_f32(1.0 / fps)
+        } else {
+            std::time::Duration::ZERO
+        };
+        let sample = crate::playback::DecodeBoundSample {
+            playing: self.playback.state == crate::playback::PlayState::Playing,
+            epoch: self.playback.epoch,
+            last_decode: self.last_decode_dur,
+            frame_period,
+            behind: self.run_held.saturating_add(self.run_dropped),
+        };
+        self.decode_bound_hint = self.decode_bound.update(std::time::Instant::now(), &sample);
+    }
+
     fn trace_playback_state(&mut self) {
         use crate::playback::PlayState;
         // Check the target this actually logs to. A bare `log_enabled!` uses
@@ -6525,6 +6561,42 @@ impl ExrApp {
                 self.frame_cache.clear();
                 self.invalidate_inflight();
                 self.request_sequence_frame(self.playback.current_frame);
+            }
+
+            // The decode-bound hint (#249), placed here on purpose: right beside
+            // Beauty preview and Scrub proxy, which are the two things that fix it.
+            // A message that says "you are decode-bound" next to the controls that
+            // resolve it is worth more than the same words anywhere else, and the
+            // status bar would have separated the diagnosis from the remedy.
+            //
+            // Non-modal, never steals focus, and dismissible. Amber rather than red:
+            // this is slow, not broken — the whole point is that the user currently
+            // cannot tell those apart.
+            if let Some(hint) = self.decode_bound_hint {
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(format!(
+                        "⚠ Decode-bound: {} ms/frame vs {} ms needed",
+                        hint.decode_ms, hint.budget_ms
+                    ))
+                    .color(egui::Color32::from_rgb(255, 200, 100)),
+                )
+                .on_hover_text(
+                    "Frames are decoding far slower than the frame rate needs, so \
+                     the picture is holding rather than playing. Beauty preview and \
+                     Scrub proxy (to the right) are the two settings that fix it.",
+                );
+                // Plain "X", matching the existing close control. `✕` (U+2715) is not
+                // in egui's default font set and rendered as an empty tofu box — a
+                // button with no legible glyph on it, in a row that is telling the
+                // user something is wrong.
+                if ui
+                    .small_button("X")
+                    .on_hover_text("Dismiss until the next seek")
+                    .clicked()
+                {
+                    self.decode_bound.dismiss();
+                }
             }
 
             ui.separator();
