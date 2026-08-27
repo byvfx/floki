@@ -4496,18 +4496,29 @@ impl ExrApp {
         // ring of frames stay resident, so a "reset everything" leaves the transport
         // gone, the picture still up, and hundreds of MB still held.
         //
-        // `open_gen_a` supersedes any in-flight slot-A decode (#109), or a result
-        // already on its way would land after the reset and re-populate `exr_data`.
-        // This is the only place that bumps it today; the open/unload paths its doc
-        // comment refers to were removed in R4.
+        // In-flight decodes are superseded by **epoch** (#57), not by `open_gen_a`.
+        // Every job floki actually submits is a seq-frame (`submit_seq` is the sole
+        // production caller of `submit_job`), and seq-frame results are matched on
+        // `res.epoch` and returned before the `open_gen` guard is ever reached — so
+        // that guard, and this bump, are inert. Kept as belt-and-braces for the day
+        // an explicit-open job exists again; see #277, which is about whether the
+        // whole mechanism should live or go.
+        //
+        // The epoch is therefore the one that matters, and it needs care: replacing
+        // `playback` below resets it to 0, and a job issued at epoch 0 and still in
+        // flight would match 0 again and be applied *after* the reset, re-populating
+        // what was just cleared. So the counter is carried across and bumped rather
+        // than restarted — supersession has to be monotonic to mean anything.
+        let next_epoch = self.playback.epoch.wrapping_add(1);
+        self.open_gen_a = self.open_gen_a.wrapping_add(1);
         self.exr_data = None;
         self.loaded_file = None;
         self.loading_a = false;
-        self.open_gen_a = self.open_gen_a.wrapping_add(1);
         self.frame_cache.clear();
         self.frame_bytes = None;
 
         self.playback = defaults.playback;
+        self.playback.epoch = next_epoch;
         self.show_playback_hud = defaults.show_playback_hud;
         self.recent_files = defaults.recent_files;
         self.theme = defaults.theme;
@@ -11265,8 +11276,31 @@ mod tests {
         assert!(app.playback.sequence.is_none(), "and the transport with it");
         assert_ne!(
             app.open_gen_a, gen_before,
-            "a decode already in flight must not land after the reset and \
-             re-populate the slot (#109)"
+            "kept in step for the day an explicit-open job exists again (#277)"
+        );
+    }
+
+    /// The reset must not restart the supersession epoch.
+    ///
+    /// Every decode floki submits is a seq-frame, matched on `res.epoch` — so if the
+    /// reset put the counter back to 0, a job issued at epoch 0 and still in flight
+    /// would match again and be applied *after* the reset, re-populating exactly what
+    /// was cleared. `open_gen_a` cannot save it: seq-frame results return before that
+    /// guard is reached (#277).
+    #[test]
+    fn resetting_everything_advances_the_epoch_rather_than_restarting_it() {
+        let mut app = ExrApp::default();
+        app.playback.epoch = 7;
+
+        app.reset_settings(ResetScope::Everything);
+
+        assert_eq!(
+            app.playback.epoch, 8,
+            "the epoch must move forward across a reset, not restart at the default"
+        );
+        assert_ne!(
+            app.playback.epoch, 0,
+            "restarting at 0 would let an in-flight epoch-0 decode land afterwards"
         );
     }
 
