@@ -39,12 +39,22 @@ $env:RUST_LOG = "floki=debug"; cargo run --release   # PowerShell
 ```
 
 ### Testing (see TESTING.md)
-The suite is **GPU-free** and gated in CI (`Test & Lint` job → blocks `build`). Run
-`cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, and
-`cargo test --all-targets` before committing. Conventions: generate EXR/`.cube`
-fixtures in a temp dir via `tempfile` (no committed binaries); never create a wgpu
+The suite is **GPU-free by default** and gated in CI (`Test & Lint` job → blocks
+`build`). Run `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`,
+and `cargo test --all-targets` before committing. Conventions: generate EXR/`.cube`
+fixtures in a temp dir via `tempfile` (no committed binaries); don't create a wgpu
 device in tests (`viewer::ui` takes `render_state: Option<&RenderState>` — pass
-`None`). Headless GUI tests drive `ExrViewer::handle_hotkeys` through `egui_kittest`
+`None`).
+
+The exception is `gpu::ocio_pass::device_tests` + `gpu::thumbnail`, which validate
+render seams no CPU stand-in can observe. They **skip** without a capable GPU, via the
+shared `test_device` helper — use it, don't hand-roll the guard. It checks two
+conditions, and the second is the one that bites: `Test & Lint` runs on ubuntu-latest,
+which *has* a software adapter (llvmpipe) but no `FLOAT32_FILTERABLE`, so an
+adapter-only guard passes the check and then panics in `request_device`. Consequence:
+**those tests report green on CI having run none of them** — a real GPU is where the
+render seams are actually verified, and macOS with `--features vendored` is the only
+config that runs every test in the repo (`metal_tests` needs macOS + an OCIO feature). Headless GUI tests drive `ExrViewer::handle_hotkeys` through `egui_kittest`
 (`gui_tests` in `viewer.rs`); because this is a binary crate, all tests live in
 inline `#[cfg(test)]` modules. Tone/color math lives in `render_math.rs`; the
 `channel_mode` integer encoding's single source of truth is `ChannelMode::as_u32`
@@ -72,10 +82,11 @@ Data flow: `app.rs` (state + menus + persistence) → `exr_loader.rs` (parse fil
 ### GPU rendering (the core mechanism)
 Rendering is a single WGSL shader (`gpu/shader.wgsl`) invoked through an `egui_wgpu::CallbackTrait` impl (`ExrCallback` in `gpu/mod.rs`). It binds **4 bind groups in fixed order**: `tex_a`, `tex_b`, `uniforms`, `lut`. The shader does all exposure / gamma / sRGB / channel-isolation / `|A-B|` diff / LUT work on the GPU. `viewer.rs` has a parallel CPU fallback path for when no GPU is available.
 
-Three things must stay in lockstep when touching rendering:
-1. The `Uniforms` struct (`gpu/mod.rs`) and the matching WGSL uniform struct in `shader.wgsl` — including the explicit `pad*` fields for alignment.
+Four things must stay in lockstep when touching rendering:
+1. The `Uniforms` struct (`gpu/mod.rs`) and the matching WGSL uniform struct in `shader.wgsl` — including the explicit `pad*` fields for alignment. The size is asserted in `uniforms_size_is_16_byte_aligned`; bump it there when the struct grows.
 2. The `channel_mode` integer mapping (`RGB=0, R=1, G=2, B=3, A=4`) is duplicated in `viewer.rs` and the shader.
 3. `ExrCallback::paint` force-resets the wgpu viewport to the full physical screen — egui_wgpu otherwise clips the quad to the primitive's bounding box and the screen-space math breaks.
+4. The **accumulate fold** (#257): each layer-stack fold is its own render pass over a full-target `Clear`, so a fold that doesn't cover a pixel *loses* it. `vs_main` therefore rasterizes `fold_min..fold_max` (the running union of the layer rects, set by `DrawCtx::fold_rect`) rather than the layer's own `rect_min..rect_max`, and `fs_main` re-emits the prior accumulation verbatim outside the layer. Pass 2's scissor must cover that same union. Get any one of the three wrong and the composite silently clips to one layer's rect — everything outside reads back as the α=−1 sentinel, i.e. black. `accumulate_preserves_the_union_of_disjoint_layer_rects` is the regression test.
 
 ### LogicalLayer regrouping (non-obvious, key domain concept)
 `exr_loader.rs` defines `LogicalLayer`, which regroups a physical EXR layer's flat channel list into displayable passes by **dotted-name prefix** (`diffuse.R`/`diffuse.G` → pass `diffuse`). This exists because Blender writes every render pass into a *single* EXR part as channel-name prefixes (`ViewLayer.Combined.R`, ...), which the `exr` crate surfaces as one unnamed layer. Without this regrouping the passes are invisible. R/G/B/A slot indices are resolved at load time so rendering never re-matches names.
