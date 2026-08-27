@@ -4435,6 +4435,11 @@ impl ExrApp {
     /// The two scopes are deliberately different in cost — see [`ResetScope`]. Both
     /// take effect immediately; neither needs a restart, because the reset runs through
     /// the same teardown a normal close does.
+    ///
+    /// `Everything` also closes what is open — the comp stack *and* slot A. That is
+    /// state rather than settings, but leaving it behind would strand the app halfway:
+    /// the transport is cleared with `playback`, so the alternative is a session with
+    /// no timeline, a picture still on screen, and its frames still resident.
     fn reset_settings(&mut self, scope: ResetScope) {
         let defaults = ExrApp::default();
 
@@ -4469,6 +4474,29 @@ impl ExrApp {
         for id in ids {
             self.remove_comp_layer(id);
         }
+
+        // Close slot A as well. `remove_comp_layer` ends by dropping the base track
+        // through `remove_base_layer`, which deliberately leaves A's own image, cache
+        // and transport alone — it exists for the case where the *panel* empties and
+        // the classic viewer takes back over. Nothing else closes slot A: the File ▸
+        // Close Image A menu went out with the #99 R4 collapse.
+        //
+        // Without this the reset half-lands: `playback` is replaced below, which
+        // clears the sequence and the playhead (those are `#[serde(skip)]` fields of
+        // `Playback`, reset along with the struct) — but the decoded image and its
+        // ring of frames stay resident, so a "reset everything" leaves the transport
+        // gone, the picture still up, and hundreds of MB still held.
+        //
+        // `open_gen_a` supersedes any in-flight slot-A decode (#109), or a result
+        // already on its way would land after the reset and re-populate `exr_data`.
+        // This is the only place that bumps it today; the open/unload paths its doc
+        // comment refers to were removed in R4.
+        self.exr_data = None;
+        self.loaded_file = None;
+        self.loading_a = false;
+        self.open_gen_a = self.open_gen_a.wrapping_add(1);
+        self.frame_cache.clear();
+        self.frame_bytes = None;
 
         self.playback = defaults.playback;
         self.show_playback_hud = defaults.show_playback_hud;
@@ -11076,6 +11104,13 @@ mod tests {
         app.playback.fps_target = 47.0;
         app.viewer.prefs.diff_floor = 0.33;
         app.viewer.prefs.background.checker_size = 77.0;
+        // An open file, so the two scopes' opposite treatment of it is observable.
+        // The temp dir can go once the pixels are decoded into memory.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("open.exr");
+        write_rgba_exr(&p);
+        app.exr_data = Some(std::sync::Arc::new(ExrData::load(&p).unwrap()));
+        app.loaded_file = Some(p);
         app
     }
 
@@ -11122,6 +11157,47 @@ mod tests {
         );
     }
 
+    /// "Reset all settings" says *Open files are closed*, so it has to close them —
+    /// including slot A, which no other path closes since the R4 collapse removed the
+    /// File ▸ Close Image A menu.
+    ///
+    /// Not pedantry about the dialog wording: `playback` is reset with everything
+    /// else, and its sequence/playhead are `#[serde(skip)]` fields of the struct being
+    /// replaced, so the transport goes regardless. Leaving the image behind would
+    /// strand the app halfway — no timeline, picture still up, frames still resident.
+    #[test]
+    fn resetting_everything_closes_slot_a_and_releases_its_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.exr");
+        write_rgba_exr(&p);
+        let data = std::sync::Arc::new(ExrData::load(&p).unwrap());
+
+        let mut app = ExrApp {
+            loaded_file: Some(p.clone()),
+            exr_data: Some(data.clone()),
+            loading_a: true,
+            frame_bytes: Some(data.approx_bytes()),
+            ..Default::default()
+        };
+        app.frame_cache.insert(ExrApp::A_SOURCE, 1, data);
+        assert!(app.frame_cache.bytes() > 0, "the fixture must be resident");
+        let gen_before = app.open_gen_a;
+
+        app.reset_settings(ResetScope::Everything);
+
+        assert!(app.exr_data.is_none(), "the image is unloaded");
+        assert!(app.loaded_file.is_none());
+        assert!(!app.loading_a);
+        assert_eq!(app.frame_cache.bytes(), 0, "its frames are released");
+        assert_eq!(app.frame_bytes, None);
+        assert!(app.playback.sequence.is_none(), "and the transport with it");
+        assert_ne!(
+            app.open_gen_a, gen_before,
+            "a decode already in flight must not land after the reset and \
+             re-populate the slot (#109)"
+        );
+    }
+
     /// The narrow scope is the one you reach for mid-session, so it must not cost the
     /// user anything: the decode levers go back to defaults and everything else is
     /// left exactly as it was.
@@ -11146,6 +11222,11 @@ mod tests {
         // and losing them would make this reset something people avoid reaching for.
         assert_eq!(app.recent_files.len(), 1);
         assert_eq!(app.ocio_path, "/tmp/config.ocio");
+        assert!(
+            app.exr_data.is_some(),
+            "the narrow scope must not close what is open — that is the whole reason \
+             it is safe to reach for mid-session"
+        );
         assert_eq!(app.lut_path, "/tmp/look.cube");
         assert_eq!(app.theme, ThemeChoice::Light);
         assert!((app.playback.fps_target - 47.0).abs() < f32::EPSILON);
