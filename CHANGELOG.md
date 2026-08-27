@@ -40,6 +40,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer falls back to hardcoded absolute paths when given no arguments.
 
 ### Fixed
+- **A GPU that can't run Floki now says so.** `FLOAT32_FILTERABLE` is required at
+  device creation, so on an adapter without it `request_device` failed and the app
+  never opened a window — no dialog, no log, nothing for a tester to report beyond
+  "it doesn't open". That is the worst failure a build handed to a colleague can
+  have, and the machines likely to hit it are exactly the ones a build gets handed
+  to: laptops running on the integrated adapter, and remote sessions, which expose a
+  software adapter and are a normal way to review. Floki now checks before it asks,
+  and if nothing qualifies it shows a dialog (and prints the same text to stderr)
+  naming the missing feature, every adapter it did find with its backend, and the two
+  things that usually fix it — selecting the discrete GPU, or forcing a backend with
+  `WGPU_BACKEND`. There is deliberately no software fallback: the feature carries the
+  colour-management LUT that every displayed image goes through.
+- **Every run logs which GPU it is on.** The adapters found and the one actually
+  chosen, with backend and driver version, at `info`. "Which GPU was it?" is the
+  first question of most bug reports here and previously had no answer in the log.
 - **Anamorphic layers keep their own aspect in a composite.** The comp resolved one
   pixel aspect for the whole canvas and stretched every layer to the bottom layer's
   rect, so a 2:1 anamorphic plate over a square-pixel previs was squeezed back to
