@@ -140,6 +140,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   green for three hours and the first run that ever fired on it failed. Retargeting
   a PR now starts a run as well, which it previously did not, so the recovery is no
   longer "retarget, then push something to wake it up".
+- The two OpenColorIO test modules gated to macOS are compiled by CI. They need
+  `target_os = "macos"` *and* an OCIO feature, and no job was both — the OCIO lint
+  ran only on Linux, and the macOS jobs only `cargo build`, which skips test code —
+  so they could be broken by anything and nothing in the pipeline would report it.
+  The vendored-OCIO lint now runs on macOS too, which type-checks them on every
+  pull request. Actually running them still takes a Mac with a real GPU.
 
 ## [1.12.0] - 2026-08-15
 

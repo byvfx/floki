@@ -195,9 +195,16 @@ jobs:
       # Lint the workspace against the real (vendored) OCIO backend. The `test` job
       # lints the stub backend (`--no-default-features`), so this is where the
       # vendored-only native paths (floki-ocio cmake build, the cxx shim) get linted.
-      # Linux-only: clippy findings are platform-independent, no need to pay it on all three.
+      # Linux *and* macOS. Not for the findings, which are platform-independent, but
+      # for compilation: `ocio_pass::metal_tests` and `thumbnail::ocio_tests` are gated
+      # `cfg(all(test, target_os = "macos", <an ocio feature>))`, so this step on the
+      # macOS runner is the only thing in CI that type-checks them — `cargo build` skips
+      # test code and every other job is either Linux or feature-less, which left those
+      # two modules compiled by nothing at all (#269). It does not *run* them; that
+      # still needs a Mac with a real GPU. Windows is left out: nothing is gated to it,
+      # and it is the slowest runner.
       - name: Clippy (OCIO, deny warnings)
-        if: runner.os == 'Linux'
+        if: runner.os != 'Windows'
         run: cargo clippy --workspace --all-targets --no-default-features --features vendored -- -D warnings
 
       # Functional smoke check of the vendored OCIO on every platform: loads a config and
