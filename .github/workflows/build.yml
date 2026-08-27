@@ -21,8 +21,16 @@ on:
       - '.gitignore'
     tags:
       - 'v*'
+  # Deliberately unfiltered by branch: `branches:` on a `pull_request` trigger
+  # matches the PR's *base*, so `[ "main" ]` meant a PR stacked on a feature
+  # branch — the convention here for tooling/chore work — ran no Build at all
+  # while GitHub still reported it mergeable (#265; #260 spent three hours in
+  # that state, and the first run that ever fired on it failed). `edited` is
+  # listed because retargeting a PR fires only that activity type, which is not
+  # in the default set, so a retargeted PR otherwise stays green-but-untested
+  # until someone pushes; the price is that a title/body edit also starts a run.
   pull_request:
-    branches: [ "main" ]
+    types: [ opened, synchronize, reopened, edited ]
     paths-ignore:
       - '**.md'
       - 'docs/**'
@@ -187,9 +195,16 @@ jobs:
       # Lint the workspace against the real (vendored) OCIO backend. The `test` job
       # lints the stub backend (`--no-default-features`), so this is where the
       # vendored-only native paths (floki-ocio cmake build, the cxx shim) get linted.
-      # Linux-only: clippy findings are platform-independent, no need to pay it on all three.
+      # Linux *and* macOS. Not for the findings, which are platform-independent, but
+      # for compilation: `ocio_pass::metal_tests` and `thumbnail::ocio_tests` are gated
+      # `cfg(all(test, target_os = "macos", <an ocio feature>))`, so this step on the
+      # macOS runner is the only thing in CI that type-checks them — `cargo build` skips
+      # test code and every other job is either Linux or feature-less, which left those
+      # two modules compiled by nothing at all (#269). It does not *run* them; that
+      # still needs a Mac with a real GPU. Windows is left out: nothing is gated to it,
+      # and it is the slowest runner.
       - name: Clippy (OCIO, deny warnings)
-        if: runner.os == 'Linux'
+        if: runner.os != 'Windows'
         run: cargo clippy --workspace --all-targets --no-default-features --features vendored -- -D warnings
 
       # Functional smoke check of the vendored OCIO on every platform: loads a config and
