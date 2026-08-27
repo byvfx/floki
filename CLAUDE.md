@@ -51,12 +51,15 @@ render seams no CPU stand-in can observe. They **skip** without a capable GPU, a
 guard must check **two** conditions — the second being the one that bites: `Test & Lint`
 runs on ubuntu-latest, which *has* a software adapter (llvmpipe) but no
 `FLOAT32_FILTERABLE`, so an adapter-only guard passes the check and then panics in
-`request_device`. `ocio_pass::device_tests::test_device` is the reference
-implementation; it's module-private, so `gpu::thumbnail` still carries two inline
-copies of the same check (#266). Don't add a fourth copy. Consequence:
-**those tests report green on CI having run none of them** — a real GPU is where the
-render seams are actually verified, and macOS with `--features vendored` is the only
-config that runs every test in the repo (`metal_tests` needs macOS + an OCIO feature). Headless GUI tests drive `ExrViewer::handle_hotkeys` through `egui_kittest`
+`request_device`. **Call `crate::gpu::test_device`** (`gpu/mod.rs`) — it checks both
+conditions and is the one shared guard (#266/#268); four hand-rolled copies is the shape
+that let the `FLOAT32_FILTERABLE` condition go missing from all of them at once, so don't
+write a fifth. Consequence: **those tests report green on CI having run none of them** —
+a real GPU is where the render seams are actually verified, and macOS with
+`--features vendored` is the only config that *runs* every test in the repo
+(`metal_tests` needs macOS + an OCIO feature). Since #269 the macOS OCIO job's clippy
+step at least **compiles** those two modules on every PR, so they can no longer rot
+undetected; it does not execute them. Headless GUI tests drive `ExrViewer::handle_hotkeys` through `egui_kittest`
 (`gui_tests` in `viewer.rs`); because this is a binary crate, all tests live in
 inline `#[cfg(test)]` modules. Tone/color math lives in `render_math.rs`; the
 `channel_mode` integer encoding's single source of truth is `ChannelMode::as_u32`
@@ -84,11 +87,12 @@ Data flow: `app.rs` (state + menus + persistence) → `exr_loader.rs` (parse fil
 ### GPU rendering (the core mechanism)
 Rendering is a single WGSL shader (`gpu/shader.wgsl`) invoked through an `egui_wgpu::CallbackTrait` impl (`ExrCallback` in `gpu/mod.rs`). It binds **4 bind groups in fixed order**: `tex_a`, `tex_b`, `uniforms`, `lut`. The shader does all exposure / gamma / sRGB / channel-isolation / `|A-B|` diff / LUT work on the GPU. `viewer.rs` has a parallel CPU fallback path for when no GPU is available.
 
-Four things must stay in lockstep when touching rendering:
+Five things must stay in lockstep when touching rendering:
 1. The `Uniforms` struct (`gpu/mod.rs`) and the matching WGSL uniform struct in `shader.wgsl` — including the explicit `pad*` fields for alignment. The size is asserted in `uniforms_size_is_16_byte_aligned`; bump it there when the struct grows.
 2. The `channel_mode` integer mapping (`RGB=0, R=1, G=2, B=3, A=4`) is duplicated in `viewer.rs` and the shader.
 3. `ExrCallback::paint` force-resets the wgpu viewport to the full physical screen — egui_wgpu otherwise clips the quad to the primitive's bounding box and the screen-space math breaks.
 4. The **accumulate fold** (#257): each layer-stack fold is its own render pass over a full-target `Clear`, so a fold that doesn't cover a pixel *loses* it. `vs_main` therefore rasterizes `fold_min..fold_max` (the running union of the layer rects, set by `DrawCtx::fold_rect`) rather than the layer's own `rect_min..rect_max`, and `fs_main` re-emits the prior accumulation verbatim outside the layer. Pass 2's scissor must cover that same union. Get any one of the three wrong and the composite silently clips to one layer's rect — everything outside reads back as the α=−1 sentinel, i.e. black. `accumulate_preserves_the_union_of_disjoint_layer_rects` is the regression test.
+5. `BlitUniforms` (`gpu/mod.rs`) and *its* WGSL mirror inside the `BLIT_SHADER` string in the same file — same rule as (1), with the size asserted in `blit_uniforms_size_is_16_byte_aligned`. Two of its fields are easy to confuse and mean different things: **`display_min`/`display_max` is everything the display stage covers** (the display window unioned with every layer rect, #254/#257) and normalizes the background gradient, while **`dim_min`/`dim_max` is the display window alone** and gates the overscan dim (#251). They were one pair until #251; with `display_*` serving both, the dim's inside-test spanned every layer rect and so was true for every pixel on screen — the dim looked wired up and silently did nothing. Note also that the overscan dim is applied **in the blit, not `fs_main`**: `out_a = select(eff_opacity, a, skip_checker == 1u)` discards `Uniforms::overscan_factor` for every comp layer, and under OCIO the dim has to happen post-transform anyway.
 
 ### LogicalLayer regrouping (non-obvious, key domain concept)
 `exr_loader.rs` defines `LogicalLayer`, which regroups a physical EXR layer's flat channel list into displayable passes by **dotted-name prefix** (`diffuse.R`/`diffuse.G` → pass `diffuse`). This exists because Blender writes every render pass into a *single* EXR part as channel-name prefixes (`ViewLayer.Combined.R`, ...), which the `exr` crate surfaces as one unnamed layer. Without this regrouping the passes are invisible. R/G/B/A slot indices are resolved at load time so rendering never re-matches names.

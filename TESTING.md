@@ -20,7 +20,15 @@ cargo clippy --all-targets -- -D warnings  # lint gate (warnings are errors)
 ```
 
 CI runs all three in a `Test & Lint` job that **gates** the build/release matrix
-(see `.github/workflows/build.yml`).
+(see `.github/workflows/build.yml`). Every pull request that touches code runs it,
+**including one stacked on another feature branch** — the trigger deliberately carries
+no `branches:` filter, because `branches:` matches a PR's *base* and once meant a
+stacked PR ran no CI at all while still reporting mergeable (#265).
+
+A docs-only PR is the exception, and runs **nothing**: `paths-ignore` skips `**.md`,
+`docs/**`, `assets/**`, `LICENSE` and `.gitignore`. A green PR with no checks at all is
+expected there — and is worth telling apart from the failure mode in #256/#265, where a
+*code* PR reported `CLEAN` having run nothing and looked identical.
 
 ## What is covered
 
@@ -32,6 +40,8 @@ CI runs all three in a `Test & Lint` job that **gates** the build/release matrix
 | Tone / color math | `src/render_math.rs` | Exposure, gamma, sRGB transfer (round-trips). Shared by the CPU fallback and mirrored by `gpu/shader.wgsl`. |
 | GPU uniform layout | `src/gpu/mod.rs` | `Uniforms` size/alignment + `Pod` round-trip, and the `ChannelMode` → `u32` encoding contract. |
 | Composite layer placement | `src/viewer.rs` (`gui_tests`) | `comp_layer_rect` / `comp_pane_layout` / `side_by_side_layout` — each layer at its own `tex_size × PAR` (#254). Pure, no device. |
+| Per-layer pixel aspect | `src/layer.rs` | `Draw::effective_par` — the override-vs-header precedence, and that one layer's override leaves its siblings alone (#263). |
+| Format & overscan geometry | `src/viewer.rs` (`gui_tests`), `src/app.rs` | `comp_display_rect` / `overscan_of` / `Overscan::label` — the display box placed from the data window, overscan as a percentage of the format across both sides, and crop vs overscan vs both (#251). `comp_format_of` is checked against an overscanned fixture, since a version reading the *data* window passes every square-window test and misreports exactly the renders the readout exists for. |
 | Render seams (on device) | `src/gpu/ocio_pass.rs` (`device_tests`), `src/gpu/thumbnail.rs` | Accumulate ping-pong blend vs a CPU reference, the layer-rect union (#257), blit coverage/checker, sRGB display-encode. Skips without a capable GPU — see [On-device tests](#on-device-tests). |
 | GUI interaction (headless) | `src/viewer.rs` (`gui_tests`) | Drives `ExrViewer::handle_hotkeys` through `egui_kittest` — channel keys, compare modes, contact-sheet gating, B-image gating. |
 
@@ -58,13 +68,12 @@ adapter-only guard sails past it and then panics in `request_device` —
 `GpuState` requires `FLOAT32_FILTERABLE` for the f32 3D LUT. That is exactly
 how the ungated tests failed CI the first time they ran there.
 
-**Any new on-device test must check both.** `ocio_pass::device_tests::test_device`
-is the reference implementation and the one to call from that module; it is
-module-private, so `gpu::thumbnail`'s two tests currently carry their own inline
-copies of the same two-stage check. Three copies of one guard is the shape that
-let the `FLOAT32_FILTERABLE` condition go missing everywhere at once — prefer
-calling the helper over adding a fourth, and see #266 for hoisting it somewhere
-both modules can reach.
+**Any new on-device test must check both — by calling `crate::gpu::test_device`**
+(`src/gpu/mod.rs`), which is the one shared guard. It used to be module-private,
+with `gpu::thumbnail`'s tests carrying their own inline copies; three copies of one
+guard is the shape that let the `FLOAT32_FILTERABLE` condition go missing from all of
+them at once, so #266/#268 hoisted it somewhere every module can reach. Don't write a
+fourth copy.
 
 Two consequences worth knowing:
 
@@ -76,6 +85,13 @@ Two consequences worth knowing:
   needs `target_os = "macos"` and `system-ocio` or `vendored`, so
   `cargo test --features vendored` on a Mac is the only configuration that
   runs every test in the repo.
+- **Compiled ≠ run.** Those two macOS+OCIO modules (`ocio_pass::metal_tests`,
+  `thumbnail::ocio_tests`) were once built by *no* CI job at all — every job was
+  either the wrong `target_os`, feature-less, or a `cargo build` that skips test
+  code — so they could rot undetected. Since #269 the macOS OCIO job runs the
+  vendored clippy with `--all-targets`, which type-checks them on every PR. That
+  catches a module that stopped compiling; it still does not execute them, and
+  GitHub's macOS runners have no device that clears the guard above.
 
 ## Conventions
 
