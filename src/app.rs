@@ -4530,7 +4530,6 @@ fn default_compare_b(
         .copied()
 }
 
-/// One named layer's draw in a resolved composite — the `Step::Draw` carrying `layer`,
 /// A `CompSource`'s pixel dimensions as the float vector the viewer places it with
 /// (#254). Clamped away from zero so a degenerate source can't produce a zero-area
 /// rect and a divide-by-zero in the uv mapping.
@@ -4538,6 +4537,7 @@ fn comp_tex_size(size: (usize, usize)) -> egui::Vec2 {
     egui::vec2(size.0.max(1) as f32, size.1.max(1) as f32)
 }
 
+/// One named layer's draw in a resolved composite — the `Step::Draw` carrying `layer`,
 /// if that layer is both present at this frame (`composite_at` drops hidden / soloed-out
 /// / trimmed-blank layers) and drawable (per `drawable`). Resolves **both** panes of a
 /// comp Side-by-Side (#99 Slice 2a), which shows two individual layers rather than the
