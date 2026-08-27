@@ -18,7 +18,7 @@ fn survey_adapters() -> Vec<floki::AdapterSummary> {
                 name: info.name.clone(),
                 backend: format!("{:?}", info.backend),
                 device_type: format!("{:?}", info.device_type),
-                float32_filterable: a.features().contains(wgpu::Features::FLOAT32_FILTERABLE),
+                float32_filterable: a.features().contains(floki::REQUIRED_DEVICE_FEATURES),
             }
         })
         .collect()
@@ -61,9 +61,7 @@ fn main() -> eframe::Result<()> {
                 // every run, not just a failing one: "which GPU was it on" is the first
                 // question of most bug reports here.
                 let info = adapter.get_info();
-                let ok = adapter
-                    .features()
-                    .contains(eframe::egui_wgpu::wgpu::Features::FLOAT32_FILTERABLE);
+                let ok = adapter.features().contains(floki::REQUIRED_DEVICE_FEATURES);
                 log::info!(
                     target: "floki",
                     "using adapter: {} ({:?}, {:?}) driver={:?} float32_filterable={ok}",
@@ -83,8 +81,7 @@ fn main() -> eframe::Result<()> {
                 }
                 eframe::egui_wgpu::wgpu::DeviceDescriptor {
                     label: Some("egui wgpu device"),
-                    required_features: eframe::egui_wgpu::wgpu::Features::default()
-                        | eframe::egui_wgpu::wgpu::Features::FLOAT32_FILTERABLE,
+                    required_features: floki::REQUIRED_DEVICE_FEATURES,
                     ..Default::default()
                 }
             });

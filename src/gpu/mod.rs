@@ -1110,6 +1110,22 @@ impl eframe::egui_wgpu::CallbackTrait for ExrCallback {
     }
 }
 
+/// The wgpu features floki cannot run without.
+///
+/// One constant for all three consumers — the startup preflight, the device eframe
+/// creates, and the on-device test guard — so the app's requirement and the checks
+/// made against it cannot drift apart. Spelling `FLOAT32_FILTERABLE` out separately in
+/// each place is exactly the shape that let the condition go missing from four
+/// hand-rolled copies of the test guard at once (#259/#266).
+///
+/// `FLOAT32_FILTERABLE` is needed to linearly sample the f32 3D LUT texture, which
+/// carries the colour management every displayed image goes through — so there is no
+/// reduced mode to fall back to if an adapter lacks it.
+///
+/// Taken from @VedantMadane's #273, which reached the same preflight design
+/// independently and factored this better than the merged version did.
+pub const REQUIRED_DEVICE_FEATURES: wgpu::Features = wgpu::Features::FLOAT32_FILTERABLE;
+
 /// One GPU adapter as the startup preflight sees it (#247).
 ///
 /// Plain strings rather than the wgpu types so the decision below is pure and
@@ -1213,7 +1229,7 @@ pub(crate) fn test_device(label: &'static str) -> Option<(wgpu::Device, wgpu::Qu
         };
     match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some(label),
-        required_features: wgpu::Features::FLOAT32_FILTERABLE,
+        required_features: REQUIRED_DEVICE_FEATURES,
         ..Default::default()
     })) {
         Ok(dq) => Some(dq),
