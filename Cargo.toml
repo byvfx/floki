@@ -51,12 +51,16 @@ sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 # page cache instead of re-reading through a BufReader. Already resolved in
 # Cargo.lock (transitive), pinned here for direct use.
 memmap2 = "0.9"
+# Blocks on wgpu's async adapter enumeration for the startup GPU preflight (#247).
+# wgpu 29 made `enumerate_adapters` a future for WebGPU's sake; this is a native
+# binary, so it just needs a minimal block_on. Was already a dev-dependency for the
+# on-device tests — same crate, now also linked into the app.
+pollster = "0.4"
 
 [dev-dependencies]
 tempfile = "3"          # scoped temp dirs/files for test fixtures (auto-cleanup)
 egui_kittest = "0.34"   # headless egui interaction harness (no wgpu/snapshot feature)
 approx = "0.5"          # float-tolerant assertions for color math
-pollster = "0.4"        # block on wgpu async in headless GPU tests
 # Serializes `ExrApp` in tests so the reset-to-defaults check (#248) compares the
 # *persisted* state rather than a hand-listed set of fields — a field added later
 # and forgotten by the reset then fails the test instead of silently surviving it.

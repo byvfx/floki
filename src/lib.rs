@@ -12,6 +12,11 @@
 pub mod app;
 pub mod exr_loader;
 
+// The startup GPU preflight (#247). Re-exported rather than making `gpu` public:
+// `main.rs` enumerates the adapters (that needs a live wgpu instance) and this
+// decides what to say about them, so only these two items cross the boundary.
+pub use gpu::{AdapterSummary, gpu_preflight_error};
+
 mod annotation;
 mod background;
 // Pure ring-cache budget math (#56): `t1_budget_bytes` sizes the T1 ring,

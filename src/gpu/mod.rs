@@ -1110,6 +1110,72 @@ impl eframe::egui_wgpu::CallbackTrait for ExrCallback {
     }
 }
 
+/// One GPU adapter as the startup preflight sees it (#247).
+///
+/// Plain strings rather than the wgpu types so the decision below is pure and
+/// testable: enumerating adapters needs a live instance, deciding what to say about
+/// them does not.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdapterSummary {
+    pub name: String,
+    pub backend: String,
+    pub device_type: String,
+    /// Whether this adapter offers `FLOAT32_FILTERABLE`, which `GpuState` requires
+    /// to linearly sample the f32 3D LUT texture.
+    pub float32_filterable: bool,
+}
+
+/// `None` if floki can run on one of `adapters`; otherwise the message to show the
+/// user before exiting (#247).
+///
+/// The requirement itself isn't negotiable — the f32 3D LUT is how every image gets
+/// colour-managed, so there is no reduced mode to fall back to, and the CPU path in
+/// `viewer.rs` can't run the OCIO ping-pong or the comp composite. What was
+/// negotiable is *failing legibly*: `required_features` at device creation made
+/// `request_device` return `Err` and the app never opened a window, so the report
+/// came back as "it doesn't open" with nothing attached.
+///
+/// The message names the adapters actually found, because the common causes are all
+/// diagnosable from that list: a laptop on its integrated adapter rather than the
+/// discrete one, or a remote session exposing only a software rasterizer — and
+/// reviewing over RDP/VDI is a normal VFX workflow, not an edge case. Pure.
+#[must_use]
+pub fn gpu_preflight_error(adapters: &[AdapterSummary]) -> Option<String> {
+    if adapters.iter().any(|a| a.float32_filterable) {
+        return None;
+    }
+    if adapters.is_empty() {
+        return Some(
+            "Floki could not find a GPU.\n\n\
+             The system reported no graphics adapter at all. Floki renders entirely \
+             on the GPU, so it cannot start without one.\n\n\
+             This is usually a remote session (RDP or VDI) that exposes no usable \
+             adapter, or a graphics driver that failed to load. Running on the \
+             machine directly, or reinstalling the driver, is normally the fix."
+                .to_string(),
+        );
+    }
+    let found = adapters
+        .iter()
+        .map(|a| format!("  - {} ({}, {})", a.name, a.backend, a.device_type))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(format!(
+        "Floki needs a GPU feature this machine's graphics adapter does not \
+         provide.\n\n\
+         Missing: FLOAT32_FILTERABLE (linear sampling of 32-bit float textures). \
+         Floki uses it for the colour-management LUT, which every displayed image \
+         goes through, so there is no reduced mode to fall back to.\n\n\
+         Adapters found:\n{found}\n\n\
+         If this machine also has a discrete GPU, launching Floki on it usually \
+         works (Windows: Settings > System > Display > Graphics; otherwise the GPU \
+         vendor's control panel). A remote session often exposes only a software \
+         adapter, which will not.\n\n\
+         If you believe the GPU does support this, try forcing a backend with the \
+         WGPU_BACKEND environment variable (vulkan, dx12, or metal)."
+    ))
+}
+
 /// A GPU device for an on-device test, or `None` when this machine can't give one —
 /// in which case the caller returns and the test is a no-op. **Every on-device test
 /// goes through this**; see TESTING.md.
@@ -1163,6 +1229,75 @@ pub(crate) fn test_device(label: &'static str) -> Option<(wgpu::Device, wgpu::Qu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn adapter(name: &str, backend: &str, kind: &str, f32f: bool) -> AdapterSummary {
+        AdapterSummary {
+            name: name.to_string(),
+            backend: backend.to_string(),
+            device_type: kind.to_string(),
+            float32_filterable: f32f,
+        }
+    }
+
+    /// One capable adapter is enough, even when it isn't the only one — a laptop
+    /// reporting both an integrated and a discrete GPU is the normal case, and
+    /// refusing to start because *an* adapter falls short would ground machines that
+    /// run floki perfectly well.
+    #[test]
+    fn preflight_passes_when_any_adapter_can_run_floki() {
+        assert!(
+            gpu_preflight_error(&[adapter(
+                "NVIDIA GeForce RTX 4090",
+                "Vulkan",
+                "DiscreteGpu",
+                true
+            )])
+            .is_none()
+        );
+        assert!(
+            gpu_preflight_error(&[
+                adapter("Intel UHD Graphics 620", "Vulkan", "IntegratedGpu", false),
+                adapter("NVIDIA RTX A2000", "Dx12", "DiscreteGpu", true),
+            ])
+            .is_none(),
+            "the discrete adapter qualifies, so the integrated one falling short is \
+             not a reason to refuse"
+        );
+    }
+
+    /// The whole point of #247 is the message, so assert it carries what a person
+    /// needs: the missing feature by name, every adapter that *was* found, and the
+    /// two things that actually fix it.
+    #[test]
+    fn preflight_names_the_missing_feature_and_the_adapters_it_found() {
+        let msg = gpu_preflight_error(&[
+            adapter("Intel UHD Graphics 620", "Vulkan", "IntegratedGpu", false),
+            adapter("Microsoft Basic Render Driver", "Dx12", "Cpu", false),
+        ])
+        .expect("no adapter qualifies");
+
+        assert!(msg.contains("FLOAT32_FILTERABLE"), "{msg}");
+        // Both adapters, so a bug report pasting this says what the machine has.
+        assert!(msg.contains("Intel UHD Graphics 620"), "{msg}");
+        assert!(msg.contains("Microsoft Basic Render Driver"), "{msg}");
+        assert!(msg.contains("Vulkan") && msg.contains("Dx12"), "{msg}");
+        // And the two routes out: the discrete GPU, or a forced backend.
+        assert!(msg.contains("discrete"), "{msg}");
+        assert!(msg.contains("WGPU_BACKEND"), "{msg}");
+    }
+
+    /// No adapters at all is a different failure with a different cause, so it gets
+    /// its own message: listing "adapters found:" and then nothing would read as a
+    /// bug in the message rather than as the diagnosis it is.
+    #[test]
+    fn preflight_distinguishes_no_adapter_from_an_unsuitable_one() {
+        let none = gpu_preflight_error(&[]).expect("no adapters at all is a failure");
+        assert!(none.contains("could not find a GPU"), "{none}");
+        assert!(!none.contains("Adapters found"), "{none}");
+        // The likely causes, which are not the same as the unsuitable-adapter ones.
+        assert!(none.contains("RDP") || none.contains("remote"), "{none}");
+        assert!(none.contains("driver"), "{none}");
+    }
 
     #[test]
     fn uniforms_size_is_16_byte_aligned() {
