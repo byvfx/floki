@@ -2623,6 +2623,20 @@ impl ExrViewer {
         // the composite straight over the line. Mirrors `draw_canvas_gpu`'s slot.
         let slot = painter.add(egui::Shape::Noop);
 
+        // The union of every rect drawn into the scene, which is what the display stage
+        // must cover (#257) — the scissor below, and the blit's display window. Declared
+        // here rather than at the layer loop because Wipe / Diff / Blink draw *before*
+        // it and are not part of it: with per-layer sizing (#254) a Blink B pane can be
+        // wider than `image_rect`, and a union that only saw the stack would scissor the
+        // display stage back to the canvas and crop it.
+        let mut union_rect: Option<egui::Rect> = None;
+        // A free fn rather than a closure: a closure capturing `union_rect` mutably
+        // would keep the borrow alive past the last `cover` call and block reading it
+        // for the scissor below.
+        fn cover(union: &mut Option<egui::Rect>, r: egui::Rect) {
+            *union = Some(union.map_or(r, |u| u.union(r)));
+        }
+
         // Wipe / Diff: one draw binding pane A as `tex_a` and pane B as `tex_b`, both at
         // the same rect; the shader splits on the wipe line or emits the difference heat
         // map. Diff is a display-space false colour, so `DrawCtx::draw` routes it past
@@ -2640,6 +2654,7 @@ impl ExrViewer {
                 false, // not an accumulate fold: tex_b is an image, not the scene
                 1.0,
             );
+            cover(&mut union_rect, image_rect);
             if is_wipe {
                 // The draggable wipe line + handle, over the image (the reserved slot
                 // keeps the GPU quad underneath). Clipped to the image like the A/B
@@ -2680,6 +2695,9 @@ impl ExrViewer {
                 false, // is_composite
                 b.draw.opacity,
             );
+            // Without this the display stage would be scissored back to `image_rect`
+            // (pane A's canvas) and crop the B pane wherever its own PAR made it wider.
+            cover(&mut union_rect, rect_b);
         }
 
         // Wipe/Diff emitted their single 2-input draw, and Blink's B phase its own; the
@@ -2703,10 +2721,6 @@ impl ExrViewer {
         // is enabled, so this costs a bool check in a normal run.
         let debug_geom = log::log_enabled!(target: "floki::playback", log::Level::Debug);
         let mut geom: Vec<String> = Vec::new();
-        // The union of the layer rects, which is what the display stage must cover
-        // (#257). Kept as a running fold rather than derived from `image_rect` so it
-        // stays correct the moment layers stop sharing one rect.
-        let mut union_rect: Option<egui::Rect> = None;
         for (i, d) in stack_draws.iter().enumerate() {
             // Each layer at its own display size (#254), centred on the canvas — the
             // composite no longer resolves one pixel aspect and stretches everything
@@ -2720,7 +2734,7 @@ impl ExrViewer {
             let layer_par = self.unsqueeze_factor(d.par);
             let layer_rect =
                 comp_layer_rect(image_rect.center(), self.scale, d.tex_size, layer_par);
-            union_rect = Some(union_rect.map_or(layer_rect, |u| u.union(layer_rect)));
+            cover(&mut union_rect, layer_rect);
             if debug_geom {
                 // Printing each layer's own rect beside its own `par` is the point:
                 // a `par=2.000` layer handed the same rect as a `par=1.000` one is
