@@ -157,6 +157,19 @@ pub struct Layer {
     /// render. Mirrors the A/B `SingleA`/`SingleB` isolation.
     pub solo: bool,
     pub trim: Trim,
+    /// Manual pixel-aspect override for **this layer** (#263): `Some(f)` displays
+    /// the layer at `f` instead of its header `pixelAspectRatio`, for footage whose
+    /// header is missing or lies.
+    ///
+    /// Per layer rather than per viewer because a stack mixes formats: #261 made the
+    /// *automatic* aspect per-layer, and a single global override collapsed all of
+    /// them back to one value — actively fighting that fix. Chaos Player and PDPlayer
+    /// both set pixel aspect per layer, which is the behaviour this matches.
+    ///
+    /// The `anamorphic_unsqueeze` master toggle stays global: it is an on/off for the
+    /// whole viewport, not a value, and `ExrViewer::sanitize_unsqueeze` still gates
+    /// every layer's effective aspect through it.
+    pub pixel_aspect_override: Option<f32>,
 }
 
 impl Layer {
@@ -220,6 +233,31 @@ pub struct Draw {
     pub transform: Transform,
     pub blend: BlendMode,
     pub opacity: f32,
+    /// The layer's manual pixel-aspect override, if any (#263). Carried on the draw
+    /// like every other per-layer render property, so the renderer resolves each
+    /// layer's effective aspect from the draw alone and never has to look the layer
+    /// back up by id.
+    pub pixel_aspect_override: Option<f32>,
+}
+
+impl Draw {
+    /// This draw's **effective** pixel aspect: the layer's manual override when set,
+    /// otherwise the source's header `pixelAspectRatio` (#263).
+    ///
+    /// The one place that precedence is expressed. It used to live in
+    /// `ExrViewer::unsqueeze_factor` as `self.pixel_aspect_override.unwrap_or(header_par)`
+    /// against a single viewer-wide field, which meant one manual value discarded
+    /// *every* layer's header aspect and collapsed a mixed-format stack to one PAR.
+    /// Resolving per draw is what keeps the override at the same scope as the
+    /// automatic aspect #261 established.
+    ///
+    /// Validity is not checked here: a non-finite or non-positive factor is clamped
+    /// downstream by `ExrViewer::sanitize_unsqueeze`, which also applies the global
+    /// unsqueeze toggle. Pure.
+    #[must_use]
+    pub fn effective_par(&self, header_par: f32) -> f32 {
+        self.pixel_aspect_override.unwrap_or(header_par)
+    }
 }
 
 /// An ordered comp stack: index `0` is the **bottom** layer (drawn first), higher
@@ -286,6 +324,7 @@ impl LayerStack {
             enabled: true,
             solo: false,
             trim,
+            pixel_aspect_override: None,
         });
         id
     }
@@ -332,6 +371,8 @@ impl LayerStack {
             enabled: true,
             solo: false,
             trim: Trim::full(0, u32::MAX),
+            // An adjustment layer has no pixels of its own, so no aspect to override.
+            pixel_aspect_override: None,
         });
         id
     }
@@ -393,6 +434,7 @@ impl LayerStack {
                         transform: l.transform,
                         blend: l.blend,
                         opacity: l.opacity,
+                        pixel_aspect_override: l.pixel_aspect_override,
                     }),
                     LayerSource::Adjustment => Step::Adjust {
                         id: l.id,
@@ -518,6 +560,68 @@ mod tests {
         assert_eq!((d1.id, d1.aov, d1.source_frame), (b, 2, 7));
         assert_eq!(d1.blend, BlendMode::Add);
         assert!((d1.opacity - 0.5).abs() < f32::EPSILON);
+    }
+
+    /// #263: the pixel-aspect override is per layer, so one layer's manual factor
+    /// leaves every other layer's header aspect intact.
+    ///
+    /// The regression this pins: the override used to be a single `ExrViewer` field
+    /// consumed as `override.unwrap_or(header_par)`, so setting it *discarded* the
+    /// header PAR for the whole stack — an anamorphic plate and a square previs both
+    /// took the typed value. That collapsed exactly the per-layer aspects #261 had
+    /// just established.
+    #[test]
+    fn a_layers_aspect_override_applies_to_that_layer_only() {
+        let mut s = LayerStack::new();
+        let plate = s.push_image("plate", src(1), 0, Trim::full(0, 100));
+        let previs = s.push_image("previs", src(2), 0, Trim::full(0, 100));
+        // The plate's header lies (says square), so it gets a manual 2.0; the previs
+        // genuinely is square and is left alone.
+        s.get_mut(plate).unwrap().pixel_aspect_override = Some(2.0);
+
+        let steps = s.composite_at(7);
+        let [Step::Draw(d_plate), Step::Draw(d_previs)] = &steps[..] else {
+            panic!("expected two draws")
+        };
+        assert_eq!(d_plate.id, plate);
+        assert_eq!(d_previs.id, previs);
+
+        // Each draw carries its own layer's override…
+        assert_eq!(d_plate.pixel_aspect_override, Some(2.0));
+        assert_eq!(d_previs.pixel_aspect_override, None);
+
+        // …and resolving against a header PAR honours it per layer. Both sources
+        // report a square header here: the override is the only thing separating
+        // them, which is the whole point.
+        assert_eq!(d_plate.effective_par(1.0), 2.0, "override wins");
+        assert_eq!(
+            d_previs.effective_par(1.0),
+            1.0,
+            "a sibling's override must not reach this layer"
+        );
+
+        // With no override, the header PAR passes through untouched — including an
+        // anamorphic one, which is the #261 automatic path.
+        assert_eq!(d_previs.effective_par(2.0), 2.0);
+        // And an override replaces the header even when the header is anamorphic:
+        // footage whose header is wrong in the *other* direction.
+        assert_eq!(d_plate.effective_par(1.85), 2.0);
+    }
+
+    /// A duplicate is a second *view* of the same footage, so it inherits the aspect
+    /// override with everything else — the copy would otherwise render at a different
+    /// width than the layer it was copied from (#242 + #263).
+    #[test]
+    fn duplicate_carries_the_aspect_override() {
+        let mut s = LayerStack::new();
+        let a = s.push_image("plate", src(1), 0, Trim::full(0, 100));
+        s.get_mut(a).unwrap().pixel_aspect_override = Some(1.33);
+        let copy = s.duplicate(a).expect("layer is in the stack");
+        assert_eq!(
+            s.get(copy).unwrap().pixel_aspect_override,
+            Some(1.33),
+            "the copy renders at the same width as its original"
+        );
     }
 
     #[test]

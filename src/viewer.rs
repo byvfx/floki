@@ -261,8 +261,15 @@ pub struct CompDraw {
     pub blend: BlendMode,
     /// Layer opacity in `[0, 1]`.
     pub opacity: f32,
-    /// This layer's own header pixel aspect ratio, used for its own unsqueeze (#254).
-    pub par: f32,
+    /// This layer's own **effective** pixel aspect — its manual override if it has
+    /// one, else its source's header `pixelAspectRatio` — used for its own unsqueeze
+    /// (#254 / #263). Resolved by the app via `Draw::effective_par`, where the layer
+    /// and its source are both in hand; the viewer only gates it through the global
+    /// unsqueeze toggle (`sanitize_unsqueeze`).
+    ///
+    /// Named `eff_par` rather than `par` deliberately: it was the raw header value
+    /// until #263, and every reader needs to know the override is already folded in.
+    pub eff_par: f32,
     /// This layer's own full-res pixel dimensions, so it can be placed at its own
     /// display size rather than stretched to the bottom layer's rect (#254). Same
     /// role `CompSideB::tex_size` has played for the Side-by-Side pane since #99 —
@@ -1091,11 +1098,19 @@ pub struct ExrViewer {
     pub scale: f32,
     pub translation: egui::Vec2,
     pub first_frame: bool,
-    /// Manual anamorphic squeeze override (#179): when `Some(f)`, the display
-    /// stretch uses `f` instead of the EXR header `pixelAspectRatio` (for footage
-    /// with a missing/wrong PAR). Session-only — not persisted, since it is
-    /// image-specific. Gated by [`ViewerPrefs::anamorphic_unsqueeze`].
-    pub pixel_aspect_override: Option<f32>,
+    /// Display-window ("format") size of whatever the canvas is currently showing,
+    /// for the always-on `WxH` readout at the image's bottom-right (#251). Set by
+    /// the app each frame before `draw_comp_composite`, alongside the other mirrored
+    /// per-frame viewer state; `None` draws nothing.
+    ///
+    /// This is the **display** window, not the data window: the format is the
+    /// question a comp TD is actually asking ("is this the right res?"), and a render
+    /// with overscan has a data window larger than it. It is also full-res even while
+    /// a proxy is on screen — `ExrData::downsampled` preserves `display_window` — so
+    /// the label does not flicker to the proxy size on scrub. That detail was in the
+    /// original implementation and is the reason this reads the display window rather
+    /// than the texture size.
+    pub comp_format: Option<(usize, usize)>,
     pub last_hover_pos_img: Option<(usize, usize)>,
     pub last_sampled_val_a: Option<[f32; 4]>,
     /// When set (by the app from `Playback::sampling_suppressed`), the canvas
@@ -1205,7 +1220,7 @@ impl Default for ExrViewer {
             scale: 1.0,
             translation: egui::Vec2::ZERO,
             first_frame: true,
-            pixel_aspect_override: None,
+            comp_format: None,
             last_hover_pos_img: None,
             last_sampled_val_a: None,
             suppress_sampling: false,
@@ -1930,15 +1945,6 @@ impl ExrViewer {
         }
     }
 
-    /// Effective horizontal unsqueeze factor for the **primary (A)** image, whose
-    /// header pixel aspect ratio is `header_par` (#179). The manual override wins
-    /// over the header PAR when set. The reference (B) image is unsqueezed from its
-    /// own header only (`sanitize_unsqueeze` on the compare pane PAR), so a
-    /// custom factor set to fix A does not distort a differently-squeezed B.
-    fn unsqueeze_factor(&self, header_par: f32) -> f32 {
-        self.sanitize_unsqueeze(self.pixel_aspect_override.unwrap_or(header_par))
-    }
-
     /// Paint all committed annotations plus the in-progress shape. Text labels are
     /// drawn here too; the editable text field is a separate popup. `scale` is the
     /// per-axis screen scale `(scale * par, scale)`; the x component carries the
@@ -2519,13 +2525,18 @@ impl ExrViewer {
         let render_state = gpu_resources.render_state();
         let (bw, bh) = base_size;
         let tex_size = egui::vec2(bw.max(1) as f32, bh.max(1) as f32);
-        // Anamorphic unsqueeze (#194 / #179): stretch the composite horizontally by
-        // the base layer's `pixelAspectRatio` (honoring the `anamorphic_unsqueeze`
-        // toggle + manual override), the same CPU-side geometry stretch the classic
-        // A/B path applies. The stretch is uniform across the image rect, so the
-        // cursor→pixel readout (`comp_hover_pixel` on `last_image_rect`) stays correct
-        // with no extra term.
-        let par = self.unsqueeze_factor(base_par);
+        // Anamorphic unsqueeze (#194 / #179): stretch the *canvas* horizontally by the
+        // base layer's effective pixel aspect, the same CPU-side geometry stretch the
+        // classic A/B path applies. The stretch is uniform across the image rect, so
+        // the cursor→pixel readout (`comp_hover_pixel` on `last_image_rect`) stays
+        // correct with no extra term.
+        //
+        // `base_par` arrives already resolved (override-or-header, per #263), so this
+        // only applies the global `anamorphic_unsqueeze` toggle and clamps a bad
+        // factor. It must NOT go back through `unsqueeze_factor`: that would re-apply
+        // the viewer-wide override on top of the per-layer one and collapse the very
+        // distinction this change draws.
+        let par = self.sanitize_unsqueeze(base_par);
 
         let (rect, response) =
             ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
@@ -2534,7 +2545,9 @@ impl ExrViewer {
         // same); framing on first paint fits the *unsqueezed* base layer extents.
         // Side-by-Side lays the composite and the current layer out horizontally, so the
         // first-paint fit must span both or the second pane spills off-screen.
-        let par_b = side_b.as_ref().map(|b| self.unsqueeze_factor(b.draw.par));
+        let par_b = side_b
+            .as_ref()
+            .map(|b| self.sanitize_unsqueeze(b.draw.eff_par));
         let fit_b = side_b
             .as_ref()
             .zip(par_b)
@@ -2683,7 +2696,7 @@ impl ExrViewer {
                 image_rect.center(),
                 self.scale,
                 b.draw.tex_size,
-                self.unsqueeze_factor(b.draw.par),
+                self.sanitize_unsqueeze(b.draw.eff_par),
             );
             ctx.draw(
                 &painter,
@@ -2731,17 +2744,24 @@ impl ExrViewer {
             // Centring, not offsetting: `Layer::transform` carries a canvas-space
             // offset and is still ignored by the renderer, so honouring it is a
             // separate change. Every layer shares a centre until then.
-            let layer_par = self.unsqueeze_factor(d.par);
+            let layer_par = self.sanitize_unsqueeze(d.eff_par);
             let layer_rect =
                 comp_layer_rect(image_rect.center(), self.scale, d.tex_size, layer_par);
             cover(&mut union_rect, layer_rect);
             if debug_geom {
-                // Printing each layer's own rect beside its own `par` is the point:
+                // Printing each layer's own rect beside its own aspect is the point:
                 // a `par=2.000` layer handed the same rect as a `par=1.000` one is
                 // #254, stated in one line.
+                //
+                // `par` is the layer's *effective* aspect (#263) — a manual override
+                // if it has one, else its header PAR — and `eff` is that after the
+                // global unsqueeze toggle. Whether the value came from the header or
+                // an override is deliberately not carried on `CompDraw`: one aspect
+                // field that is always the one to draw with beats two that a caller
+                // can pick wrongly, and the Layers panel shows both figures anyway.
                 geom.push(format!(
                     "l{i}:par={:.3},eff={:.3},x=[{:.0},{:.0}],y=[{:.0},{:.0}]",
-                    d.par,
+                    d.eff_par,
                     layer_par,
                     layer_rect.min.x,
                     layer_rect.max.x,
@@ -2816,6 +2836,43 @@ impl ExrViewer {
                 log::debug!(target: "floki::playback", "{line}");
                 self.dbg_layer_geom = Some(line);
             }
+        }
+
+        // Always-on display-window resolution ("format") readout at the image's
+        // bottom-right (#251). Present on every image before the #99 A/B collapse
+        // deleted it with the old render path, and never restored on the comp path —
+        // this is that label, in its original position, styling and alignment.
+        //
+        // It reports the format of whatever **pane A** is showing: the composite's
+        // canvas layer when Stacked, and the current layer in a compare (the app
+        // hands `base_size` / `comp_format` over to that layer there). That is
+        // "the viewer's format" in the Nuke sense, rather than each input's.
+        //
+        // Suppressed in Side-by-Side, exactly as the original was: the two panes are
+        // different layers at possibly different formats, so a single label under
+        // both of them would be naming one pane while appearing to describe the pair.
+        // Per-layer formats are in the Layers panel, which is where a mismatch is
+        // meant to be compared.
+        //
+        // Positioned at the bottom-right of the canvas rect, which on the comp path is
+        // the *data* window (`disp_rect == image_rect` — the stack has no display-window
+        // geometry yet). So on an overscan render the label sits on the data window
+        // while naming the display window's size. The size is the honest answer to
+        // "what format is this"; anchoring it to a drawn display-window box is the
+        // other half of #251, along with the overscan dim and bbox annotations.
+        //
+        // Drawn with the same unclipped painter as the annotations below, and before
+        // the early return, so the Diff path gets it too.
+        if let Some((fw, fh)) = self.comp_format
+            && !is_sbs
+        {
+            painter.text(
+                disp_rect.right_bottom() + egui::vec2(0.0, 5.0),
+                egui::Align2::RIGHT_TOP,
+                format!("{fw}x{fh}"),
+                egui::FontId::proportional(12.0),
+                egui::Color32::from_gray(200),
+            );
         }
 
         // Annotation overlay + the in-place text field (#45 / #99 Slice 3d). Drawn here
@@ -4109,40 +4166,36 @@ mod gui_tests {
         );
     }
 
+    /// The viewer's remaining half of the unsqueeze contract (#179 / #263): the
+    /// global on/off toggle and the degenerate-factor clamp. Choosing *which* factor
+    /// (a layer's override vs its header PAR) is no longer the viewer's business —
+    /// that is `Draw::effective_par`, resolved per layer before the value ever
+    /// reaches here, so one manual factor can't collapse a mixed-format stack.
     #[test]
-    fn unsqueeze_factor_gates_on_toggle_and_override() {
+    fn sanitize_unsqueeze_gates_on_the_global_toggle_and_clamps_bad_factors() {
         let mut v = ExrViewer::default();
 
-        // Toggle on (the default), no override: the header PAR is used verbatim,
-        // and PAR 1.0 is a no-op for square-pixel footage.
+        // Toggle on (the default): the effective aspect passes through verbatim,
+        // and 1.0 is a no-op for square-pixel footage.
         assert!(v.prefs.anamorphic_unsqueeze);
-        assert_eq!(v.unsqueeze_factor(2.0), 2.0);
-        assert_eq!(v.unsqueeze_factor(1.0), 1.0);
-
-        // Manual override wins over the header PAR while the toggle is on — but
-        // only for the primary (A) image. The reference (B) image is unsqueezed
-        // from its own header via `sanitize_unsqueeze`, which ignores the override,
-        // so a custom factor set to fix A does not distort a differently-squeezed B.
-        v.pixel_aspect_override = Some(1.33);
-        assert_eq!(v.unsqueeze_factor(2.0), 1.33);
         assert_eq!(v.sanitize_unsqueeze(2.0), 2.0);
+        assert_eq!(v.sanitize_unsqueeze(1.33), 1.33);
+        assert_eq!(v.sanitize_unsqueeze(1.0), 1.0);
 
-        // Toggle off returns raw (1.0) regardless of header PAR or override.
+        // Toggle off returns 1.0 whatever the layer resolved to. The toggle stays
+        // global on purpose: it is an on/off for the whole viewport, not a value.
         v.prefs.anamorphic_unsqueeze = false;
-        assert_eq!(v.unsqueeze_factor(2.0), 1.0);
-        assert_eq!(v.unsqueeze_factor(1.0), 1.0);
         assert_eq!(v.sanitize_unsqueeze(2.0), 1.0);
+        assert_eq!(v.sanitize_unsqueeze(1.0), 1.0);
 
-        // A degenerate factor (0, negative, or NaN — e.g. a malformed/absent
-        // header PAR) falls back to 1.0 (no stretch) instead of collapsing the
-        // image to a near-zero width.
+        // A degenerate factor (0, negative, or NaN — a malformed/absent header PAR,
+        // or a bad override) falls back to 1.0 instead of collapsing the image to a
+        // near-zero width and poisoning the screen↔image reciprocal.
         v.prefs.anamorphic_unsqueeze = true;
-        v.pixel_aspect_override = Some(0.0);
-        assert_eq!(v.unsqueeze_factor(2.0), 1.0);
-        v.pixel_aspect_override = None;
-        assert_eq!(v.unsqueeze_factor(0.0), 1.0);
-        assert_eq!(v.unsqueeze_factor(-2.0), 1.0);
-        assert_eq!(v.unsqueeze_factor(f32::NAN), 1.0);
+        assert_eq!(v.sanitize_unsqueeze(0.0), 1.0);
+        assert_eq!(v.sanitize_unsqueeze(-2.0), 1.0);
+        assert_eq!(v.sanitize_unsqueeze(f32::NAN), 1.0);
+        assert_eq!(v.sanitize_unsqueeze(f32::INFINITY), 1.0);
     }
 
     #[test]

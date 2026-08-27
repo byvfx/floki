@@ -34,8 +34,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   header pixel aspect, so a stack of mismatched formats shows each one at its true
   display shape. Side-by-Side already did this for its second pane; that is now how
   every layer is placed. Wipe and Diff still share one rect (they are a single
-  two-input draw) and are tracked separately, as is the pixel-aspect *override*,
-  which is still applied globally rather than per layer.
+  two-input draw) and are tracked separately.
+- **The pixel-aspect override is per layer.** It was a single viewer-wide value
+  applied as "override *instead of* the header", so typing one factor discarded
+  every layer's own aspect and collapsed a mixed-format stack to that number — an
+  anamorphic plate and a square previs both took it. Worse after the fix above than
+  before it: the control flattened exactly the per-layer aspects that had just been
+  established, so the only safe advice was to leave it alone. Each layer now carries
+  its own override, persisted with it, editable per row in the Layers panel's ⋮ menu
+  (or from Display ▾ for the current layer, which is the same value from the other
+  end). Chaos Player and PDPlayer both set pixel aspect per layer; this matches them.
+  The **Unsqueeze anamorphic** master switch stays global — it is an on/off for the
+  viewport, not a value.
+- **The display-resolution readout is back.** The always-on `WxH` label at the
+  image's bottom-right went out with the A/B render path in 1.12.0 and was never
+  restored on the comp path, which left nothing in the UI stating what format you
+  were looking at — the fastest answer to "is this the right plate?", and the reason
+  the mismatched-aspect bug above had to be found by measuring a screenshot. It
+  reports the format of whatever pane A shows: the canvas layer when stacked, the
+  current layer in a compare. Per-layer format and header pixel aspect are listed in
+  the Layers panel too, which is where a stack of mismatched formats is compared.
+  Suppressed in Side-by-Side, where one label under two panes would be naming one of
+  them while appearing to describe both. The overscan dim and the data-window
+  annotations, which went out at the same time, are still to come.
 - **The composite no longer clips to one layer's rect.** Each layer of the stack is
   folded in its own render pass over a full-target clear, and the fold covered only
   that layer — so everything outside the topmost layer's rectangle was left as the
