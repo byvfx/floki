@@ -1520,6 +1520,7 @@ dependencies = [
  "pollster",
  "rayon",
  "rfd",
+ "ron",
  "serde",
  "smallvec",
  "sysinfo",

@@ -502,6 +502,23 @@ struct DbgFollowerRow {
     inflight: usize,
 }
 
+/// How much a "reset settings" clears (#248).
+///
+/// Two scopes because the heavyweight one costs the user their session, and most bad
+/// states are one of a handful of decode/budget toggles rather than anything to do with
+/// the stack or the colour setup.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ResetScope {
+    /// The decode / budget levers only — beauty preview, proxy, precache, T2, the RAM
+    /// budget. Leaves the comp stack, recent files, colour management and view
+    /// preferences alone, so it is safe to reach for mid-session without losing work.
+    PlaybackSettings,
+    /// Every persisted field, plus the comp stack and the viewer's own display
+    /// preferences. The equivalent of deleting `app.ron`, without having to know where
+    /// it lives.
+    Everything,
+}
+
 /// Top-level application state and the [`eframe::App`] implementation. Owns the
 /// loaded A/B images, the `ExrViewer` canvas, OCIO/LUT colour state, and the
 /// menu/tool UI. Fields marked `#[serde(skip)]` are runtime-only (images, GPU
@@ -524,6 +541,10 @@ pub struct ExrApp {
     exr_data: Option<std::sync::Arc<ExrData>>,
     #[serde(skip)]
     error_msg: Option<String>,
+    /// A reset awaiting confirmation (#248). Runtime-only — a pending dialog must not
+    /// survive a restart, least of all one that clears the stack.
+    #[serde(skip)]
+    pending_reset: Option<ResetScope>,
     #[serde(skip)]
     viewer: ExrViewer,
 
@@ -1076,6 +1097,7 @@ impl Default for ExrApp {
             open_gen_a: 0,
             exr_data: None,
             error_msg: None,
+            pending_reset: None,
             viewer: ExrViewer::default(),
             playback: crate::playback::Playback::default(),
             frame_cache: crate::cache::FrameCache::new(),
@@ -4400,6 +4422,109 @@ impl ExrApp {
         self.viewer.prefs = prefs;
     }
 
+    /// Reset persisted state to defaults (#248) — the escape hatch from a setting
+    /// that has made the app look broken.
+    ///
+    /// Everything meaningful persists, so a toggle flipped once stays flipped across
+    /// every future session whether or not the user remembers doing it. Beauty preview
+    /// turned off mid-session is the worst of them: on 4K multi-part footage it takes
+    /// decode from ~40 ms to ~650 ms a frame, the picture simply stops moving, and
+    /// nothing in the UI connects that to a checkbox from last week. Until now the only
+    /// cure was knowing that `%APPDATA%\floki\data\app.ron` exists.
+    ///
+    /// The two scopes are deliberately different in cost — see [`ResetScope`]. Both
+    /// take effect immediately; neither needs a restart, because the reset runs through
+    /// the same teardown a normal close does.
+    ///
+    /// `Everything` also closes what is open — the comp stack *and* slot A. That is
+    /// state rather than settings, but leaving it behind would strand the app halfway:
+    /// the transport is cleared with `playback`, so the alternative is a session with
+    /// no timeline, a picture still on screen, and its frames still resident.
+    fn reset_settings(&mut self, scope: ResetScope) {
+        let defaults = ExrApp::default();
+
+        // The decode / budget levers, which are the ones that make playback look
+        // broken. Reset by both scopes.
+        self.t2_enabled = defaults.t2_enabled;
+        self.beauty_preview = defaults.beauty_preview;
+        self.proxy_enabled = defaults.proxy_enabled;
+        self.proxy_size = defaults.proxy_size;
+        self.proxy_disk_cache = defaults.proxy_disk_cache;
+        self.proxy_cache_gb = defaults.proxy_cache_gb;
+        self.precache = defaults.precache;
+        self.ram_budget_gb = defaults.ram_budget_gb;
+
+        if scope == ResetScope::PlaybackSettings {
+            return;
+        }
+
+        // ── Everything below is the full reset ──────────────────────────────────
+        //
+        // Clear the stack **first**, while the live state it hangs off still exists:
+        // `remove_comp_layer` is the proven teardown (drops the source, its decode
+        // follower, its cached frames, its upload-gate slot, and releases the clock if
+        // it drove the transport). Reaching for the model directly would leave every
+        // one of those behind.
+        //
+        // Collected before the loop because removal mutates the stack. #242 makes this
+        // the thing most likely to *need* clearing: a stack could accumulate invisible
+        // duplicates across sessions, each one dividing the decode worker and the RAM
+        // budget.
+        let ids: Vec<_> = self.comp_stack.iter().map(|l| l.id).collect();
+        for id in ids {
+            self.remove_comp_layer(id);
+        }
+
+        // Close slot A as well. `remove_comp_layer` ends by dropping the base track
+        // through `remove_base_layer`, which deliberately leaves A's own image, cache
+        // and transport alone — it exists for the case where the *panel* empties and
+        // the classic viewer takes back over. Nothing else closes slot A: the File ▸
+        // Close Image A menu went out with the #99 R4 collapse.
+        //
+        // Without this the reset half-lands: `playback` is replaced below, which
+        // clears the sequence and the playhead (those are `#[serde(skip)]` fields of
+        // `Playback`, reset along with the struct) — but the decoded image and its
+        // ring of frames stay resident, so a "reset everything" leaves the transport
+        // gone, the picture still up, and hundreds of MB still held.
+        //
+        // `open_gen_a` supersedes any in-flight slot-A decode (#109), or a result
+        // already on its way would land after the reset and re-populate `exr_data`.
+        // This is the only place that bumps it today; the open/unload paths its doc
+        // comment refers to were removed in R4.
+        self.exr_data = None;
+        self.loaded_file = None;
+        self.loading_a = false;
+        self.open_gen_a = self.open_gen_a.wrapping_add(1);
+        self.frame_cache.clear();
+        self.frame_bytes = None;
+
+        self.playback = defaults.playback;
+        self.show_playback_hud = defaults.show_playback_hud;
+        self.recent_files = defaults.recent_files;
+        self.theme = defaults.theme;
+        self.save_snapshots = defaults.save_snapshots;
+        self.watch_enabled = defaults.watch_enabled;
+        self.watch_follow = defaults.watch_follow;
+        self.ocio_path = defaults.ocio_path;
+        self.ocio_display = defaults.ocio_display;
+        self.ocio_view = defaults.ocio_view;
+        self.ocio_input_cs = defaults.ocio_input_cs;
+        self.ocio_enabled = defaults.ocio_enabled;
+        self.ocio_bake_lut = defaults.ocio_bake_lut;
+        self.lut_path = defaults.lut_path;
+        self.enable_lut = defaults.enable_lut;
+        self.lut_error = defaults.lut_error;
+
+        // The two serde bridges are rebuilt from live state in `save()`, so clearing
+        // them alone would not stick — `viewer.prefs` is the field that actually
+        // persists the display preferences, and the stack was cleared above. Reset
+        // both anyway so the in-memory state is consistent the moment this returns
+        // rather than only after the next save.
+        self.persisted_prefs = defaults.persisted_prefs;
+        self.persisted_layers = defaults.persisted_layers;
+        self.viewer = ExrViewer::default();
+    }
+
     fn tracked_image_bytes(&self) -> u64 {
         // For a sequence the active frame is one of the resident T1 frames (a
         // shared `Arc`), so the cache already accounts for slot A — don't also add
@@ -5060,6 +5185,77 @@ impl ExrApp {
     }
 
     fn draw_help_window(&mut self, ctx: &egui::Context) {
+        // Confirm before resetting (#248). A modal rather than an immediate action:
+        // the full scope clears the layer stack, which is not something to do on a
+        // mis-click in a menu, and the two scopes differ enough in cost that the
+        // dialog names what this one will take.
+        if let Some(scope) = self.pending_reset {
+            let mut close = false;
+            egui::Window::new("Reset settings")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .show(ctx, |ui| {
+                    match scope {
+                        ResetScope::PlaybackSettings => {
+                            ui.label(
+                                "Restore the decode and memory settings to their \
+                                 defaults?",
+                            );
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new(
+                                    "Beauty preview, proxy, precache, disk cache, T2 \
+                                     and the RAM budget. Your layers, recent files and \
+                                     colour setup are kept.",
+                                )
+                                .weak(),
+                            );
+                        }
+                        ResetScope::Everything => {
+                            ui.label("Restore every setting to its default?");
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new(
+                                    "This also clears the layer stack, recent files, \
+                                     and the OCIO / LUT setup, and cannot be undone. \
+                                     Open files are closed; nothing on disk is touched.",
+                                )
+                                .weak(),
+                            );
+                        }
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                        let go = match scope {
+                            ResetScope::PlaybackSettings => "Reset playback settings",
+                            ResetScope::Everything => "Reset everything",
+                        };
+                        if ui.button(go).clicked() {
+                            self.reset_settings(scope);
+                            // Say so: a reset that changes nothing visible (the narrow
+                            // scope on an already-default config) would otherwise look
+                            // like the button did nothing.
+                            self.snapshot_status = Some(match scope {
+                                ResetScope::PlaybackSettings => {
+                                    "Playback settings reset to defaults.".to_string()
+                                }
+                                ResetScope::Everything => {
+                                    "All settings reset to defaults.".to_string()
+                                }
+                            });
+                            close = true;
+                        }
+                    });
+                });
+            if close {
+                self.pending_reset = None;
+            }
+        }
+
         if self.show_help {
             egui::Window::new("Help & Shortcuts")
                 .open(&mut self.show_help)
@@ -5493,6 +5689,34 @@ impl ExrApp {
                     ui.menu_button("Help", |ui| {
                         if ui.button("Keyboard Shortcuts").clicked() {
                             self.show_help = true;
+                            ui.close();
+                        }
+                        // The escape hatch from a persisted bad state (#248). Under
+                        // Help rather than Settings on purpose: you come looking for
+                        // this when the app seems broken, which is where people look.
+                        ui.separator();
+                        if ui
+                            .button("Reset playback settings…")
+                            .on_hover_text(
+                                "Restore the decode and memory settings — beauty \
+                                 preview, proxy, precache, RAM budget — to their \
+                                 defaults. Keeps your layers, recent files and colour \
+                                 setup.",
+                            )
+                            .clicked()
+                        {
+                            self.pending_reset = Some(ResetScope::PlaybackSettings);
+                            ui.close();
+                        }
+                        if ui
+                            .button("Reset all settings…")
+                            .on_hover_text(
+                                "Restore every setting to its default and clear the \
+                                 layer stack — the equivalent of deleting app.ron.",
+                            )
+                            .clicked()
+                        {
+                            self.pending_reset = Some(ResetScope::Everything);
                             ui.close();
                         }
                     });
@@ -10846,6 +11070,187 @@ mod tests {
             app.viewer.active_layer, 0,
             "active_layer clamped to a valid index for the new layer count"
         );
+    }
+
+    /// Dirty every persisted field this test knows how to reach, so the reset has
+    /// something to clear on each of them.
+    fn app_with_dirtied_settings() -> ExrApp {
+        let mut app = ExrApp::default();
+        // Decode / budget levers — the group the narrow scope owns.
+        app.t2_enabled = !app.t2_enabled;
+        app.beauty_preview = !app.beauty_preview;
+        app.proxy_enabled = !app.proxy_enabled;
+        app.proxy_disk_cache = !app.proxy_disk_cache;
+        app.precache = !app.precache;
+        app.proxy_size = 999;
+        app.proxy_cache_gb = 123.0;
+        app.ram_budget_gb = 7.0;
+        // Everything else.
+        app.show_playback_hud = !app.show_playback_hud;
+        app.save_snapshots = !app.save_snapshots;
+        app.watch_enabled = !app.watch_enabled;
+        app.watch_follow = !app.watch_follow;
+        app.enable_lut = !app.enable_lut;
+        app.ocio_enabled = !app.ocio_enabled;
+        app.ocio_bake_lut = !app.ocio_bake_lut;
+        app.recent_files.push(PathBuf::from("/tmp/nope.exr"));
+        app.ocio_path = "/tmp/config.ocio".to_string();
+        app.ocio_display = "sRGB".to_string();
+        app.ocio_view = "Film".to_string();
+        app.ocio_input_cs = "ACEScg".to_string();
+        app.lut_path = "/tmp/look.cube".to_string();
+        app.lut_error = Some("stale".to_string());
+        app.theme = ThemeChoice::Light;
+        app.playback.fps_target = 47.0;
+        app.viewer.prefs.diff_floor = 0.33;
+        app.viewer.prefs.background.checker_size = 77.0;
+        // An open file, so the two scopes' opposite treatment of it is observable.
+        // The temp dir can go once the pixels are decoded into memory.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("open.exr");
+        write_rgba_exr(&p);
+        app.exr_data = Some(std::sync::Arc::new(ExrData::load(&p).unwrap()));
+        app.loaded_file = Some(p);
+        app
+    }
+
+    /// Exactly what `save()` would write to `app.ron`, as a string.
+    ///
+    /// Serializing the **whole app** is the point: serde emits precisely the fields
+    /// that aren't `#[serde(skip)]`, so this tracks the persisted set on its own. A
+    /// hand-listed comparison would have to be kept in step with `reset_settings`, and
+    /// the two would then go stale together — which is no test at all.
+    ///
+    /// Takes `&mut` to mirror `save()`'s two bridges (#151 / #99 PR-B.5), which are
+    /// rebuilt from live state at persist time; without that this would compare stale
+    /// bridge values instead of what actually reaches disk.
+    fn persisted_ron(app: &mut ExrApp) -> String {
+        app.persisted_prefs = app.viewer.prefs.clone();
+        app.persisted_layers = app.comp_layers_persist();
+        ron::to_string(app).expect("ExrApp serializes")
+    }
+
+    /// A full reset must leave **nothing** persisted behind, and this compares the
+    /// serialized state rather than a hand-listed set of fields.
+    ///
+    /// That is the whole point: the failure mode for a reset written as a list of
+    /// assignments is a field added months later that nobody adds to the list, which
+    /// then survives the reset silently — the same shape of bug #248 exists to cure.
+    /// Serde sees exactly the persisted fields, so a missed one shows up here as a
+    /// diff instead.
+    #[test]
+    fn resetting_everything_leaves_no_persisted_field_behind() {
+        let mut app = app_with_dirtied_settings();
+        let fresh = persisted_ron(&mut ExrApp::default());
+        assert_ne!(
+            persisted_ron(&mut app),
+            fresh,
+            "the fixture must actually dirty something"
+        );
+
+        app.reset_settings(ResetScope::Everything);
+
+        assert_eq!(
+            persisted_ron(&mut app),
+            fresh,
+            "a persisted field survived the full reset — add it to `reset_settings`"
+        );
+    }
+
+    /// "Reset all settings" says *Open files are closed*, so it has to close them —
+    /// including slot A, which no other path closes since the R4 collapse removed the
+    /// File ▸ Close Image A menu.
+    ///
+    /// Not pedantry about the dialog wording: `playback` is reset with everything
+    /// else, and its sequence/playhead are `#[serde(skip)]` fields of the struct being
+    /// replaced, so the transport goes regardless. Leaving the image behind would
+    /// strand the app halfway — no timeline, picture still up, frames still resident.
+    #[test]
+    fn resetting_everything_closes_slot_a_and_releases_its_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.exr");
+        write_rgba_exr(&p);
+        let data = std::sync::Arc::new(ExrData::load(&p).unwrap());
+
+        let mut app = ExrApp {
+            loaded_file: Some(p.clone()),
+            exr_data: Some(data.clone()),
+            loading_a: true,
+            frame_bytes: Some(data.approx_bytes()),
+            ..Default::default()
+        };
+        app.frame_cache.insert(ExrApp::A_SOURCE, 1, data);
+        assert!(app.frame_cache.bytes() > 0, "the fixture must be resident");
+        let gen_before = app.open_gen_a;
+
+        app.reset_settings(ResetScope::Everything);
+
+        assert!(app.exr_data.is_none(), "the image is unloaded");
+        assert!(app.loaded_file.is_none());
+        assert!(!app.loading_a);
+        assert_eq!(app.frame_cache.bytes(), 0, "its frames are released");
+        assert_eq!(app.frame_bytes, None);
+        assert!(app.playback.sequence.is_none(), "and the transport with it");
+        assert_ne!(
+            app.open_gen_a, gen_before,
+            "a decode already in flight must not land after the reset and \
+             re-populate the slot (#109)"
+        );
+    }
+
+    /// The narrow scope is the one you reach for mid-session, so it must not cost the
+    /// user anything: the decode levers go back to defaults and everything else is
+    /// left exactly as it was.
+    #[test]
+    fn resetting_playback_settings_touches_only_the_decode_levers() {
+        let mut app = app_with_dirtied_settings();
+        let d = ExrApp::default();
+
+        app.reset_settings(ResetScope::PlaybackSettings);
+
+        // Reset…
+        assert_eq!(app.beauty_preview, d.beauty_preview);
+        assert_eq!(app.proxy_enabled, d.proxy_enabled);
+        assert_eq!(app.proxy_size, d.proxy_size);
+        assert_eq!(app.proxy_disk_cache, d.proxy_disk_cache);
+        assert_eq!(app.proxy_cache_gb, d.proxy_cache_gb);
+        assert_eq!(app.precache, d.precache);
+        assert_eq!(app.t2_enabled, d.t2_enabled);
+        assert!((app.ram_budget_gb - d.ram_budget_gb).abs() < f32::EPSILON);
+
+        // …and kept. Recent files and the colour setup are work, not settings-gone-bad,
+        // and losing them would make this reset something people avoid reaching for.
+        assert_eq!(app.recent_files.len(), 1);
+        assert_eq!(app.ocio_path, "/tmp/config.ocio");
+        assert!(
+            app.exr_data.is_some(),
+            "the narrow scope must not close what is open — that is the whole reason \
+             it is safe to reach for mid-session"
+        );
+        assert_eq!(app.lut_path, "/tmp/look.cube");
+        assert_eq!(app.theme, ThemeChoice::Light);
+        assert!((app.playback.fps_target - 47.0).abs() < f32::EPSILON);
+        assert!((app.viewer.prefs.diff_floor - 0.33).abs() < f32::EPSILON);
+    }
+
+    /// `save()` rebuilds `persisted_prefs` from `viewer.prefs`, so a reset that cleared
+    /// only the bridge would be undone by the very next save — the settings would come
+    /// back on the next launch and the reset would look like it had silently failed.
+    #[test]
+    fn resetting_everything_resets_the_source_of_the_prefs_bridge_not_just_the_bridge() {
+        let mut app = ExrApp::default();
+        app.viewer.prefs.background.checker_size = 77.0;
+        app.viewer.prefs.diff_floor = 0.42;
+
+        app.reset_settings(ResetScope::Everything);
+
+        let d = crate::viewer::ViewerPrefs::default();
+        assert!(
+            (app.viewer.prefs.background.checker_size - d.background.checker_size).abs()
+                < f32::EPSILON,
+            "viewer.prefs is what persists; clearing only the bridge would not stick"
+        );
+        assert!((app.viewer.prefs.diff_floor - d.diff_floor).abs() < f32::EPSILON);
     }
 
     #[test]

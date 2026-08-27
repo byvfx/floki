@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Reset settings to defaults**, under Help, in two scopes. Everything meaningful
+  persists, so a toggle flipped once stayed flipped across every future session
+  whether or not you remembered doing it — and the only cure was knowing that
+  `app.ron` exists and where. **Reset playback settings** restores the decode and
+  memory levers (beauty preview, proxy, precache, disk cache, T2, the RAM budget) and
+  keeps your layers, recent files and colour setup, so it is safe to reach for
+  mid-session; a reset that costs you your work is one nobody uses when they need it.
+  **Reset all settings** additionally clears the layer stack, recents and the OCIO /
+  LUT setup — the equivalent of deleting `app.ron` without having to find it. Both
+  confirm first, naming what that scope will take, and say so afterwards, since a
+  reset that changes nothing visible otherwise looks like a button that did nothing.
+  The worst case this answers: beauty preview switched off on 4K multi-part footage
+  takes decode from ~40 ms a frame to ~650 ms, so the picture simply stops moving,
+  with nothing in the UI connecting that to a checkbox from a previous session.
 - **Duplicate layer.** A second layer on the same source, from the layer's context
   menu — retime it, re-trim it, or point it at a different pass independently. It
   shares the original's decoded source, so it costs no decode, no extra cache
