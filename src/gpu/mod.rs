@@ -1149,9 +1149,12 @@ pub fn gpu_preflight_error(adapters: &[AdapterSummary]) -> Option<String> {
             "Floki could not find a GPU.\n\n\
              The system reported no graphics adapter at all. Floki renders entirely \
              on the GPU, so it cannot start without one.\n\n\
-             This is usually a remote session (RDP or VDI) that exposes no usable \
-             adapter, or a graphics driver that failed to load. Running on the \
-             machine directly, or reinstalling the driver, is normally the fix."
+             If the WGPU_BACKEND environment variable is set, unset it and try \
+             again: it restricts which adapters Floki can see, and a value naming a \
+             backend this machine does not have leaves none at all.\n\n\
+             Otherwise this is usually a remote session (RDP or VDI) that exposes no \
+             usable adapter, or a graphics driver that failed to load. Running on \
+             the machine directly, or reinstalling the driver, is normally the fix."
                 .to_string(),
         );
     }
@@ -1171,8 +1174,10 @@ pub fn gpu_preflight_error(adapters: &[AdapterSummary]) -> Option<String> {
          works (Windows: Settings > System > Display > Graphics; otherwise the GPU \
          vendor's control panel). A remote session often exposes only a software \
          adapter, which will not.\n\n\
-         If you believe the GPU does support this, try forcing a backend with the \
-         WGPU_BACKEND environment variable (vulkan, dx12, or metal)."
+         If the WGPU_BACKEND environment variable is set, unset it — it restricts \
+         which adapters Floki can see, and may be hiding one that would work. If it \
+         is not set and you believe the GPU does support this, try forcing a backend \
+         with it (vulkan, dx12, or metal)."
     ))
 }
 
@@ -1297,6 +1302,12 @@ mod tests {
         // The likely causes, which are not the same as the unsuitable-adapter ones.
         assert!(none.contains("RDP") || none.contains("remote"), "{none}");
         assert!(none.contains("driver"), "{none}");
+        // `WGPU_BACKEND` filtering every adapter out reaches this same branch, and
+        // it is the one cause the user can fix in a second. Verifying #247 hit
+        // exactly that — a backend value with no native adapters — and the message
+        // then blamed a remote session and a broken driver, neither of which was
+        // true. Both branches name it now.
+        assert!(none.contains("WGPU_BACKEND"), "{none}");
     }
 
     #[test]
