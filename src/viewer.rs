@@ -459,6 +459,26 @@ pub(crate) struct Overscan {
     pub bottom: i32,
 }
 
+impl Overscan {
+    /// What the caption calls this window relationship.
+    ///
+    /// Three cases, not two: a data window that is *offset* as well as differently
+    /// sized runs past the format on one side and falls short on another, so both
+    /// flags are set. Labelling that "Overscan" describes half of it and hides the
+    /// half that costs you — a side with no pixels where the format expects them.
+    /// Pure.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match (self.overscanned, self.cropped) {
+            (true, true) => "Overscan + crop",
+            (false, true) => "Crop",
+            // Neither is unreachable from the overlay, which only draws when one of
+            // them holds; name it honestly rather than asserting.
+            _ => "Overscan",
+        }
+    }
+}
+
 /// Measure a layer's overscan (#251).
 ///
 /// The percentage is expressed against the **display window**, per axis, as the total
@@ -3117,7 +3137,7 @@ impl ExrViewer {
                 egui::Align2::LEFT_TOP,
                 format!(
                     "{}: {}x{} (pos: {}, {})  {:+.1}% × {:+.1}%",
-                    if o.overscanned { "Overscan" } else { "Crop" },
+                    o.label(),
                     f.data_size.0,
                     f.data_size.1,
                     f.data_pos.0,
@@ -4172,6 +4192,47 @@ mod gui_tests {
         // Margins are very nearly symmetric, as a render with uniform overscan is.
         assert_eq!((o.left, o.top), (460, 317));
         assert_eq!((o.right, o.bottom), (461, 316));
+    }
+
+    /// A data window that is *offset* as well as differently sized overruns the format
+    /// on one side and falls short on another, so it is both overscanned and cropped —
+    /// and the caption has to say so.
+    ///
+    /// The overlay used to pick its word from `overscanned` alone, which named the
+    /// half that costs nothing and hid the half that costs you: a side with no pixels
+    /// where the format expects them, reported as "Overscan".
+    #[test]
+    fn a_window_that_overruns_one_side_and_falls_short_of_another_says_both() {
+        let o = super::overscan_of(super::CompFormat {
+            disp_pos: (0, 0),
+            disp_size: (1920, 1080),
+            // Shifted right and down: pixels past the right/bottom edges, none along
+            // the left/top ones.
+            data_pos: (200, 100),
+            data_size: (1920, 1080),
+        });
+        assert!(o.overscanned, "overruns the right and bottom");
+        assert!(o.cropped, "falls short along the left and top");
+        assert_eq!(o.label(), "Overscan + crop");
+        assert_eq!((o.left, o.top), (-200, -100));
+        assert_eq!((o.right, o.bottom), (200, 100));
+        // Same size as the format, so neither axis gained area — the percentage is
+        // about size and the margins are about placement; a caption showing 0% beside
+        // non-zero margins is correct, not a contradiction.
+        assert_eq!((o.extra_w_pct, o.extra_h_pct), (0.0, 0.0));
+
+        // The single-sided cases keep their plain labels.
+        assert_eq!(super::overscan_of(overscan_fixture()).label(), "Overscan");
+        assert_eq!(
+            super::overscan_of(super::CompFormat {
+                disp_pos: (0, 0),
+                disp_size: (1920, 1080),
+                data_pos: (100, 50),
+                data_size: (1000, 500),
+            })
+            .label(),
+            "Crop"
+        );
     }
 
     /// The display-window box is placed from the layer's own rect, so restoring the

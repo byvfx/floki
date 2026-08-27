@@ -8702,10 +8702,14 @@ impl ExrApp {
             // source's header PAR (#263). Resolved here, where the layer's draw and
             // its source are both in hand, so the renderer never re-derives it.
             let eff_par = d.effective_par(cs.exr_data.image.attributes.pixel_aspect);
+            // Resolved once per layer and shared by the canvas format below and this
+            // draw's `data_pos`: two calls would be two chances to disagree if the
+            // lookup ever grows a fallback.
+            let geom = comp_window_geometry(&cs.exr_data, d.aov);
             if draws.is_empty() {
                 base_size = cs.size;
                 base_par = eff_par;
-                base_format = Some(comp_window_geometry(&cs.exr_data, d.aov));
+                base_format = Some(geom);
             }
             draws.push(crate::viewer::CompDraw {
                 bind_group,
@@ -8713,7 +8717,7 @@ impl ExrApp {
                 opacity: d.opacity,
                 eff_par,
                 tex_size: comp_tex_size(cs.size),
-                data_pos: comp_window_geometry(&cs.exr_data, d.aov).data_pos,
+                data_pos: geom.data_pos,
                 // Nuke's "viewed node": the overscan overlay boxes this layer's
                 // bounding box against the canvas layer's format (#251).
                 is_current: Some(d.id) == current_layer,
@@ -8789,13 +8793,14 @@ impl ExrApp {
                     && let Some(bind_group) = cs.bind_group.clone()
                 {
                     let eff_par = a.effective_par(cs.exr_data.image.attributes.pixel_aspect);
+                    let geom = comp_window_geometry(&cs.exr_data, a.aov);
                     draws = vec![crate::viewer::CompDraw {
                         bind_group,
                         blend: a.blend,
                         opacity: a.opacity,
                         eff_par,
                         tex_size: comp_tex_size(cs.size),
-                        data_pos: comp_window_geometry(&cs.exr_data, a.aov).data_pos,
+                        data_pos: geom.data_pos,
                         // Pane A of a compare *is* the current layer, though the
                         // overlay is suppressed there either way.
                         is_current: true,
@@ -8804,7 +8809,7 @@ impl ExrApp {
                     base_par = eff_par;
                     // In a compare, pane A *is* the current layer, so the format
                     // readout follows it here rather than the composite's canvas.
-                    base_format = Some(comp_window_geometry(&cs.exr_data, a.aov));
+                    base_format = Some(geom);
                 }
                 self.comp_arrangement
             }
