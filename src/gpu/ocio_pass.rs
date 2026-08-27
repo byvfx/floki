@@ -1039,23 +1039,9 @@ mod metal_tests {
     // creation + execution on the platform GPU (Metal here).
     #[test]
     fn ocio_pipeline_creates_and_runs_on_device() {
-        let instance =
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-        let adapter = match pollster::block_on(
-            instance.request_adapter(&wgpu::RequestAdapterOptions::default()),
-        ) {
-            Ok(a) => a,
-            Err(_) => {
-                eprintln!("no GPU adapter available; skipping on-device OCIO test");
-                return;
-            }
+        let Some((device, queue)) = crate::gpu::test_device("ocio-test-device") else {
+            return;
         };
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("ocio-test-device"),
-            required_features: wgpu::Features::FLOAT32_FILTERABLE,
-            ..Default::default()
-        }))
-        .expect("request_device");
 
         let cfg = floki_ocio::OcioConfig::load(floki_ocio::ConfigSource::BuiltIn("ocio://default"))
             .expect("load default config");
@@ -1172,42 +1158,7 @@ mod metal_tests {
 mod device_tests {
     use super::*;
 
-    /// A GPU device for the tests below, or `None` when this machine can't give one —
-    /// in which case the caller returns and the test is a no-op.
-    ///
-    /// There are **two** ways to come up short and both must skip rather than fail.
-    /// The obvious one is a runner with no adapter. The one that actually bit when
-    /// these tests were ungated (#259) is a runner whose adapter is *software*:
-    /// `Test & Lint` is ubuntu-latest, which has llvmpipe, so an adapter-only guard
-    /// sails straight past and then panics in `request_device` — llvmpipe has no
-    /// `FLOAT32_FILTERABLE`, which `GpuState` requires for the f32 3D LUT.
-    ///
-    /// One helper rather than a copy per test: five hand-rolled guards is how the
-    /// second condition came to be missing from all of them at once.
-    fn test_device(label: &'static str) -> Option<(wgpu::Device, wgpu::Queue)> {
-        let instance =
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-        let adapter = match pollster::block_on(
-            instance.request_adapter(&wgpu::RequestAdapterOptions::default()),
-        ) {
-            Ok(a) => a,
-            Err(_) => {
-                eprintln!("no GPU adapter available; skipping {label}");
-                return None;
-            }
-        };
-        match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some(label),
-            required_features: wgpu::Features::FLOAT32_FILTERABLE,
-            ..Default::default()
-        })) {
-            Ok(dq) => Some(dq),
-            Err(e) => {
-                eprintln!("GPU lacks FLOAT32_FILTERABLE ({e:?}); skipping {label}");
-                None
-            }
-        }
-    }
+    use crate::gpu::test_device;
 
     // Validates the blit pipeline (`GpuState::blit_pipeline` + `BLIT_SHADER`, and its
     // bind-group layout) compiles and runs on the platform GPU, and that its three

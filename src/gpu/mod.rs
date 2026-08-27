@@ -1097,6 +1097,49 @@ impl eframe::egui_wgpu::CallbackTrait for ExrCallback {
     }
 }
 
+/// A GPU device for an on-device test, or `None` when this machine can't give one —
+/// in which case the caller returns and the test is a no-op. **Every on-device test
+/// goes through this**; see TESTING.md.
+///
+/// There are two ways to come up short and both must skip rather than fail:
+///
+/// 1. No adapter at all — a headless runner with no Vulkan/Metal/DX.
+/// 2. An adapter that *exists* but lacks `FLOAT32_FILTERABLE`, which [`GpuState`]
+///    requires for the f32 3D LUT. This is the one that bites: `Test & Lint` runs on
+///    ubuntu-latest, which has llvmpipe in software, so an adapter-only guard passes
+///    the first check and then panics in `request_device`.
+///
+/// Condition 2 was reported in #195 and reached CI in #259, where five hand-rolled
+/// copies of this guard were all missing it. Living in `gpu` rather than in one test
+/// module is the point (#266): `ocio_pass::metal_tests`, `ocio_pass::device_tests` and
+/// `thumbnail` all need it, and four copies is how the condition went missing from
+/// every copy at once.
+#[cfg(test)]
+pub(crate) fn test_device(label: &'static str) -> Option<(wgpu::Device, wgpu::Queue)> {
+    let instance =
+        wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let adapter =
+        match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+        {
+            Ok(a) => a,
+            Err(_) => {
+                eprintln!("no GPU adapter available; skipping {label}");
+                return None;
+            }
+        };
+    match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some(label),
+        required_features: wgpu::Features::FLOAT32_FILTERABLE,
+        ..Default::default()
+    })) {
+        Ok(dq) => Some(dq),
+        Err(e) => {
+            eprintln!("GPU lacks FLOAT32_FILTERABLE ({e:?}); skipping {label}");
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
