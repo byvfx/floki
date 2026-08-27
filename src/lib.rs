@@ -14,7 +14,9 @@ pub mod exr_loader;
 
 // The startup GPU preflight (#247). Re-exported rather than making `gpu` public:
 // `main.rs` enumerates the adapters (that needs a live wgpu instance) and this
-// decides what to say about them, so only these two items cross the boundary.
+// crate decides what to say about them, so only what that split needs crosses the
+// boundary — the summary type, the requirement to test each adapter against, and
+// the verdict.
 pub use gpu::{AdapterSummary, REQUIRED_DEVICE_FEATURES, gpu_preflight_error};
 
 mod annotation;
