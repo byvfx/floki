@@ -1134,7 +1134,14 @@ pub(crate) fn test_device(label: &'static str) -> Option<(wgpu::Device, wgpu::Qu
     })) {
         Ok(dq) => Some(dq),
         Err(e) => {
-            eprintln!("GPU lacks FLOAT32_FILTERABLE ({e:?}); skipping {label}");
+            // Don't assert the cause: a missing FLOAT32_FILTERABLE is the expected
+            // reason and the one worth naming, but `request_device` fails for others
+            // too, and a message that states the wrong cause is worse than none when
+            // you are reading a CI log trying to work out why a test went quiet.
+            eprintln!(
+                "request_device failed ({e:?}) — this test needs FLOAT32_FILTERABLE; \
+                 skipping {label}"
+            );
             None
         }
     }

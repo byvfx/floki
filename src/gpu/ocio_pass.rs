@@ -1150,9 +1150,10 @@ mod metal_tests {
 /// crate), so these ran in **zero** CI jobs.
 ///
 /// This deliberately breaks the GPU-free convention in TESTING.md, which exists so
-/// the suite runs on headless CI. These stay compatible with that: each returns
-/// early when `request_adapter` finds no GPU, so a runner without one skips them
-/// rather than failing. The trade-off is that a skip reads as a pass — see the
+/// the suite runs on headless CI. These stay compatible with that: each goes through
+/// [`crate::gpu::test_device`], which returns `None` — and so skips the test — both
+/// when there is no adapter and when the adapter can't give a device with
+/// `FLOAT32_FILTERABLE`. The trade-off is that a skip reads as a pass — see the
 /// note on #259.
 #[cfg(test)]
 mod device_tests {

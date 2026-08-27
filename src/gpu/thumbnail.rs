@@ -479,7 +479,9 @@ mod tests {
     /// On-device proof that the `Rgba8Unorm` + `srgb=1` assumption holds: feed a
     /// known scene-linear input through the thumbnail render and read back the
     /// target bytes. Linear 0.5 must encode to sRGB ~188 (not 128 = no encode,
-    /// not 223 = double encode). Skips gracefully if no GPU adapter is present.
+    /// not 223 = double encode). Skips gracefully when this machine has no usable
+    /// GPU — no adapter at all, *or* an adapter that can't give a device with
+    /// `FLOAT32_FILTERABLE`. See [`crate::gpu::test_device`].
     #[test]
     fn thumbnail_render_srgb_encodes_on_device() {
         let Some((device, queue)) = crate::gpu::test_device("thumbnail-test-device") else {
