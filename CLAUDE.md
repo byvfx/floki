@@ -47,11 +47,13 @@ device in tests (`viewer::ui` takes `render_state: Option<&RenderState>` — pas
 `None`).
 
 The exception is `gpu::ocio_pass::device_tests` + `gpu::thumbnail`, which validate
-render seams no CPU stand-in can observe. They **skip** without a capable GPU, via the
-shared `test_device` helper — use it, don't hand-roll the guard. It checks two
-conditions, and the second is the one that bites: `Test & Lint` runs on ubuntu-latest,
-which *has* a software adapter (llvmpipe) but no `FLOAT32_FILTERABLE`, so an
-adapter-only guard passes the check and then panics in `request_device`. Consequence:
+render seams no CPU stand-in can observe. They **skip** without a capable GPU, and the
+guard must check **two** conditions — the second being the one that bites: `Test & Lint`
+runs on ubuntu-latest, which *has* a software adapter (llvmpipe) but no
+`FLOAT32_FILTERABLE`, so an adapter-only guard passes the check and then panics in
+`request_device`. `ocio_pass::device_tests::test_device` is the reference
+implementation; it's module-private, so `gpu::thumbnail` still carries two inline
+copies of the same check (#266). Don't add a fourth copy. Consequence:
 **those tests report green on CI having run none of them** — a real GPU is where the
 render seams are actually verified, and macOS with `--features vendored` is the only
 config that runs every test in the repo (`metal_tests` needs macOS + an OCIO feature). Headless GUI tests drive `ExrViewer::handle_hotkeys` through `egui_kittest`

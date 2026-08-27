@@ -46,7 +46,7 @@ premultiplied-alpha blend, the α=−1 "no image" sentinel, and whether
 
 **They skip rather than fail** when the machine can't supply a device, so a
 GPU-less CI runner still goes green. There are **two** ways to come up short
-and both are checked, via the shared `test_device` helper:
+and both must be checked:
 
 | Condition | Where it bites |
 |---|---|
@@ -55,8 +55,16 @@ and both are checked, via the shared `test_device` helper:
 
 The second one is the trap. An adapter *is* found on ubuntu, so an
 adapter-only guard sails past it and then panics in `request_device` —
-`GpuState` requires `FLOAT32_FILTERABLE` for the f32 3D LUT. Every on-device
-test must go through `test_device`; do not hand-roll the guard.
+`GpuState` requires `FLOAT32_FILTERABLE` for the f32 3D LUT. That is exactly
+how the ungated tests failed CI the first time they ran there.
+
+**Any new on-device test must check both.** `ocio_pass::device_tests::test_device`
+is the reference implementation and the one to call from that module; it is
+module-private, so `gpu::thumbnail`'s two tests currently carry their own inline
+copies of the same two-stage check. Three copies of one guard is the shape that
+let the `FLOAT32_FILTERABLE` condition go missing everywhere at once — prefer
+calling the helper over adding a fourth, and see #266 for hoisting it somewhere
+both modules can reach.
 
 Two consequences worth knowing:
 
