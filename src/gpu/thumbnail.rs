@@ -479,32 +479,12 @@ mod tests {
     /// On-device proof that the `Rgba8Unorm` + `srgb=1` assumption holds: feed a
     /// known scene-linear input through the thumbnail render and read back the
     /// target bytes. Linear 0.5 must encode to sRGB ~188 (not 128 = no encode,
-    /// not 223 = double encode). Skips gracefully if no GPU adapter is present.
+    /// not 223 = double encode). Skips gracefully when this machine has no usable
+    /// GPU — no adapter at all, *or* an adapter that can't give a device with
+    /// `FLOAT32_FILTERABLE`. See [`crate::gpu::test_device`].
     #[test]
     fn thumbnail_render_srgb_encodes_on_device() {
-        let instance =
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-        let adapter = match pollster::block_on(
-            instance.request_adapter(&wgpu::RequestAdapterOptions::default()),
-        ) {
-            Ok(a) => a,
-            Err(_) => {
-                eprintln!("no GPU adapter available; skipping on-device thumbnail test");
-                return;
-            }
-        };
-        // FLOAT32_FILTERABLE is required by `GpuState` (the 3D LUT). CI runners
-        // often expose a software adapter that lacks it — skip rather than panic so
-        // this device-gated test never fails on a GPU-less/limited runner (it still
-        // runs + asserts on a real GPU, e.g. Metal locally).
-        let Ok((device, queue)) =
-            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-                label: Some("thumbnail-test-device"),
-                required_features: wgpu::Features::FLOAT32_FILTERABLE,
-                ..Default::default()
-            }))
-        else {
-            eprintln!("GPU lacks FLOAT32_FILTERABLE; skipping on-device thumbnail test");
+        let Some((device, queue)) = crate::gpu::test_device("thumbnail-test-device") else {
             return;
         };
 
@@ -650,25 +630,7 @@ mod ocio_tests {
 
     #[test]
     fn ocio_thumbnail_two_pass_runs_on_device() {
-        let instance =
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-        let adapter = match pollster::block_on(
-            instance.request_adapter(&wgpu::RequestAdapterOptions::default()),
-        ) {
-            Ok(a) => a,
-            Err(_) => {
-                eprintln!("no GPU adapter available; skipping on-device OCIO thumbnail test");
-                return;
-            }
-        };
-        let Ok((device, queue)) =
-            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-                label: Some("ocio-thumb-test-device"),
-                required_features: wgpu::Features::FLOAT32_FILTERABLE,
-                ..Default::default()
-            }))
-        else {
-            eprintln!("GPU lacks FLOAT32_FILTERABLE; skipping on-device OCIO thumbnail test");
+        let Some((device, queue)) = crate::gpu::test_device("ocio-thumb-test-device") else {
             return;
         };
 
