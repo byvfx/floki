@@ -96,8 +96,18 @@ pub struct Uniforms {
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct BlitUniforms {
+    /// The region the display stage covers: the display window **unioned with every
+    /// layer rect** (#254/#257). Normalizes the background gradient, so it must span
+    /// everything drawn or the gradient clips to the canvas layer.
     pub display_min: [f32; 2],
     pub display_max: [f32; 2],
+    /// The display window alone — the format boundary the overscan dim gates on
+    /// (#251). Separate from `display_*` because that pair grew to mean "everything
+    /// covered": with one pair serving both, the dim's `inside` test spanned every
+    /// layer rect and so was true everywhere, silently dimming nothing. Set both to
+    /// the same rect to disable the dim.
+    pub dim_min: [f32; 2],
+    pub dim_max: [f32; 2],
     pub screen_size: [f32; 2],
     pub overscan_factor: f32,
     /// Customizable viewport background (issue #18), composited here in *display*
@@ -189,6 +199,8 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VOut {
 struct BlitUniforms {
     display_min: vec2<f32>,
     display_max: vec2<f32>,
+    dim_min: vec2<f32>,
+    dim_max: vec2<f32>,
     screen_size: vec2<f32>,
     overscan_factor: f32,
     bg_mode: f32,
@@ -273,10 +285,11 @@ fn fs_main(i: VOut) -> @location(0) vec4<f32> {
     }
 
     // Overscan dim: multiply by the dim factor where the pixel is outside the display
-    // window (data-window overscan region).
+    // window (data-window overscan region). Gates on `dim_*`, the display window
+    // alone — `display_*` is the whole covered region and would always test inside.
     let screen_pt2 = i.uv * bu.screen_size;
-    let inside = screen_pt2.x >= bu.display_min.x && screen_pt2.x <= bu.display_max.x
-              && screen_pt2.y >= bu.display_min.y && screen_pt2.y <= bu.display_max.y;
+    let inside = screen_pt2.x >= bu.dim_min.x && screen_pt2.x <= bu.dim_max.x
+              && screen_pt2.y >= bu.dim_min.y && screen_pt2.y <= bu.dim_max.y;
     let dim = select(bu.overscan_factor, 1.0, inside);
     rgb = rgb * dim;
 
@@ -1179,7 +1192,7 @@ mod tests {
             "BlitUniforms size ({size}) must be a multiple of 16"
         );
         assert_eq!(
-            size, 96,
+            size, 112,
             "BlitUniforms layout changed — update BLIT_SHADER to match"
         );
     }

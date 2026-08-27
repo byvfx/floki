@@ -55,8 +55,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   current layer in a compare. Per-layer format and header pixel aspect are listed in
   the Layers panel too, which is where a stack of mismatched formats is compared.
   Suppressed in Side-by-Side, where one label under two panes would be naming one of
-  them while appearing to describe both. The overscan dim and the data-window
-  annotations, which went out at the same time, are still to come.
+  them while appearing to describe both.
+- **The overscan overlay is back, and now says how much overscan.** The orange
+  data-window box, the white display-window box with its corner coordinates, the
+  caption, and the **Overscan Opacity** dim all went out with the A/B render path in
+  1.12.0. Until now nothing in the UI said a frame *had* overscan, how much, or where
+  the format boundary sat — for a viewer aimed at comp TDs, where a data window
+  exceeding the display window is a normal property of a render, that is not cosmetic.
+  The caption is new: alongside the pixel dimensions and origin it reports the
+  overscan as a percentage of the format, per axis and across both sides — a 40%
+  overscan render reads `+40.0% × +40.0%`, which is the figure a delivery spec is
+  written in. It also distinguishes a **crop** (data window inside the format) from an
+  overscan; the original had one word for both, so a cropped render read as its
+  opposite. Following Nuke, the two boxes describe different things: the white box is
+  the canvas layer's format, the orange one the **current** layer's bounding box, so a
+  layer that does not match the shot format shows up as exactly that. Where the current
+  layer isn't drawn — hidden, soloed out, trimmed away — the overlay falls back to the
+  canvas layer rather than vanishing.
 - **The composite no longer clips to one layer's rect.** Each layer of the stack is
   folded in its own render pass over a full-target clear, and the fold covered only
   that layer — so everything outside the topmost layer's rectangle was left as the

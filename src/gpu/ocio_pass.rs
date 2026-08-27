@@ -1264,6 +1264,10 @@ mod device_tests {
         let bu = crate::gpu::BlitUniforms {
             display_min: [0.0, 0.0],
             display_max: [3.0, 1.0],
+            // The dim gate (#251) is its own window now; the whole row is inside it,
+            // so `overscan_factor` stays inert here as the comment above intends.
+            dim_min: [0.0, 0.0],
+            dim_max: [3.0, 1.0],
             screen_size: [3.0, 1.0],
             overscan_factor: 0.5,
             bg_mode: 0.0, // checkerboard
