@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.13.0] - 2026-08-28
+
 ### Added
 - **Floki says when it is decode-bound instead of just looking frozen.** When decode
   can't keep up, the picture stops moving and nothing in the UI said why: the
@@ -875,7 +877,8 @@ Initial release.
 - Advanced metadata header inspector.
 - Cross-platform GitHub Actions builds (Linux, Windows, macOS).
 
-[Unreleased]: https://github.com/byvfx/floki/compare/v1.12.0...HEAD
+[Unreleased]: https://github.com/byvfx/floki/compare/v1.13.0...HEAD
+[1.13.0]: https://github.com/byvfx/floki/compare/v1.12.0...v1.13.0
 [1.12.0]: https://github.com/byvfx/floki/compare/v1.11.0...v1.12.0
 [1.11.0]: https://github.com/byvfx/floki/compare/v1.10.2...v1.11.0
 [1.10.2]: https://github.com/byvfx/floki/compare/v1.10.0...v1.10.2
