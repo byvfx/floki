@@ -4,28 +4,13 @@
 //! pressure, and (on macOS) the wgpu Metal device's allocated/budget VRAM, so the
 //! status bar can render a discrete readout without doing per-frame work.
 
+use crate::budget::Sample;
 use eframe::egui_wgpu::wgpu;
 use std::time::{Duration, Instant};
 
 /// How often the underlying OS / GPU queries actually run. Between refreshes the
 /// status bar reads the cached [`Sample`].
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
-
-/// One sampled snapshot of memory usage, all values in bytes.
-#[derive(Clone, Copy, Debug)]
-pub struct Sample {
-    /// Resident set size of this process.
-    pub proc_bytes: u64,
-    /// System-wide memory in use.
-    pub sys_used: u64,
-    /// Total system memory.
-    pub sys_total: u64,
-    /// GPU memory currently allocated by this process. `None` when unavailable
-    /// (non-macOS, or the active backend is not Metal).
-    pub gpu_used: Option<u64>,
-    /// Recommended GPU working-set budget. `None` when unavailable.
-    pub gpu_budget: Option<u64>,
-}
 
 /// Throttled sampler. Holds a `sysinfo::System` and reuses it across refreshes so
 /// we only pay for the memory/process collectors we asked for.
@@ -54,8 +39,10 @@ impl ResourceMonitor {
 
     /// Return the current snapshot, refreshing the underlying queries at most once
     /// per [`REFRESH_INTERVAL`]. `device` is the live wgpu device used for the GPU
-    /// memory query; pass the one from `RenderState`.
-    pub fn sample(&mut self, device: &wgpu::Device) -> Sample {
+    /// memory query; pass the one from `RenderState`, or `None` on the CPU-only
+    /// path, where the system figures are still wanted and `gpu_used` /
+    /// `gpu_budget` simply come back unavailable (#288).
+    pub fn sample(&mut self, device: Option<&wgpu::Device>) -> Sample {
         let now = Instant::now();
         let due = self
             .last_at
@@ -68,7 +55,7 @@ impl ResourceMonitor {
         self.last.expect("sample populated on first refresh")
     }
 
-    fn refresh(&mut self, device: &wgpu::Device) -> Sample {
+    fn refresh(&mut self, device: Option<&wgpu::Device>) -> Sample {
         self.sys.refresh_memory();
 
         let proc_bytes = self
@@ -100,8 +87,14 @@ impl ResourceMonitor {
 /// Returns `(used, budget)` in bytes, or `(None, None)` when the value can't be
 /// obtained (non-macOS, or the running backend is not Metal).
 #[cfg(target_os = "macos")]
-fn gpu_memory(device: &wgpu::Device) -> (Option<u64>, Option<u64>) {
+fn gpu_memory(device: Option<&wgpu::Device>) -> (Option<u64>, Option<u64>) {
     use objc2_metal::MTLDevice;
+
+    // No device on the CPU-only path — the system RAM figures are still valid,
+    // only the VRAM pair is unavailable (#288).
+    let Some(device) = device else {
+        return (None, None);
+    };
 
     // SAFETY: `as_hal` hands us the underlying Metal device only while the guard is
     // alive; we just read two scalar properties off it and copy them out. We never
@@ -121,7 +114,7 @@ fn gpu_memory(device: &wgpu::Device) -> (Option<u64>, Option<u64>) {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn gpu_memory(_device: &wgpu::Device) -> (Option<u64>, Option<u64>) {
+fn gpu_memory(_device: Option<&wgpu::Device>) -> (Option<u64>, Option<u64>) {
     (None, None)
 }
 

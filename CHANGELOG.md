@@ -224,6 +224,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so they could be broken by anything and nothing in the pipeline would report it.
   The vendored-OCIO lint now runs on macOS too, which type-checks them on every
   pull request. Actually running them still takes a Mac with a real GPU.
+- The RAM cache-cap arithmetic is covered by tests. `tick_budgets` sized both the RAM
+  ring and the VRAM ring behind a single early return on the GPU device, so under the
+  GPU-free test convention the RAM half was unreachable — and #215, #230, #232 and
+  #233 all landed in code no test could call. The helpers underneath it were each
+  covered; their composition was not. It now splits into a device-free
+  `tick_budgets_t1` and a `tick_budgets_t2` that keeps the GPU, with the memory
+  `Sample` moved to `budget.rs` so it can be constructed by hand. Six tests follow:
+  the cap and the byte budget stating one figure in two units, the two-frame floor
+  applying in both, the RAM setting binding only as a ceiling, the live-pressure
+  shrink firing with nothing in flight, an unmeasured divisor leaving both bounds
+  untouched, and the budget being computed at all where there is no GPU.
+- **A machine with no usable GPU now gets a RAM cache budget.** Sizing both rings
+  behind one early return on the GPU device meant the CPU-only fallback path never
+  reached the *RAM* half either, so the frame ring kept its constructed default —
+  eight frames, and a byte bound of "unlimited" — no matter how little memory was
+  free. On heavy footage that is eight full frames held regardless, which is the one
+  direction the memory contract is meant to prevent. Only the VRAM figures ever
+  needed a device; the system ones come from the OS. Unchanged wherever a GPU is
+  present, which is every normal session.
 
 ## [1.12.0] - 2026-08-15
 

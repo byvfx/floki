@@ -632,7 +632,7 @@ pub struct ExrApp {
     /// Last `ResourceMonitor` sample, stashed each status tick for the overlay
     /// (the budget inputs: sys + VRAM used/total).
     #[serde(skip)]
-    dbg_last_sample: Option<crate::resource_monitor::Sample>,
+    dbg_last_sample: Option<crate::budget::Sample>,
     /// Cumulative T1 evictions and dropped stale-epoch results, for the overlay.
     #[serde(skip)]
     dbg_evictions: u64,
@@ -3931,13 +3931,42 @@ impl ExrApp {
     /// internally throttled so the cost is a struct copy — and lives here, not
     /// in a draw method: the caps are overcommit protection, and must keep
     /// running through any UI restructure (#150).
+    ///
+    /// Samples once and hands the same figure to both tiers. Only the *VRAM* half
+    /// of the sample needs a device, so the sampler takes an `Option` and **T1
+    /// runs unconditionally** (#288). It has to: gating the whole method on
+    /// `gpu_resources` left the CPU-only fallback path (`viewer.rs`) with no RAM
+    /// budget at all — the cap frozen at its constructed default and the byte
+    /// bound at `u64::MAX` — which is the one direction the memory contract
+    /// cannot tolerate. T2 stays gated; it sizes a ring of GPU textures, and
+    /// `pump_t2` independently bails without a device anyway.
     fn tick_budgets(&mut self) {
-        let Some(gpu) = &self.gpu_resources else {
-            return;
-        };
-        let sample = self.resource_monitor.sample(&gpu.render_state().device);
+        let device = self
+            .gpu_resources
+            .as_ref()
+            .map(|gpu| &gpu.render_state().device);
+        let sample = self.resource_monitor.sample(device);
         self.dbg_last_sample = Some(sample); // stash for the status bar + debug overlay
+        self.tick_budgets_t1(&sample);
+        if self.gpu_resources.is_some() {
+            self.tick_budgets_t2(&sample);
+        }
+    }
 
+    /// The **T1** (system-RAM ring) half of [`Self::tick_budgets`]: pure
+    /// arithmetic over `sample`, with no wgpu device in reach.
+    ///
+    /// Split out so the cap arithmetic is reachable headlessly (#288). It had
+    /// been the one part of the memory contract the suite could not execute —
+    /// `tick_budgets` early-returns without `gpu_resources`, so #215 / #230 /
+    /// #232 / #233 all landed in code no test could call. The helpers beneath it
+    /// (`sizing_frame_bytes`, `budget::*`) were covered; their *composition* was
+    /// not.
+    ///
+    /// Must run **after** `tick_playback` / `tick_precache`: the divisor is the
+    /// fidelity the pump just issued (contract invariant 1), and the eviction
+    /// below has to see the final resident set.
+    fn tick_budgets_t1(&mut self, sample: &crate::budget::Sample) {
         // T1: recomputed each tick; shrinks under other memory pressure. The
         // divisor is what one *new* frame costs at the fidelity the pump is
         // currently issuing ([`Self::sizing_frame_bytes`]); the resident side is
@@ -3951,7 +3980,7 @@ impl ExrApp {
             // fewer would fit — the floor is a deliberate override of the budget,
             // so it has to apply in bytes too or the byte bound would undo it.
             let budget = crate::budget::t1_budget_bytes(
-                &sample,
+                sample,
                 self.frame_cache.bytes(),
                 self.ram_budget_bytes(),
             );
@@ -3979,7 +4008,12 @@ impl ExrApp {
                 ) as u64);
             }
         }
+    }
 
+    /// The **T2** (VRAM texture ring) half of [`Self::tick_budgets`]. Keeps the
+    /// device-dependent side: `vram_available` reads the GPU figures the sampler
+    /// filled in, and the resulting caps land on the viewer's per-source rings.
+    fn tick_budgets_t2(&mut self, sample: &crate::budget::Sample) {
         // T2: conservative — capped low, and disabled (→ lazy path) unless at
         // least a couple of frames comfortably fit, since a wgpu OOM aborts
         // the process. Off entirely when the user disables it or no sequence
@@ -3994,7 +4028,7 @@ impl ExrApp {
             })
         };
         let t2_on = self.t2_enabled && self.playback.is_active();
-        let avail = crate::budget::vram_available(&sample);
+        let avail = crate::budget::vram_available(sample);
         // Split the pool in *bytes* (not frame counts) across the active sources
         // (#99) so each derives its own count from its own resolution when they
         // differ. One active follower (B) → the same A/B halving as before.
@@ -10518,6 +10552,187 @@ mod tests {
             app.cache_bound(),
             crate::cache::Bound::new(424, 24_000_000_000)
         );
+    }
+
+    // --- T1 cap arithmetic (#288) --------------------------------------------
+    //
+    // These drive `tick_budgets_t1` directly. Until the T1/T2 split it was
+    // unreachable from a test at all: `tick_budgets` early-returns without
+    // `gpu_resources`, and the GPU-free convention means no test has one. The
+    // helpers underneath (`sizing_frame_bytes`, `budget::t1_budget_bytes`,
+    // `budget::frames_in`) were each covered on their own; what follows is their
+    // *composition*, which is where #215 / #230 / #232 / #233 actually landed.
+
+    /// A synthetic memory sample. Constructing one by hand is the whole point of
+    /// moving `Sample` off the GPU-bound sampler (#288) — the arithmetic under
+    /// test never needed a device, only the figures.
+    fn mem_sample(sys_total: u64, sys_used: u64) -> crate::budget::Sample {
+        crate::budget::Sample {
+            proc_bytes: 0,
+            sys_used,
+            sys_total,
+            gpu_used: None,
+            gpu_budget: None,
+        }
+    }
+
+    /// A playing sequence sized off **full** frames (both cheap modes off), so
+    /// the divisor is the unambiguous `frame_bytes` latch.
+    fn app_sizing_off_full_frames() -> (tempfile::TempDir, ExrApp) {
+        let (dir, mut app) = app_playing_with_all_three_latches();
+        app.proxy_enabled = false;
+        app.beauty_preview = false;
+        assert_eq!(app.sizing_frame_bytes(), Some(1_000_000));
+        (dir, app)
+    }
+
+    #[test]
+    fn t1_states_one_budget_in_two_units() {
+        // #232 through the composition rather than `frames_in` alone: the cap is
+        // *derived* from the byte budget, so the two can never disagree about the
+        // same budget however the divisor was chosen.
+        let (_dir, mut app) = app_sizing_off_full_frames();
+
+        // 20 GB total, 2 GB used ⇒ 18 GB free; 60% of that = 10.8 GB.
+        app.tick_budgets_t1(&mem_sample(20_000_000_000, 2_000_000_000));
+        assert_eq!(app.frame_cache_budget, 10_800_000_000);
+        assert_eq!(app.frame_cache_cap, 10_800);
+        assert_eq!(
+            app.frame_cache_cap,
+            crate::budget::frames_in(app.frame_cache_budget, 1_000_000),
+            "the count is always the byte budget over the divisor"
+        );
+    }
+
+    #[test]
+    fn t1_floors_at_two_frames_in_both_units() {
+        // Under external pressure the budget can admit fewer than two frames.
+        // Playback still has to double-buffer, so the count is floored — and the
+        // floor has to apply in *bytes* too, or the byte bound would immediately
+        // evict what the count floor just protected.
+        let (_dir, mut app) = app_sizing_off_full_frames();
+
+        // 3 MB free; 60% = 1.8 MB — under one 1 MB frame's double-buffer pair.
+        app.tick_budgets_t1(&mem_sample(20_000_000_000, 19_997_000_000));
+        assert_eq!(app.frame_cache_cap, 2, "count floors at two frames");
+        assert_eq!(
+            app.frame_cache_budget, 2_000_000,
+            "and the byte bound floors with it, or it undoes the count floor"
+        );
+    }
+
+    #[test]
+    fn t1_user_ram_setting_binds_only_as_a_ceiling() {
+        let (_dir, mut app) = app_sizing_off_full_frames();
+        let plenty = mem_sample(20_000_000_000, 2_000_000_000);
+
+        app.ram_budget_gb = 0.0; // below RAM_BUDGET_AUTO_BELOW_GB ⇒ Auto
+        app.tick_budgets_t1(&plenty);
+        let auto = app.frame_cache_budget;
+        assert_eq!(auto, 10_800_000_000);
+
+        // A small setting deliberately constrains below the auto figure.
+        app.ram_budget_gb = 4.0;
+        app.tick_budgets_t1(&plenty);
+        assert_eq!(app.frame_cache_budget, 4 * (1 << 30));
+        assert!(app.frame_cache_budget < auto);
+
+        // A generous one cannot push *past* free RAM — that is the OOM guard,
+        // and the reason the setting is a ceiling rather than an override.
+        app.ram_budget_gb = 64.0;
+        app.tick_budgets_t1(&plenty);
+        assert_eq!(
+            app.frame_cache_budget, auto,
+            "a generous setting never exceeds the free-RAM slice"
+        );
+    }
+
+    #[test]
+    fn t1_shrinks_a_latched_ring_under_live_pressure() {
+        // #146: eviction otherwise runs only on insert, so with precache latched
+        // (nothing in flight, nothing inserting) a cap lowered by external memory
+        // pressure left the ring holding every frame indefinitely — the contract's
+        // live-pressure degradation never fired.
+        let (_dir, paths) = write_sequence(6);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&paths[0]);
+        for (i, p) in paths.iter().enumerate() {
+            let data = std::sync::Arc::new(ExrData::load(p).unwrap());
+            app.frame_cache.insert(ExrApp::A_SOURCE, i as u32 + 1, data);
+        }
+        assert_eq!(app.frame_cache.len(), 6);
+
+        // Latched: no decode is in flight, so nothing will insert and trim.
+        app.precache = true;
+        app.precache_filled = true;
+        assert!(app.inflight.is_empty());
+
+        // A divisor dear enough that 10.8 GB admits only one frame ⇒ cap floors
+        // at 2, well under the six resident.
+        app.proxy_enabled = false;
+        app.beauty_preview = false;
+        app.frame_bytes = Some(6_000_000_000);
+
+        app.tick_budgets_t1(&mem_sample(20_000_000_000, 2_000_000_000));
+        assert_eq!(app.frame_cache_cap, 2);
+        assert!(
+            app.frame_cache.len() < 6,
+            "the pressure tick evicts without waiting for an insert"
+        );
+        assert!(app.dbg_evictions > 0, "and the evictions are counted");
+    }
+
+    #[test]
+    fn t1_runs_on_the_cpu_only_path_where_there_is_no_gpu() {
+        // `gpu_resources` is `None` in the CPU fallback path (`viewer.rs`) as well
+        // as in every test. Gating all of `tick_budgets` on it left that path with
+        // no RAM budget whatsoever — cap stuck at its constructed default, byte
+        // bound at `u64::MAX` — so the ring grew to eight frames of whatever size
+        // regardless of free RAM. Only the VRAM query needs a device; the system
+        // figures come from sysinfo either way.
+        //
+        // Drives the real `tick_budgets`, so the figures are the host's own and
+        // only the invariants are asserted, not exact numbers.
+        let (_dir, mut app) = app_sizing_off_full_frames();
+        assert!(app.gpu_resources.is_none());
+        app.frame_cache_cap = 8;
+        app.frame_cache_budget = u64::MAX;
+
+        app.tick_budgets();
+
+        assert!(
+            app.frame_cache_budget < u64::MAX,
+            "a RAM budget is computed with no GPU present"
+        );
+        assert!(
+            app.dbg_last_sample
+                .is_some_and(|s| s.sys_total > 0 && s.gpu_budget.is_none()),
+            "system figures sampled; the VRAM pair reports unavailable"
+        );
+        assert_eq!(
+            app.frame_cache_cap,
+            crate::budget::frames_in(app.frame_cache_budget, 1_000_000).max(2),
+            "and the count is still derived from that same byte budget"
+        );
+    }
+
+    #[test]
+    fn t1_leaves_both_bounds_alone_when_nothing_is_measured() {
+        // Contract invariant 2's failure mode, pinned: a `None` divisor makes the
+        // whole T1 branch a no-op, so the cap keeps its constructed default with
+        // no budget check at all. Deliberate — a fallback that guessed a divisor
+        // here would guess in the OOM direction — but worth a test so it stays a
+        // decision rather than a discovery.
+        let (_dir, mut app) = app_playing_with_all_three_latches();
+        app.frame_bytes = None;
+        app.beauty_bytes = None;
+        app.proxy_bytes = None;
+        assert_eq!(app.sizing_frame_bytes(), None);
+
+        let (cap, budget) = (app.frame_cache_cap, app.frame_cache_budget);
+        app.tick_budgets_t1(&mem_sample(20_000_000_000, 19_999_000_000));
+        assert_eq!(app.frame_cache_cap, cap, "no divisor ⇒ no cap change");
+        assert_eq!(app.frame_cache_budget, budget);
     }
 
     #[test]

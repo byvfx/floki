@@ -11,7 +11,29 @@
 //! that *remains* after current usage — return `0` when not even one fits, which
 //! is the signal to degrade to decode-on-demand rather than crash.
 
-use crate::resource_monitor::Sample;
+/// One sampled snapshot of memory usage, all values in bytes.
+///
+/// Lives here rather than beside the sampler that produces it
+/// ([`crate::resource_monitor::ResourceMonitor`]): the sampler needs a live
+/// `wgpu::Device` for the Metal VRAM query, and pulling that dependency in
+/// through the type would make this whole module — and every caller that only
+/// wants to *do the arithmetic* — reachable only with a GPU. As a plain POD it
+/// can be constructed by hand, which is what lets the cap arithmetic in
+/// `ExrApp::tick_budgets_t1` be tested headlessly (#288).
+#[derive(Clone, Copy, Debug)]
+pub struct Sample {
+    /// Resident set size of this process.
+    pub proc_bytes: u64,
+    /// System-wide memory in use.
+    pub sys_used: u64,
+    /// Total system memory.
+    pub sys_total: u64,
+    /// GPU memory currently allocated by this process. `None` when unavailable
+    /// (non-macOS, or the active backend is not Metal).
+    pub gpu_used: Option<u64>,
+    /// Recommended GPU working-set budget. `None` when unavailable.
+    pub gpu_budget: Option<u64>,
+}
 
 /// Percent of the reported VRAM working-set budget the T2 ring may claim,
 /// leaving headroom for the rest of the app and allocator slop. Conservative;
