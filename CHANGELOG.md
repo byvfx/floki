@@ -224,6 +224,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so they could be broken by anything and nothing in the pipeline would report it.
   The vendored-OCIO lint now runs on macOS too, which type-checks them on every
   pull request. Actually running them still takes a Mac with a real GPU.
+- The RAM cache-cap arithmetic is covered by tests. `tick_budgets` sized both the RAM
+  ring and the VRAM ring behind a single early return on the GPU device, so under the
+  GPU-free test convention the RAM half was unreachable — and #215, #230, #232 and
+  #233 all landed in code no test could call. The helpers underneath it were each
+  covered; their composition was not. It now splits into a device-free
+  `tick_budgets_t1` and a `tick_budgets_t2` that keeps the GPU, with the memory
+  `Sample` moved to `budget.rs` so it can be constructed by hand. Five tests follow:
+  the cap and the byte budget stating one figure in two units, the two-frame floor
+  applying in both, the RAM setting binding only as a ceiling, the live-pressure
+  shrink firing with nothing in flight, and an unmeasured divisor leaving both bounds
+  untouched. No behaviour change.
 
 ## [1.12.0] - 2026-08-15
 

@@ -65,9 +65,11 @@ inline `#[cfg(test)]` modules. Tone/color math lives in `render_math.rs`; the
 `channel_mode` integer encoding's single source of truth is `ChannelMode::as_u32`
 (`viewer.rs`), mirrored by `gpu/shader.wgsl`.
 
-**The test suite cannot see everything.** `tick_budgets` early-returns without a GPU
-device, so the cap arithmetic is unreachable under the GPU-free convention — test the
-pure helpers (`sizing_frame_bytes`, `cache_is_full`, `budget::*`) instead. And the
+**The test suite cannot see everything.** The T1 cap arithmetic *is* now reachable —
+`tick_budgets` splits into `tick_budgets_t1(&Sample)` (pure; `Sample` lives in
+`budget.rs` precisely so it can be built by hand) and `tick_budgets_t2(&Sample)`
+(keeps the device), so drive T1 directly rather than only the pure helpers beneath it
+(#288). T2's caps still need a real GPU. And the
 soak harness (`run-windows.ps1 soak`) auto-plays and never idles, so anything whose
 trigger is *human timing* is invisible to both: #236 (a pause filed the whole idle
 span as one frame time) survived 360 passing tests and a dozen clean soak runs. For

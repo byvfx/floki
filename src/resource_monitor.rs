@@ -4,28 +4,13 @@
 //! pressure, and (on macOS) the wgpu Metal device's allocated/budget VRAM, so the
 //! status bar can render a discrete readout without doing per-frame work.
 
+use crate::budget::Sample;
 use eframe::egui_wgpu::wgpu;
 use std::time::{Duration, Instant};
 
 /// How often the underlying OS / GPU queries actually run. Between refreshes the
 /// status bar reads the cached [`Sample`].
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
-
-/// One sampled snapshot of memory usage, all values in bytes.
-#[derive(Clone, Copy, Debug)]
-pub struct Sample {
-    /// Resident set size of this process.
-    pub proc_bytes: u64,
-    /// System-wide memory in use.
-    pub sys_used: u64,
-    /// Total system memory.
-    pub sys_total: u64,
-    /// GPU memory currently allocated by this process. `None` when unavailable
-    /// (non-macOS, or the active backend is not Metal).
-    pub gpu_used: Option<u64>,
-    /// Recommended GPU working-set budget. `None` when unavailable.
-    pub gpu_budget: Option<u64>,
-}
 
 /// Throttled sampler. Holds a `sysinfo::System` and reuses it across refreshes so
 /// we only pay for the memory/process collectors we asked for.
