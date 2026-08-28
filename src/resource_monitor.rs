@@ -39,8 +39,10 @@ impl ResourceMonitor {
 
     /// Return the current snapshot, refreshing the underlying queries at most once
     /// per [`REFRESH_INTERVAL`]. `device` is the live wgpu device used for the GPU
-    /// memory query; pass the one from `RenderState`.
-    pub fn sample(&mut self, device: &wgpu::Device) -> Sample {
+    /// memory query; pass the one from `RenderState`, or `None` on the CPU-only
+    /// path, where the system figures are still wanted and `gpu_used` /
+    /// `gpu_budget` simply come back unavailable (#288).
+    pub fn sample(&mut self, device: Option<&wgpu::Device>) -> Sample {
         let now = Instant::now();
         let due = self
             .last_at
@@ -53,7 +55,7 @@ impl ResourceMonitor {
         self.last.expect("sample populated on first refresh")
     }
 
-    fn refresh(&mut self, device: &wgpu::Device) -> Sample {
+    fn refresh(&mut self, device: Option<&wgpu::Device>) -> Sample {
         self.sys.refresh_memory();
 
         let proc_bytes = self
@@ -85,8 +87,14 @@ impl ResourceMonitor {
 /// Returns `(used, budget)` in bytes, or `(None, None)` when the value can't be
 /// obtained (non-macOS, or the running backend is not Metal).
 #[cfg(target_os = "macos")]
-fn gpu_memory(device: &wgpu::Device) -> (Option<u64>, Option<u64>) {
+fn gpu_memory(device: Option<&wgpu::Device>) -> (Option<u64>, Option<u64>) {
     use objc2_metal::MTLDevice;
+
+    // No device on the CPU-only path — the system RAM figures are still valid,
+    // only the VRAM pair is unavailable (#288).
+    let Some(device) = device else {
+        return (None, None);
+    };
 
     // SAFETY: `as_hal` hands us the underlying Metal device only while the guard is
     // alive; we just read two scalar properties off it and copy them out. We never
@@ -106,7 +114,7 @@ fn gpu_memory(device: &wgpu::Device) -> (Option<u64>, Option<u64>) {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn gpu_memory(_device: &wgpu::Device) -> (Option<u64>, Option<u64>) {
+fn gpu_memory(_device: Option<&wgpu::Device>) -> (Option<u64>, Option<u64>) {
     (None, None)
 }
 

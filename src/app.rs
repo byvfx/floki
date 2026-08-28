@@ -3932,17 +3932,25 @@ impl ExrApp {
     /// in a draw method: the caps are overcommit protection, and must keep
     /// running through any UI restructure (#150).
     ///
-    /// Samples once and hands the same figure to both tiers. Only the *sample*
-    /// needs the GPU — the Metal VRAM query inside `ResourceMonitor::refresh` —
-    /// so the T1 arithmetic lives in its own device-free method (#288).
+    /// Samples once and hands the same figure to both tiers. Only the *VRAM* half
+    /// of the sample needs a device, so the sampler takes an `Option` and **T1
+    /// runs unconditionally** (#288). It has to: gating the whole method on
+    /// `gpu_resources` left the CPU-only fallback path (`viewer.rs`) with no RAM
+    /// budget at all — the cap frozen at its constructed default and the byte
+    /// bound at `u64::MAX` — which is the one direction the memory contract
+    /// cannot tolerate. T2 stays gated; it sizes a ring of GPU textures, and
+    /// `pump_t2` independently bails without a device anyway.
     fn tick_budgets(&mut self) {
-        let Some(gpu) = &self.gpu_resources else {
-            return;
-        };
-        let sample = self.resource_monitor.sample(&gpu.render_state().device);
+        let device = self
+            .gpu_resources
+            .as_ref()
+            .map(|gpu| &gpu.render_state().device);
+        let sample = self.resource_monitor.sample(device);
         self.dbg_last_sample = Some(sample); // stash for the status bar + debug overlay
         self.tick_budgets_t1(&sample);
-        self.tick_budgets_t2(&sample);
+        if self.gpu_resources.is_some() {
+            self.tick_budgets_t2(&sample);
+        }
     }
 
     /// The **T1** (system-RAM ring) half of [`Self::tick_budgets`]: pure
@@ -10672,6 +10680,40 @@ mod tests {
             "the pressure tick evicts without waiting for an insert"
         );
         assert!(app.dbg_evictions > 0, "and the evictions are counted");
+    }
+
+    #[test]
+    fn t1_runs_on_the_cpu_only_path_where_there_is_no_gpu() {
+        // `gpu_resources` is `None` in the CPU fallback path (`viewer.rs`) as well
+        // as in every test. Gating all of `tick_budgets` on it left that path with
+        // no RAM budget whatsoever — cap stuck at its constructed default, byte
+        // bound at `u64::MAX` — so the ring grew to eight frames of whatever size
+        // regardless of free RAM. Only the VRAM query needs a device; the system
+        // figures come from sysinfo either way.
+        //
+        // Drives the real `tick_budgets`, so the figures are the host's own and
+        // only the invariants are asserted, not exact numbers.
+        let (_dir, mut app) = app_sizing_off_full_frames();
+        assert!(app.gpu_resources.is_none());
+        app.frame_cache_cap = 8;
+        app.frame_cache_budget = u64::MAX;
+
+        app.tick_budgets();
+
+        assert!(
+            app.frame_cache_budget < u64::MAX,
+            "a RAM budget is computed with no GPU present"
+        );
+        assert!(
+            app.dbg_last_sample
+                .is_some_and(|s| s.sys_total > 0 && s.gpu_budget.is_none()),
+            "system figures sampled; the VRAM pair reports unavailable"
+        );
+        assert_eq!(
+            app.frame_cache_cap,
+            crate::budget::frames_in(app.frame_cache_budget, 1_000_000).max(2),
+            "and the count is still derived from that same byte budget"
+        );
     }
 
     #[test]
