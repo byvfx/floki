@@ -4,6 +4,13 @@ Floki's test suite covers parsing/import logic, the batch converter, color/tone
 math, and headless GUI interaction. It runs on a plain CI runner with no
 committed binary fixtures.
 
+> This document is the **automated** suite. For hands-on testing of a shipped
+> build — what to exercise, known caveats, what to report — see
+> [`docs/release-testing/`](docs/release-testing/), which carries one field-test
+> guide per release. The two are complements: the suite is structurally blind to
+> anything whose trigger is human timing, which is most of what field testing
+> finds.
+
 Almost all of it is **GPU-free** — that is the default and the rule for new
 tests. The exception is a small set of **on-device** tests that validate the
 render seams a CPU cannot stand in for (`gpu::ocio_pass::device_tests`,
