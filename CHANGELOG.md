@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.13.1] - 2026-08-28
+
 ### Fixed
 - **Precache works again with a comp stack loaded.** (#296) With the comp stack
   driving the transport, enabling Precache filled nothing — but flipping the
@@ -900,7 +902,8 @@ Initial release.
 - Advanced metadata header inspector.
 - Cross-platform GitHub Actions builds (Linux, Windows, macOS).
 
-[Unreleased]: https://github.com/byvfx/floki/compare/v1.13.0...HEAD
+[Unreleased]: https://github.com/byvfx/floki/compare/v1.13.1...HEAD
+[1.13.1]: https://github.com/byvfx/floki/compare/v1.13.0...v1.13.1
 [1.13.0]: https://github.com/byvfx/floki/compare/v1.12.0...v1.13.0
 [1.12.0]: https://github.com/byvfx/floki/compare/v1.11.0...v1.12.0
 [1.11.0]: https://github.com/byvfx/floki/compare/v1.10.2...v1.11.0
