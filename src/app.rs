@@ -636,6 +636,12 @@ pub struct ExrApp {
     /// Cumulative T1 evictions and dropped stale-epoch results, for the overlay.
     #[serde(skip)]
     dbg_evictions: u64,
+    /// The last `evt=precache_latch` line's (cache_full, resident count).
+    /// Every playhead move clears the latch and the next tick re-earns it —
+    /// by-design churn — so the latch log dedupes against this or a scrub
+    /// would emit one identical line per frame.
+    #[serde(skip)]
+    dbg_last_latch: Option<(bool, usize)>,
     #[serde(skip)]
     dbg_dropped_epoch: u64,
     /// Cumulative cheap decodes the worker had to satisfy with something dearer
@@ -1128,6 +1134,7 @@ impl Default for ExrApp {
             decode_bound_hint: None,
             dbg_last_sample: None,
             dbg_evictions: 0,
+            dbg_last_latch: None,
             dbg_fallbacks: 0,
             decode_fell_back: false,
             dbg_dropped_epoch: 0,
@@ -2283,6 +2290,11 @@ impl ExrApp {
         self.proxy_bytes = None;
         self.beauty_bytes = None;
         self.decode_fell_back = false;
+        // The clock moved, so the precache target moved with it (#296 dogfood):
+        // a latch earned filling the old clock's range says nothing about the
+        // new one's, and left standing it kept the idle fill dead until the
+        // playhead happened to move.
+        self.precache_filled = false;
     }
 
     /// The *active* followers — those with a detected sequence (the N-source
@@ -2371,6 +2383,19 @@ impl ExrApp {
     fn cache_is_full(&self) -> bool {
         self.frame_cache.len() >= self.frame_cache_cap
             || self.frame_cache.bytes() >= self.frame_cache_budget
+    }
+
+    /// Whether a sequence decode is outstanding on **any** source — the primary
+    /// or a follower. The one predicate for "the worker is busy", shared by the
+    /// pump's early-return and the precache latch (#296).
+    ///
+    /// Slot A's `inflight` alone is not that answer: with the comp stack driving
+    /// the transport, `next_want` returns `None` for `A_SOURCE` by construction
+    /// and every job lands in a follower's own `inflight`, so A's set is empty
+    /// by the same #99 R4-lite rule that keeps it from decoding — the
+    /// `transport_awaiting` trap (#200), one field over.
+    fn decode_in_flight(&self) -> bool {
+        !self.inflight.is_empty() || self.followers.values().any(|s| !s.inflight.is_empty())
     }
 
     fn read_behind_depth(&self) -> usize {
@@ -2938,12 +2963,9 @@ impl ExrApp {
         // block while the primary or any follower has an outstanding job or awaited
         // playhead.
         if !self.playback.is_active()
-            || !self.inflight.is_empty()
+            || self.decode_in_flight()
             || self.loading_a
-            || self
-                .followers
-                .values()
-                .any(|s| !s.inflight.is_empty() || s.loading)
+            || self.followers.values().any(|s| s.loading)
         {
             return;
         }
@@ -3679,8 +3701,31 @@ impl ExrApp {
         // budget: there `next_want` always finds a non-resident frame (it loop-
         // wraps to the far side), so `inflight` is never empty and the old
         // nothing-wanted latch never fired — precache churned decode→evict forever.
-        if self.inflight.is_empty() || self.cache_is_full() {
+        // "Nothing wanted" must be read across every source (#296): with a
+        // comp-driven transport the pump's jobs land in follower `inflight`s and
+        // slot A's set stays empty, so checking it alone latched on the first
+        // tick — precache went dead with one job barely in flight.
+        let full = self.cache_is_full();
+        if !self.decode_in_flight() || full {
             self.precache_filled = true;
+            // The 1 Hz trace goes quiet the moment the fill stops (nothing
+            // outstanding), so a premature latch is invisible to it — this line
+            // is the only record of when the fill ended and which arm ended it.
+            // Deduped: every playhead move clears the latch and the next tick
+            // re-earns it, so an undeduped line fires once per scrub frame.
+            let latch = (full, self.frame_cache.len());
+            if self.dbg_last_latch != Some(latch) {
+                self.dbg_last_latch = Some(latch);
+                log::debug!(
+                    target: "floki::playback",
+                    "evt=precache_latch reason={} t1={}/{} t1_bytes={}/{}",
+                    if full { "cache_full" } else { "nothing_wanted" },
+                    self.frame_cache.len(),
+                    self.frame_cache_cap,
+                    self.frame_cache.bytes(),
+                    self.frame_cache_budget,
+                );
+            }
         } else {
             self.request_repaint_after(std::time::Duration::from_millis(16));
         }
@@ -7677,6 +7722,10 @@ impl ExrApp {
                     ..Default::default()
                 },
             );
+            // A new follower widens the precache target: whatever latch the old
+            // source set is stale now, and left standing it kept the idle fill
+            // dead for the new layer until the playhead moved (#296 dogfood).
+            self.precache_filled = false;
             // Size the T1 budget from this decode when it drives the clock
             // (#100/#199). This path decodes **synchronously** and inserts straight
             // into the cache, so it never reaches `apply_load_result`'s seed — and
@@ -7941,6 +7990,10 @@ impl ExrApp {
             // source can't hit a stale follower / cache entry. No-op for a still
             // (no follower registered).
             self.followers.remove(&source);
+            // The precache target shrank with the source set; re-derive the
+            // latch against what remains rather than trusting one earned when
+            // this source still counted (#296 dogfood).
+            self.precache_filled = false;
             // Release the upload gate too (#202), or a source removed mid-build
             // would leave a permanently-held in-flight slot behind. A result may
             // still land for it; `collect_comp_textures` drops results for sources
@@ -14049,6 +14102,111 @@ mod tests {
         assert!(
             !app.inflight.is_empty(),
             "latched on the capacity check (a frame was still wanted), not nothing-wanted"
+        );
+    }
+
+    #[test]
+    fn stack_and_clock_changes_clear_the_precache_latch() {
+        // #296 dogfood: a latch earned filling one stack's range says nothing
+        // about the next one's. Left standing across an add / remove / clock
+        // re-point, it kept the idle fill dead until the playhead happened to
+        // move — observed live as "no caching until I press play" after
+        // rebuilding the layer stack.
+        let (_dir, paths) = write_sequence(5);
+        let mut app = ExrApp {
+            precache_filled: true,
+            ..ExrApp::default()
+        };
+
+        app.add_comp_source(paths[0].clone());
+        assert!(
+            !app.precache_filled,
+            "a new follower widens the fill target"
+        );
+
+        let source = crate::layer::SourceId(COMP_SOURCE_BASE);
+        app.set_transport_source(None);
+        app.precache_filled = true;
+        app.set_transport_source(Some(source));
+        assert!(
+            !app.precache_filled,
+            "the clock moved, so the fill window moved with it"
+        );
+        app.precache_filled = true;
+        app.set_transport_source(Some(source));
+        assert!(
+            app.precache_filled,
+            "a same-source re-point is a no-op and must not churn the latch"
+        );
+
+        let id = app.comp_stack.iter().next().unwrap().id;
+        app.precache_filled = true;
+        app.remove_comp_layer(id);
+        assert!(
+            !app.precache_filled,
+            "the fill target shrank with the source set"
+        );
+    }
+
+    #[test]
+    fn precache_does_not_latch_on_slot_a_while_a_follower_decodes() {
+        // #296: the latch read `self.inflight` — slot A's set alone. With the
+        // comp stack driving the transport, `next_want` returns `None` for
+        // `A_SOURCE` by construction (#99 R4-lite) and every pumped job lands in
+        // a follower's own `inflight`, so A's set is empty forever and the latch
+        // fired on the first tick with one job barely in flight. Each checkbox
+        // re-enable then cleared the latch and pumped exactly one more frame:
+        // "no precache, but flipping the button fills it incrementally".
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("p.0001.exr");
+        write_sized_exr(&src, 256, 128);
+        write_sized_exr(&dir.path().join("p.0002.exr"), 256, 128);
+        touch_sequence(dir.path(), 3);
+
+        let mut app = ExrApp::default();
+        app.detect_sequence(&dir.path().join("s.0001.exr"));
+        let s = crate::layer::SourceId(2);
+        seed_comp_source(&mut app, s, &dir.path().join("seed.exr"), 256, 128);
+        app.followers.insert(
+            s,
+            SourceState {
+                sequence: crate::sequence::detect_from_file(&src),
+                current_frame: 1,
+                ..Default::default()
+            },
+        );
+        app.set_transport_source(Some(s));
+        app.precache = true;
+
+        app.tick_precache();
+        assert!(
+            app.followers
+                .get(&s)
+                .is_some_and(|st| !st.inflight.is_empty()),
+            "the pump submitted a follower job"
+        );
+        assert!(
+            app.inflight.is_empty(),
+            "slot A never decodes on a comp transport — which is why it can't carry the latch"
+        );
+        assert!(
+            !app.precache_filled,
+            "a follower decode in flight is not a filled range"
+        );
+
+        // The latch must still fire once the fill genuinely completes: the
+        // follower's range resident, nothing in flight on any source.
+        if let Some(st) = app.followers.get_mut(&s) {
+            st.inflight.clear();
+        }
+        for n in [1u32, 2] {
+            app.frame_cache
+                .insert(s, n, std::sync::Arc::new(ExrData::load(&src).unwrap()));
+        }
+        app.tick_precache();
+        assert!(
+            app.precache_filled,
+            "all sources idle + range resident ⇒ latch"
         );
     }
 

@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Precache works again with a comp stack loaded.** (#296) With the comp stack
+  driving the transport, enabling Precache filled nothing — but flipping the
+  checkbox off and on advanced the cache bar by roughly one frame per flip. The
+  fill's "done" latch was reading slot A's in-flight set alone, and on a comp
+  transport every decode lands in a layer's own set while slot A's stays empty
+  by construction — so the latch declared the range filled on the first tick,
+  with one job barely in flight, and each re-enable bought exactly one more
+  frame. The latch now asks the same "any decode in flight on any source?"
+  question the decode pump's own back-pressure check asks, shared as one
+  predicate so the two can't drift apart again.
+
+  Dogfooding the fix surfaced a second way the same latch went stale: nothing
+  cleared it when the layer stack changed, so rebuilding the stack — or adding
+  a layer, or re-pointing the clock — inherited a "range is filled" verdict
+  earned against footage that was no longer loaded, and the new stack neither
+  precached nor upgraded until the playhead happened to move. Observed live as
+  "no image and no caching until I press play". The latch now clears whenever
+  a follower is added or removed or the transport re-points, and the playback
+  trace gained an `evt=precache_latch` line recording when a fill ends and
+  which arm ended it — the 1 Hz trace goes quiet the moment the fill stops,
+  which is exactly why the premature latch was invisible to it.
+
 ## [1.13.0] - 2026-08-28
 
 ### Added
