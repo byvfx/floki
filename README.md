@@ -4,6 +4,7 @@
 [![egui](https://img.shields.io/badge/GUI-egui-blue)](https://github.com/emilk/egui)
 [![wgpu](https://img.shields.io/badge/wgpu-Native-green.svg)](https://wgpu.rs)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Ko-fi](https://img.shields.io/badge/Ko--fi-Support%20Floki-ff5e5b?logo=ko-fi&logoColor=white)](https://ko-fi.com/byvfx)
 
 **Floki** is a fast, hardware-accelerated Rust GUI application tailored for Technical Directors, Compositors, and LookDev Artists who need to deeply inspect and compare multi-layered OpenEXR files. 
 
