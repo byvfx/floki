@@ -2373,6 +2373,19 @@ impl ExrApp {
             || self.frame_cache.bytes() >= self.frame_cache_budget
     }
 
+    /// Whether a sequence decode is outstanding on **any** source — the primary
+    /// or a follower. The one predicate for "the worker is busy", shared by the
+    /// pump's early-return and the precache latch (#296).
+    ///
+    /// Slot A's `inflight` alone is not that answer: with the comp stack driving
+    /// the transport, `next_want` returns `None` for `A_SOURCE` by construction
+    /// and every job lands in a follower's own `inflight`, so A's set is empty
+    /// by the same #99 R4-lite rule that keeps it from decoding — the
+    /// `transport_awaiting` trap (#200), one field over.
+    fn decode_in_flight(&self) -> bool {
+        !self.inflight.is_empty() || self.followers.values().any(|s| !s.inflight.is_empty())
+    }
+
     fn read_behind_depth(&self) -> usize {
         if !self.playback.is_playing() {
             return 0;
@@ -2938,12 +2951,9 @@ impl ExrApp {
         // block while the primary or any follower has an outstanding job or awaited
         // playhead.
         if !self.playback.is_active()
-            || !self.inflight.is_empty()
+            || self.decode_in_flight()
             || self.loading_a
-            || self
-                .followers
-                .values()
-                .any(|s| !s.inflight.is_empty() || s.loading)
+            || self.followers.values().any(|s| s.loading)
         {
             return;
         }
@@ -3679,7 +3689,11 @@ impl ExrApp {
         // budget: there `next_want` always finds a non-resident frame (it loop-
         // wraps to the far side), so `inflight` is never empty and the old
         // nothing-wanted latch never fired — precache churned decode→evict forever.
-        if self.inflight.is_empty() || self.cache_is_full() {
+        // "Nothing wanted" must be read across every source (#296): with a
+        // comp-driven transport the pump's jobs land in follower `inflight`s and
+        // slot A's set stays empty, so checking it alone latched on the first
+        // tick — precache went dead with one job barely in flight.
+        if !self.decode_in_flight() || self.cache_is_full() {
             self.precache_filled = true;
         } else {
             self.request_repaint_after(std::time::Duration::from_millis(16));
@@ -14049,6 +14063,68 @@ mod tests {
         assert!(
             !app.inflight.is_empty(),
             "latched on the capacity check (a frame was still wanted), not nothing-wanted"
+        );
+    }
+
+    #[test]
+    fn precache_does_not_latch_on_slot_a_while_a_follower_decodes() {
+        // #296: the latch read `self.inflight` — slot A's set alone. With the
+        // comp stack driving the transport, `next_want` returns `None` for
+        // `A_SOURCE` by construction (#99 R4-lite) and every pumped job lands in
+        // a follower's own `inflight`, so A's set is empty forever and the latch
+        // fired on the first tick with one job barely in flight. Each checkbox
+        // re-enable then cleared the latch and pumped exactly one more frame:
+        // "no precache, but flipping the button fills it incrementally".
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("p.0001.exr");
+        write_sized_exr(&src, 256, 128);
+        write_sized_exr(&dir.path().join("p.0002.exr"), 256, 128);
+        touch_sequence(dir.path(), 3);
+
+        let mut app = ExrApp::default();
+        app.detect_sequence(&dir.path().join("s.0001.exr"));
+        let s = crate::layer::SourceId(2);
+        seed_comp_source(&mut app, s, &dir.path().join("seed.exr"), 256, 128);
+        app.followers.insert(
+            s,
+            SourceState {
+                sequence: crate::sequence::detect_from_file(&src),
+                current_frame: 1,
+                ..Default::default()
+            },
+        );
+        app.set_transport_source(Some(s));
+        app.precache = true;
+
+        app.tick_precache();
+        assert!(
+            app.followers
+                .get(&s)
+                .is_some_and(|st| !st.inflight.is_empty()),
+            "the pump submitted a follower job"
+        );
+        assert!(
+            app.inflight.is_empty(),
+            "slot A never decodes on a comp transport — which is why it can't carry the latch"
+        );
+        assert!(
+            !app.precache_filled,
+            "a follower decode in flight is not a filled range"
+        );
+
+        // The latch must still fire once the fill genuinely completes: the
+        // follower's range resident, nothing in flight on any source.
+        if let Some(st) = app.followers.get_mut(&s) {
+            st.inflight.clear();
+        }
+        for n in [1u32, 2] {
+            app.frame_cache
+                .insert(s, n, std::sync::Arc::new(ExrData::load(&src).unwrap()));
+        }
+        app.tick_precache();
+        assert!(
+            app.precache_filled,
+            "all sources idle + range resident ⇒ latch"
         );
     }
 
