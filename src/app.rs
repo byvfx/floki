@@ -636,6 +636,12 @@ pub struct ExrApp {
     /// Cumulative T1 evictions and dropped stale-epoch results, for the overlay.
     #[serde(skip)]
     dbg_evictions: u64,
+    /// The last `evt=precache_latch` line's (cache_full, resident count).
+    /// Every playhead move clears the latch and the next tick re-earns it —
+    /// by-design churn — so the latch log dedupes against this or a scrub
+    /// would emit one identical line per frame.
+    #[serde(skip)]
+    dbg_last_latch: Option<(bool, usize)>,
     #[serde(skip)]
     dbg_dropped_epoch: u64,
     /// Cumulative cheap decodes the worker had to satisfy with something dearer
@@ -1128,6 +1134,7 @@ impl Default for ExrApp {
             decode_bound_hint: None,
             dbg_last_sample: None,
             dbg_evictions: 0,
+            dbg_last_latch: None,
             dbg_fallbacks: 0,
             decode_fell_back: false,
             dbg_dropped_epoch: 0,
@@ -2283,6 +2290,11 @@ impl ExrApp {
         self.proxy_bytes = None;
         self.beauty_bytes = None;
         self.decode_fell_back = false;
+        // The clock moved, so the precache target moved with it (#296 dogfood):
+        // a latch earned filling the old clock's range says nothing about the
+        // new one's, and left standing it kept the idle fill dead until the
+        // playhead happened to move.
+        self.precache_filled = false;
     }
 
     /// The *active* followers — those with a detected sequence (the N-source
@@ -3693,8 +3705,27 @@ impl ExrApp {
         // comp-driven transport the pump's jobs land in follower `inflight`s and
         // slot A's set stays empty, so checking it alone latched on the first
         // tick — precache went dead with one job barely in flight.
-        if !self.decode_in_flight() || self.cache_is_full() {
+        let full = self.cache_is_full();
+        if !self.decode_in_flight() || full {
             self.precache_filled = true;
+            // The 1 Hz trace goes quiet the moment the fill stops (nothing
+            // outstanding), so a premature latch is invisible to it — this line
+            // is the only record of when the fill ended and which arm ended it.
+            // Deduped: every playhead move clears the latch and the next tick
+            // re-earns it, so an undeduped line fires once per scrub frame.
+            let latch = (full, self.frame_cache.len());
+            if self.dbg_last_latch != Some(latch) {
+                self.dbg_last_latch = Some(latch);
+                log::debug!(
+                    target: "floki::playback",
+                    "evt=precache_latch reason={} t1={}/{} t1_bytes={}/{}",
+                    if full { "cache_full" } else { "nothing_wanted" },
+                    self.frame_cache.len(),
+                    self.frame_cache_cap,
+                    self.frame_cache.bytes(),
+                    self.frame_cache_budget,
+                );
+            }
         } else {
             self.request_repaint_after(std::time::Duration::from_millis(16));
         }
@@ -7691,6 +7722,10 @@ impl ExrApp {
                     ..Default::default()
                 },
             );
+            // A new follower widens the precache target: whatever latch the old
+            // source set is stale now, and left standing it kept the idle fill
+            // dead for the new layer until the playhead moved (#296 dogfood).
+            self.precache_filled = false;
             // Size the T1 budget from this decode when it drives the clock
             // (#100/#199). This path decodes **synchronously** and inserts straight
             // into the cache, so it never reaches `apply_load_result`'s seed — and
@@ -7955,6 +7990,10 @@ impl ExrApp {
             // source can't hit a stale follower / cache entry. No-op for a still
             // (no follower registered).
             self.followers.remove(&source);
+            // The precache target shrank with the source set; re-derive the
+            // latch against what remains rather than trusting one earned when
+            // this source still counted (#296 dogfood).
+            self.precache_filled = false;
             // Release the upload gate too (#202), or a source removed mid-build
             // would leave a permanently-held in-flight slot behind. A result may
             // still land for it; `collect_comp_textures` drops results for sources
@@ -14063,6 +14102,49 @@ mod tests {
         assert!(
             !app.inflight.is_empty(),
             "latched on the capacity check (a frame was still wanted), not nothing-wanted"
+        );
+    }
+
+    #[test]
+    fn stack_and_clock_changes_clear_the_precache_latch() {
+        // #296 dogfood: a latch earned filling one stack's range says nothing
+        // about the next one's. Left standing across an add / remove / clock
+        // re-point, it kept the idle fill dead until the playhead happened to
+        // move — observed live as "no caching until I press play" after
+        // rebuilding the layer stack.
+        let (_dir, paths) = write_sequence(5);
+        let mut app = ExrApp {
+            precache_filled: true,
+            ..ExrApp::default()
+        };
+
+        app.add_comp_source(paths[0].clone());
+        assert!(
+            !app.precache_filled,
+            "a new follower widens the fill target"
+        );
+
+        let source = crate::layer::SourceId(COMP_SOURCE_BASE);
+        app.set_transport_source(None);
+        app.precache_filled = true;
+        app.set_transport_source(Some(source));
+        assert!(
+            !app.precache_filled,
+            "the clock moved, so the fill window moved with it"
+        );
+        app.precache_filled = true;
+        app.set_transport_source(Some(source));
+        assert!(
+            app.precache_filled,
+            "a same-source re-point is a no-op and must not churn the latch"
+        );
+
+        let id = app.comp_stack.iter().next().unwrap().id;
+        app.precache_filled = true;
+        app.remove_comp_layer(id);
+        assert!(
+            !app.precache_filled,
+            "the fill target shrank with the source set"
         );
     }
 

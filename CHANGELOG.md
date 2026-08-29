@@ -19,6 +19,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   question the decode pump's own back-pressure check asks, shared as one
   predicate so the two can't drift apart again.
 
+  Dogfooding the fix surfaced a second way the same latch went stale: nothing
+  cleared it when the layer stack changed, so rebuilding the stack — or adding
+  a layer, or re-pointing the clock — inherited a "range is filled" verdict
+  earned against footage that was no longer loaded, and the new stack neither
+  precached nor upgraded until the playhead happened to move. Observed live as
+  "no image and no caching until I press play". The latch now clears whenever
+  a follower is added or removed or the transport re-points, and the playback
+  trace gained an `evt=precache_latch` line recording when a fill ends and
+  which arm ended it — the 1 Hz trace goes quiet the moment the fill stops,
+  which is exactly why the premature latch was invisible to it.
+
 ## [1.13.0] - 2026-08-28
 
 ### Added
