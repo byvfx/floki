@@ -19,6 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   explicitly, and all of them go together — keeping one source's full-frame size
   next to another's proxy size is what breaks the ordering that keeps a wrong
   guess merely wasteful.
+- **Playback statistics no longer mix two layers together.** (#329) The frame-time
+  percentiles and the fps readout measure only the layer driving playback, but
+  nothing reset them when a hidden layer handed that job to another — so the
+  figures afterwards described a blend of both, in the same way an idle pause
+  once landed in them as a single enormous frame. They now reset when the driving
+  layer changes. The clock's own timing reference is left alone, so hiding a layer
+  still doesn't cause a hitch.
 
 ## [1.13.2] - 2026-08-30
 

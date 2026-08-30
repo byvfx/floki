@@ -2377,6 +2377,12 @@ impl ExrApp {
         self.proxy_bytes = None;
         self.beauty_bytes = None;
         self.decode_fell_back = false;
+        // This re-point *is* the clearing, so the next `sync_clock_sizing` must
+        // adopt the new clock silently rather than treat it as a change and clear
+        // again (#325). Without this, a re-claim later in the session would wipe
+        // the synchronous seed `add_comp_source` performs right after — landing on
+        // exactly the unsized ring this is meant to prevent (#100/#199).
+        self.last_clock_source = None;
         // The clock moved, so the precache target moved with it (#296 dogfood):
         // a latch earned filling the old clock's range says nothing about the
         // new one's, and left standing it kept the idle fill dead until the
@@ -2418,6 +2424,12 @@ impl ExrApp {
                 self.proxy_bytes = None;
                 self.beauty_bytes = None;
                 self.decode_fell_back = false;
+                // The pacing ring measures only the clock source's frames
+                // (`note_display`), so it now holds two sources' cadences mixed
+                // and the percentiles describe neither (#329). Statistics only —
+                // the clock keeps its anchor, so hiding a layer doesn't hitch
+                // playback.
+                self.playback.reset_pacing_stats();
             }
         }
     }
@@ -5101,6 +5113,17 @@ impl eframe::App for ExrApp {
         // since the last paint is on screen *this* frame rather than next.
         self.collect_comp_textures();
 
+        // A hidden or un-soloed clock layer re-points the *effective* clock without
+        // touching `transport_source` (#211), so the sizing latches are dropped here
+        // rather than in `set_transport_source` alone (#325).
+        //
+        // **Before the playback and precache ticks, not merely before
+        // `tick_budgets`.** Those two schedule decodes against `frame_cache_cap` and
+        // the prefetch depth derived from it, so clearing later in the same pass
+        // would let the first frame after a visibility change budget and submit work
+        // off the old clock's measurements — the stale cap doing damage before
+        // anything recomputed it.
+        self.sync_clock_sizing();
         // Sequence playback (#7): consume transport keys (Space/←/→) before the
         // viewer sees them, then run the frame clock. Both are no-ops unless a
         // sequence is loaded, so single-image behavior is unchanged.
@@ -5112,11 +5135,6 @@ impl eframe::App for ExrApp {
         // Pick up frames a render writes while we're open (#101); no-op unless the
         // user enabled Watch and a sequence is loaded.
         self.tick_render_watch(ui.ctx());
-        // A hidden or un-soloed clock layer re-points the *effective* clock without
-        // touching `transport_source` (#211), so the sizing latches have to be
-        // dropped here rather than in `set_transport_source` alone (#325). Before
-        // `tick_budgets`, so the cap is never computed from another source's frames.
-        self.sync_clock_sizing();
         // Keep the T1/T2 rings sized to the live RAM/VRAM budgets (#56, #150).
         self.tick_budgets();
 
@@ -10539,11 +10557,28 @@ mod tests {
             "nothing has re-synced yet, so the stale figure is still standing"
         );
 
+        // Pacing measured against the old clock is about to describe two sources
+        // at once (#329), so it goes with the latches.
+        let t = std::time::Instant::now();
+        app.playback.start_playing(t);
+        for (i, ms) in [40u64, 40, 40].into_iter().enumerate() {
+            app.playback.note_shown(
+                t + std::time::Duration::from_millis(ms * (i as u64 + 1)),
+                i as u32,
+            );
+        }
+        assert!(app.playback.frame_time_samples() > 0, "samples recorded");
+
         app.sync_clock_sizing();
         assert_eq!(
             (app.frame_bytes, app.proxy_bytes, app.beauty_bytes),
             (None, None, None),
             "all three go together, or the dearest-measured ordering breaks"
+        );
+        assert_eq!(
+            app.playback.frame_time_samples(),
+            0,
+            "and the pacing ring, or the percentiles mix two sources' cadences"
         );
 
         // The new clock's own decode re-measures, and it is the bigger source.
@@ -10561,6 +10596,19 @@ mod tests {
             app.frame_bytes,
             Some(after),
             "an unchanged clock is not a re-point"
+        );
+
+        // Review catch on #328: an explicit re-point does its own clearing, so the
+        // next sync must adopt silently. Otherwise a re-claim later in the session
+        // wipes the synchronous seed `add_comp_source` performs right after it, and
+        // lands on the unsized ring this exists to prevent (#100/#199).
+        app.set_transport_source(Some(s_small));
+        app.frame_bytes = Some(4242); // stand in for that seed
+        app.sync_clock_sizing();
+        assert_eq!(
+            app.frame_bytes,
+            Some(4242),
+            "the seed that follows an explicit re-point must survive the next sync"
         );
     }
 

@@ -320,6 +320,28 @@ impl Playback {
         self.pending = None;
     }
 
+    /// Drop the pacing **statistics** without disturbing the transport (#329).
+    ///
+    /// For when the source being measured changes underneath a running clock:
+    /// `note_shown` records only the frames of whichever source drives the clock,
+    /// and `clock_source()` can re-point itself when a layer is hidden or a solo
+    /// excludes it (#211). The ring then holds two sources' cadences mixed, and
+    /// p50/p95/p99 describe neither — the same way an idle span filed as one
+    /// enormous frame time made the percentiles describe nothing in #236.
+    ///
+    /// Deliberately narrower than [`Self::stop`]: `anchor` and
+    /// `frames_since_anchor` stay, so the drift-corrected clock keeps its
+    /// reference and playback does not hitch when a layer is hidden. Only the
+    /// measured figures go. `last_shown` goes with them, or the first interval
+    /// after the change would span both sources and land in the ring as one
+    /// oversized sample.
+    pub fn reset_pacing_stats(&mut self) {
+        self.measured_fps = 0.0;
+        self.last_shown = None;
+        self.last_shown_frame = None;
+        self.frame_times.clear();
+    }
+
     /// Frame period for the target fps (clamped so fps can't be ≤ 0).
     #[must_use]
     pub fn period(&self) -> Duration {
@@ -923,6 +945,31 @@ mod tests {
             pb.frame_time_samples(),
             2,
             "1 → 2 → 1 is two intervals; the wrap back to 1 is a real frame"
+        );
+    }
+
+    #[test]
+    fn reset_pacing_stats_drops_the_measurements_and_keeps_the_clock() {
+        // #329: `note_shown` records only the clock source's frames, and the
+        // effective clock re-points itself when a layer is hidden (#211). Without
+        // a reset the ring holds two sources' cadences mixed and the percentiles
+        // describe neither — the #236 failure in a different disguise.
+        let mut pb = Playback::default();
+        shown_after(&mut pb, &[40u64; 30]);
+        assert_eq!(pb.frame_time_samples(), 30);
+        assert!(pb.measured_fps > 0.0);
+        let (anchor, since) = (pb.anchor, pb.frames_since_anchor);
+
+        pb.reset_pacing_stats();
+
+        assert_eq!(pb.frame_time_samples(), 0, "the ring is dropped");
+        assert!(pb.frame_time_pcts().is_none(), "and reports no percentiles");
+        assert_eq!(pb.measured_fps, 0.0, "the EWMA goes with it");
+        assert_eq!(
+            (pb.anchor, pb.frames_since_anchor),
+            (anchor, since),
+            "but the drift-corrected clock keeps its reference — hiding a layer \
+             must not hitch playback"
         );
     }
 
