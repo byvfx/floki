@@ -722,6 +722,11 @@ pub struct ExrApp {
     /// line reported a divisor the cap was never built from.
     #[serde(skip)]
     dbg_sizing: Option<Sizing>,
+    /// The clock source the sizing latches were last measured against (#325), so
+    /// [`ExrApp::sync_clock_sizing`] can tell a visibility-driven re-point of the
+    /// *effective* clock from the steady state. `None` until the first frame.
+    #[serde(skip)]
+    last_clock_source: Option<crate::layer::SourceId>,
     #[serde(skip)]
     dbg_dropped_epoch: u64,
     /// Cumulative cheap decodes the worker had to satisfy with something dearer
@@ -1216,6 +1221,7 @@ impl Default for ExrApp {
             dbg_evictions: 0,
             dbg_last_latch: None,
             dbg_sizing: None,
+            last_clock_source: None,
             dbg_fallbacks: 0,
             decode_fell_back: false,
             dbg_dropped_epoch: 0,
@@ -2376,6 +2382,44 @@ impl ExrApp {
         // new one's, and left standing it kept the idle fill dead until the
         // playhead happened to move.
         self.precache_filled = false;
+    }
+
+    /// Drop the sizing latches when the **effective** clock source changes (#325).
+    ///
+    /// [`Self::set_transport_source`] already does this for an explicit re-point,
+    /// and its doc gives the reason: `frame_bytes` is a `get_or_insert_with` latch,
+    /// so a re-point to a different-resolution follower would "keep sizing the ring
+    /// off the old source forever". That clear only fires when `transport_source`
+    /// itself is set, and [`Self::clock_source`] re-points *itself* whenever the
+    /// claimed layer stops being visible (#211 — hidden, or excluded by a solo).
+    /// That path never touches `transport_source`, so nothing cleared and the
+    /// figures outlived the source they were measured from. The same shape as
+    /// #296 → #319, one subsystem over.
+    ///
+    /// **All three go together, not just `frame_bytes`.** The fallback chains rely
+    /// on `frame_bytes` being the dearest measured figure (#233); a mix of the new
+    /// clock's full size with the old clock's proxy and beauty sizes breaks that
+    /// ordering, and the ordering is what keeps a wrong divisor merely wasteful
+    /// instead of #215's OOM.
+    ///
+    /// The first observation adopts the current clock without clearing, so the
+    /// synchronous seed `add_comp_source` performs for a freshly opened sequence
+    /// (#100/#199) survives — that seed is the only thing standing between a first
+    /// paused open and a completely unsized ring.
+    fn sync_clock_sizing(&mut self) {
+        let clock = self.clock_source();
+        // `replace` hands back the previous observation: `None` is the first call
+        // (adopt without clearing), an equal id is the steady state.
+        match self.last_clock_source.replace(clock) {
+            None => {}
+            Some(prev) if prev == clock => {}
+            Some(_) => {
+                self.frame_bytes = None;
+                self.proxy_bytes = None;
+                self.beauty_bytes = None;
+                self.decode_fell_back = false;
+            }
+        }
     }
 
     /// The *active* followers — those with a detected sequence (the N-source
@@ -4487,6 +4531,13 @@ impl ExrApp {
                             // rest of the session.
                             self.beauty_bytes = Some(arc.approx_bytes());
                         } else {
+                            // First-write-wins, deliberately: the fallback chains
+                            // rely on `frame_bytes` being the **dearest** measured
+                            // figure (#233), and a later, smaller full frame would
+                            // break that ordering. Staleness across a clock change
+                            // is handled by dropping all three latches together in
+                            // `sync_clock_sizing` (#325), not by overwriting this
+                            // one out from under the ordering.
                             self.frame_bytes.get_or_insert_with(|| arc.approx_bytes());
                         }
                     }
@@ -5061,6 +5112,11 @@ impl eframe::App for ExrApp {
         // Pick up frames a render writes while we're open (#101); no-op unless the
         // user enabled Watch and a sequence is loaded.
         self.tick_render_watch(ui.ctx());
+        // A hidden or un-soloed clock layer re-points the *effective* clock without
+        // touching `transport_source` (#211), so the sizing latches have to be
+        // dropped here rather than in `set_transport_source` alone (#325). Before
+        // `tick_budgets`, so the cap is never computed from another source's frames.
+        self.sync_clock_sizing();
         // Keep the T1/T2 rings sized to the live RAM/VRAM budgets (#56, #150).
         self.tick_budgets();
 
@@ -10425,6 +10481,87 @@ mod tests {
             fell_back: false,
             result: Ok(data),
         });
+    }
+
+    #[test]
+    fn frame_bytes_follows_the_clock_when_visibility_re_points_it() {
+        // #325, and the #296 -> #319 shape a third time: a guard that fires on the
+        // explicit trigger and misses the visibility-derived one.
+        //
+        // `set_transport_source` clears the sizing latches on a re-point, and says
+        // why — a first-write-wins `frame_bytes` would "keep sizing the ring off
+        // the old source forever". But `clock_source()` re-points *itself* when the
+        // claimed clock layer is hidden or excluded by a solo (#211), and that path
+        // leaves `transport_source` untouched, so nothing clears. The old figure
+        // then sizes the new source's frames.
+        //
+        // Direction matters: falling back to a source with **larger** frames while
+        // a smaller figure stands makes the cap too large, which is #215's OOM
+        // error rather than the merely-wasteful one.
+        let dir = tempfile::tempdir().unwrap();
+        let (small, big) = (dir.path().join("s.0001.exr"), dir.path().join("b.0001.exr"));
+        write_sized_exr(&small, 64, 64);
+        write_sized_exr(&dir.path().join("s.0002.exr"), 64, 64);
+        write_sized_exr(&big, 256, 256);
+        write_sized_exr(&dir.path().join("b.0002.exr"), 256, 256);
+
+        let mut app = ExrApp::default();
+        app.add_comp_source(small.clone());
+        app.add_comp_source(big.clone());
+        let ids: Vec<_> = app.comp_stack.iter().map(|l| l.id).collect();
+        let (s_small, s_big) = (
+            crate::layer::SourceId(COMP_SOURCE_BASE),
+            crate::layer::SourceId(COMP_SOURCE_BASE + 1),
+        );
+        assert_eq!(
+            app.clock_source(),
+            s_small,
+            "the first source drives the clock"
+        );
+
+        // A full decode on the clock source seeds the divisor.
+        app.sync_clock_sizing(); // first observation: adopt, don't clear
+        deliver_source_frame(&mut app, s_small, &dir.path().join("s.0002.exr"), 2);
+        let small_bytes = app.frame_bytes.expect("seeded from the clock source");
+        app.proxy_bytes = Some(small_bytes / 4); // as a cheap decode would leave it
+
+        // Hide the clock layer. `transport_source` is untouched; the *effective*
+        // clock falls back to the other visible follower.
+        app.set_layer_enabled(ids[0], false);
+        assert_eq!(
+            app.clock_source(),
+            s_big,
+            "a hidden layer must not drive the clock (#211)"
+        );
+        assert_eq!(
+            app.frame_bytes,
+            Some(small_bytes),
+            "nothing has re-synced yet, so the stale figure is still standing"
+        );
+
+        app.sync_clock_sizing();
+        assert_eq!(
+            (app.frame_bytes, app.proxy_bytes, app.beauty_bytes),
+            (None, None, None),
+            "all three go together, or the dearest-measured ordering breaks"
+        );
+
+        // The new clock's own decode re-measures, and it is the bigger source.
+        deliver_source_frame(&mut app, s_big, &dir.path().join("b.0002.exr"), 2);
+        let after = app.frame_bytes.expect("re-seeded from the new clock");
+        assert!(
+            after > small_bytes,
+            "the divisor must describe the source now driving the clock: \
+             {after} should exceed the old {small_bytes}"
+        );
+
+        // Steady state must not churn: re-running with the same clock keeps it.
+        app.sync_clock_sizing();
+        assert_eq!(
+            app.frame_bytes,
+            Some(after),
+            "an unchanged clock is not a re-point"
+        );
     }
 
     #[test]

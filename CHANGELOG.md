@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Hiding the layer that drives playback no longer leaves the cache sized for
+  it.** (#325) A hidden or un-soloed layer stops driving the clock, and playback
+  falls back to another visible one — but the figures the cache uses to decide
+  how many frames fit were still the hidden layer's. On a stack mixing
+  resolutions that is the dangerous direction: fall back to heavier footage
+  while a lighter layer's measurement stands, and the cache admits far more
+  frames than the RAM budget actually holds. The measurements are now dropped
+  whenever the layer driving playback changes, not only when it is re-pointed
+  explicitly, and all of them go together — keeping one source's full-frame size
+  next to another's proxy size is what breaks the ordering that keeps a wrong
+  guess merely wasteful.
+
 ## [1.13.2] - 2026-08-30
 
 ### Fixed
