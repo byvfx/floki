@@ -8,6 +8,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Read-ahead no longer stalls the UI thread on networked storage.** (#309) The
+  warmer that pulls upcoming frames through the page cache first asked the disk
+  proxy cache whether it already held each candidate — and that question stats
+  the source file twice and the cache file once, on the UI thread, for up to two
+  candidates on every decode that lands. On the networked media this warmer
+  exists for, each of those round trips is milliseconds: a large bite out of the
+  41 ms a frame gets at 24 fps, taken up to a hundred times a second on a
+  disk-cache-hit pass. It is invisible on a local NVMe, where a stat is free,
+  which is why no soak ever showed it. The question is now asked on the warmer
+  thread, where waiting on storage costs nothing that is on screen.
+
+  The same gate had a second cost: a cache hit returned before the path reached
+  the warmer's dedupe ring, so the pump re-offered the same frame — and re-paid
+  the stats — on every pump until it decoded. Gating after the hand-off fixes
+  that by construction.
+- **Read-ahead stops doing work proportional to the precache span.** (#309)
+  Picking the two frames to warm went through the full decode want-list, which
+  first collected every resident frame in the ring and then every wanted frame
+  in the window — a quarter of a million comparisons per submitted decode at a
+  1000-frame span, to read two entries off the front. It now stops walking at
+  the two it needs.
 - **A layer you un-hide starts caching again.** (#319) Hiding a layer stops it
   decoding and stops it counting toward the RAM split, so bringing one back —
   un-hiding it, or clearing a solo — widens the range precache is meant to fill.

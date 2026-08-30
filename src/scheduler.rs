@@ -99,6 +99,75 @@ pub fn want_list(
     wants
 }
 
+/// The first `limit` entries of [`want_list`] — same priority order, same step
+/// rule — without building the rest of it.
+///
+/// Takes residency as a predicate rather than a materialized `HashSet`, and
+/// stops walking the moment it has `limit` frames. The read-ahead warmer (#164)
+/// consumes exactly two entries, and reaching them through `want_list` meant
+/// collecting the whole ring's resident set *and* every wanted frame in the
+/// window first: at a 1000-frame precache span that is a quarter-million
+/// `wants.contains` compares per submitted decode, on the UI thread (#309) —
+/// the cost [`next_want`]'s own doc gives as the reason the pump doesn't build
+/// a `Vec`.
+///
+/// `limit` is small by construction, so the duplicate check stays a linear scan
+/// of at most `limit` entries.
+// Same shape as `want_list`, plus the limit — see the note there.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn want_first_n(
+    playhead: u32,
+    in_pt: u32,
+    out_pt: u32,
+    direction: Direction,
+    mode: LoopMode,
+    decode_ahead: usize,
+    read_behind: usize,
+    limit: usize,
+    is_resident: impl Fn(u32) -> bool,
+) -> Vec<u32> {
+    let mut wants = Vec::with_capacity(limit);
+    if limit == 0 {
+        return wants;
+    }
+
+    // P1: the playhead itself, if we don't already have it.
+    if !is_resident(playhead) {
+        wants.push(playhead);
+        if wants.len() == limit {
+            return wants;
+        }
+    }
+
+    // P2 then P3 — the forward prefetch window, then the read-behind window
+    // (#169) walked against the play direction. Both start from the playhead and
+    // use the clock's own step rule, so loop / ping-pong wrap consistently; the
+    // playhead and duplicates from a bounce are skipped, exactly as in
+    // `want_list`.
+    for (steps, start_dir) in [
+        (decode_ahead, direction),
+        (read_behind, direction.opposite()),
+    ] {
+        let mut frame = playhead;
+        let mut dir = start_dir;
+        for _ in 0..steps {
+            let Some((next, next_dir)) = advance(frame, in_pt, out_pt, dir, mode) else {
+                break; // Once reached the boundary.
+            };
+            frame = next;
+            dir = next_dir;
+            if frame != playhead && !is_resident(frame) && !wants.contains(&frame) {
+                wants.push(frame);
+                if wants.len() == limit {
+                    return wants;
+                }
+            }
+        }
+    }
+    wants
+}
+
 /// The single highest-priority frame worth decoding next, or `None` if nothing
 /// is wanted — the same priority order as [`want_list`] (the playhead first,
 /// then the prefetch window in the play direction) but **allocation-free** and
@@ -393,5 +462,64 @@ mod tests {
             |_| true,
         );
         assert_eq!(got, Some(7));
+    }
+
+    #[test]
+    fn want_first_n_matches_the_prefix_of_want_list() {
+        // #309: `want_first_n` exists only to avoid building the tail of
+        // `want_list`, so the two must not disagree about the head. Swept
+        // across both loop modes, both directions, holes in the resident set,
+        // and playheads at and away from the boundaries — the wrap cases are
+        // where a re-implemented walk would drift.
+        for mode in [LoopMode::Loop, LoopMode::Once, LoopMode::PingPong] {
+            for dir in [Direction::Forward, Direction::Reverse] {
+                for playhead in [1u32, 4, 7, 10] {
+                    for res in [vec![], vec![4], vec![1, 2, 3, 9, 10], vec![4, 5, 6]] {
+                        let set = resident(&res);
+                        let full = want_list(playhead, 1, 10, dir, mode, &set, 6, 2);
+                        for limit in 0..=4 {
+                            let got = want_first_n(playhead, 1, 10, dir, mode, 6, 2, limit, |f| {
+                                set.contains(&f)
+                            });
+                            let want: Vec<u32> = full.iter().copied().take(limit).collect();
+                            assert_eq!(
+                                got, want,
+                                "mode={mode:?} dir={dir:?} playhead={playhead} \
+                                 resident={res:?} limit={limit}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn want_first_n_stops_walking_once_the_limit_is_reached() {
+        // The point of the function: a huge decode-ahead (an eager precache
+        // span) must not cost a walk proportional to the span. Count how many
+        // frames the residency predicate is asked about — with a limit of 2 on
+        // a 1000-deep window it must stay tiny, not linear in the depth.
+        let asked = std::cell::Cell::new(0usize);
+        let got = want_first_n(
+            1,
+            1,
+            500,
+            Direction::Forward,
+            LoopMode::Loop,
+            1000,
+            0,
+            2,
+            |_| {
+                asked.set(asked.get() + 1);
+                false
+            },
+        );
+        assert_eq!(got, vec![1, 2]);
+        assert!(
+            asked.get() <= 4,
+            "walked {} frames to collect 2 — it is not short-circuiting",
+            asked.get()
+        );
     }
 }
