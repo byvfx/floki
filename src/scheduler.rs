@@ -468,9 +468,9 @@ mod tests {
     fn want_first_n_matches_the_prefix_of_want_list() {
         // #309: `want_first_n` exists only to avoid building the tail of
         // `want_list`, so the two must not disagree about the head. Swept
-        // across both loop modes, both directions, holes in the resident set,
-        // and playheads at and away from the boundaries — the wrap cases are
-        // where a re-implemented walk would drift.
+        // across all three loop modes, both directions, holes in the resident
+        // set, and playheads at and away from the boundaries — the wrap cases
+        // are where a re-implemented walk would drift.
         for mode in [LoopMode::Loop, LoopMode::Once, LoopMode::PingPong] {
             for dir in [Direction::Forward, Direction::Reverse] {
                 for playhead in [1u32, 4, 7, 10] {
