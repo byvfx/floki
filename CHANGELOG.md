@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **A layer you un-hide starts caching again.** (#319) Hiding a layer stops it
+  decoding and stops it counting toward the RAM split, so bringing one back —
+  un-hiding it, or clearing a solo — widens the range precache is meant to fill.
+  Neither cleared the fill's "range is filled" latch, so a verdict earned while
+  that layer didn't count stood over the stack that now includes it, and its
+  frames stayed cold until the playhead happened to move. The same staleness
+  class as the v1.13.1 hotfix (#296), one trigger over — the latch now clears on
+  visibility and solo changes alongside the follower add, follower remove and
+  clock re-point clears that shipped there.
+
 ## [1.13.1] - 2026-08-28
 
 ### Fixed

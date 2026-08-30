@@ -7962,6 +7962,43 @@ impl ExrApp {
         }
     }
 
+    /// Show or hide a Layers-panel layer.
+    ///
+    /// Routed through the model rather than mutating `comp_stack` at the widget so
+    /// the precache latch clears with it (#319). Visibility reshapes what the fill
+    /// targets: `active_followers` filters on `source_is_visible`, and since #211 an
+    /// invisible source stops decoding and stops counting toward the budget split —
+    /// so un-hiding widens the target exactly the way adding a follower does, and a
+    /// latch earned while that source didn't count leaves its frames cold until the
+    /// playhead happens to move. Hiding only ever shrinks the target, so it's the
+    /// harmless direction; clearing both ways is cheaper than reasoning about which,
+    /// since a spurious clear costs one `tick_precache` that re-latches on
+    /// `nothing_wanted`.
+    fn set_layer_enabled(&mut self, id: crate::layer::LayerId, enabled: bool) {
+        let Some(l) = self.comp_stack.get_mut(id) else {
+            return;
+        };
+        // A no-op toggle must not churn the latch, matching `set_transport_source`.
+        if l.enabled == enabled {
+            return;
+        }
+        l.enabled = enabled;
+        self.precache_filled = false;
+    }
+
+    /// Toggle a Layers-panel layer's solo.
+    ///
+    /// Same latch reasoning as [`Self::set_layer_enabled`] (#319): solo overrides
+    /// `enabled` in `source_is_visible`, so flipping it reshapes the fill target the
+    /// same way — un-soloing brings every other source back into the split.
+    fn toggle_layer_solo(&mut self, id: crate::layer::LayerId) {
+        let Some(l) = self.comp_stack.get_mut(id) else {
+            return;
+        };
+        l.solo = !l.solo;
+        self.precache_filled = false;
+    }
+
     /// Remove a Layers-panel layer and free its source's pixels/VRAM once no other
     /// layer references it (#99 PR-B.2). A source can be shared by several layers
     /// (e.g. back-to-beauty AOVs of one file), so its [`CompSource`] is dropped
@@ -8806,18 +8843,16 @@ impl ExrApp {
                         .checkbox(&mut enabled, "")
                         .on_hover_text("Visible")
                         .changed()
-                        && let Some(l) = self.comp_stack.get_mut(row.id)
                     {
-                        l.enabled = enabled;
+                        self.set_layer_enabled(row.id, enabled);
                     }
                     // Solo: isolate this layer (any solo hides non-soloed layers).
                     if ui
                         .selectable_label(row.solo, "S")
                         .on_hover_text("Solo")
                         .clicked()
-                        && let Some(l) = self.comp_stack.get_mut(row.id)
                     {
-                        l.solo = !row.solo;
+                        self.toggle_layer_solo(row.id);
                     }
                     // Name, greyed when it won't render. Truncated rather than
                     // wrapped: the gutter is a fixed width shared with every row.
@@ -14145,6 +14180,52 @@ mod tests {
         assert!(
             !app.precache_filled,
             "the fill target shrank with the source set"
+        );
+    }
+
+    #[test]
+    fn visibility_and_solo_changes_clear_the_precache_latch() {
+        // #319: the #296 staleness class, one trigger over. `active_followers`
+        // filters on `source_is_visible`, and since #211 an invisible source stops
+        // decoding and stops counting toward the budget split — so un-hiding widens
+        // the fill target exactly the way adding a follower does. A latch earned
+        // while the source didn't count left its frames cold until the playhead
+        // happened to move.
+        let (_dir, paths) = write_sequence(5);
+        let mut app = ExrApp::default();
+        app.add_comp_source(paths[0].clone());
+        let id = app.comp_stack.iter().last().unwrap().id;
+
+        app.precache_filled = true;
+        app.set_layer_enabled(id, false);
+        assert!(!app.precache_filled, "hiding reshapes the fill target");
+
+        app.precache_filled = true;
+        app.set_layer_enabled(id, true);
+        assert!(
+            !app.precache_filled,
+            "un-hiding is the direction that bites — the source counts again"
+        );
+
+        app.precache_filled = true;
+        app.set_layer_enabled(id, true);
+        assert!(
+            app.precache_filled,
+            "a no-op toggle is not a target change and must not churn the latch"
+        );
+
+        app.precache_filled = true;
+        app.toggle_layer_solo(id);
+        assert!(
+            !app.precache_filled,
+            "solo overrides `enabled`, so it moves the target the same way"
+        );
+
+        app.precache_filled = true;
+        app.toggle_layer_solo(id);
+        assert!(
+            !app.precache_filled,
+            "un-soloing brings every other source back into the split"
         );
     }
 
