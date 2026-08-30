@@ -8,6 +8,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Precache fills the RAM you gave it instead of stopping at a thirtieth of
+  it.** (#322) With precache on and the clock stopped, the cache bar could walk
+  a little way and stop for good — 26 frames, 2.8 GB of a 28.4 GB budget, in the
+  session that found it — and nothing but pressing Play would restart it. The
+  cap is the byte budget divided by what one new frame costs, and that divisor
+  falls back to the *full* frame size until the cheap fidelity the pump is
+  actually issuing has been measured once. A 4K full frame gives a cap of 26
+  where the measured proxy figure gives about 7,900. At 26 resident the ring
+  then called itself full, so the pump submitted nothing, so no cheap frame was
+  ever decoded, so the measurement that would have corrected the cap never
+  arrived: the too-small cap prevented the decode that would have fixed it. A
+  count bound derived from an admittedly provisional divisor no longer gets to
+  declare the ring full while the byte budget still has room. The byte bound —
+  measured rather than derived, and the one that guards against running the
+  machine out of memory — is untouched.
+- **The playback trace and the debug overlay report the divisor the cap was
+  actually built from.** (#322) Both re-derived it, the trace a whole UI pass
+  after the cap was computed, and that figure is read from live state — so the
+  two could disagree, and the line's own documented sanity check (resident bytes
+  over frame count, against the stated per-frame size) then reads as 30x off on
+  a ring that is arithmetically correct. It is recorded where it is used now,
+  and carries a new `size_src=` naming which of the four arms produced it, since
+  two of them fall back to the full frame size and the byte count alone cannot
+  say which case you are looking at.
 - **Read-ahead no longer stalls the UI thread on networked storage.** (#309) The
   warmer that pulls upcoming frames through the page cache first asked the disk
   proxy cache whether it already held each candidate — and that question stats

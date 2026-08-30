@@ -100,6 +100,39 @@ enum PlaybackProxy {
     Unknown,
 }
 
+/// Which arm of [`ExrApp::sizing_frame_bytes_src`] produced the T1 divisor (#322).
+///
+/// Reported in the playback trace next to the figure itself. The arm is the
+/// diagnostic half: a cap that looks too small is a different bug depending on
+/// whether sizing believed the next decode would be a proxy, a beauty frame or a
+/// full one, and the byte count alone can't say which — two of the arms fall
+/// back to `frame_bytes` when their own measurement is missing, so a full-frame
+/// figure does not imply the full arm answered.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SizeSrc {
+    /// The last decode fell back (#233), so sizing is pinned to the dearest
+    /// measured figure regardless of what the pump would ask for.
+    Fallback,
+    /// The pump would ask for a proxy at the probe frame.
+    Proxy,
+    /// The pump would ask for a beauty-only frame at the probe frame.
+    Beauty,
+    /// Neither cheap path applies: a full frame is what the ring will take.
+    Full,
+}
+
+impl SizeSrc {
+    /// Trace token, matching the `evt=` / `reason=` style of the other levers.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Fallback => "fallback",
+            Self::Proxy => "proxy",
+            Self::Beauty => "beauty",
+            Self::Full => "full",
+        }
+    }
+}
+
 /// Floor for the viewport-derived playback proxy (#209). A pathological zoom-out
 /// (or a tiny window) shouldn't drive the decode down to a thumbnail — below this
 /// the saving is irrelevant anyway, and the cost is a visibly mushy frame the
@@ -593,7 +626,7 @@ pub struct ExrApp {
     /// while sizing the ring off a full 23-part decode: measured `t1=23/23` and
     /// `evict=726` in 45 s on a 1035 MB/frame Karma render against a 24 GB budget,
     /// a ~10x under-use of the configured budget on exactly the footage where cache
-    /// depth matters most. Read through [`Self::sizing_frame_bytes`].
+    /// depth matters most. Read through [`Self::sizing_frame_bytes_src`].
     #[serde(skip)]
     beauty_bytes: Option<usize>,
     /// Sequence frame numbers submitted to the worker but not yet returned (#57).
@@ -642,6 +675,13 @@ pub struct ExrApp {
     /// would emit one identical line per frame.
     #[serde(skip)]
     dbg_last_latch: Option<(bool, usize)>,
+    /// The T1 divisor `tick_budgets_t1` last sized the ring from, and which arm
+    /// produced it (#322). Recorded rather than re-derived at trace time: the
+    /// trace runs a whole UI pass later, and `sizing_frame_bytes_src` reads live
+    /// state, so the two are not guaranteed to agree — and when they didn't, the
+    /// line reported a divisor the cap was never built from.
+    #[serde(skip)]
+    dbg_sizing: Option<(usize, SizeSrc)>,
     #[serde(skip)]
     dbg_dropped_epoch: u64,
     /// Cumulative cheap decodes the worker had to satisfy with something dearer
@@ -654,7 +694,7 @@ pub struct ExrApp {
     #[serde(skip)]
     dbg_fallbacks: u64,
     /// Whether the clock source's most recent sequence decode fell back. Makes
-    /// [`Self::sizing_frame_bytes`] size off full frames while a cheap path is
+    /// [`Self::sizing_frame_bytes_src`] size off full frames while a cheap path is
     /// failing, instead of off the fidelity that was merely *asked* for.
     #[serde(skip)]
     decode_fell_back: bool,
@@ -1135,6 +1175,7 @@ impl Default for ExrApp {
             dbg_last_sample: None,
             dbg_evictions: 0,
             dbg_last_latch: None,
+            dbg_sizing: None,
             dbg_fallbacks: 0,
             decode_fell_back: false,
             dbg_dropped_epoch: 0,
@@ -2381,8 +2422,46 @@ impl ExrApp {
     /// latches and churns decode -> evict forever. That is the same failure the
     /// count check was added to fix (#56), in the other unit.
     fn cache_is_full(&self) -> bool {
+        // ...but the *count* bound is only as good as the divisor it came from,
+        // and sizing can admit its divisor is a guess: the cheap arms fall back to
+        // `frame_bytes` until their own fidelity has been measured once (#233's
+        // conservative direction). A 4K full frame over the same budget yields a
+        // cap of ~26 where the measured proxy figure yields ~7900, so the ring
+        // reports itself full at a thirtieth of what it can hold — and the pump,
+        // reading this, submits nothing. Nothing decodes, so no cheap frame is
+        // ever measured, so the fallback that produced the small cap is never
+        // replaced: the too-small cap prevents the decode that would fix it.
+        //
+        // This is the hole in the memory contract's claim that too-small caps are
+        // "merely wasteful and self-correct" (#322). They self-correct only while
+        // decoding continues. Observed live as precache walking to 26 frames — 2.8
+        // GB of a 28.4 GB budget — latching `cache_full`, and sitting there for ten
+        // minutes until a Play re-sized it.
+        //
+        // So a provisional count bound does not get to say "full" while the byte
+        // budget still has room. The byte bound is unaffected and keeps its veto:
+        // it is measured, not derived, so it is the one that guards against OOM.
+        if self.sizing_is_provisional() && self.frame_cache.bytes() < self.frame_cache_budget {
+            return false;
+        }
         self.frame_cache.len() >= self.frame_cache_cap
             || self.frame_cache.bytes() >= self.frame_cache_budget
+    }
+
+    /// Whether the T1 divisor is a **fallback rather than a measurement** — the
+    /// pump would issue a cheap decode, but that fidelity has never been measured,
+    /// so sizing used the dearer `frame_bytes` in its place (#322).
+    ///
+    /// Deliberately narrow. `SizeSrc::Full` is not provisional (a full frame *is*
+    /// what the ring will take), and neither is `Fallback`, which is #233's
+    /// pin to the dearest measured figure after a decode genuinely fell back —
+    /// there the dear divisor is the correct one, not a stand-in.
+    fn sizing_is_provisional(&self) -> bool {
+        match self.dbg_sizing {
+            Some((_, SizeSrc::Proxy)) => self.proxy_bytes.is_none(),
+            Some((_, SizeSrc::Beauty)) => self.beauty_bytes.is_none(),
+            _ => false,
+        }
     }
 
     /// Whether a sequence decode is outstanding on **any** source — the primary
@@ -2899,6 +2978,13 @@ impl ExrApp {
     /// Every fallback chain ends at `frame_bytes`, never at something smaller: a
     /// cheap mode whose bytes have not been measured yet errs conservative — a cap
     /// that is too small, which is merely wasteful — instead of toward OOM.
+    ///
+    /// The divisor without its provenance. Production sizing goes through
+    /// [`Self::sizing_frame_bytes_src`] and reports the arm alongside the figure
+    /// (#322), so this remains only as the form twenty-odd tests assert against,
+    /// where the arm is either the subject of its own assertion or beside the
+    /// point.
+    #[cfg(test)]
     fn sizing_frame_bytes(&self) -> Option<usize> {
         // The **clock source**, matching `apply_load_result`'s latch condition
         // (`res.source == self.clock_source()`) exactly. Probing `A_SOURCE` would
@@ -2928,18 +3014,45 @@ impl ExrApp {
         // been measured keeps the override's one-directional guarantee (every arm
         // is >= what the requested-mode chains below would return) without the
         // hole.
+        self.sizing_frame_bytes_src().map(|(bytes, _)| bytes)
+    }
+
+    /// The T1 divisor plus **which arm answered** — the figure and its provenance
+    /// in one call, so a caller that reports the divisor reports the one it
+    /// actually used (#322).
+    ///
+    /// Split out because the trace used to call `sizing_frame_bytes` again, some
+    /// three hundred lines and a whole UI pass after `tick_budgets_t1` computed the
+    /// cap from it. This function reads live state — the clock source, the probe
+    /// frame, the cheap-decode gates — so re-deriving it later is not guaranteed to
+    /// reproduce the earlier answer, and when it doesn't, the trace line reports a
+    /// `size_bytes` the cap was never built from. That is not a cosmetic mismatch:
+    /// the line documents `t1_bytes / t1` against `size_bytes` as a sanity check,
+    /// so a stale figure makes correct arithmetic look broken and a genuine
+    /// mis-sizing look fine.
+    fn sizing_frame_bytes_src(&self) -> Option<(usize, SizeSrc)> {
         if self.decode_fell_back {
-            return self.frame_bytes.or(self.beauty_bytes).or(self.proxy_bytes);
+            return self
+                .frame_bytes
+                .or(self.beauty_bytes)
+                .or(self.proxy_bytes)
+                .map(|b| (b, SizeSrc::Fallback));
         }
         let src = self.clock_source();
         let probe = self.source_playhead(src).wrapping_add(1);
         if self.decode_proxy_target_for(src, probe).is_some() {
-            return self.proxy_bytes.or(self.frame_bytes);
+            return self
+                .proxy_bytes
+                .or(self.frame_bytes)
+                .map(|b| (b, SizeSrc::Proxy));
         }
         if self.decode_beauty_only_for(src, probe) {
-            return self.beauty_bytes.or(self.frame_bytes);
+            return self
+                .beauty_bytes
+                .or(self.frame_bytes)
+                .map(|b| (b, SizeSrc::Beauty));
         }
-        self.frame_bytes
+        self.frame_bytes.map(|b| (b, SizeSrc::Full))
     }
 
     /// Per-source counterpart of [`Self::decode_proxy_target`] (#99). The primary
@@ -4019,11 +4132,15 @@ impl ExrApp {
     fn tick_budgets_t1(&mut self, sample: &crate::budget::Sample) {
         // T1: recomputed each tick; shrinks under other memory pressure. The
         // divisor is what one *new* frame costs at the fidelity the pump is
-        // currently issuing ([`Self::sizing_frame_bytes`]); the resident side is
+        // currently issuing ([`Self::sizing_frame_bytes_src`]); the resident side is
         // the ring's own measured bytes rather than `len * divisor` — with a
         // heterogeneous ring that synthesized figure put the same possibly-wrong
         // scalar on both sides of the budget at once (#230).
-        if let Some(bytes) = self.sizing_frame_bytes() {
+        if let Some((bytes, src)) = self.sizing_frame_bytes_src() {
+            // Record the divisor this tick actually used, for the trace to report
+            // (#322) — see `sizing_frame_bytes_src` for why re-deriving it later is
+            // not the same question.
+            self.dbg_sizing = Some((bytes, src));
             // One byte budget, stated in two units (#232). The user's RAM setting
             // is folded in as a ceiling, never an override. Both are floored at two
             // frames' worth so playback still double-buffers when the budget says
@@ -5240,7 +5357,8 @@ impl ExrApp {
              worker={worker} submit_age={submit_age:.2} last_decode={last_decode:.2} \
              precache={precache}/{precache_filled} \
              t1={t1_len}/{t1_cap} frame_bytes={frame_bytes} \
-             size_bytes={size_bytes} t1_bytes={t1_bytes}/{t1_budget} \
+             size_bytes={size_bytes} size_src={size_src} \
+             t1_bytes={t1_bytes}/{t1_budget} \
              t2={t2_len}/{t2_cap} \
              evict={evict} fallback={fallback} drop_epoch={drop_epoch} run_dropped={run_dropped} run_held={run_held} \
              fps={fps:.1}/{fps_target:.0} ft_n={ft_n} \
@@ -5291,9 +5409,15 @@ impl ExrApp {
             // the line said so. `size_bytes` is the divisor for the fidelity the
             // pump is issuing; `t1_bytes` is what the ring measurably holds — so
             // `t1_bytes / t1` against `size_bytes` is a direct sanity check.
+            // What `tick_budgets_t1` sized the cap from *this frame*, not a
+            // re-derivation (#322). `size_src` names the arm, because two of them
+            // fall back to `frame_bytes` when their own measurement is missing —
+            // so a full-frame figure under `size_src=proxy` is a missing
+            // `proxy_bytes`, a different bug from the proxy gate saying no.
             size_bytes = self
-                .sizing_frame_bytes()
-                .map_or_else(|| "none".to_string(), |b| b.to_string()),
+                .dbg_sizing
+                .map_or_else(|| "none".to_string(), |(b, _)| b.to_string()),
+            size_src = self.dbg_sizing.map_or("none", |(_, s)| s.as_str()),
             t1_bytes = self.frame_cache.bytes(),
             // The bound eviction actually enforces (#232). `t1_bytes` up against
             // this while `t1` sits well under `t1_cap` is the byte bound binding —
@@ -6156,8 +6280,11 @@ impl ExrApp {
         let t2_cap = self.viewer.t2_cap(Self::A_SOURCE);
         // The divisor the cap is actually computed from, and what the ring measurably
         // holds (#230) — not the raw `frame_bytes` latch, which is only one of three
-        // fidelities and is the wrong one during beauty/proxy playback.
-        let sizing_bytes = self.sizing_frame_bytes();
+        // fidelities and is the wrong one during beauty/proxy playback. Read from
+        // what `tick_budgets_t1` recorded rather than re-derived here (#322): the
+        // overlay draws mid-frame, and a figure that disagrees with the cap beside
+        // it is worse than no figure — it was read as the cap being wrong.
+        let sizing_bytes = self.dbg_sizing.map(|(b, _)| b);
         let t1_bytes = self.frame_cache.bytes();
         let t1_budget = self.frame_cache_budget;
         let (dbg_fallbacks, decode_fell_back) = (self.dbg_fallbacks, self.decode_fell_back);
@@ -10695,6 +10822,141 @@ mod tests {
             crate::budget::frames_in(app.frame_cache_budget, 1_000_000),
             "the count is always the byte budget over the divisor"
         );
+    }
+
+    #[test]
+    fn a_provisional_count_bound_does_not_declare_the_ring_full() {
+        // #322: sizing's cheap arms fall back to `frame_bytes` until that
+        // fidelity has been measured once, so the cap can be ~26 (4K full frame)
+        // where the measured proxy figure gives ~7900. At 26 resident the ring
+        // called itself full, the pump stopped, nothing decoded, nothing was ever
+        // measured, and the fallback that caused the small cap was never
+        // replaced — observed live as precache stuck at 2.8 GB of a 28.4 GB
+        // budget for ten minutes until a Play re-sized it.
+        let (_dir, mut app) = app_playing_with_all_three_latches();
+        app.proxy_enabled = false;
+        app.beauty_preview = true;
+        app.beauty_bytes = None; // never measured — the arm falls back to full
+        // A deliberately tight budget: ~8.3 MB free ⇒ 60% ⇒ ~5 MB, which over the
+        // full-frame stand-in gives a handful of frames rather than ten thousand.
+        // The stall's shape needs the count bound met and the byte bound far away,
+        // not a big ring.
+        let tight = mem_sample(20_000_000_000, 19_991_666_667);
+        app.tick_budgets_t1(&tight);
+
+        let (bytes, src) = app.dbg_sizing.expect("sizing recorded");
+        assert_eq!(
+            (bytes, src),
+            (1_000_000, SizeSrc::Beauty),
+            "the beauty arm answered, with the full frame standing in for it"
+        );
+        assert!(app.sizing_is_provisional());
+
+        // Fill the ring to the (provisional) cap while staying well under the
+        // byte budget — the shape the stall had. The sequence fixture is
+        // placeholder files, so the frames come from a real EXR written here;
+        // one decode shared across the slots is enough, the ring measures each.
+        let real_dir = tempfile::tempdir().unwrap();
+        let real = real_dir.path().join("real.exr");
+        write_rgba_exr(&real);
+        let data = std::sync::Arc::new(ExrData::load(&real).unwrap());
+        for n in 0..app.frame_cache_cap as u32 {
+            app.frame_cache
+                .insert(ExrApp::A_SOURCE, n, std::sync::Arc::clone(&data));
+        }
+        assert!(
+            app.frame_cache.len() >= app.frame_cache_cap,
+            "count bound met"
+        );
+        assert!(
+            app.frame_cache.bytes() < app.frame_cache_budget,
+            "byte bound nowhere near — only the derived count binds"
+        );
+        assert!(
+            !app.cache_is_full(),
+            "a count bound built from a fallback divisor must not stop the decode \
+             that would replace it"
+        );
+
+        // Once the fidelity has actually been measured, the count bound is a real
+        // bound again and full means full.
+        app.beauty_bytes = Some(80_000);
+        app.tick_budgets_t1(&tight);
+        assert!(!app.sizing_is_provisional());
+        app.frame_cache_cap = app.frame_cache.len();
+        assert!(
+            app.cache_is_full(),
+            "a measured divisor's count bound still says full"
+        );
+    }
+
+    #[test]
+    fn the_byte_bound_still_vetoes_while_sizing_is_provisional() {
+        // The relaxation above is scoped to the *count* bound. The byte bound is
+        // measured rather than derived, so it is the one guarding against OOM and
+        // it keeps its veto whatever sizing thinks a frame costs.
+        let (_dir, mut app) = app_playing_with_all_three_latches();
+        app.proxy_enabled = false;
+        app.beauty_preview = true;
+        app.beauty_bytes = None;
+        app.tick_budgets_t1(&mem_sample(20_000_000_000, 2_000_000_000));
+        assert!(app.sizing_is_provisional());
+
+        // A ring holding anything at all is over a one-byte budget. It has to
+        // actually hold something: an empty ring under the budget is *correctly*
+        // not full, which is what the first draft of this test got wrong.
+        let real_dir = tempfile::tempdir().unwrap();
+        let real = real_dir.path().join("real.exr");
+        write_rgba_exr(&real);
+        app.frame_cache.insert(
+            ExrApp::A_SOURCE,
+            1,
+            std::sync::Arc::new(ExrData::load(&real).unwrap()),
+        );
+        app.frame_cache_budget = 1;
+        assert!(app.frame_cache.bytes() >= app.frame_cache_budget);
+        assert!(
+            app.cache_is_full(),
+            "over the byte budget is full regardless of the divisor's provenance"
+        );
+    }
+
+    #[test]
+    fn the_reported_divisor_is_the_one_the_cap_was_built_from() {
+        // #322: the trace and the debug overlay both *re-derived* this figure —
+        // the trace a whole UI pass after `tick_budgets_t1` had used it — and
+        // `sizing_frame_bytes` reads live state (clock source, probe frame, the
+        // cheap-decode gates), so the two are not obliged to agree. Seen live as
+        // `size_bytes=3576624` printed beside `t1=26/26`, a cap of budget over
+        // the *full* 1.09 GB frame: the line's own documented sanity check
+        // (`t1_bytes / t1` against `size_bytes`) off by 30x, which reads as a
+        // mis-sized cap. The figure is now recorded where it is used.
+        let plenty = mem_sample(20_000_000_000, 2_000_000_000);
+
+        for (proxy, beauty, want_bytes, want_src) in [
+            (true, false, 9_000usize, SizeSrc::Proxy),
+            (false, true, 80_000, SizeSrc::Beauty),
+            (false, false, 1_000_000, SizeSrc::Full),
+        ] {
+            let (_dir, mut app) = app_playing_with_all_three_latches();
+            app.proxy_enabled = proxy;
+            app.beauty_preview = beauty;
+            app.tick_budgets_t1(&plenty);
+
+            let (bytes, src) = app
+                .dbg_sizing
+                .expect("the T1 branch records the divisor it sized from");
+            assert_eq!(
+                (bytes, src),
+                (want_bytes, want_src),
+                "proxy={proxy} beauty={beauty}"
+            );
+            assert_eq!(
+                app.frame_cache_cap,
+                crate::budget::frames_in(app.frame_cache_budget, bytes).max(2),
+                "the reported divisor and the cap must describe one arithmetic"
+            );
+        }
     }
 
     #[test]
