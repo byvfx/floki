@@ -3065,42 +3065,46 @@ impl ExrApp {
         const WARM_AHEAD: usize = 2;
         let behind = crate::scheduler::read_behind(depth);
         let ahead = depth - behind;
-        let mut resident: std::collections::HashSet<u32> =
-            self.frame_cache.resident_frames(source).collect();
-        resident.insert(submitted);
-        let wants = self.want_list_for(source, &resident, ahead, behind);
-        for w in wants.into_iter().take(WARM_AHEAD) {
+        // Bounded at the two entries this consumes (#309). Reaching them via the
+        // full `want_list` also collected the whole ring's resident set and every
+        // wanted frame in the window — at an eager precache depth, hundreds of
+        // thousands of compares per submitted decode, on the UI thread.
+        let wants = self.want_first_n_for(source, submitted, ahead, behind, WARM_AHEAD);
+        // Same AOV the decode will ask the cache for (#217) — checking layer 0
+        // while the decode wants layer 2 would skip the warm on a frame that is
+        // about to miss and open the source anyway. Frame-independent, so it is
+        // resolved once rather than per candidate.
+        let aov = self
+            .cheap_decode_layer(source)
+            .map_or(0, |(_, logical)| logical);
+        for w in wants {
             if let Some(path) = self.frame_path_for(source, w) {
-                // Skip the read-ahead warm when the on-disk proxy cache (#165)
-                // already holds this frame at the size it would decode: the worker
-                // will hit the cache and never open the source, so pulling it
-                // through the page cache is wasted bandwidth — exactly the
-                // networked-storage cost the cache exists to remove. `contains`
-                // self-gates to `false` when the disk cache is off.
+                // The disk-cache gate rides along and is answered on the warmer
+                // thread (#309): `contains` stats the source twice and the cache
+                // file once, which on the networked storage this warmer exists for
+                // is milliseconds of blocking I/O per candidate per decode — a
+                // large slice of a 41 ms frame at 24 fps, and invisible in a local
+                // soak where stats are free.
                 let px = self.decode_proxy_target_for(source, w);
-                // Same AOV the decode will ask the cache for (#217) — checking
-                // layer 0 while the decode wants layer 2 would skip the warm on a
-                // frame that is about to miss and open the source anyway.
-                let aov = self
-                    .cheap_decode_layer(source)
-                    .map_or(0, |(_, logical)| logical);
-                if px.is_some_and(|px| self.proxy_cache.contains(&path, px, aov)) {
-                    continue;
-                }
-                self.prefetcher.warm(path);
+                self.prefetcher.warm(path, px, aov, &self.proxy_cache);
             }
         }
     }
 
-    /// One source's decode-ahead want-list in its own frame space (#99): the
-    /// primary's transport in/out range, else the follower's sequence range; both
-    /// share the master direction / loop. Empty for an inactive / unknown follower.
-    fn want_list_for(
+    /// The first `limit` frames of one source's decode-ahead want-list, in its own
+    /// frame space (#99): the primary's transport in/out range, else the
+    /// follower's sequence range; both share the master direction / loop. Empty
+    /// for an inactive / unknown follower.
+    ///
+    /// `submitted` counts as resident — the caller has just queued it, so warming
+    /// it again would only warm the frame already being decoded.
+    fn want_first_n_for(
         &self,
         source: crate::layer::SourceId,
-        resident: &std::collections::HashSet<u32>,
+        submitted: u32,
         ahead: usize,
         behind: usize,
+        limit: usize,
     ) -> Vec<u32> {
         let (playhead, lo, hi) = if source == Self::A_SOURCE {
             (
@@ -3116,15 +3120,16 @@ impl ExrApp {
         } else {
             return Vec::new();
         };
-        crate::scheduler::want_list(
+        crate::scheduler::want_first_n(
             playhead,
             lo,
             hi,
             self.playback.direction,
             self.playback.loop_mode,
-            resident,
             ahead,
             behind,
+            limit,
+            |f| f == submitted || self.frame_cache.contains(source, f),
         )
     }
 
