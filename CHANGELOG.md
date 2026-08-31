@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.13.3] - 2026-08-31
+
 ### Removed
 - **Dead code behind the layer stack, removed.** (#301) An earlier design had the
   first file you opened become a special "base track" pinned to the bottom of the
@@ -1001,7 +1003,8 @@ Initial release.
 - Advanced metadata header inspector.
 - Cross-platform GitHub Actions builds (Linux, Windows, macOS).
 
-[Unreleased]: https://github.com/byvfx/floki/compare/v1.13.2...HEAD
+[Unreleased]: https://github.com/byvfx/floki/compare/v1.13.3...HEAD
+[1.13.3]: https://github.com/byvfx/floki/compare/v1.13.2...v1.13.3
 [1.13.2]: https://github.com/byvfx/floki/compare/v1.13.1...v1.13.2
 [1.13.1]: https://github.com/byvfx/floki/compare/v1.13.0...v1.13.1
 [1.13.0]: https://github.com/byvfx/floki/compare/v1.12.0...v1.13.0
