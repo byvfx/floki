@@ -13,13 +13,16 @@
 //! display chain is the two-pass OCIO callback ([`crate::gpu::ocio_pass`])
 //! instead.
 //!
-//! **Where a built texture lives.** One [`LayerTexture`] per source, held in
-//! `ExrApp::comp_sources` — not in the viewer. Followers build on the upload
-//! worker pool ([`crate::tex_upload`], #202) and are bound by
-//! `ExrApp::collect_comp_textures` when the workers finish; a still tracks AOV
-//! switches through `ExrApp::ensure_comp_aov`. There is no per-layer texture
-//! cache in `ExrViewer` any more: the `gpu_textures` vector it used to keep was
-//! written and never read, and went with the A/B viewport in #302.
+//! **Where a built texture lives.** Not in the viewer. [`LayerTexture`] is this
+//! module's own return type and does not cross the boundary:
+//! `build_source_texture` destructures it into a
+//! `(wgpu::Texture, Arc<wgpu::BindGroup>)` pair, and `ExrApp::CompSource` stores
+//! those as its own `texture` / `bind_group` fields — one pair per source.
+//! Followers build on the upload worker pool ([`crate::tex_upload`], #202) and are
+//! bound by `ExrApp::collect_comp_textures` when the workers finish; a still
+//! tracks AOV switches through `ExrApp::ensure_comp_aov`. There is no per-layer
+//! texture cache in `ExrViewer` any more: the `gpu_textures` vector it used to
+//! keep was written and never read, and went with the A/B viewport in #302.
 //!
 //! The only CPU bake that remains is [`Self::generate_texture`] for
 //! contact-sheet thumbnails — the **headless / no-GPU fallback** (used by tests
