@@ -1136,12 +1136,6 @@ pub struct ExrViewer {
     pub overscan_opacity: f32,
     pub last_hover_pos_img: Option<(usize, usize)>,
     pub last_sampled_val_a: Option<[f32; 4]>,
-    /// When set (by the app from `Playback::sampling_suppressed`), the canvas
-    /// pixel readout is suppressed: no sampling, the cached values are cleared so
-    /// the status bar shows nothing stale, and a hover hint explains why
-    /// (INV-SAMPLE, #7). Always false outside sequence playback.
-    pub suppress_sampling: bool,
-
     /// Natural (unclipped) height of the contextual mode-param row, recorded each
     /// frame it renders so the slide-in animation knows how far to grow. Transient
     /// runtime state — not persisted.
@@ -1245,7 +1239,6 @@ impl Default for ExrViewer {
             overscan_opacity: 0.2,
             last_hover_pos_img: None,
             last_sampled_val_a: None,
-            suppress_sampling: false,
             last_canvas_rect: None,
             last_image_rect: None,
             last_image_rect_b: None,

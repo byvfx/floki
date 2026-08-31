@@ -563,7 +563,9 @@ groundwork the final collapse (**R4**) sits on. All in `src/app.rs` + the GPU re
 - **Pixel readout in the comp path** `ab63b16` — `sample_pixel` → `pub(crate)`; `draw_comp_central`
   records the topmost drawable layer (`comp_readout`) and, after the draw, samples its source pixels
   under the cursor into the shared `last_hover_pos_img` / `last_sampled_val_a` (honors
-  `suppress_sampling` so it blanks during playback); `draw_status_bar` gains a comp row reusing
+  `suppress_sampling` so it blanks during playback — **the flag was deleted in #300**; the
+  suppression is now read straight from `playback.sampling_suppressed()` inside
+  `sample_comp_readout`, so do not re-add it from these notes); `draw_status_bar` gains a comp row reusing
   `draw_nuke_status_line`. Two pure helpers (`top_sample_source`, `comp_hover_pixel`) unit-tested.
 - **Copilot review fixes** `cad0a56` — (1) fold a display-stage salt into the comp-path `render_sig`
   so toggling OCIO on a static frame re-renders (was leaving a stale `display_view`); (2) cache the

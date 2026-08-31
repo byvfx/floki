@@ -9057,8 +9057,16 @@ impl ExrApp {
         // layer-stack path. Drawn before the composite so it sits above it.
         self.draw_comp_layer_bar(ui);
 
-        // Mirror the per-frame viewer state the slot-A path sets before `viewer.ui`,
-        // so the composite honors the same tone / OCIO / LUT settings.
+        // Per-frame app→viewer state, so the composite honours the current tone /
+        // OCIO / LUT settings. (It used to say it mirrored "the slot-A path"; that
+        // path was retired in #301 and this is now the only main-viewport writer.)
+        //
+        // **Sampling suppression is deliberately not here** (#300). INV-SAMPLE is
+        // enforced at the point of use: `sample_comp_readout` asks
+        // `playback.sampling_suppressed()` itself and skips the hover entirely. A
+        // mirrored `suppress_sampling` flag existed alongside it, was written here
+        // and on the sheet path, and was read by nothing — deleted rather than
+        // completed, so there is one place that decides and no copy to drift.
         self.viewer.enable_lut = self.enable_lut && self.lut_bg.is_some();
         self.viewer.lut_domain_min = self.lut_domain_min;
         self.viewer.lut_domain_max = self.lut_domain_max;
@@ -9415,13 +9423,14 @@ impl ExrApp {
             return false;
         };
 
-        // The per-frame app→viewer state the sheet's tone snapshot reads.
+        // The per-frame app→viewer state the sheet's tone snapshot reads. Sampling
+        // suppression is not mirrored here either — see the note in
+        // `draw_comp_central` (#300).
         self.viewer.enable_lut = self.enable_lut && self.lut_bg.is_some();
         self.viewer.lut_domain_min = self.lut_domain_min;
         self.viewer.lut_domain_max = self.lut_domain_max;
         self.viewer.ocio_active = self.ocio_enabled && self.ocio_ready;
         self.viewer.ocio_render_gen = self.ocio_render_gen;
-        self.viewer.suppress_sampling = self.playback.sampling_suppressed();
 
         self.viewer.invalidate_thumbnails_on_ocio_change();
         self.viewer.drain_thumb_frees(self.gpu_resources.as_ref());
