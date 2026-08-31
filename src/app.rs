@@ -5109,12 +5109,19 @@ impl eframe::App for ExrApp {
     fn on_exit(&mut self) {
         log::info!(
             target: "floki::playback",
-            "evt=shutdown stage=begin t1={} t1_bytes={} sources={} gpu={}",
+            "evt=shutdown stage=begin t1={} t1_bytes={} sources={} gpu={} uploads={}",
             self.frame_cache.len(),
             self.frame_cache.bytes(),
             self.comp_sources.len(),
             u8::from(self.gpu_resources.is_some()),
+            self.tex_uploader.as_ref().map_or(0, |u| u.inflight_len()),
         );
+        // **Workers first.** Dropping the handle closes the job channel, which ends
+        // every upload worker's `recv` loop (#202) — so no new texture build can
+        // start while the rest of this runs. Releasing textures underneath a pool
+        // still picking up work is the ordering this hook exists to avoid.
+        self.tex_uploader = None;
+        log::info!(target: "floki::playback", "evt=shutdown stage=uploaders_stopped");
         // The largest structure by far: up to the whole T1 budget in `ExrData`,
         // measured at 12.6 GB across 200 frames on the footage #206 was seen with.
         self.frame_cache.clear();
@@ -5122,6 +5129,13 @@ impl eframe::App for ExrApp {
         // Each holds a wgpu texture plus its decoded pixels.
         self.comp_sources.clear();
         log::info!(target: "floki::playback", "evt=shutdown stage=sources_cleared");
+        // The 3D LUT's texture + bind group, the last app-owned GPU handles
+        // outside `gpu_resources`.
+        self.lut_bg = None;
+        self.lut_texture = None;
+        log::info!(target: "floki::playback", "evt=shutdown stage=lut_released");
+        // The device and its pipelines last: everything above holds handles onto
+        // it, so it has to outlive them.
         self.gpu_resources = None;
         log::info!(target: "floki::playback", "evt=shutdown stage=gpu_released");
     }
