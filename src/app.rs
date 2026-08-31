@@ -9410,6 +9410,39 @@ impl ExrApp {
     /// Owns the per-frame thumbnail housekeeping that `ExrViewer::ui` used to run:
     /// `sync_texture_caches` (which sizes the caches the sheet indexes **unguarded**),
     /// the deferred GPU-id drain, and the OCIO-change invalidation.
+    /// The pixels the contact sheet bakes from for `source` (#240): the frame
+    /// actually on screen when that is a **full** decode, else the open-time
+    /// `exr_data`.
+    ///
+    /// `cs.exr_data` is written once by `add_comp_source` and never replaced —
+    /// deliberately, because `full_layer_table` (#217) needs a layer table it can
+    /// trust, and a cheap decode's table would claim one layer per part about every
+    /// file. That pinning is load-bearing there; it is just the wrong source for a
+    /// sheet that should follow the playhead, which is what left the sheet frozen on
+    /// the open-time frame forever.
+    ///
+    /// **Only a full decode substitutes.** A proxy or beauty-only frame carries a
+    /// single logical layer, and the sheet's grid is sized from
+    /// `logical_layers.len()` — so swapping one in would collapse a 40-AOV sheet to
+    /// one cell. While the clock moves, cheap frames are what is resident, so the
+    /// sheet keeps showing the open-time decode exactly as before. On settle,
+    /// `settle_to_full` re-decodes the playhead at full fidelity and
+    /// `invalidate_active_thumbnails` (reachable on the comp path since #239)
+    /// re-bakes from it — also the only affordable refresh point, since #144 exists
+    /// because re-baking every layer per frame swap is not.
+    ///
+    /// Split from `draw_comp_contact_sheet` so the choice is testable: the sheet
+    /// itself needs an `egui::Ui` and bakes into `TextureHandle`s that cannot exist
+    /// without a device, but which `ExrData` it *should* bake is plain state.
+    fn sheet_source_data(&self, source: crate::layer::SourceId) -> Option<std::sync::Arc<ExrData>> {
+        let cs = self.comp_sources.get(&source)?;
+        let shown = cs
+            .cur_frame
+            .and_then(|f| self.frame_cache.peek(source, f))
+            .filter(|a| !a.proxy && !a.beauty_only && a.only_layer.is_none());
+        Some(shown.unwrap_or_else(|| cs.exr_data.clone()))
+    }
+
     fn draw_comp_contact_sheet(&mut self, ui: &mut egui::Ui) -> bool {
         let Some(layer_id) = self.active_comp_layer() else {
             return false;
@@ -9419,7 +9452,7 @@ impl ExrApp {
         else {
             return false;
         };
-        let Some(exr) = self.comp_sources.get(&source).map(|cs| cs.exr_data.clone()) else {
+        let Some(exr) = self.sheet_source_data(source) else {
             return false;
         };
 
@@ -12851,6 +12884,54 @@ mod tests {
                 cur_frame: None,
                 cur_full: false,
             },
+        );
+    }
+
+    #[test]
+    fn the_contact_sheet_bakes_the_shown_frame_once_it_is_full() {
+        // #240: the sheet baked from `CompSource::exr_data`, which
+        // `add_comp_source` writes once and never replaces — so it showed the
+        // open-time frame forever, "frozen after pause". That pinning is
+        // load-bearing for `full_layer_table` (#217), so the fix is to leave
+        // `exr_data` alone and pick a different source for the *pixels*.
+        let dir = tempfile::tempdir().unwrap();
+        let (open, played) = (dir.path().join("open.exr"), dir.path().join("played.exr"));
+        write_sized_exr(&open, 8, 8);
+        write_sized_exr(&played, 16, 16); // a different frame, distinguishable by size
+        let s = crate::layer::SourceId(COMP_SOURCE_BASE);
+
+        let mut app = ExrApp::default();
+        seed_comp_source_from(&mut app, s, &open);
+        let open_size = app.comp_sources.get(&s).unwrap().exr_data.logical_size(0);
+
+        // Nothing bound yet ⇒ the open-time decode, as before.
+        assert_eq!(
+            app.sheet_source_data(s).unwrap().logical_size(0),
+            open_size,
+            "no bound frame ⇒ the open-time decode"
+        );
+
+        // A *cheap* frame is bound: it carries one logical layer, and the sheet's
+        // grid is sized from `logical_layers.len()`, so substituting it would
+        // collapse a 40-AOV sheet to a single cell. It must not be used.
+        let mut cheap = ExrData::load(&played).unwrap();
+        cheap.beauty_only = true;
+        app.frame_cache.insert(s, 7, std::sync::Arc::new(cheap));
+        app.comp_sources.get_mut(&s).unwrap().cur_frame = Some(7);
+        assert_eq!(
+            app.sheet_source_data(s).unwrap().logical_size(0),
+            open_size,
+            "a beauty-only frame must not become the sheet's source"
+        );
+
+        // The settle upgrade replaces it with a full decode at the same key —
+        // now the sheet follows the playhead.
+        app.frame_cache
+            .insert(s, 7, std::sync::Arc::new(ExrData::load(&played).unwrap()));
+        assert_eq!(
+            app.sheet_source_data(s).unwrap().logical_size(0),
+            Some((16, 16)),
+            "a full decode at the bound frame is what the sheet bakes"
         );
     }
 
