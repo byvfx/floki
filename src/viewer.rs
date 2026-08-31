@@ -3138,6 +3138,8 @@ impl ExrViewer {
             accumulate: true,
             // OCIO off → the display stage is the sRGB display-encode pass (R2).
             use_display_encode: !self.ocio_active,
+            // ...and whether that stage encodes or copies is the sRGB toggle (#343).
+            display_srgb: self.srgb,
             overlay_draws,
             display_format: render_state.target_format,
             blit_uniforms,

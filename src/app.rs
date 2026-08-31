@@ -8151,7 +8151,19 @@ impl ExrApp {
                 self.viewer.reset_exposure();
                 self.viewer.reset_gamma();
             }
-            if ui.checkbox(&mut self.viewer.srgb, "sRGB").changed() {
+            // With OCIO live the display transform owns the encode, so the toggle has
+            // nothing to act on (#343). Disabled rather than left inert: a control that
+            // silently does nothing is how this went unnoticed in the first place.
+            let ocio_owns_encode = self.viewer.ocio_active;
+            let srgb_box = ui
+                .add_enabled(
+                    !ocio_owns_encode,
+                    egui::Checkbox::new(&mut self.viewer.srgb, "sRGB"),
+                )
+                .on_disabled_hover_text(
+                    "OCIO is active - its display transform applies the encode",
+                );
+            if srgb_box.changed() {
                 self.viewer.invalidate_tone();
             }
             ui.separator();
