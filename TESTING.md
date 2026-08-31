@@ -23,10 +23,16 @@ can't provide one, so a GPU-less CI job still goes green; see
 ## Running the tests
 
 ```bash
-cargo test                 # all tests (debug)
-cargo fmt --all -- --check # formatting gate
-cargo clippy --all-targets -- -D warnings  # lint gate (warnings are errors)
+cargo fmt --all -- --check
+cargo clippy --all-targets --no-default-features -- -D warnings
+cargo test --all-targets --no-default-features
 ```
+
+`--no-default-features` selects the pure-Rust OCIO stub. It is not optional if you
+want to reproduce CI: the runner has no OpenColorIO installed, so that is the
+feature set CI lints and tests. Dropping the flag locally checks something the
+gate never does — and, without an OCIO install, fails to build at all. (See the
+build tiers in [README](README.md#color-management-opencolorio).)
 
 CI runs all three in a `Test & Lint` job that **gates** the build/release matrix
 (see `.github/workflows/build.yml`). Every pull request that touches code runs it,
