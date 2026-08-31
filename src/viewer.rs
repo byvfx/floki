@@ -725,7 +725,7 @@ enum GradientTarget {
 /// process at submit (Metal tolerated it; Vulkan does not). The `BindGroup` is
 /// shared (`Arc`) with the active-layer slot while displayed.
 ///
-/// Was `LayerTexture`, named for the pre-upload ring that produced it; the ring was
+/// Was `T2Texture`, named for the pre-upload ring that produced it; the ring was
 /// retired in #299 and this is now simply what [`ExrViewer::build_layer_texture`]
 /// hands back, on the upload worker or the UI thread alike.
 struct LayerTexture {
@@ -3152,8 +3152,9 @@ impl ExrViewer {
     }
 
     /// Build a GPU texture + bind group for one layer of an `ExrData`, returning
-    /// the [`LayerTexture`] (which keeps the `Texture` handle so it can be explicitly
-    /// destroyed on eviction). The shader applies channel isolation, exposure,
+    /// the [`LayerTexture`] (which owns the `Texture` handle so the VRAM is released
+    /// when it drops — see the type docs for why eviction is drop-only rather than an
+    /// explicit `Texture::destroy()`). The shader applies channel isolation, exposure,
     /// gamma, sRGB and every arrangement, so this one generator serves them all.
     ///
     /// **Not UI-thread bound.** It takes a [`crate::gpu::TexBuildCtx`] rather than
