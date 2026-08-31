@@ -25,9 +25,10 @@ impl From<ThemeChoice> for egui::ThemePreference {
 }
 
 /// Result of an off-thread EXR decode, delivered back to the UI thread by
-/// [`ExrApp::open_file`]'s worker and applied in [`ExrApp::apply_load_result`].
-/// A stale result from a superseded request is discarded, keyed on `epoch` (#57);
-/// every decode floki submits is a seq-frame.
+/// [`ExrApp::ensure_worker`]'s thread and applied in [`ExrApp::apply_load_result`].
+/// A stale result from a superseded request is discarded, keyed on `epoch` (#57):
+/// in production every decode is a seq-frame, so it is the only key needed. Tests
+/// reach [`ExrApp::submit_job`] directly and may set `seq_frame` either way.
 /// How expensive a decode is, cheapest first: proxy < beauty-only < full (#233).
 ///
 /// A proxy carries `beauty_only` too (it is a downsampled beauty decode), so the
@@ -50,7 +51,7 @@ struct LoadResult {
     /// B-open vs A-open (path/generation supersession); for a **seq frame**
     /// (`seq_frame`) it is the cache source (locked-step A/B, #98).
     source: crate::layer::SourceId,
-    /// True for an image-sequence frame (#7): apply via `swap_image_data` to
+    /// True for an image-sequence frame (#7): apply via `swap_image_arc` to
     /// preserve the viewer session, rather than starting a fresh session.
     seq_frame: bool,
     /// Playback frame number (meaningful only when `seq_frame`); the cache key.
@@ -1129,7 +1130,7 @@ pub struct ExrApp {
     conversion_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 
     // Async image loading: a single dedicated worker thread processes load
-    // requests one at a time (see `open_file`). Using one worker instead of
+    // requests one at a time (see `ensure_worker`). Using one worker instead of
     // spawning a thread per file prevents multiple parallel EXR parses from
     // exhausting memory on large files — each parse can be GBs of working set.
     #[serde(skip)]
@@ -1720,10 +1721,11 @@ impl ExrApp {
     /// Arm slot-A sequence playback from `path` — **test fixture only** (#99
     /// Slice 3h.2). Production arms the transport through `add_comp_source`, which
     /// uses `sequence::detect_from_file` + `playback.enter` directly; this survived
-    /// its production caller (`open_file`) because ~45 playback tests use it to set
-    /// up a sequence before exercising advance / loop / scrub / cache / pump — all
-    /// of which are live. Rewriting those onto `add_comp_source` is a test-refactor
-    /// worth doing separately, not deletion fallout.
+    /// its production caller (`open_file`, since removed) because ~45 playback
+    /// tests use it to set up a sequence before exercising advance / loop / scrub
+    /// / cache / pump — all of which are live. Rewriting those onto
+    /// `add_comp_source` is a test-refactor worth doing separately, not deletion
+    /// fallout.
     /// Drops the frame cache — it is keyed by frame number, which a different
     /// sequence reuses.
     #[cfg(test)]
@@ -4507,11 +4509,11 @@ impl ExrApp {
         // Nothing follows: every decode is a sequence frame. The explicit-open
         // branch that used to live here — and the #109 open-generation
         // supersession guarding it — went with the slot-A data path in #277,
-        // unreachable because the one `submit_job` call site hardcodes
-        // `seq_frame: true`.
+        // unreachable because `submit_seq`, its sole production caller,
+        // hardcodes `seq_frame: true`.
     }
 
-    /// As [`Self::swap_image_data`], but takes an already-`Arc`'d image so a
+    /// As [`Self::swap_image_arc`], but takes an already-`Arc`'d image so a
     /// playback cache hit (#56) can show a resident frame without cloning its
     /// pixel buffers — the same `Arc` is held by the T1 ring and the active slot.
     fn swap_image_arc(&mut self, data: std::sync::Arc<ExrData>) {
