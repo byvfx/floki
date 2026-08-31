@@ -25,10 +25,10 @@ impl From<ThemeChoice> for egui::ThemePreference {
 }
 
 /// Result of an off-thread EXR decode, delivered back to the UI thread by
-/// [`ExrApp::open_file`]'s worker and applied in [`ExrApp::apply_load_result`].
-/// A stale result from a superseded request is discarded; which field is the
-/// supersession key depends on the request kind: a **seq-frame** by `epoch`
-/// (#57) and an explicit open by `open_gen` (#109).
+/// [`ExrApp::ensure_worker`]'s thread and applied in [`ExrApp::apply_load_result`].
+/// A stale result from a superseded request is discarded, keyed on `epoch` (#57):
+/// in production every decode is a seq-frame, so it is the only key needed. Tests
+/// reach [`ExrApp::submit_job`] directly and may set `seq_frame` either way.
 /// How expensive a decode is, cheapest first: proxy < beauty-only < full (#233).
 ///
 /// A proxy carries `beauty_only` too (it is a downsampled beauty decode), so the
@@ -51,19 +51,13 @@ struct LoadResult {
     /// B-open vs A-open (path/generation supersession); for a **seq frame**
     /// (`seq_frame`) it is the cache source (locked-step A/B, #98).
     source: crate::layer::SourceId,
-    /// True for an image-sequence frame (#7): apply via `swap_image_data` to
+    /// True for an image-sequence frame (#7): apply via `swap_image_arc` to
     /// preserve the viewer session, rather than starting a fresh session.
     seq_frame: bool,
     /// Playback frame number (meaningful only when `seq_frame`); the cache key.
     frame: u32,
     /// Supersession epoch at issue time (#57).
     epoch: u64,
-    /// Slot-A explicit-open generation at issue time (#109). Supersedes by a
-    /// *later open*, independent of `loaded_file` — which playback churns to the
-    /// current frame's path (`request_sequence_frame`), so it can't be the
-    /// supersession key for the open. Unused for seq-frames (epoch-keyed) and B
-    /// (its `b.loaded_file` is stable, still path-keyed).
-    open_gen: u64,
     /// The worker returned a decode **dearer than this job asked for** (#233):
     /// a cheap decode's `or_else` fallback fired, most consequentially all the way
     /// to a full all-parts `load`.
@@ -475,8 +469,6 @@ struct LoadJob {
     /// Supersession epoch at issue time (#57); the result is dropped if it no
     /// longer matches `Playback::epoch` on arrival.
     epoch: u64,
-    /// Slot-A explicit-open generation at issue time (#109); see [`LoadResult`].
-    open_gen: u64,
     /// Decode beauty-only (a single layer) rather than all AOVs (#56, hardening
     /// step 3). Set for playback prefetch while the clock advances; cleared for
     /// explicit opens and the full re-decode on settle. See [`ExrData::load_beauty`].
@@ -601,12 +593,6 @@ enum ResetScope {
 pub struct ExrApp {
     #[serde(skip)]
     loaded_file: Option<PathBuf>,
-    /// Monotonic slot-A explicit-open generation (#109). Bumped on every slot-A
-    /// `open_file` and on unload; a load result whose `open_gen` no longer matches
-    /// was superseded by a later open. Decouples open-supersession from
-    /// `loaded_file` (which playback rewrites to the current frame's path).
-    #[serde(skip)]
-    open_gen_a: u64,
     // `Arc` so a decoded frame can be the active image (tier T3) and stay
     // resident in the playback ring cache (tier T1) at once, without cloning the
     // (often 600 MB+) pixel buffers. See docs/playback/memory-contract.md.
@@ -1144,7 +1130,7 @@ pub struct ExrApp {
     conversion_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 
     // Async image loading: a single dedicated worker thread processes load
-    // requests one at a time (see `open_file`). Using one worker instead of
+    // requests one at a time (see `ensure_worker`). Using one worker instead of
     // spawning a thread per file prevents multiple parallel EXR parses from
     // exhausting memory on large files — each parse can be GBs of working set.
     #[serde(skip)]
@@ -1181,7 +1167,6 @@ impl Default for ExrApp {
     fn default() -> Self {
         Self {
             loaded_file: None,
-            open_gen_a: 0,
             exr_data: None,
             error_msg: None,
             pending_reset: None,
@@ -1736,10 +1721,11 @@ impl ExrApp {
     /// Arm slot-A sequence playback from `path` — **test fixture only** (#99
     /// Slice 3h.2). Production arms the transport through `add_comp_source`, which
     /// uses `sequence::detect_from_file` + `playback.enter` directly; this survived
-    /// its production caller (`open_file`) because ~45 playback tests use it to set
-    /// up a sequence before exercising advance / loop / scrub / cache / pump — all
-    /// of which are live. Rewriting those onto `add_comp_source` is a test-refactor
-    /// worth doing separately, not deletion fallout.
+    /// its production caller (`open_file`, since removed) because ~45 playback
+    /// tests use it to set up a sequence before exercising advance / loop / scrub
+    /// / cache / pump — all of which are live. Rewriting those onto
+    /// `add_comp_source` is a test-refactor worth doing separately, not deletion
+    /// fallout.
     /// Drops the frame cache — it is keyed by frame number, which a different
     /// sequence reuses.
     #[cfg(test)]
@@ -2077,7 +2063,6 @@ impl ExrApp {
                         seq_frame: job.seq_frame,
                         frame: job.frame,
                         epoch: job.epoch,
-                        open_gen: job.open_gen,
                         fell_back,
                         result,
                     })));
@@ -3434,8 +3419,6 @@ impl ExrApp {
             seq_frame: true,
             frame: w,
             epoch: self.playback.epoch,
-            // Seq-frames supersede by epoch, not open generation.
-            open_gen: 0,
             beauty_only,
             proxy_target,
             aov_layer,
@@ -4522,50 +4505,15 @@ impl ExrApp {
             }
             // The worker just freed up — submit the next wanted frame.
             self.pump_decode();
-            return;
         }
-
-        // Supersession for an explicit open. The primary slot is
-        // **generation**-keyed (#109): `loaded_file` is rewritten to the current
-        // frame's path during playback, so a path check could drop a still-current
-        // open's result — and dropping it here returns before clearing `loading_a`,
-        // permanently gating `pump_decode`. The generation is bumped only by a
-        // later open or an unload.
-        if res.open_gen != self.open_gen_a {
-            return;
-        }
-        self.loading_a = false;
-
-        match res.result {
-            Ok(data) => {
-                {
-                    // The full decode is this image's first paint — reset the
-                    // viewer so it fits the new image.
-                    self.exr_data = Some(std::sync::Arc::new(data));
-                    self.reset_viewer_session();
-                    // If this open started a sequence, seed the T1 ring with the
-                    // opened frame so a scrub-back to it is an instant hit (#56).
-                    if self.playback.is_active()
-                        && let Some(arc) = &self.exr_data
-                    {
-                        self.frame_bytes.get_or_insert_with(|| arc.approx_bytes());
-                        self.frame_cache.insert(
-                            Self::A_SOURCE,
-                            self.playback.current_frame,
-                            arc.clone(),
-                        );
-                    }
-                }
-                self.error_msg = None;
-            }
-            Err(e) => {
-                self.exr_data = None;
-                self.error_msg = Some(e);
-            }
-        }
+        // Nothing follows: every decode is a sequence frame. The explicit-open
+        // branch that used to live here — and the #109 open-generation
+        // supersession guarding it — went with the slot-A data path in #277,
+        // unreachable because `submit_seq`, its sole production caller,
+        // hardcodes `seq_frame: true`.
     }
 
-    /// As [`Self::swap_image_data`], but takes an already-`Arc`'d image so a
+    /// As [`Self::swap_image_arc`], but takes an already-`Arc`'d image so a
     /// playback cache hit (#56) can show a resident frame without cloning its
     /// pixel buffers — the same `Arc` is held by the T1 ring and the active slot.
     fn swap_image_arc(&mut self, data: std::sync::Arc<ExrData>) {
@@ -4615,23 +4563,6 @@ impl ExrApp {
             self.viewer.last_hover_pos_img = None;
         }
         self.error_msg = None;
-    }
-
-    /// Reset the entire viewer to defaults - the "new session" path for an
-    /// explicit open / new sequence. Drops zoom, pan, compare mode, channel
-    /// mode, annotations, swatches, and tone/OCIO/LUT view state. The caller is
-    /// responsible for clearing the image slots (e.g. dropping B when A
-    /// changes). Contrast [`Self::swap_image_data`], which replaces pixels while
-    /// preserving session state for per-frame playback (#7).
-    ///
-    /// Persisted display prefs (diff controls, custom gradients, background +
-    /// presets) are single-owned by the viewer now (#151), so carry them across
-    /// the reset — opening a new image must not wipe the user's background or
-    /// gradient settings (previously the app re-pushed them each frame).
-    fn reset_viewer_session(&mut self) {
-        let prefs = std::mem::take(&mut self.viewer.prefs);
-        self.viewer = ExrViewer::default();
-        self.viewer.prefs = prefs;
     }
 
     /// Reset persisted state to defaults (#248) — the escape hatch from a setting
@@ -4698,21 +4629,12 @@ impl ExrApp {
         // ring of frames stay resident, so a "reset everything" leaves the transport
         // gone, the picture still up, and hundreds of MB still held.
         //
-        // In-flight decodes are superseded by **epoch** (#57), not by `open_gen_a`.
-        // Every job floki actually submits is a seq-frame (`submit_seq` is the sole
-        // production caller of `submit_job`), and seq-frame results are matched on
-        // `res.epoch` and returned before the `open_gen` guard is ever reached — so
-        // that guard, and this bump, are inert. Kept as belt-and-braces for the day
-        // an explicit-open job exists again; see #277, which is about whether the
-        // whole mechanism should live or go.
-        //
         // The epoch is therefore the one that matters, and it needs care: replacing
         // `playback` below resets it to 0, and a job issued at epoch 0 and still in
         // flight would match 0 again and be applied *after* the reset, re-populating
         // what was just cleared. So the counter is carried across and bumped rather
         // than restarted — supersession has to be monotonic to mean anything.
         let next_epoch = self.playback.epoch.wrapping_add(1);
-        self.open_gen_a = self.open_gen_a.wrapping_add(1);
         self.exr_data = None;
         self.loaded_file = None;
         self.loading_a = false;
@@ -6094,157 +6016,133 @@ impl ExrApp {
             }
 
             ui.vertical(|ui| {
-                let draw_nuke_status_line =
-                    |ui: &mut egui::Ui,
-                     prefix: &str,
-                     data: Option<&ExrData>,
-                     hover_pos: Option<(usize, usize)>,
-                     val: Option<[f32; 4]>,
-                     physical_index: usize,
-                     layer_name: &str| {
-                        if let Some(d) = data {
-                            // Scroll each row horizontally on its own. Wrapping the whole
-                            // vertical stack in one ScrollArea hides the stacked row
-                            // height from the auto-sizing bottom panel, collapsing it.
-                            egui::ScrollArea::horizontal()
-                                .id_salt(prefix)
-                                .show(ui, |ui| {
-                                    ui.horizontal(|ui| {
-                                        let disp_w = d.image.attributes.display_window.size.x();
-                                        let disp_h = d.image.attributes.display_window.size.y();
+                let draw_status_line = |ui: &mut egui::Ui,
+                                        prefix: &str,
+                                        data: Option<&ExrData>,
+                                        hover_pos: Option<(usize, usize)>,
+                                        val: Option<[f32; 4]>,
+                                        physical_index: usize,
+                                        layer_name: &str| {
+                    if let Some(d) = data {
+                        // Scroll each row horizontally on its own. Wrapping the whole
+                        // vertical stack in one ScrollArea hides the stacked row
+                        // height from the auto-sizing bottom panel, collapsing it.
+                        egui::ScrollArea::horizontal()
+                            .id_salt(prefix)
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    let disp_w = d.image.attributes.display_window.size.x();
+                                    let disp_h = d.image.attributes.display_window.size.y();
 
-                                        let channels_str = &d.channels_str;
+                                    let channels_str = &d.channels_str;
 
-                                        if let Some(layer) = d.image.layer_data.get(physical_index)
-                                        {
-                                            let data_window_min = layer.attributes.layer_position;
-                                            let data_w = layer.size.0;
-                                            let data_h = layer.size.1;
+                                    if let Some(layer) = d.image.layer_data.get(physical_index) {
+                                        let data_window_min = layer.attributes.layer_position;
+                                        let data_w = layer.size.0;
+                                        let data_h = layer.size.1;
 
-                                            ui.label(
-                                                egui::RichText::new(format!(
-                                                    "{}: {}x{} bbox: {} {} {} {} channels: {}",
-                                                    prefix,
-                                                    disp_w,
-                                                    disp_h,
-                                                    data_window_min.x(),
-                                                    data_window_min.y(),
-                                                    data_w,
-                                                    data_h,
-                                                    channels_str
-                                                ))
-                                                .color(egui::Color32::DARK_GRAY),
-                                            );
-                                        }
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "{}: {}x{} bbox: {} {} {} {} channels: {}",
+                                                prefix,
+                                                disp_w,
+                                                disp_h,
+                                                data_window_min.x(),
+                                                data_window_min.y(),
+                                                data_w,
+                                                data_h,
+                                                channels_str
+                                            ))
+                                            .color(egui::Color32::DARK_GRAY),
+                                        );
+                                    }
 
-                                        ui.add_space(10.0);
+                                    ui.add_space(10.0);
 
-                                        if let (Some((x, y)), Some(v)) = (hover_pos, val) {
-                                            ui.label(
-                                                egui::RichText::new(format!(
-                                                    "x={x} y={y} {layer_name}"
-                                                ))
-                                                .strong()
-                                                .color(egui::Color32::WHITE),
-                                            );
-                                            ui.spacing_mut().item_spacing.x = 4.0;
-                                            ui.label(
-                                                egui::RichText::new(format!("{:.5}", v[0]))
-                                                    .color(egui::Color32::from_rgb(255, 80, 80)),
-                                            );
-                                            ui.label(
-                                                egui::RichText::new(format!("{:.5}", v[1]))
-                                                    .color(egui::Color32::from_rgb(80, 255, 80)),
-                                            );
-                                            ui.label(
-                                                egui::RichText::new(format!("{:.5}", v[2]))
-                                                    .color(egui::Color32::from_rgb(100, 150, 255)),
-                                            );
-                                            ui.label(
-                                                egui::RichText::new(format!("{:.5}", v[3]))
-                                                    .color(egui::Color32::LIGHT_GRAY),
-                                            );
-
-                                            // Swatch
-                                            let (r, g, b) = (
-                                                (v[0].clamp(0.0, 1.0) * 255.0) as u8,
-                                                (v[1].clamp(0.0, 1.0) * 255.0) as u8,
-                                                (v[2].clamp(0.0, 1.0) * 255.0) as u8,
-                                            );
-                                            let (rect, _response) = ui.allocate_exact_size(
-                                                egui::vec2(20.0, 14.0),
-                                                egui::Sense::hover(),
-                                            );
-                                            ui.painter().rect_filled(
-                                                rect,
-                                                0.0,
-                                                egui::Color32::from_rgb(r, g, b),
-                                            );
-
-                                            // HSVL
-                                            ui.add_space(10.0);
-                                            let max = v[0].max(v[1]).max(v[2]);
-                                            let min = v[0].min(v[1]).min(v[2]);
-                                            let delta = max - min;
-                                            let mut h = 0.0;
-                                            if delta > 0.0 {
-                                                if max == v[0] {
-                                                    h = 60.0 * (((v[1] - v[2]) / delta) % 6.0);
-                                                } else if max == v[1] {
-                                                    h = 60.0 * (((v[2] - v[0]) / delta) + 2.0);
-                                                } else if max == v[2] {
-                                                    h = 60.0 * (((v[0] - v[1]) / delta) + 4.0);
-                                                }
-                                            }
-                                            if h < 0.0 {
-                                                h += 360.0;
-                                            }
-                                            let s = if max > 0.0 { delta / max } else { 0.0 };
-                                            let val_v = max;
-                                            let l = 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2];
-
-                                            ui.label(
-                                                egui::RichText::new(format!(
-                                                    "H:{h:.0} S:{s:.2} V:{val_v:.2} L:{l:.5}"
-                                                ))
+                                    if let (Some((x, y)), Some(v)) = (hover_pos, val) {
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "x={x} y={y} {layer_name}"
+                                            ))
+                                            .strong()
+                                            .color(egui::Color32::WHITE),
+                                        );
+                                        ui.spacing_mut().item_spacing.x = 4.0;
+                                        ui.label(
+                                            egui::RichText::new(format!("{:.5}", v[0]))
+                                                .color(egui::Color32::from_rgb(255, 80, 80)),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(format!("{:.5}", v[1]))
+                                                .color(egui::Color32::from_rgb(80, 255, 80)),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(format!("{:.5}", v[2]))
+                                                .color(egui::Color32::from_rgb(100, 150, 255)),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(format!("{:.5}", v[3]))
                                                 .color(egui::Color32::LIGHT_GRAY),
-                                            );
-                                        } else {
-                                            ui.label(
-                                                egui::RichText::new(format!(
-                                                    "x=-- y=-- {layer_name}"
-                                                ))
-                                                .color(egui::Color32::DARK_GRAY),
-                                            );
+                                        );
+
+                                        // Swatch
+                                        let (r, g, b) = (
+                                            (v[0].clamp(0.0, 1.0) * 255.0) as u8,
+                                            (v[1].clamp(0.0, 1.0) * 255.0) as u8,
+                                            (v[2].clamp(0.0, 1.0) * 255.0) as u8,
+                                        );
+                                        let (rect, _response) = ui.allocate_exact_size(
+                                            egui::vec2(20.0, 14.0),
+                                            egui::Sense::hover(),
+                                        );
+                                        ui.painter().rect_filled(
+                                            rect,
+                                            0.0,
+                                            egui::Color32::from_rgb(r, g, b),
+                                        );
+
+                                        // HSVL
+                                        ui.add_space(10.0);
+                                        let max = v[0].max(v[1]).max(v[2]);
+                                        let min = v[0].min(v[1]).min(v[2]);
+                                        let delta = max - min;
+                                        let mut h = 0.0;
+                                        if delta > 0.0 {
+                                            if max == v[0] {
+                                                h = 60.0 * (((v[1] - v[2]) / delta) % 6.0);
+                                            } else if max == v[1] {
+                                                h = 60.0 * (((v[2] - v[0]) / delta) + 2.0);
+                                            } else if max == v[2] {
+                                                h = 60.0 * (((v[0] - v[1]) / delta) + 4.0);
+                                            }
                                         }
-                                    });
+                                        if h < 0.0 {
+                                            h += 360.0;
+                                        }
+                                        let s = if max > 0.0 { delta / max } else { 0.0 };
+                                        let val_v = max;
+                                        let l = 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2];
+
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "H:{h:.0} S:{s:.2} V:{val_v:.2} L:{l:.5}"
+                                            ))
+                                            .color(egui::Color32::LIGHT_GRAY),
+                                        );
+                                    } else {
+                                        ui.label(
+                                            egui::RichText::new(format!("x=-- y=-- {layer_name}"))
+                                                .color(egui::Color32::DARK_GRAY),
+                                        );
+                                    }
                                 });
-                        }
-                    };
+                            });
+                    }
+                };
 
-                // `logical_layer`, not `logical_layers.get` — during playback the
-                // live frame may be a per-AOV decode whose own table is renumbered
-                // (#217), and a raw index into it names the wrong pass.
-                let ll_a = self
-                    .exr_data
-                    .as_ref()
-                    .and_then(|d| d.logical_layer(self.viewer.active_layer));
-                let phys_idx_a = ll_a.map(|l| l.physical_index).unwrap_or(0);
-                let layer_name_a = ll_a.map(|l| l.name.as_str()).unwrap_or("");
-
-                draw_nuke_status_line(
-                    ui,
-                    "A",
-                    self.exr_data.as_deref(),
-                    self.viewer.last_hover_pos_img,
-                    self.viewer.last_sampled_val_a,
-                    phys_idx_a,
-                    layer_name_a,
-                );
-
-                // Comp-path readout (#99 R4): the topmost layer under the cursor.
-                // In comp mode `exr_data` is None, so the row above renders nothing
-                // and this is the sole readout row.
+                // The pixel readout: the topmost comp layer under the cursor
+                // (#99 R4). Sole readout row since #277 removed the slot-A twin,
+                // which drew nothing — `exr_data` was permanently `None`.
                 if let Some((src, aov)) = self.comp_readout
                     && let Some(cs) = self.comp_sources.get(&src)
                 {
@@ -6261,7 +6159,7 @@ impl ExrApp {
                         })
                         .map(|l| l.name.as_str())
                         .unwrap_or("Layer");
-                    draw_nuke_status_line(
+                    draw_status_line(
                         ui,
                         prefix,
                         Some(cs.exr_data.as_ref()),
@@ -7156,21 +7054,12 @@ impl ExrApp {
                             Option<crate::layer::LayerId>,
                         );
                         let mut files_to_show: Vec<InfoEntry> = vec![];
-                        if let (Some(path), Some(data)) = (&self.loaded_file, &self.exr_data) {
-                            files_to_show.push((
-                                "Image A".to_string(),
-                                path.file_name()
-                                    .unwrap_or_default()
-                                    .to_string_lossy()
-                                    .into_owned(),
-                                data.clone(),
-                                None,
-                            ));
-                        }
-                        // Comp / layer-stack path (#99 R4): `exr_data` is None, so show
-                        // the current layer's source metadata first (Nuke-style), then
-                        // the rest of the stack top→bottom.
-                        if files_to_show.is_empty() {
+                        // The current layer's source metadata first (Nuke-style),
+                        // then the rest of the stack top→bottom. The "Image A" entry
+                        // that used to precede this went with the slot-A data path in
+                        // #277 — `exr_data` was permanently `None`, so it never
+                        // rendered.
+                        {
                             let cur = self.active_comp_layer();
                             let ids: Vec<crate::layer::LayerId> = {
                                 let mut v: Vec<_> =
@@ -10058,7 +9947,6 @@ mod tests {
             seq_frame: true,
             frame,
             epoch: app.playback.epoch,
-            open_gen: 0,
             fell_back: false,
             result: Ok(data),
         });
@@ -10182,7 +10070,6 @@ mod tests {
                 seq_frame: true,
                 frame,
                 epoch: app.playback.epoch,
-                open_gen: 0,
                 fell_back: false,
                 result: Err("stub".to_string()),
             });
@@ -10300,7 +10187,6 @@ mod tests {
             seq_frame: true,
             frame,
             epoch: app.playback.epoch,
-            open_gen: 0,
             fell_back: false,
             result: Ok(data),
         });
@@ -10625,7 +10511,6 @@ mod tests {
             seq_frame: true,
             frame,
             epoch: app.playback.epoch,
-            open_gen: 0,
             fell_back,
             result: Ok(ExrData::load(path).unwrap()),
         });
@@ -10732,7 +10617,6 @@ mod tests {
             seq_frame: true,
             frame: 2,
             epoch: app.playback.epoch,
-            open_gen: 0,
             fell_back: true,
             result: Ok(data),
         });
@@ -11556,104 +11440,6 @@ mod tests {
     }
 
     #[test]
-    fn stale_load_result_is_ignored() {
-        // A result from an open the user has since superseded (a later open bumped
-        // the slot-A generation) must not clobber state or clear the in-flight flag
-        // for the current request (#109).
-        let mut app = ExrApp {
-            loaded_file: Some(PathBuf::from("current.exr")),
-            open_gen_a: 2, // a newer open is in flight
-            loading_a: true,
-            ..Default::default()
-        };
-
-        app.apply_load_result(LoadResult {
-            source: ExrApp::A_SOURCE,
-            seq_frame: false,
-            frame: 0,
-            epoch: 0,
-            open_gen: 1, // the older, superseded open
-            fell_back: false,
-            result: Err("boom".to_string()),
-        });
-
-        assert!(
-            app.error_msg.is_none(),
-            "stale result must not surface its error"
-        );
-        assert!(
-            app.loading_a,
-            "stale result must leave the current load in flight"
-        );
-    }
-
-    /// #109: opening a new EXR while the timeline plays must load it. Playback
-    /// rewrites `loaded_file` to the current frame's path
-    /// (`request_sequence_frame`), so superseding the explicit open by *path*
-    /// dropped its still-current result — and that drop returned before clearing
-    /// `loading_a`, permanently gating `pump_decode` ("doesn't load until you stop
-    /// and reopen"). The open is now superseded by **generation**, immune to the
-    /// `loaded_file` churn.
-    #[test]
-    fn open_result_applies_despite_loaded_file_churn_during_playback() {
-        let dir = tempfile::tempdir().unwrap();
-        let newf = dir.path().join("new.exr");
-        write_rgba_exr(&newf);
-        let data = ExrData::load(&newf).unwrap();
-
-        // An explicit open of `new.exr` is in flight at generation 5.
-        let mut app = ExrApp {
-            loaded_file: Some(newf.clone()),
-            open_gen_a: 5,
-            loading_a: true,
-            ..Default::default()
-        };
-        // Playback then rewrites `loaded_file` to the frame on screen — the churn
-        // that used to make the open's result look superseded.
-        app.loaded_file = Some(dir.path().join("seq.0007.exr"));
-
-        app.apply_load_result(LoadResult {
-            source: ExrApp::A_SOURCE,
-            seq_frame: false,
-            frame: 0,
-            epoch: 0,
-            open_gen: 5, // still the current open
-            fell_back: false,
-            result: Ok(data),
-        });
-
-        assert!(
-            app.exr_data.is_some(),
-            "the open is applied despite the loaded_file churn"
-        );
-        assert!(
-            !app.loading_a,
-            "loading flag cleared — pump_decode is not left gated"
-        );
-    }
-    #[test]
-    fn matching_error_result_surfaces_and_clears_loading() {
-        let mut app = ExrApp {
-            loaded_file: Some(PathBuf::from("current.exr")),
-            loading_a: true,
-            ..Default::default()
-        };
-
-        app.apply_load_result(LoadResult {
-            source: ExrApp::A_SOURCE,
-            seq_frame: false,
-            frame: 0,
-            epoch: 0,
-            open_gen: 0,
-            fell_back: false,
-            result: Err("bad exr".to_string()),
-        });
-
-        assert_eq!(app.error_msg.as_deref(), Some("bad exr"));
-        assert!(!app.loading_a, "matching result clears the loading flag");
-    }
-
-    #[test]
     fn swap_image_data_a_preserves_viewer_state() {
         // The per-frame playback path (#7): a new A frame lands but the user's
         // view (zoom, pan, exposure, channel mode, swatches, annotations) must be
@@ -11843,7 +11629,6 @@ mod tests {
         };
         app.frame_cache.insert(ExrApp::A_SOURCE, 1, data);
         assert!(app.frame_cache.bytes() > 0, "the fixture must be resident");
-        let gen_before = app.open_gen_a;
 
         app.reset_settings(ResetScope::Everything);
 
@@ -11853,10 +11638,6 @@ mod tests {
         assert_eq!(app.frame_cache.bytes(), 0, "its frames are released");
         assert_eq!(app.frame_bytes, None);
         assert!(app.playback.sequence.is_none(), "and the transport with it");
-        assert_ne!(
-            app.open_gen_a, gen_before,
-            "kept in step for the day an explicit-open job exists again (#277)"
-        );
     }
 
     /// The reset must not restart the supersession epoch.
@@ -11864,8 +11645,8 @@ mod tests {
     /// Every decode floki submits is a seq-frame, matched on `res.epoch` — so if the
     /// reset put the counter back to 0, a job issued at epoch 0 and still in flight
     /// would match again and be applied *after* the reset, re-populating exactly what
-    /// was cleared. `open_gen_a` cannot save it: seq-frame results return before that
-    /// guard is reached (#277).
+    /// was cleared. There is no second guard to fall back on:
+    /// the epoch is the only supersession key (#277).
     #[test]
     fn resetting_everything_advances_the_epoch_rather_than_restarting_it() {
         let mut app = ExrApp::default();
@@ -11935,52 +11716,6 @@ mod tests {
             "viewer.prefs is what persists; clearing only the bridge would not stick"
         );
         assert!((app.viewer.prefs.diff_floor - d.diff_floor).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn reset_viewer_session_clears_view_state() {
-        // The open/new-session path: the viewer is fully reset. The caller is
-        // responsible for the image slots (here we only exercise the viewer reset).
-        let mut app = ExrApp::default();
-        app.viewer.scale = 4.0;
-        app.viewer.translation = egui::Vec2::new(99.0, 99.0);
-        app.viewer.exposure = 2.0;
-        app.viewer.swatches.push([0.0; 4]);
-        app.viewer.annotations.push(crate::annotation::Annotation {
-            kind: crate::annotation::AnnotationKind::Rect {
-                a: [0.0, 0.0],
-                b: [1.0, 1.0],
-            },
-            color: egui::Color32::RED,
-            width: 1.0,
-        });
-        // #151: display prefs are viewer-owned now — a new-session reset must NOT
-        // wipe them (opening a new file shouldn't lose your background / gradients).
-        app.viewer.prefs.diff_floor = 0.2;
-        app.viewer.prefs.background.checker_size = 77.0;
-        app.viewer.prefs.custom_gradients.push((
-            "keep".into(),
-            crate::gradient::Colormap::default().gradient(),
-        ));
-
-        app.reset_viewer_session();
-
-        assert_eq!(app.viewer.scale, 1.0, "zoom reset");
-        assert_eq!(app.viewer.translation, egui::Vec2::ZERO, "pan reset");
-        assert_eq!(app.viewer.exposure, 0.0, "exposure reset");
-        assert!(app.viewer.swatches.is_empty(), "swatches cleared");
-        assert!(app.viewer.annotations.is_empty(), "annotations cleared");
-        // Prefs survive the reset.
-        assert_eq!(app.viewer.prefs.diff_floor, 0.2, "diff_floor preserved");
-        assert_eq!(
-            app.viewer.prefs.background.checker_size, 77.0,
-            "background preserved"
-        );
-        assert_eq!(
-            app.viewer.prefs.custom_gradients.len(),
-            1,
-            "custom gradients preserved"
-        );
     }
 
     #[test]
@@ -12691,7 +12426,6 @@ mod tests {
             seq_frame: true,
             frame: 3,
             epoch: app.playback.epoch,
-            open_gen: 0,
             fell_back: false,
             result: Err("truncated exr".to_string()),
         });
@@ -12732,7 +12466,6 @@ mod tests {
             seq_frame: true,
             frame: 2,
             epoch: app.playback.epoch,
-            open_gen: 0,
             fell_back: false,
             result: Ok(data2),
         });
@@ -14215,7 +13948,6 @@ mod tests {
             seq_frame: true,
             frame: 2,
             epoch: live_epoch.wrapping_sub(1),
-            open_gen: 0,
             fell_back: false,
             result: Ok(ExrData::load(&f1).unwrap()),
         });
@@ -14241,7 +13973,6 @@ mod tests {
             seq_frame: true,
             frame: 2,
             epoch: live_epoch,
-            open_gen: 0,
             fell_back: false,
             result: Ok(ExrData::load(&f1).unwrap()),
         });
@@ -14275,7 +14006,6 @@ mod tests {
             seq_frame: false,
             frame: 0,
             epoch: 0,
-            open_gen: app.open_gen_a,
             beauty_only: false,
             proxy_target: None,
             aov_layer: None,
@@ -14681,7 +14411,6 @@ mod tests {
             seq_frame: true,
             frame: 1,
             epoch: app.playback.epoch,
-            open_gen: 0,
             fell_back: false,
             result: Ok(full),
         });
@@ -14842,7 +14571,6 @@ mod tests {
             seq_frame: true,
             frame,
             epoch: app.playback.epoch,
-            open_gen: 0,
             fell_back: false,
             result: Ok(data),
         });
@@ -14902,7 +14630,6 @@ mod tests {
             seq_frame: true,
             frame: 2,
             epoch: stale_epoch,
-            open_gen: 0,
             fell_back: false,
             result: Ok(data2),
         });
