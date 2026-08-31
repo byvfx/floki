@@ -3,7 +3,7 @@
 //! Pure, side-effect-free helpers that turn a [`Sample`] of current memory usage
 //! plus a frame's dimensions / decoded size into how many frames may be held at
 //! each cache tier. The two budgets bind different tiers from different sources:
-//! VRAM bounds the T2 GPU-texture ring, system RAM bounds the T1 CPU-frame ring.
+//! System RAM bounds the T1 CPU-frame ring. (The T2 VRAM ring was retired in #299.)
 //!
 //! See `docs/playback/memory-contract.md` for the full contract. Callers
 //! recompute periodically (the live `Sample` shifts as textures and frames are
@@ -35,12 +35,6 @@ pub struct Sample {
     pub gpu_budget: Option<u64>,
 }
 
-/// Percent of the reported VRAM working-set budget the T2 ring may claim,
-/// leaving headroom for the rest of the app and allocator slop. Conservative;
-/// to be exposed in the tools window later. wgpu can *abort the process* on a
-/// GPU OOM, so we stay well under the reported budget proactively.
-pub const VRAM_HEADROOM_PCT: u64 = 80;
-
 /// Percent of *currently-free* system RAM the T1 ring may claim, leaving the
 /// rest as headroom for the OS, other apps, and floki's own non-cache memory.
 ///
@@ -52,51 +46,11 @@ pub const VRAM_HEADROOM_PCT: u64 = 80;
 /// degrades smoothly under external pressure instead of falling off a cliff.
 pub const RAM_FREE_PCT: u64 = 60;
 
-/// Conservative VRAM budget (bytes) assumed when the platform can't report a GPU
-/// working-set size (`Sample::gpu_budget == None` — non-Metal backends). 1 GiB
-/// keeps a handful of 4K textures resident without risking an OOM on unknown
-/// hardware. Playback still runs off-Metal; it just caps the texture ring lower.
-pub const FALLBACK_VRAM_BUDGET: u64 = 1 << 30;
-
-/// VRAM one T2 frame texture occupies: `Rgba32Float` is 16 bytes/pixel, active
-/// layer only.
-#[must_use]
-pub fn t2_frame_bytes(width: usize, height: usize) -> u64 {
-    // Saturating so a pathological/huge dimension can't wrap to a *small* size
-    // (which would over-allocate); an overflow becomes "too big to fit" -> 0 frames.
-    (width as u64)
-        .saturating_mul(height as u64)
-        .saturating_mul(16)
-}
-
 /// Apply an integer-percent headroom to a budget. Integer math keeps results
 /// deterministic (no float rounding surprises) and is exact for realistic
 /// memory sizes.
 fn with_headroom(total: u64, pct: u64) -> u64 {
     total.saturating_mul(pct) / 100
-}
-
-/// VRAM bytes the T2 ring(s) may claim: the headroomed working-set budget minus
-/// what is already allocated. Uses `Sample::gpu_budget` when available, else
-/// [`FALLBACK_VRAM_BUDGET`]. This is the pool the caller splits across the A and
-/// B rings in locked-step compare (#166) — compute it once, then slice it.
-#[must_use]
-pub fn vram_available(sample: &Sample) -> u64 {
-    let total = sample.gpu_budget.unwrap_or(FALLBACK_VRAM_BUDGET);
-    let used = sample.gpu_used.unwrap_or(0);
-    with_headroom(total, VRAM_HEADROOM_PCT).saturating_sub(used)
-}
-
-/// How many T2 textures of the given dimensions fit `available` VRAM bytes. One
-/// texture per frame, active layer only. Returns `0` for a degenerate frame size
-/// or when not even one fits (caller disables pre-upload and decodes on demand).
-#[must_use]
-pub fn frames_for(available: u64, width: usize, height: usize) -> usize {
-    let per_frame = t2_frame_bytes(width, height);
-    if per_frame == 0 {
-        return 0;
-    }
-    usize::try_from(available / per_frame).unwrap_or(usize::MAX)
 }
 
 /// The T1 **byte** budget: how many bytes the ring may hold (#232).
@@ -152,74 +106,6 @@ mod tests {
             gpu_used,
             gpu_budget,
         }
-    }
-
-    #[test]
-    fn t2_frame_bytes_is_16_per_pixel() {
-        assert_eq!(t2_frame_bytes(1920, 1080), 1920 * 1080 * 16);
-        // A 4K frame is ~126.5 MiB.
-        assert_eq!(t2_frame_bytes(3840, 2160), 132_710_400);
-        assert_eq!(t2_frame_bytes(0, 1080), 0);
-    }
-
-    #[test]
-    fn vram_available_divides_headroomed_budget_by_frame() {
-        // 2 GB budget, nothing used, 80% headroom = 1.6 GB; 1000x1000 = 16 MB.
-        let s = sample(0, 0, Some(2_000_000_000), Some(0));
-        assert_eq!(frames_for(vram_available(&s), 1000, 1000), 100);
-    }
-
-    #[test]
-    fn vram_available_subtracts_current_allocation() {
-        // 1.6 GB headroomed, 800 MB already allocated -> 800 MB free / 16 MB = 50.
-        let s = sample(0, 0, Some(2_000_000_000), Some(800_000_000));
-        assert_eq!(vram_available(&s), 800_000_000);
-        assert_eq!(frames_for(vram_available(&s), 1000, 1000), 50);
-    }
-
-    #[test]
-    fn vram_available_uses_fallback_budget_when_gpu_budget_unknown() {
-        // Off-Metal: gpu_budget None -> 1 GiB * 80% = 858_993_459; /16 MB = 53.
-        let s = sample(0, 0, None, None);
-        assert_eq!(vram_available(&s), 858_993_459);
-        assert_eq!(frames_for(vram_available(&s), 1000, 1000), 53);
-    }
-
-    #[test]
-    fn frames_for_zero_when_nothing_fits() {
-        // Budget fully consumed.
-        let s = sample(0, 0, Some(2_000_000_000), Some(2_000_000_000));
-        assert_eq!(vram_available(&s), 0);
-        assert_eq!(frames_for(vram_available(&s), 1000, 1000), 0);
-        // Degenerate frame size.
-        let s2 = sample(0, 0, Some(2_000_000_000), Some(0));
-        assert_eq!(frames_for(vram_available(&s2), 0, 1000), 0);
-    }
-
-    #[test]
-    fn frames_for_splits_evenly_across_equal_dims() {
-        // 1.6 GB available; 1000x1000 = 16 MB -> 100 frames whole, 50 each half.
-        let s = sample(0, 0, Some(2_000_000_000), Some(0));
-        let avail = vram_available(&s);
-        assert_eq!(frames_for(avail, 1000, 1000), 100);
-        assert_eq!(frames_for(avail / 2, 1000, 1000), 50);
-    }
-
-    #[test]
-    fn frames_for_gives_a_larger_slot_proportionally_fewer() {
-        // Same half-budget, B twice A's area -> B fits ~half as many as A.
-        let s = sample(0, 0, Some(2_000_000_000), Some(0));
-        let half = vram_available(&s) / 2;
-        let a = frames_for(half, 1000, 1000); // 16 MB/frame
-        let b = frames_for(half, 1000, 2000); // 32 MB/frame
-        assert_eq!(a, 50);
-        assert_eq!(b, 25);
-    }
-
-    #[test]
-    fn frames_for_zero_for_degenerate_or_empty_budget() {
-        assert_eq!(frames_for(1_000_000_000, 0, 1000), 0);
-        assert_eq!(frames_for(0, 1000, 1000), 0);
     }
 
     #[test]

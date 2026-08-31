@@ -22,6 +22,7 @@
 //! (`FrameCache::pick_victim`) protects the same behind window it fetches, so
 //! the two never fight over the last slots.
 
+#[cfg(test)]
 use std::collections::HashSet;
 
 use crate::playback::{Direction, LoopMode, advance};
@@ -40,6 +41,13 @@ pub fn read_behind(depth: usize) -> usize {
 /// (optional) playhead frame, then at most `read_behind` frames behind it (#169).
 // The playback cursor plus the two window sizes are independent inputs; see
 // `next_want` for the same trade-off.
+///
+/// **Test-only since #299.** Its last production caller was the T2 pre-upload
+/// pump, retired with the ring it fed. It stays as the reference implementation
+/// [`want_first_n`] is asserted against — that test is what pins the bounded
+/// walk to the same priority order and wrap behaviour — so deleting it would
+/// cost the guarantee without saving anything shipped.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 #[must_use]
 pub fn want_list(

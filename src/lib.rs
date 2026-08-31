@@ -21,9 +21,9 @@ pub use gpu::{AdapterSummary, REQUIRED_DEVICE_FEATURES, gpu_preflight_error};
 
 mod annotation;
 mod background;
-// Pure ring-cache budget math (#56): `t1_budget_bytes` sizes the T1 ring,
-// `frames_for(vram_available(..))` the T2 pre-upload ring — split across the A
-// and B rings in locked-step compare (#166; both live in `tick_budgets`).
+// Pure ring-cache budget math (#56): `t1_budget_bytes` sizes the T1 ring, and
+// `frames_in` is the only bytes-to-count conversion (#232). The VRAM half went
+// with the T2 pre-upload ring in #299.
 mod budget;
 // T1 ring cache for sequence playback (#56).
 mod cache;

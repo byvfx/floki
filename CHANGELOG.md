@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+- **The "GPU cache" setting is gone, and playback does less work without it.**
+  (#299) It pre-uploaded upcoming frames to GPU textures for smoother playback —
+  except the code that read those textures was deleted in an earlier refactor and
+  the code that built them was not. So every frame of playback built a full-size
+  GPU texture, on the UI thread, and filed it somewhere nothing could ever look:
+  a 4K build costs 20–60 ms of the time that should be drawing, and up to eight
+  frames of video memory (around 0.9 GB at 4.6K) sat occupied by textures no
+  frame could ever display. Turning the setting off was the faster choice, and
+  nobody could have known. Both halves are now removed rather than reconnected —
+  the mechanism that keeps texture uploads off the UI thread for every other
+  layer is the one worth having, and slot A joining it is tracked separately.
+
 ### Fixed
 - **Hiding the layer that drives playback no longer leaves the cache sized for
   it.** (#325) A hidden or un-soloed layer stops driving the clock, and playback

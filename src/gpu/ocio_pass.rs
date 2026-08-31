@@ -361,7 +361,7 @@ impl Drop for OcioTargets {
         // rebuild the OCIO pass after a callback was queued (or run a second
         // callback into the resize branch in one frame), switch this to
         // drop-only like T2 eviction — a destroy of an in-flight texture aborts
-        // the submit on Vulkan (see the note at viewer.rs `T2Texture`).
+        // the submit on Vulkan (see the note at viewer.rs `LayerTexture`).
         self._scene.destroy();
         self._scene_b.destroy();
         self._display.destroy();
