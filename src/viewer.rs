@@ -8,18 +8,25 @@
 //! requires a GPU and aborts without one):
 //! [`Self::build_layer_texture`](ExrViewer::build_layer_texture) uploads a
 //! layer's RGBA into a bind group; `gpu/shader.wgsl` then applies channel
-//! isolation, exposure, gamma, sRGB **and every compare mode** (wipe / diff /
-//! composite) in-shader, so a single generator serves all modes, cached per layer
-//! in `gpu_textures` / `gpu_textures_b`. Under OCIO the display chain is the
-//! two-pass OCIO callback ([`crate::gpu::ocio_pass`]) instead.
+//! isolation, exposure, gamma, sRGB **and every arrangement** (wipe / diff /
+//! composite) in-shader, so a single generator serves them all. Under OCIO the
+//! display chain is the two-pass OCIO callback ([`crate::gpu::ocio_pass`])
+//! instead.
+//!
+//! **Where a built texture lives.** One [`LayerTexture`] per source, held in
+//! `ExrApp::comp_sources` — not in the viewer. Followers build on the upload
+//! worker pool ([`crate::tex_upload`], #202) and are bound by
+//! `ExrApp::collect_comp_textures` when the workers finish; a still tracks AOV
+//! switches through `ExrApp::ensure_comp_aov`. There is no per-layer texture
+//! cache in `ExrViewer` any more: the `gpu_textures` vector it used to keep was
+//! written and never read, and went with the A/B viewport in #302.
 //!
 //! The only CPU bake that remains is [`Self::generate_texture`] for
 //! contact-sheet thumbnails — the **headless / no-GPU fallback** (used by tests
 //! and when no GPU is present). With a GPU, thumbnails render through
 //! [`crate::gpu::thumbnail`] (OCIO included). Thumbnail caches invalidate on a
-//! layer-count change, an OCIO-state change
-//! ([`ExrViewer::invalidate_thumbnails_on_ocio_change`]), and via
-//! [`ExrViewer::invalidate_reference_textures`] when B is replaced.
+//! layer-count change and on an OCIO-state change
+//! ([`ExrViewer::invalidate_thumbnails_on_ocio_change`]).
 
 use crate::annotation::{Annotation, AnnotationKind, AnnotationTool};
 use crate::exr_loader::ExrData;
@@ -129,7 +136,7 @@ pub(crate) mod tex_build_stats {
 /// except Side-by-Side draws B over A in the same rect, so the extent is just the
 /// A image; Side-by-Side lays A and B out horizontally (B height-normalized to A
 /// when enabled), so framing must fit their *combined* width or the second image
-/// spills off-screen. Mirrors the SBS layout in [`ExrViewer::emit_mode_draws`],
+/// spills off-screen. Mirrors the SBS layout in [`ExrViewer::draw_comp_composite`],
 /// measured in unscaled space (the `scale` cancels out of the fit ratio).
 ///
 /// Takes `side_by_side` as a plain bool rather than a compare enum so the comp path
@@ -741,7 +748,7 @@ struct LayerTexture {
 /// persistent ring buffer, LUT/default bind groups, and the interior-mutable
 /// per-frame accumulators (`uniform_offset` ring allocator, `overscan_factor`,
 /// `ocio_sig`, `ocio_draws`). It replaces the old `draw_gpu` closure + its loose
-/// `Cell`/`RefCell` captures, so [`ExrViewer::emit_mode_draws`] can dispatch the
+/// `Cell`/`RefCell` captures, so [`ExrViewer::draw_comp_composite`] can dispatch the
 /// compare modes as a plain method call and the OCIO tail can read the
 /// accumulators back after the draws land.
 struct DrawCtx<'a> {
@@ -824,7 +831,7 @@ impl DrawCtx<'_> {
         u.opacity = opacity;
         u.overscan_factor = self.overscan_factor.get();
         // Under OCIO the only `is_composite` draw is the layer-stack accumulate top
-        // layer (composite folds through the scene ping-pong there — see `emit_mode_draws`
+        // layer (composite folds through the scene ping-pong there — see `draw_comp_composite`
         // + `OcioCallback::accumulate`), whose `tex_b` is the screen-sized scene
         // accumulation. Flag it so the shader samples `tex_b` at screen coords, not the
         // image-local uv. The non-OCIO single-pass composite keeps `tex_b` as an image (0).
@@ -1024,7 +1031,6 @@ pub struct ExrViewer {
     /// signature compare in `draw_contact_sheet` re-renders the sheet when it
     /// changes, catching every mutation path.
     gpu_thumb_bg: Option<crate::background::Background>,
-    gpu_textures: Vec<Option<std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>>>,
 
     /// Persisted display preferences, single-owned here (#151): diff controls,
     /// custom gradients, background + presets. `ExrApp` mirrors these to disk only
@@ -1192,7 +1198,6 @@ impl Default for ExrViewer {
             pending_thumb_frees: Vec::new(),
             dbg_thumb_bakes: 0,
             gpu_thumb_bg: None,
-            gpu_textures: Vec::new(),
             prefs: ViewerPrefs::default(),
             colormap_lut: Vec::new(),
             colormap_sig: None,
@@ -2124,8 +2129,6 @@ impl ExrViewer {
                 self.pending_thumb_frees.push(id);
             }
             self.gpu_thumbnails.resize_with(layer_count, || None);
-            self.gpu_textures.clear();
-            self.gpu_textures.resize(layer_count, None);
         }
     }
 
@@ -2405,7 +2408,7 @@ impl ExrViewer {
     /// this frame; `draw_gpu` copies it and overrides the per-draw fields (rect,
     /// diff/composite flags, opacity, overscan). Pure — reads the viewer's tone,
     /// compare, LUT-domain and background state plus the frame geometry. Split out
-    /// of `draw_canvas_gpu` (#152).
+    /// of `draw_comp_composite` (#152).
     fn build_frame_uniforms(
         &self,
         image_rect: egui::Rect,
@@ -2458,7 +2461,7 @@ impl ExrViewer {
 
     /// Wipe-mode handle interaction: drag the center handle to move the split,
     /// scroll while hovering it to rotate. Mutates `wipe_center`/`wipe_angle`.
-    /// Split out of `draw_canvas_gpu` (#152).
+    /// Split out of `draw_comp_composite` (#152).
     fn handle_wipe_interaction(&mut self, ui: &egui::Ui, image_rect: egui::Rect) {
         let center_screen = egui::pos2(
             image_rect.min.x + image_rect.width() * self.wipe_center[0],
@@ -2673,7 +2676,7 @@ impl ExrViewer {
         let painter = ui.painter().with_clip_rect(rect);
         // Reserve the image slot BEFORE the divider so the GPU quad renders *beneath*
         // it (same layer, insertion order) — appending the callback last would paint
-        // the composite straight over the line. Mirrors `draw_canvas_gpu`'s slot.
+        // the composite straight over the line. Mirrors `draw_comp_composite`'s slot.
         let slot = painter.add(egui::Shape::Noop);
 
         // The union of every rect drawn into the scene, which is what the display stage
@@ -3537,15 +3540,6 @@ impl ExrViewer {
         self.histogram_key = None;
     }
 
-    /// Drop the cached image-A **viewport** bind groups so the central canvas
-    /// rebuilds from the newly swapped data. This is the half of the A swap that
-    /// must run on *every* frame — it's how the next sequence frame actually
-    /// paints. Split from the thumbnail clear so playback can rebuild the viewport
-    /// per frame without re-baking the contact sheet every swap (#144).
-    pub fn invalidate_active_viewport(&mut self) {
-        self.gpu_textures.fill(None);
-    }
-
     /// Drop the cached image-A contact-sheet **thumbnails** (CPU + GPU) so the
     /// sheet re-bakes from the newly swapped data. Skipped while the transport is
     /// busy (`ExrApp::thumbs_suppressed`) and run once on settle (#144), so the
@@ -3558,7 +3552,7 @@ impl ExrViewer {
     /// Apply the canvas zoom/pan interaction for one frame from `response`:
     /// first-frame fit-to-view, cursor-centered wheel/pinch zoom, and drag pan
     /// (suppressed while an annotation tool is active). Extracted from
-    /// the comp path so the proxy first-paint path ([`Self::draw_proxy`]) shares
+    /// the comp path so the proxy first-paint path shares
     /// the exact same interaction model — the handoff from proxy to full-res is
     /// visually continuous because zoom/pan state is identical.
     fn handle_canvas_interaction(
