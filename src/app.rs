@@ -5085,6 +5085,61 @@ fn comp_hover_pixel(
 }
 
 impl eframe::App for ExrApp {
+    /// Release the heavy, GPU-backed state deterministically at shutdown, and
+    /// record how far teardown got (#206).
+    ///
+    /// **This is instrumentation and ordering, not a fix.** #206 is an
+    /// intermittent `thread 'main' has overflowed its stack` on close — roughly
+    /// one in fifteen, reproducible only by luck, and every configuration knob
+    /// tried (cache bytes, object count, source count, layer count) has been
+    /// refuted as the trigger. Whatever recurses is still unidentified.
+    ///
+    /// Two things this does buy:
+    ///
+    /// - **A stage marker.** Without it, a crash on close says only "it died
+    ///   somewhere in teardown". Each `evt=shutdown stage=` line that survives
+    ///   in the log narrows that to a span, the same way `size_src=` turned #322
+    ///   from a mystery into a one-tick read. Needs `floki=info` to be captured,
+    ///   so it helps a logged session rather than a bare launch.
+    /// - **A guaranteed-live device.** `eframe` calls this before dropping the
+    ///   app, so releasing the wgpu-backed sources here happens while the device
+    ///   is definitely alive, instead of during `ExrApp`'s implicit drop where
+    ///   the ordering against the renderer's own teardown is not ours to state.
+    ///   That is worth having on its own merits, independently of #206.
+    fn on_exit(&mut self) {
+        log::info!(
+            target: "floki::playback",
+            "evt=shutdown stage=begin t1={} t1_bytes={} sources={} gpu={} uploads={}",
+            self.frame_cache.len(),
+            self.frame_cache.bytes(),
+            self.comp_sources.len(),
+            u8::from(self.gpu_resources.is_some()),
+            self.tex_uploader.as_ref().map_or(0, |u| u.inflight_len()),
+        );
+        // **Workers first.** Dropping the handle closes the job channel, which ends
+        // every upload worker's `recv` loop (#202) — so no new texture build can
+        // start while the rest of this runs. Releasing textures underneath a pool
+        // still picking up work is the ordering this hook exists to avoid.
+        self.tex_uploader = None;
+        log::info!(target: "floki::playback", "evt=shutdown stage=uploaders_stopped");
+        // The largest structure by far: up to the whole T1 budget in `ExrData`,
+        // measured at 12.6 GB across 200 frames on the footage #206 was seen with.
+        self.frame_cache.clear();
+        log::info!(target: "floki::playback", "evt=shutdown stage=t1_cleared");
+        // Each holds a wgpu texture plus its decoded pixels.
+        self.comp_sources.clear();
+        log::info!(target: "floki::playback", "evt=shutdown stage=sources_cleared");
+        // The 3D LUT's texture + bind group, the last app-owned GPU handles
+        // outside `gpu_resources`.
+        self.lut_bg = None;
+        self.lut_texture = None;
+        log::info!(target: "floki::playback", "evt=shutdown stage=lut_released");
+        // The device and its pipelines last: everything above holds handles onto
+        // it, so it has to outlive them.
+        self.gpu_resources = None;
+        log::info!(target: "floki::playback", "evt=shutdown stage=gpu_released");
+    }
+
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         // Mirror the viewer-owned display prefs (#151) into the serde bridge so the
         // whole-app serialize below persists them. Done here, at persist time only,
