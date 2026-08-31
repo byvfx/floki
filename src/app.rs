@@ -4477,6 +4477,29 @@ impl ExrApp {
                         // playhead has moved on by the time it lands (#204).
                         // `ensure_comp_frame` records the swap that actually shows it.
                         self.request_repaint();
+                        // A **settle upgrade** landing is the moment the contact
+                        // sheet can refresh (#240): its source frame is now a full
+                        // decode, so let the cached thumbnails go and re-bake.
+                        //
+                        // The slot-A twin of this lives in `swap_image_arc`, and both
+                        // of *its* call sites are primary-only — which the comp path
+                        // never reaches, so nothing here ever invalidated and the
+                        // sheet stayed pinned to whatever it first baked.
+                        // `settle_to_full` covers only the case where the playhead
+                        // was *already* full; after playing with proxies it takes the
+                        // other branch and requests this decode instead.
+                        //
+                        // Gated on the clock source and on a genuinely full frame, so
+                        // a trailing layer's prefetch or a cheap frame cannot trigger
+                        // a 40-AOV re-bake; `thumbs_suppressed` keeps it off the
+                        // per-swap path the #144 freeze exists to prevent.
+                        if res.source == self.clock_source()
+                            && !arc.proxy
+                            && !arc.beauty_only
+                            && !self.thumbs_suppressed()
+                        {
+                            self.viewer.invalidate_active_thumbnails();
+                        }
                     }
                     self.error_msg = None;
                 }
@@ -9410,9 +9433,8 @@ impl ExrApp {
     /// Owns the per-frame thumbnail housekeeping that `ExrViewer::ui` used to run:
     /// `sync_texture_caches` (which sizes the caches the sheet indexes **unguarded**),
     /// the deferred GPU-id drain, and the OCIO-change invalidation.
-    /// The pixels the contact sheet bakes from for `source` (#240): the frame
-    /// actually on screen when that is a **full** decode, else the open-time
-    /// `exr_data`.
+    /// The pixels the contact sheet bakes from for `source` (#240): the frame at
+    /// the playhead when that is a **full** decode, else the open-time `exr_data`.
     ///
     /// `cs.exr_data` is written once by `add_comp_source` and never replaced —
     /// deliberately, because `full_layer_table` (#217) needs a layer table it can
@@ -9436,9 +9458,16 @@ impl ExrApp {
     /// without a device, but which `ExrData` it *should* bake is plain state.
     fn sheet_source_data(&self, source: crate::layer::SourceId) -> Option<std::sync::Arc<ExrData>> {
         let cs = self.comp_sources.get(&source)?;
-        let shown = cs
-            .cur_frame
-            .and_then(|f| self.frame_cache.peek(source, f))
+        // Keyed on the **playhead**, not `cs.cur_frame`. `cur_frame` records which
+        // frame the *viewport* last bound — and while the sheet is up,
+        // `draw_central_canvas` returns before `draw_comp_central`, so
+        // `ensure_comp_frame` never runs and `cur_frame` is frozen at whatever it
+        // was when the sheet opened. Peeking it re-baked the identical frame every
+        // time: the sheet visibly blinked on each settle and never changed.
+        let frame = self.source_playhead(source);
+        let shown = self
+            .frame_cache
+            .peek(source, frame)
             .filter(|a| !a.proxy && !a.beauty_only && a.only_layer.is_none());
         Some(shown.unwrap_or_else(|| cs.exr_data.clone()))
     }
@@ -12904,20 +12933,32 @@ mod tests {
         seed_comp_source_from(&mut app, s, &open);
         let open_size = app.comp_sources.get(&s).unwrap().exr_data.logical_size(0);
 
-        // Nothing bound yet ⇒ the open-time decode, as before.
+        // Nothing resident at the playhead ⇒ the open-time decode, as before.
         assert_eq!(
             app.sheet_source_data(s).unwrap().logical_size(0),
             open_size,
-            "no bound frame ⇒ the open-time decode"
+            "nothing resident at the playhead ⇒ the open-time decode"
         );
 
-        // A *cheap* frame is bound: it carries one logical layer, and the sheet's
-        // grid is sized from `logical_layers.len()`, so substituting it would
-        // collapse a 40-AOV sheet to a single cell. It must not be used.
+        // Put the source's playhead on frame 7. Keyed on the playhead rather than
+        // `cs.cur_frame` deliberately: `cur_frame` is the frame the *viewport* last
+        // bound, and while the sheet is open `draw_comp_central` never runs, so it
+        // freezes at whatever it was when the sheet opened.
+        app.followers.insert(
+            s,
+            SourceState {
+                current_frame: 7,
+                ..Default::default()
+            },
+        );
+        app.comp_sources.get_mut(&s).unwrap().cur_frame = Some(1); // stale on purpose
+
+        // A *cheap* frame is resident there: it carries one logical layer, and the
+        // sheet's grid is sized from `logical_layers.len()`, so substituting it
+        // would collapse a 40-AOV sheet to a single cell. It must not be used.
         let mut cheap = ExrData::load(&played).unwrap();
         cheap.beauty_only = true;
         app.frame_cache.insert(s, 7, std::sync::Arc::new(cheap));
-        app.comp_sources.get_mut(&s).unwrap().cur_frame = Some(7);
         assert_eq!(
             app.sheet_source_data(s).unwrap().logical_size(0),
             open_size,

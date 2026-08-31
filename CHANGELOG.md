@@ -11,11 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The contact sheet follows the playhead again.** (#240) Opening the sheet over
   a sequence showed the frame that was loaded when you first opened the file, and
   kept showing it however far you played — most visibly as a sheet that stayed
-  frozen after pausing. It now bakes from the frame actually on screen once that
-  frame has settled to full resolution. While the clock is moving it still shows
-  the original, deliberately: the frames resident during playback carry a single
-  pass, and a sheet is a grid of *every* pass, so switching to one mid-flight
-  would collapse forty cells into one.
+  frozen after pausing. It now re-bakes to the frame under the playhead whenever
+  playback settles. While the clock is moving it still shows the original,
+  deliberately: the frames resident during playback carry a single pass, and a
+  sheet is a grid of *every* pass, so switching to one mid-flight would collapse
+  forty cells into one.
 
 ## [1.13.3] - 2026-08-31
 
