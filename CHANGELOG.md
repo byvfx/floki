@@ -17,6 +17,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sheet is a grid of *every* pass, so switching to one mid-flight would collapse
   forty cells into one.
 
+### Removed
+- **The slot-A open path, removed.** (#277) Before the unified layer model,
+  the first file you opened went into a dedicated "image A" slot with its own
+  open path, its own supersession counter, and its own status-bar and info-window
+  rows. Every file you open is an ordinary composite layer now, so none of that
+  could run: the branch that applied an explicit open was unreachable, and the
+  two UI rows fed from a slot that is never filled and so drew nothing. No
+  behaviour changes.
+
 ## [1.13.3] - 2026-08-31
 
 ### Removed
