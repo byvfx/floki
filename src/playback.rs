@@ -329,14 +329,22 @@ impl Playback {
     /// p50/p95/p99 describe neither — the same way an idle span filed as one
     /// enormous frame time made the percentiles describe nothing in #236.
     ///
-    /// Deliberately narrower than [`Self::stop`]: `anchor` and
+    /// Deliberately narrower than [`Self::stop`]. `anchor` and
     /// `frames_since_anchor` stay, so the drift-corrected clock keeps its
-    /// reference and playback does not hitch when a layer is hidden. Only the
-    /// measured figures go. `last_shown` goes with them, or the first interval
-    /// after the change would span both sources and land in the ring as one
-    /// oversized sample.
+    /// reference and playback does not hitch when a layer is hidden.
+    ///
+    /// **`measured_fps` stays too.** The ring holds a hundred samples, so it
+    /// carries the old source's cadence for seconds and has to go; the EWMA has a
+    /// ~5-frame time constant and re-converges in about a fifth of a second by
+    /// itself, so zeroing it buys nothing and costs a readout that says `0.0`
+    /// during real playback — which is the exact misleading signal #249 was
+    /// written to get rid of ("the one number that should have said slow said
+    /// 0.0"). Dogfooding caught this: hiding a layer mid-run made the fps display
+    /// read zero.
+    ///
+    /// `last_shown` does go, or the first interval after the change would span
+    /// both sources and land in the ring as one oversized sample.
     pub fn reset_pacing_stats(&mut self) {
-        self.measured_fps = 0.0;
         self.last_shown = None;
         self.last_shown_frame = None;
         self.frame_times.clear();
@@ -964,7 +972,11 @@ mod tests {
 
         assert_eq!(pb.frame_time_samples(), 0, "the ring is dropped");
         assert!(pb.frame_time_pcts().is_none(), "and reports no percentiles");
-        assert_eq!(pb.measured_fps, 0.0, "the EWMA goes with it");
+        assert!(
+            pb.measured_fps > 0.0,
+            "but the EWMA stays: it re-converges in ~5 frames on its own, and \
+             zeroing it makes the readout say 0.0 during real playback (#249)"
+        );
         assert_eq!(
             (pb.anchor, pb.frames_since_anchor),
             (anchor, since),
