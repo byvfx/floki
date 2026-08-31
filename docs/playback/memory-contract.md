@@ -13,9 +13,9 @@ A frame may be resident at several tiers at once.
 
 | Tier | What | Size (4K) | Producer | Lives in | Purpose |
 |------|------|-----------|----------|----------|---------|
-| **T0 Proxy** | `ProxyImage` low-res RGBA32F (`proxy.rs`) | 5–20 MB | worker (`from_exr_fast_read`) | CPU | scrub preview / fallback paint |
+| **T0 Proxy** | a downsampled `ExrData` flagged `proxy: true`, f16 where the source is (#170) (`exr_loader.rs`) | 5–20 MB | worker (`ExrData::load_proxy` / `load_layer_proxy_into`) | RAM | scrub preview / fallback paint |
 | **T1 CPU frame** | full `ExrData`, ALL layers (`exr_loader.rs`) | 0.6–1.3 GB | worker (`ExrData::load`) | RAM | **only sampling source** + upload source for T2 |
-| **T2 GPU texture** | `Rgba16Float` for f16 sources (`Rgba32Float` for f32/u32), **active layer only** | ~66 MB (16F) / ~133 MB (32F) | UI thread (`build_layer_texture`) | VRAM | instant paint on `swap_image_data` |
+| ~~**T2 GPU texture**~~ | **Retired in #299.** The pre-upload ring had no consumer — write-only — while its producer built a full-res texture every playback frame on the UI thread. Textures now live one-per-source in `ExrApp::comp_sources`, built on the upload worker pool (#202). The T2 passages below are kept as the record of a tier that no longer exists; nothing in the T1 contract depends on them. |
 | **T3 active** | the `ExrData` promoted into `self.exr_data` | (== one T1) | UI thread (swap) | — | what renderer + sampler see this frame |
 
 T1 frames are held as `Arc<ExrData>` so a frame can be both **active (T3)** and **resident (T1)**
@@ -25,7 +25,7 @@ without cloning ~600 MB (this is why Phase 0 moves `exr_data` to `Option<Arc<Exr
 
 They bind different tiers from different sources.
 
-### VRAM budget — binds T2
+### VRAM budget — bound T2 *(retired in #299; the sampler stays, feeding the `vram=` readout)*
 `ResourceMonitor` already reads `recommendedMaxWorkingSetSize` / `currentAllocatedSize`
 (`resource_monitor.rs`, Metal only).
 
@@ -115,7 +115,7 @@ A fidelity change is safe without any re-measure: the cap recomputes every tick,
 force-evicts in the same tick when the ring exceeds it (#146), so beauty → full raises the divisor,
 drops the cap, and shrinks the ring together.
 
-## Windows differ — T1 vs T2
+## Windows differ — T1 vs T2 *(historical — T2 retired in #299)*
 
 - **T1 window** = the decode-ahead horizon ahead of the playhead (RAM-budgeted).
 - **T2 window** = a smaller texture ring around the playhead (VRAM-budgeted).

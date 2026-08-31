@@ -137,15 +137,27 @@ Make sure you have [Rust and Cargo](https://rustup.rs/) installed on your system
 git clone https://github.com/byvfx/floki.git
 cd floki
 
-# Build and run the app in release mode (Highly recommended for EXR parsing speed)
-cargo run --release
+# Build and run — needs no OpenColorIO installed (see the tiers below)
+cargo run --release --no-default-features
 ```
+
+> **On a clean machine, use `--no-default-features`.** The default build links an
+> *installed* OpenColorIO and fails at build time if it can't find one. The flag
+> selects the pure-Rust stub backend — no native dependencies, no C++ toolchain —
+> which is also what CI builds and lints. Colour management is then limited to the
+> built-in transforms; see the three tiers below to get full OCIO.
 
 ### Color management (OpenColorIO)
 
 OCIO support is **always compiled** — it is mandatory, not an opt-in feature. What you choose
-is the native backend: link an installed OCIO (the default), or statically build a vendored
-copy. A bare `cargo run` uses the system backend.
+is the *backend*, and there are three tiers. A bare `cargo run` uses the system backend, which
+is why it fails on a machine with no OCIO installed.
+
+| Tier | Command | Needs | Gets you |
+|---|---|---|---|
+| **Stub** | `cargo run --release --no-default-features` | nothing beyond Rust | Builds and runs anywhere. Built-in transforms only — no `.ocio` config support. **This is what CI builds, lints and tests.** |
+| **System** (default) | `cargo run --release` | an installed OCIO | Full OCIO, fast builds, no cmake |
+| **Vendored** | `cargo ocio-run` | C++ toolchain, cmake, ninja, python3 | Full OCIO, self-contained — what the release binaries ship |
 
 **Fast dev — link an installed OCIO (system, the default):** a plain `cargo run --release`
 links an OCIO found via `OPENCOLORIO_ROOT` (any OS) or Homebrew (macOS). Fast, no cmake.
@@ -257,8 +269,11 @@ standalone `floki-ocio` crate that wraps OpenColorIO.
 - **`playback.rs`** — the transport state machine (playhead, loop modes, in/out trim, pacing) and the pure frame-advance logic.
 - **`scheduler.rs`** — the pure decode want-list / next-frame scheduler (priority order, prefetch window).
 - **`cache.rs`** — the byte-budgeted T1 ring of decoded frames with directional-ring + LRU eviction.
-- **`budget.rs`** — the RAM/VRAM budget math sizing the T1/T2 rings from a live memory sample.
-- **`proxy.rs`** — the low-res first-paint proxy (fast subsampled EXR read).
+- **`budget.rs`** — the RAM budget math sizing the T1 ring from a live memory sample.
+- **`pixels.rs`** — pure pixel access over decoded EXR channels + thumbnail decimation.
+- **`prefetch.rs`** — read-ahead file warmer; overlaps the next frame's file read with the current decode via the OS page cache.
+- **`proxy_cache.rs`** — persistent on-disk proxy cache (`~/.floki/proxy-cache`), so a scrub proxy's first-touch decode is paid once ever.
+- **`tex_upload.rs`** — off-thread comp-texture upload; the paint thread submits a frame and collects a finished GPU texture instead of interleaving and uploading inline.
 - **`layer.rs`** — the pure comp layer-stack model backing A/B compare (the spine for N-way / locked-step).
 
 **Tooling & CLI**

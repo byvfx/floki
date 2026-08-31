@@ -660,7 +660,7 @@ to collapse the fork, not delete one arm. (2) Moving a hotkey means **removing**
 handler: `handle_hotkeys` delegates to `handle_channel_hotkeys`, so a key serviced in both toggles
 twice and reads as dead. (3) Broken intra-doc links (~14 across the slice) are a real defect clippy
 does not catch. (4) Two things were **parked, not deleted** — `draw_proxy` (unreachable, but
-`proxy.rs`/`proxy_cache.rs` are live for scrub proxy) and `layer::Layout` (redundant with
+`proxy_cache.rs` is live for scrub proxies) and `layer::Layout` (redundant with
 `Arrangement`, but model API); and `detect_sequence` was restored as `#[cfg(test)]` because ~45 live
 playback tests use it as a fixture.
 
