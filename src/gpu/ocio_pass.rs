@@ -1426,7 +1426,9 @@ mod device_tests {
         sign * mag
     }
 
-    // The shader's premultiplied-alpha blend switch (shader.wgsl:214-249),
+    // The shader's premultiplied-alpha blend switch (the `is_composite` branch in
+    // `fs_main`, `gpu/shader.wgsl` — referenced by name, not line, because line
+    // numbers in comments drift silently),
     // transcribed as the *independent* CPU reference the on-device accumulate test
     // asserts against — no such helper exists elsewhere in the tree. `layer` is
     // `color_a` (the incoming top layer), `accum` is `color_b`

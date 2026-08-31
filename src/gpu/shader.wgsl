@@ -262,8 +262,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // and mapped through the `colormap_tex` ramp. This is a false-color
         // visualization, emitted directly in display space and NOT color-managed —
         // the viewer routes diff through this pipeline even under OCIO. Keep the
-        // metric/floor math in lockstep with `DiffMetric` in src/gradient.rs — the CPU
-        // mirror this once named was removed with the CPU render path in #59.
+        // metric selection in lockstep with `DiffMetric::as_u32` in src/gradient.rs.
+        // The floor/gain math below is shader-only — `diff_floor` / `diff_gain` arrive
+        // as uniforms from `ViewerPrefs`, and the CPU mirror that once shadowed it
+        // went with the CPU render path in #59, so there is nothing to match it to.
         let dr = abs(r - color_b.r);
         let dg = abs(g - color_b.g);
         let db = abs(b - color_b.b);
