@@ -302,7 +302,7 @@ impl ExrData {
     /// box-filter accumulator (#171). The decode worker owns one `scratch` across
     /// the whole session, so proxy playback pays the accumulator allocation +
     /// page-zeroing **once** instead of per channel per frame — the decode-side
-    /// analogue of the T2 `t2_staging` reuse. Proxies are uniform-size per
+    /// analogue of the upload path's staging-buffer reuse. Proxies are uniform-size per
     /// sequence, so the buffer never reallocates after the first frame.
     pub fn load_proxy_into(
         path: impl AsRef<Path>,

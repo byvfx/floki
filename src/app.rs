@@ -186,7 +186,7 @@ const COMP_LAYER_CAP: usize = 6;
 /// First `SourceId` the Layers panel allocates for its sources (#99 Phase 2).
 /// `SourceId(0)` is the base-plate slot ([`ExrApp::A_SOURCE`]) and `SourceId(1)`
 /// was the old locked-step B follower (deleted in Slice 3h.2), so comp sources
-/// start at 2 and never alias either in the shared T1 cache / T2 rings /
+/// start at 2 and never alias either in the shared T1 cache /
 /// `followers` map once they decode as sequence followers.
 const COMP_SOURCE_BASE: u64 = 2;
 
@@ -449,7 +449,7 @@ fn default_proxy_cache_gb() -> f32 {
     10.0
 }
 
-/// serde default for `t2_enabled` (bool's own default is `false`).
+/// serde default for the on-by-default toggles (bool's own default is `false`).
 fn ret_true() -> bool {
     true
 }
@@ -582,7 +582,7 @@ struct DbgFollowerRow {
 /// the stack or the colour setup.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ResetScope {
-    /// The decode / budget levers only — beauty preview, proxy, precache, T2, the RAM
+    /// The decode / budget levers only — beauty preview, proxy, precache, the RAM
     /// budget. Leaves the comp stack, recent files, colour management and view
     /// preferences alone, so it is safe to reach for mid-session without losing work.
     PlaybackSettings,
@@ -838,12 +838,6 @@ pub struct ExrApp {
     #[serde(default)]
     save_snapshots: bool,
 
-    /// Pre-upload sequence frames to GPU textures ahead of the playhead (#56, the
-    /// T2 ring) for smoother playback. On by default; a kill-switch back to the
-    /// lazy per-swap path if it misbehaves on a given GPU. Persisted.
-    #[serde(default = "ret_true")]
-    t2_enabled: bool,
-
     /// Decode only the beauty/first layer for the playback ring while the clock
     /// is advancing (#56, hardening step 3): cheaper decode + smaller resident
     /// frames for multi-part AOV EXRs, so playback feeds the decode wall faster.
@@ -921,11 +915,6 @@ pub struct ExrApp {
     /// the new window refills. Never persisted.
     #[serde(skip)]
     precache_filled: bool,
-    /// The playhead the T2 ring was last pumped for (#142 U4). A full ring plus
-    /// an unchanged playhead means every slot is already built for this frame, so
-    /// the pump skips its want-list allocation — the common paused / settled case.
-    #[serde(skip)]
-    last_t2_pump: Option<u32>,
     /// A timeline drag is in progress (#143). While held, seeks decode
     /// beauty-only like playback does — the readout is suppressed or showing
     /// the beauty layer anyway — and the release settles the landing frame to
@@ -1237,7 +1226,6 @@ impl Default for ExrApp {
             persisted_prefs: crate::viewer::ViewerPrefs::default(),
             persisted_layers: Vec::new(),
             save_snapshots: false,
-            t2_enabled: true,
             beauty_preview: true,
             proxy_enabled: true,
             proxy_size: default_proxy_size(),
@@ -1249,7 +1237,6 @@ impl Default for ExrApp {
             precache: true,
             ram_budget_gb: 0.0,
             precache_filled: false,
-            last_t2_pump: None,
             scrub_active: false,
             watch_enabled: false,
             watch_follow: false,
@@ -1764,10 +1751,6 @@ impl ExrApp {
         self.dbg_evictions = 0;
         self.dbg_fallbacks = 0;
         self.dbg_dropped_epoch = 0;
-        // A different sequence reuses frame numbers, so drop the T2 GPU ring too
-        // (and reset the on-screen frame; the first show re-sets it).
-        self.viewer.clear_t2(Self::A_SOURCE);
-        self.viewer.set_t2_frame(Self::A_SOURCE, None);
         // Drop any prior sequence's in-flight frames (a different sequence reuses
         // frame numbers); `enter`/`clear` bump the epoch so their results are
         // dropped. `loading_a` is left to the caller.
@@ -2004,7 +1987,7 @@ impl ExrApp {
                 // owned by the worker for its whole life. Proxies are uniform-size
                 // per sequence, so this allocates + zeroes once instead of per
                 // channel per frame during scrub/playback (the decode-side analogue
-                // of the T2 `t2_staging` reuse).
+                // of the upload path's staging-buffer reuse).
                 let mut proxy_scratch: Vec<f32> = Vec::new();
                 for job in job_rx {
                     // Drop a sequence job a newer seek/scrub already superseded,
@@ -2149,7 +2132,6 @@ impl ExrApp {
                 && !self.scrub_active
                 && (data.beauty_only || data.proxy);
             self.loading_a = false;
-            self.viewer.set_t2_frame(Self::A_SOURCE, Some(frame)); // bind this frame's T2 texture
             self.swap_image_arc(data);
             if needs_full {
                 self.playback.pending = Some(frame);
@@ -2292,7 +2274,7 @@ impl ExrApp {
     }
 
     /// The source id of the **primary** compare slot (A) — `SourceId(0)`. The
-    /// master clock's source; keys A's T1 cache + T2 ring (#99).
+    /// master clock's source; keys A's T1 cache (#99).
     const A_SOURCE: crate::layer::SourceId = crate::layer::SourceId(0);
 
     /// Whether the comp stack (rather than slot A) owns the global clock — the
@@ -3465,63 +3447,6 @@ impl ExrApp {
         self.decode_submit_at = Some(std::time::Instant::now());
     }
 
-    /// Pre-upload T2 GPU textures (#56) for the on-screen frame and the next few
-    /// T1-cached frames ahead of the playhead, within the VRAM budget. Builds at
-    /// most a couple per call to amortize the upload across UI frames; only
-    /// touches frames already resident in T1 (never decodes). UI-thread only.
-    fn pump_t2(&mut self) {
-        if !self.playback.is_active() || self.viewer.t2_cap(Self::A_SOURCE) == 0 {
-            return;
-        }
-        // Nothing to do when the ring is full and the playhead hasn't moved since
-        // the last pump: every slot is already built for this frame. Skips the
-        // want-list allocation in the paused / settled case (#142 U4). A playhead
-        // move, or a shrunk/evicted ring, drops one of these conditions and pumps.
-        if self.viewer.t2_len(Self::A_SOURCE) >= self.viewer.t2_cap(Self::A_SOURCE)
-            && self.last_t2_pump == Some(self.playback.current_frame)
-        {
-            return;
-        }
-        let Some(gpu) = self.gpu_resources.as_ref() else {
-            return;
-        };
-        let depth = self.viewer.t2_cap(Self::A_SOURCE).saturating_sub(1);
-        // Empty resident set -> want_list returns the playhead + the window ahead;
-        // we then keep only frames actually cached in T1. No read-behind here
-        // (#169): the T2 VRAM ring is tiny (≤ 8) and strictly forward — behind
-        // textures would displace the upcoming frames it exists to have ready.
-        let wants = crate::scheduler::want_list(
-            self.playback.current_frame,
-            self.playback.in_point,
-            self.playback.out_point,
-            self.playback.direction,
-            self.playback.loop_mode,
-            &std::collections::HashSet::new(),
-            depth,
-            0,
-        );
-        self.last_t2_pump = Some(self.playback.current_frame);
-        // Budget by time, not a fixed count (#142 U4): one 4K build is 20-60ms on
-        // the UI thread, so a flat "2 builds/frame" is a hiccup generator at 4K
-        // yet leaves throughput unused at 2K. Always allow the first build (the
-        // ring must make progress even when a single build exceeds the slice),
-        // then stop once this pump has spent its budget — so 4K does ~1 build per
-        // frame and lower resolutions amortize more.
-        const PUMP_BUDGET: std::time::Duration = std::time::Duration::from_millis(4);
-        let start = std::time::Instant::now();
-        let mut built = 0;
-        for w in std::iter::once(self.playback.current_frame).chain(wants) {
-            if built > 0 && start.elapsed() >= PUMP_BUDGET {
-                break;
-            }
-            if let Some(arc) = self.frame_cache.peek(Self::A_SOURCE, w)
-                && self.viewer.prebuild_t2(Self::A_SOURCE, gpu, &arc, w)
-            {
-                built += 1;
-            }
-        }
-    }
-
     fn invalidate_inflight(&mut self) {
         self.playback.bump_epoch();
         // Publish the new epoch so the worker skips the jobs this just superseded
@@ -4190,7 +4115,7 @@ impl ExrApp {
         }
     }
 
-    /// Resize the T1 (RAM) and T2 (VRAM) rings to the live resource budgets
+    /// Resize the T1 (RAM) ring to the live resource budget
     /// (#56). Runs every frame from `ui()` — `ResourceMonitor::sample` is
     /// internally throttled so the cost is a struct copy — and lives here, not
     /// in a draw method: the caps are overcommit protection, and must keep
@@ -4202,8 +4127,7 @@ impl ExrApp {
     /// `gpu_resources` left the CPU-only fallback path (`viewer.rs`) with no RAM
     /// budget at all — the cap frozen at its constructed default and the byte
     /// bound at `u64::MAX` — which is the one direction the memory contract
-    /// cannot tolerate. T2 stays gated; it sizes a ring of GPU textures, and
-    /// `pump_t2` independently bails without a device anyway.
+    /// cannot tolerate.
     fn tick_budgets(&mut self) {
         let device = self
             .gpu_resources
@@ -4212,9 +4136,6 @@ impl ExrApp {
         let sample = self.resource_monitor.sample(device);
         self.dbg_last_sample = Some(sample); // stash for the status bar + debug overlay
         self.tick_budgets_t1(&sample);
-        if self.gpu_resources.is_some() {
-            self.tick_budgets_t2(&sample);
-        }
     }
 
     /// The **T1** (system-RAM ring) half of [`Self::tick_budgets`]: pure
@@ -4279,41 +4200,6 @@ impl ExrApp {
         }
     }
 
-    /// The **T2** (VRAM texture ring) half of [`Self::tick_budgets`]. Keeps the
-    /// device-dependent side: `vram_available` reads the GPU figures the sampler
-    /// filled in, and the resulting caps land on the viewer's per-source rings.
-    fn tick_budgets_t2(&mut self, sample: &crate::budget::Sample) {
-        // T2: conservative — capped low, and disabled (→ lazy path) unless at
-        // least a couple of frames comfortably fit, since a wgpu OOM aborts
-        // the process. Off entirely when the user disables it or no sequence
-        // is loaded. In locked-step compare (#166) the VRAM budget is split
-        // across the A and B rings so neither can push VRAM over the ceiling.
-        const T2_HARD_CAP: usize = 8;
-        // One texture per frame maps `available` bytes → a capped, ≥2-or-off count.
-        let cap_from = |available: u64, dims: Option<(usize, usize)>| -> usize {
-            dims.map_or(0, |(w, h)| {
-                let fits = crate::budget::frames_for(available, w, h);
-                if fits < 2 { 0 } else { fits.min(T2_HARD_CAP) }
-            })
-        };
-        let t2_on = self.t2_enabled && self.playback.is_active();
-        let avail = crate::budget::vram_available(sample);
-        // Split the pool in *bytes* (not frame counts) across the active sources
-        // (#99) so each derives its own count from its own resolution when they
-        // differ. One active follower (B) → the same A/B halving as before.
-        let per_source = avail / self.n_active_sources() as u64;
-        let a_avail = per_source;
-        let a_dims = t2_on
-            .then(|| {
-                self.exr_data
-                    .as_ref()
-                    .and_then(|d| d.logical_size(self.viewer.active_layer))
-            })
-            .flatten();
-        self.viewer
-            .set_t2_cap(Self::A_SOURCE, cap_from(a_avail, a_dims));
-    }
-
     /// The ctx-free, synchronous core of the render-watch: re-scan the group,
     /// diff against the baseline, and apply. Returns whether a change was applied
     /// (the first call only baselines). Runs the FS work inline — production goes
@@ -4370,10 +4256,9 @@ impl ExrApp {
         group: std::collections::BTreeMap<u32, std::path::PathBuf>,
         diff: &crate::sequence::ScanDiff,
     ) {
-        // 1. A re-rendered or removed frame's cached pixels are stale — drop T1+T2.
+        // 1. A re-rendered or removed frame's cached pixels are stale — drop them.
         for &f in diff.changed.iter().chain(&diff.removed) {
             self.frame_cache.remove(Self::A_SOURCE, f);
-            self.viewer.evict_t2_frame(Self::A_SOURCE, f);
             self.inflight.remove(&f);
         }
 
@@ -4554,16 +4439,6 @@ impl ExrApp {
                         }
                     }
                     self.frame_cache.insert(res.source, res.frame, arc.clone());
-                    // A full-res frame landing (the settle upgrade, #94/#56)
-                    // replaces a proxy/beauty frame, so its pre-built T2 GPU
-                    // texture is now stale — evict it or the viewport keeps binding
-                    // the blurry proxy texture ("stuck in proxy"). Primary only for
-                    // now (the compare follower's settle-evict is a follow-up);
-                    // fires only for full frames (settle), not the proxy/beauty
-                    // frames decoded while moving.
-                    if is_primary && !arc.beauty_only {
-                        self.viewer.evict_t2_frame(Self::A_SOURCE, res.frame);
-                    }
                     // In Loop mode eviction distance follows the play direction
                     // around the loop, so prefetch wrapped past the out point
                     // isn't classified "behind" and evicted on arrival (#140).
@@ -4587,7 +4462,6 @@ impl ExrApp {
                         if res.frame == self.playback.current_frame {
                             self.loading_a = false;
                             self.playback.pending = None;
-                            self.viewer.set_t2_frame(Self::A_SOURCE, Some(res.frame));
                             self.swap_image_arc(arc);
                             self.playback
                                 .note_shown(std::time::Instant::now(), res.frame);
@@ -4676,8 +4550,8 @@ impl ExrApp {
     /// pixel buffers — the same `Arc` is held by the T1 ring and the active slot.
     fn swap_image_arc(&mut self, data: std::sync::Arc<ExrData>) {
         // Same Arc as already displayed (scrub-return, settle onto the shown
-        // frame): the pixels are identical, so skip the invalidations — on a T2
-        // miss they'd force a full re-pack + re-upload of the same data (#146).
+        // frame): the pixels are identical, so skip the invalidations — on a
+        // texture miss they'd force a full re-pack + re-upload of the same data (#146).
         let same = self
             .exr_data
             .as_ref()
@@ -4764,7 +4638,6 @@ impl ExrApp {
 
         // The decode / budget levers, which are the ones that make playback look
         // broken. Reset by both scopes.
-        self.t2_enabled = defaults.t2_enabled;
         self.beauty_preview = defaults.beauty_preview;
         self.proxy_enabled = defaults.proxy_enabled;
         self.proxy_size = defaults.proxy_size;
@@ -5190,7 +5063,7 @@ impl eframe::App for ExrApp {
         // Pick up frames a render writes while we're open (#101); no-op unless the
         // user enabled Watch and a sequence is loaded.
         self.tick_render_watch(ui.ctx());
-        // Keep the T1/T2 rings sized to the live RAM/VRAM budgets (#56, #150).
+        // Keep the T1 ring sized to the live RAM budget (#56, #150).
         self.tick_budgets();
 
         // Snapshot to clipboard (#19): request a framebuffer screenshot on the
@@ -5217,9 +5090,6 @@ impl eframe::App for ExrApp {
         self.draw_timeline_panel(ui);
         self.draw_side_panel(ui);
         self.draw_central_canvas(ui);
-        // Pre-upload T2 GPU textures ahead of the playhead (#56). After the canvas
-        // so the on-screen frame's texture exists; self-gates when T2 is off.
-        self.pump_t2();
     }
 }
 
@@ -5534,7 +5404,6 @@ impl ExrApp {
              t1={t1_len}/{t1_cap} frame_bytes={frame_bytes} \
              size_bytes={size_bytes} size_src={size_src} size_prov={size_prov} \
              t1_bytes={t1_bytes}/{t1_budget} \
-             t2={t2_len}/{t2_cap} \
              evict={evict} fallback={fallback} drop_epoch={drop_epoch} run_dropped={run_dropped} run_held={run_held} \
              fps={fps:.1}/{fps_target:.0} ft_n={ft_n} \
              p50={p50:.1} p95={p95:.1} p99={p99:.1} ft_max={pmax:.1} \
@@ -5602,8 +5471,6 @@ impl ExrApp {
             // this while `t1` sits well under `t1_cap` is the byte bound binding —
             // the case a count-only evictor could not see at all.
             t1_budget = self.frame_cache_budget,
-            t2_len = self.viewer.t2_len(Self::A_SOURCE),
-            t2_cap = self.viewer.t2_cap(Self::A_SOURCE),
             evict = self.dbg_evictions,
             // Cheap decodes satisfied with something dearer (#233). Climbing while
             // `soft=1` means the fidelity the trace reports asking for is not the
@@ -5639,7 +5506,7 @@ impl ExrApp {
                             ui.add_space(4.0);
                             ui.label(
                                 egui::RichText::new(
-                                    "Beauty preview, proxy, precache, disk cache, T2 \
+                                    "Beauty preview, proxy, precache, disk cache \
                                      and the RAM budget. Your layers, recent files and \
                                      colour setup are kept.",
                                 )
@@ -6174,7 +6041,7 @@ impl ExrApp {
             }
 
             // Discrete RAM/VRAM readout, right-aligned (#51). The sample is taken
-            // (and the T1/T2 budgets recomputed) by `tick_budgets` each frame;
+            // (and the T1 budget recomputed) by `tick_budgets` each frame;
             // request a slow repaint so the numbers keep ticking while the app
             // is otherwise idle.
             if let Some(sample) = self.dbg_last_sample {
@@ -6455,8 +6322,6 @@ impl ExrApp {
 
         let t1_len = self.frame_cache.len();
         let t1_cap = self.frame_cache_cap;
-        let t2_len = self.viewer.t2_len(Self::A_SOURCE);
-        let t2_cap = self.viewer.t2_cap(Self::A_SOURCE);
         // The divisor the cap is actually computed from, and what the ring measurably
         // holds (#230) — not the raw `frame_bytes` latch, which is only one of three
         // fidelities and is the wrong one during beauty/proxy playback. Read from
@@ -6468,8 +6333,8 @@ impl ExrApp {
         let t1_budget = self.frame_cache_budget;
         let (dbg_fallbacks, decode_fell_back) = (self.dbg_fallbacks, self.decode_fell_back);
         // The comp path holds one texture per source, rebuilt on the UI thread by
-        // `ensure_comp_frame` — with T2 structurally off there (every ring call site
-        // passes `A_SOURCE`), this is the VRAM the player actually occupies (#100).
+        // `ensure_comp_frame` — the only GPU-resident frames the player holds now
+        // that the T2 ring is retired (#299), so this is its real VRAM (#100).
         let comp_tex: Vec<(u64, (usize, usize))> = {
             let mut v: Vec<_> = self
                 .comp_sources
@@ -6624,19 +6489,6 @@ impl ExrApp {
                                 }
                             )
                         });
-                        ui.end_row();
-
-                        // Labelled A-only because it *is* A-only: every ring call
-                        // site passes `A_SOURCE`, so in the comp path this reads
-                        // `off` by construction and is not the VRAM instrument.
-                        // `comp tex` below is (#100).
-                        ui.label("T2 (GPU, A only)");
-                        let t2 = if t2_cap == 0 {
-                            "off".to_string()
-                        } else {
-                            format!("{t2_len} / {t2_cap} frames")
-                        };
-                        ui.label(t2);
                         ui.end_row();
 
                         ui.label("comp tex");
@@ -6925,22 +6777,6 @@ impl ExrApp {
             ui.label(
                 egui::RichText::new(format!("{:.1} actual", self.playback.measured_fps)).weak(),
             );
-
-            ui.separator();
-
-            // T2 GPU pre-upload kill-switch (#56). Off → the lazy per-swap
-            // path (decode-ahead still smooths via the T1 ring).
-            if ui
-                .checkbox(&mut self.t2_enabled, "GPU cache")
-                .on_hover_text(
-                    "Pre-upload upcoming frames to GPU textures for smoother \
-                         playback. Turn off if you see VRAM pressure.",
-                )
-                .changed()
-                && !self.t2_enabled
-            {
-                self.viewer.clear_t2(Self::A_SOURCE);
-            }
 
             ui.separator();
 
@@ -7775,7 +7611,7 @@ impl ExrApp {
     }
 
     /// Remove the slot-A base track + its comp source (#99 R3), if present. Unlike
-    /// a comp source, `A_SOURCE` is A's *own* transport cache / T2 ring, not a
+    /// a comp source, `A_SOURCE` is A's *own* transport cache, not a
     /// follower — so this drops only the model layer + the `comp_sources` entry and
     /// must NEVER `clear_slot`/touch `followers` for it. Called when the last comp
     /// source is removed and when A is unloaded.
@@ -11066,8 +10902,8 @@ mod tests {
 
     // --- T1 cap arithmetic (#288) --------------------------------------------
     //
-    // These drive `tick_budgets_t1` directly. Until the T1/T2 split it was
-    // unreachable from a test at all: `tick_budgets` early-returns without
+    // These drive `tick_budgets_t1` directly. Until the T1/T2 split (#288) it was
+    // unreachable from a test at all: `tick_budgets` then early-returned without
     // `gpu_resources`, and the GPU-free convention means no test has one. The
     // helpers underneath (`sizing_frame_bytes`, `budget::t1_budget_bytes`,
     // `budget::frames_in`) were each covered on their own; what follows is their
@@ -12066,7 +11902,6 @@ mod tests {
     fn app_with_dirtied_settings() -> ExrApp {
         let mut app = ExrApp::default();
         // Decode / budget levers — the group the narrow scope owns.
-        app.t2_enabled = !app.t2_enabled;
         app.beauty_preview = !app.beauty_preview;
         app.proxy_enabled = !app.proxy_enabled;
         app.proxy_disk_cache = !app.proxy_disk_cache;
@@ -12227,7 +12062,6 @@ mod tests {
         assert_eq!(app.proxy_disk_cache, d.proxy_disk_cache);
         assert_eq!(app.proxy_cache_gb, d.proxy_cache_gb);
         assert_eq!(app.precache, d.precache);
-        assert_eq!(app.t2_enabled, d.t2_enabled);
         assert!((app.ram_budget_gb - d.ram_budget_gb).abs() < f32::EPSILON);
 
         // …and kept. Recent files and the colour setup are work, not settings-gone-bad,

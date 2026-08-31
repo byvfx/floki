@@ -66,10 +66,11 @@ inline `#[cfg(test)]` modules. Tone/color math lives in `render_math.rs`; the
 (`viewer.rs`), mirrored by `gpu/shader.wgsl`.
 
 **The test suite cannot see everything.** The T1 cap arithmetic *is* now reachable —
-`tick_budgets` splits into `tick_budgets_t1(&Sample)` (pure; `Sample` lives in
-`budget.rs` precisely so it can be built by hand) and `tick_budgets_t2(&Sample)`
-(keeps the device), so drive T1 directly rather than only the pure helpers beneath it
-(#288). T2's caps still need a real GPU. And the
+`tick_budgets` delegates to `tick_budgets_t1(&Sample)` (pure; `Sample` lives in
+`budget.rs` precisely so it can be built by hand), so drive that directly rather than
+only the pure helpers beneath it (#288). The T2 VRAM ring it used to size alongside
+was retired in #299 — it had produced a full-frame GPU texture every playback frame,
+on the UI thread, into a map with no getter. And the
 soak harness (`run-windows.ps1 soak`) auto-plays and never idles, so anything whose
 trigger is *human timing* is invisible to both: #236 (a pause filed the whole idle
 span as one frame time) survived 360 passing tests and a dozen clean soak runs. For

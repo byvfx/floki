@@ -71,7 +71,7 @@ thread_local! {
 ///
 /// Process-global and lock-free because the builders are associated functions
 /// reached from several call sites (`ensure_comp_frame` via the pool,
-/// `ensure_base_frame`, `prebuild_t2`, the Add flow) on several threads; threading
+/// `ensure_base_frame`, the Add flow) on several threads; threading
 /// a collector through all of them would touch far more code than the measurement
 /// is worth. The 1 Hz trace drains the counters, so each line reports the cost
 /// incurred during that second.
@@ -716,139 +716,25 @@ enum GradientTarget {
     Background,
 }
 
-/// A pre-built T2 GPU texture (#56): the `BindGroup` to paint plus the owning
-/// `Texture`. Eviction simply **drops** this handle; wgpu reclaims the VRAM once
-/// no live reference remains (it refuses to free a texture whose view is still
-/// bound, which is the safety we rely on). We deliberately do *not* call
+/// A built GPU texture for one layer: the `BindGroup` to paint plus the owning
+/// `Texture`. Dropping this handle releases our reference; wgpu reclaims the VRAM
+/// once no live reference remains (it refuses to free a texture whose view is
+/// still bound, which is the safety we rely on). We deliberately do *not* call
 /// `Texture::destroy()` — that forcibly frees regardless of references, and on
 /// Vulkan a draw recorded this frame against a just-destroyed texture aborts the
 /// process at submit (Metal tolerated it; Vulkan does not). The `BindGroup` is
 /// shared (`Arc`) with the active-layer slot while displayed.
-struct T2Texture {
-    // Held to own the texture for the ring entry's lifetime: dropping this handle
-    // (on eviction) releases our reference so wgpu can reclaim the VRAM once the
-    // bind group is gone too. Not read directly — ownership/drop is the point.
+///
+/// Was `T2Texture`, named for the pre-upload ring that produced it; the ring was
+/// retired in #299 and this is now simply what [`ExrViewer::build_layer_texture`]
+/// hands back, on the upload worker or the UI thread alike.
+struct LayerTexture {
+    // Held to own the texture for the entry's lifetime: dropping this handle
+    // releases our reference so wgpu can reclaim the VRAM once the bind group is
+    // gone too. Not read directly — ownership/drop is the point.
     #[allow(dead_code)]
     texture: eframe::egui_wgpu::wgpu::Texture,
     bind_group: std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>,
-}
-
-/// Pick the T2 frame to evict: the resident frame furthest from the on-screen
-/// frame, which is itself never chosen (its texture is bound for paint). `None`
-/// when nothing but the on-screen frame remains. Pure — the eviction policy is
-/// unit-tested here; the surrounding handle drop is not.
-fn t2_victim(frames: impl Iterator<Item = u32>, on_screen: Option<u32>) -> Option<u32> {
-    let anchor = on_screen.unwrap_or(0);
-    frames
-        .filter(|&f| Some(f) != on_screen)
-        .max_by_key(|&f| f.abs_diff(anchor))
-}
-
-/// Frame-keyed GPU-texture ring with a pure map policy (#153): cap-shrink
-/// eviction, layer-switch invalidation, and on-screen protection, factored out
-/// of [`ExrViewer`] so the risky part is unit-testable. Generic over the payload
-/// `T` — production stores [`T2Texture`] (which needs a GPU device), but the
-/// policy has no GPU dependency, so the tests use a trivial payload.
-///
-/// Eviction is **drop-only**: removing an entry drops its `T`, which for
-/// `T2Texture` releases the VRAM reference (wgpu reclaims once no view is bound).
-/// We never `Texture::destroy()` — see [`T2Texture`] for why a synchronous
-/// destroy aborts the process on Vulkan.
-struct T2Ring<T> {
-    /// Pre-built payloads keyed by sequence frame number.
-    map: std::collections::HashMap<u32, T>,
-    /// The active layer the ring was built for; a change invalidates it.
-    layer: usize,
-    /// Max frames the ring may hold (VRAM-budgeted by the app). `0` disables it.
-    cap: usize,
-    /// The on-screen frame — never evicted (its texture is bound for paint).
-    frame: Option<u32>,
-}
-
-impl<T> T2Ring<T> {
-    fn new() -> Self {
-        Self {
-            map: std::collections::HashMap::new(),
-            layer: 0,
-            cap: 0,
-            frame: None,
-        }
-    }
-
-    fn cap(&self) -> usize {
-        self.cap
-    }
-
-    fn len(&self) -> usize {
-        self.map.len()
-    }
-
-    fn contains(&self, frame: u32) -> bool {
-        self.map.contains_key(&frame)
-    }
-    /// Set the on-screen frame (bound for paint, never evicted).
-    fn set_frame(&mut self, frame: Option<u32>) {
-        self.frame = frame;
-    }
-
-    /// Ring a payload for `frame`. Does not evict — the caller pairs this with
-    /// [`Self::evict_to_cap`] so a freshly-built and a pre-built insert share one
-    /// eviction pass.
-    fn insert(&mut self, frame: u32, value: T) {
-        self.map.insert(frame, value);
-    }
-
-    /// Drop a single frame's payload, if present — a re-rendered frame (#101).
-    fn evict_frame(&mut self, frame: u32) {
-        self.map.remove(&frame);
-    }
-
-    /// Drop the whole ring (new sequence / disabled / layer switch).
-    fn clear(&mut self) {
-        self.map.clear();
-    }
-
-    /// Invalidate the ring when the active layer changed (textures are
-    /// per-layer). Returns whether it cleared.
-    fn ensure_layer(&mut self, active: usize) -> bool {
-        if self.layer != active {
-            self.map.clear();
-            self.layer = active;
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Set the capacity; an unchanged cap is a no-op. Shrinking to `0` clears the
-    /// ring (→ the lazy per-swap path); otherwise it evicts to the new cap.
-    fn set_cap(&mut self, cap: usize) {
-        if cap == self.cap {
-            return;
-        }
-        self.cap = cap;
-        if cap == 0 {
-            self.map.clear();
-        } else {
-            self.evict_to_cap();
-        }
-    }
-
-    /// Evict frames furthest from the on-screen frame until within the cap
-    /// (floored at 1, so the on-screen frame always survives). Drop-only. Returns
-    /// how many were evicted.
-    fn evict_to_cap(&mut self) -> usize {
-        let cap = self.cap.max(1);
-        let mut evicted = 0;
-        while self.map.len() > cap {
-            let Some(victim) = t2_victim(self.map.keys().copied(), self.frame) else {
-                break; // only the on-screen frame remains
-            };
-            self.map.remove(&victim);
-            evicted += 1;
-        }
-        evicted
-    }
 }
 
 /// Per-frame GPU draw context for the canvas (#152): the base uniforms plus the
@@ -1140,21 +1026,6 @@ pub struct ExrViewer {
     gpu_thumb_bg: Option<crate::background::Background>,
     gpu_textures: Vec<Option<std::sync::Arc<eframe::egui_wgpu::wgpu::BindGroup>>>,
 
-    /// T2 GPU-texture ring (#56): pre-built active-layer textures keyed by frame
-    /// number, so a sequence frame swap binds an already-uploaded texture instead
-    /// of re-packing + re-uploading on the UI thread. Valid only for its built
-    /// layer; cleared on a layer switch. Empty / unused for a single image. The
-    /// map policy (cap-shrink eviction, layer invalidation, on-screen protection)
-    /// lives in the unit-tested [`T2Ring`]; the app drives it every frame via
-    /// `set_t2_cap`/`set_t2_frame`/`prebuild_t2` (#153).
-    ///
-    /// **Per-`SourceId` (#99):** one ring per source, created lazily. Today the
-    /// only keys are the A/B compare slots ([`Self::T2_SOURCE_A`] /
-    /// [`Self::T2_SOURCE_B`]) — B mirrors A but keyed on B's frame number and built
-    /// for B's layer (`active_layer` clamped to B's layer count), pre-uploading the
-    /// compared sequence ahead of the playhead. An absent ring reads as disabled
-    /// (cap/len 0). Phase 2 rings the comp stack's N sources under their own ids.
-    t2_rings: std::collections::BTreeMap<crate::layer::SourceId, T2Ring<T2Texture>>,
     /// Persisted display preferences, single-owned here (#151): diff controls,
     /// custom gradients, background + presets. `ExrApp` mirrors these to disk only
     /// at eframe `save()`/load time; the UI mutates them in place.
@@ -1322,7 +1193,6 @@ impl Default for ExrViewer {
             dbg_thumb_bakes: 0,
             gpu_thumb_bg: None,
             gpu_textures: Vec::new(),
-            t2_rings: std::collections::BTreeMap::new(),
             prefs: ViewerPrefs::default(),
             colormap_lut: Vec::new(),
             colormap_sig: None,
@@ -3282,8 +3152,9 @@ impl ExrViewer {
     }
 
     /// Build a GPU texture + bind group for one layer of an `ExrData`, returning
-    /// the [`T2Texture`] (which keeps the `Texture` handle so it can be explicitly
-    /// destroyed on eviction). The shader applies channel isolation, exposure,
+    /// the [`LayerTexture`] (which owns the `Texture` handle so the VRAM is released
+    /// when it drops — see the type docs for why eviction is drop-only rather than an
+    /// explicit `Texture::destroy()`). The shader applies channel isolation, exposure,
     /// gamma, sRGB and every arrangement, so this one generator serves them all.
     ///
     /// **Not UI-thread bound.** It takes a [`crate::gpu::TexBuildCtx`] rather than
@@ -3294,7 +3165,7 @@ impl ExrViewer {
         ctx: &crate::gpu::TexBuildCtx,
         exr_data: &ExrData,
         layer_index: usize,
-    ) -> Option<T2Texture> {
+    ) -> Option<LayerTexture> {
         let (layer, r_chan, g_chan, b_chan, a_chan) = exr_data.logical_channels(layer_index)?;
         let width = layer.size.0;
         let height = layer.size.1;
@@ -3457,7 +3328,7 @@ impl ExrViewer {
         });
         tex_build_stats::record(alloc_dur, pack_dur, write_dur, lap(&mut t), upload_bytes);
 
-        Some(T2Texture {
+        Some(LayerTexture {
             texture,
             bind_group: std::sync::Arc::new(bind_group),
         })
@@ -3482,112 +3353,6 @@ impl ExrViewer {
     )> {
         let t = Self::build_layer_texture(ctx, exr_data, aov)?;
         Some((t.texture, t.bind_group))
-    }
-
-    // --- T2 GPU-texture ring (#56) -------------------------------------------
-
-    /// `source`'s T2 ring, created empty on first use. Mutating entry points
-    /// (`set_t2_cap`, `set_t2_frame`) go through here; reads (`t2_cap`, `t2_len`)
-    /// tolerate an absent ring as "disabled".
-    fn t2_ring_mut(&mut self, source: crate::layer::SourceId) -> &mut T2Ring<T2Texture> {
-        self.t2_rings.entry(source).or_insert_with(T2Ring::new)
-    }
-
-    /// The layer a source's T2 ring builds for: the active layer clamped to the
-    /// source's own layer count. A no-op for the primary (its active layer is
-    /// always in range); the clamp only bites a differently-shaped compared source
-    /// (#98 Phase 1 / #99). Kept as one helper so the ring's `ensure_layer` key,
-    /// the GPU build, and the bind all agree.
-    ///
-    /// A per-AOV decode (#217) answers for its own AOV and nothing else, so it
-    /// short-circuits the clamp: clamping its one-entry table to 0 would ask a
-    /// frame that holds layer 3 for layer 0, `logical_channels` would (correctly)
-    /// refuse, and every build would fail.
-    fn t2_layer_for(&self, exr_data: &ExrData) -> usize {
-        exr_data.only_layer.unwrap_or_else(|| {
-            self.active_layer
-                .min(exr_data.logical_layers.len().saturating_sub(1))
-        })
-    }
-
-    /// Set the VRAM-budgeted T2 capacity (frames) for `source`. `0` disables
-    /// pre-upload and drops that ring → the lazy per-swap path. Shrinking evicts
-    /// immediately. Called every frame from `tick_budgets` — an unchanged cap is a
-    /// no-op. The app splits the VRAM budget across active sources (#166/#99), so
-    /// each source derives its own count from its own resolution.
-    pub(crate) fn set_t2_cap(&mut self, source: crate::layer::SourceId, cap: usize) {
-        self.t2_ring_mut(source).set_cap(cap);
-    }
-
-    /// Tell the viewer which sequence frame of `source` is on screen, so `ui()`
-    /// binds its T2 texture. `None` for a single image / non-sequence (lazy path).
-    pub(crate) fn set_t2_frame(&mut self, source: crate::layer::SourceId, frame: Option<u32>) {
-        self.t2_ring_mut(source).set_frame(frame);
-    }
-
-    /// `source`'s current T2 capacity in frames (`0` = disabled / no ring).
-    pub(crate) fn t2_cap(&self, source: crate::layer::SourceId) -> usize {
-        self.t2_rings.get(&source).map_or(0, |r| r.cap())
-    }
-
-    /// Number of GPU textures currently resident in `source`'s T2 ring
-    /// (instrumentation).
-    pub(crate) fn t2_len(&self, source: crate::layer::SourceId) -> usize {
-        self.t2_rings.get(&source).map_or(0, |r| r.len())
-    }
-
-    /// Pre-build the T2 texture for `(frame, source's layer)` and ring it under
-    /// `source`, evicting to the cap. Returns `true` if it actually built (so the
-    /// caller can amortize uploads across frames). No-op — returns `false` — when
-    /// disabled, already resident, or the build fails. UI-thread only. Pass frames
-    /// already resident in that source's T1 cache; T2 never triggers a decode. The
-    /// ring bookkeeping is [`T2Ring`]'s; only the GPU build stays here.
-    pub(crate) fn prebuild_t2(
-        &mut self,
-        source: crate::layer::SourceId,
-        gpu: &crate::gpu::GpuResources,
-        exr_data: &ExrData,
-        frame: u32,
-    ) -> bool {
-        let layer = self.t2_layer_for(exr_data);
-        let ring = self.t2_rings.entry(source).or_insert_with(T2Ring::new);
-        if ring.cap() == 0 {
-            return false;
-        }
-        ring.ensure_layer(layer);
-        if ring.contains(frame) {
-            return false;
-        }
-        let Some(t2) = Self::build_layer_texture(&gpu.tex_build_ctx(), exr_data, layer) else {
-            return false;
-        };
-        ring.insert(frame, t2);
-        ring.evict_to_cap();
-        true
-    }
-
-    /// Drop a single frame's T2 texture, if present. Used by the render-watch
-    /// (#101) so a re-rendered frame's stale GPU texture is released and rebuilt
-    /// from the fresh decode. Drop-only (no `destroy()`): if this frame is the one
-    /// on screen, the bound bind group keeps the old texture alive until the next
-    /// paint rebinds the fresh one — no in-flight draw is ever invalidated.
-    pub(crate) fn evict_t2_frame(&mut self, source: crate::layer::SourceId, frame: u32) {
-        if let Some(ring) = self.t2_rings.get_mut(&source) {
-            ring.evict_frame(frame);
-        }
-    }
-
-    /// Drop every T2 texture in `source`'s ring (new sequence / disabled / layer
-    /// switch / source dropped). Drop-only: the on-screen frame's texture stays
-    /// alive through its still-bound bind group (cloned into `gpu_textures*`) and is
-    /// freed by wgpu once that binding is replaced — critically, this clear can run
-    /// *before* the central panel rebinds for the just-advanced frame, so the bound
-    /// frame may differ from the ring's on-screen frame; dropping is safe for
-    /// either, a `destroy()` is not.
-    pub(crate) fn clear_t2(&mut self, source: crate::layer::SourceId) {
-        if let Some(ring) = self.t2_rings.get_mut(&source) {
-            ring.clear();
-        }
     }
 
     /// CPU contact-sheet thumbnail bake: decimate `layer_index` to the thumbnail
@@ -4529,164 +4294,6 @@ mod gui_tests {
             comp_hover_side(egui::pos2(150.0, 100.0), rect, Some(rect_b), None, None),
             Some(CompSide::A)
         );
-    }
-
-    #[test]
-    fn t2_victim_evicts_furthest_and_protects_on_screen() {
-        use super::t2_victim;
-        // On-screen frame 5; the furthest resident frame is evicted, never 5.
-        assert_eq!(t2_victim([3, 4, 5, 6, 9].into_iter(), Some(5)), Some(9));
-        assert_eq!(t2_victim([1, 2, 5, 6].into_iter(), Some(5)), Some(1));
-        // Only the on-screen frame left -> nothing to evict.
-        assert_eq!(t2_victim([5].into_iter(), Some(5)), None);
-        assert_eq!(t2_victim(std::iter::empty(), Some(5)), None);
-    }
-
-    // The T2 ring policy (#153), tested with a trivial `()` payload — the map
-    // policy has no GPU dependency, so these run headless like every other test.
-    // Sorted resident frames, to assert which survived eviction.
-    fn resident(ring: &super::T2Ring<()>) -> Vec<u32> {
-        let mut keys: Vec<u32> = ring.map.keys().copied().collect();
-        keys.sort_unstable();
-        keys
-    }
-
-    #[test]
-    fn t2ring_evicts_furthest_and_protects_on_screen() {
-        let mut ring: super::T2Ring<()> = super::T2Ring::new();
-        ring.set_cap(3);
-        ring.set_frame(Some(5));
-        for f in [3, 4, 5, 6, 9] {
-            ring.insert(f, ());
-        }
-        assert_eq!(ring.evict_to_cap(), 2, "over cap by 2");
-        // Furthest from 5 (9, then 3) go first; the on-screen frame is kept.
-        assert_eq!(resident(&ring), vec![4, 5, 6]);
-        assert!(ring.contains(5), "on-screen frame is never evicted");
-    }
-
-    #[test]
-    fn t2ring_shrinking_cap_evicts_down_immediately() {
-        let mut ring: super::T2Ring<()> = super::T2Ring::new();
-        ring.set_cap(6);
-        ring.set_frame(Some(10));
-        for f in [10, 11, 12, 13, 20, 21] {
-            ring.insert(f, ());
-        }
-        ring.set_cap(2); // external memory pressure lowers the cap
-        assert_eq!(ring.len(), 2, "shrink evicts on the cap change, not later");
-        assert!(ring.contains(10), "on-screen frame survives the shrink");
-    }
-
-    #[test]
-    fn t2ring_cap_zero_clears_and_disables() {
-        let mut ring: super::T2Ring<()> = super::T2Ring::new();
-        ring.set_cap(4);
-        ring.set_frame(Some(1));
-        for f in 0..4 {
-            ring.insert(f, ());
-        }
-        ring.set_cap(0);
-        assert_eq!(ring.len(), 0, "cap 0 drops the whole ring");
-        assert_eq!(ring.cap(), 0);
-    }
-
-    #[test]
-    fn t2ring_evict_to_cap_floors_at_one() {
-        // evict_to_cap is only reached with cap >= 1 in production, but the floor
-        // is the safety belt: even at cap 0 the on-screen texture (bound for
-        // paint) must survive rather than be freed mid-frame.
-        let mut ring: super::T2Ring<()> = super::T2Ring::new();
-        ring.cap = 0; // force the degenerate path directly
-        ring.set_frame(Some(2));
-        for f in [1, 2, 3] {
-            ring.insert(f, ());
-        }
-        ring.evict_to_cap();
-        assert_eq!(resident(&ring), vec![2], "floors at the on-screen frame");
-    }
-
-    #[test]
-    fn t2ring_layer_switch_clears_else_noops() {
-        let mut ring: super::T2Ring<()> = super::T2Ring::new();
-        ring.set_cap(4);
-        for f in 0..3 {
-            ring.insert(f, ());
-        }
-        assert!(!ring.ensure_layer(0), "same layer: no clear");
-        assert_eq!(ring.len(), 3);
-        assert!(ring.ensure_layer(1), "layer change invalidates the ring");
-        assert_eq!(ring.len(), 0);
-        assert!(!ring.ensure_layer(1), "stays put on the new layer");
-    }
-
-    #[test]
-    fn framing_bounds_fits_the_combined_layout_only_in_side_by_side() {
-        use super::framing_bounds;
-        let a = egui::vec2(1920.0, 1080.0);
-        let b = egui::vec2(1000.0, 2000.0);
-        // Every non-SBS arrangement frames the A image, regardless of B or normalize.
-        assert_eq!(framing_bounds(false, true, a, Some(b)), a);
-        assert_eq!(framing_bounds(false, false, a, Some(b)), a);
-        // SBS with no B loaded falls back to the single image.
-        assert_eq!(framing_bounds(true, true, a, None), a);
-        // SBS unnormalized: combined width, tallest height.
-        assert_eq!(
-            framing_bounds(true, false, a, Some(b)),
-            egui::vec2(2920.0, 2000.0)
-        );
-        // SBS normalized: B scaled to A's height (1080) → width 1000*1080/2000 = 540.
-        let f = framing_bounds(true, true, a, Some(b));
-        assert!((f.x - 2460.0).abs() < 0.01, "combined width {f:?}");
-        assert!(
-            (f.y - 1080.0).abs() < 0.01,
-            "equal heights when normalized {f:?}"
-        );
-    }
-
-    /// The viewer's remaining half of the unsqueeze contract (#179 / #263): the
-    /// global on/off toggle and the degenerate-factor clamp. Choosing *which* factor
-    /// (a layer's override vs its header PAR) is no longer the viewer's business —
-    /// that is `Draw::effective_par`, resolved per layer before the value ever
-    /// reaches here, so one manual factor can't collapse a mixed-format stack.
-    #[test]
-    fn sanitize_unsqueeze_gates_on_the_global_toggle_and_clamps_bad_factors() {
-        let mut v = ExrViewer::default();
-
-        // Toggle on (the default): the effective aspect passes through verbatim,
-        // and 1.0 is a no-op for square-pixel footage.
-        assert!(v.prefs.anamorphic_unsqueeze);
-        assert_eq!(v.sanitize_unsqueeze(2.0), 2.0);
-        assert_eq!(v.sanitize_unsqueeze(1.33), 1.33);
-        assert_eq!(v.sanitize_unsqueeze(1.0), 1.0);
-
-        // Toggle off returns 1.0 whatever the layer resolved to. The toggle stays
-        // global on purpose: it is an on/off for the whole viewport, not a value.
-        v.prefs.anamorphic_unsqueeze = false;
-        assert_eq!(v.sanitize_unsqueeze(2.0), 1.0);
-        assert_eq!(v.sanitize_unsqueeze(1.0), 1.0);
-
-        // A degenerate factor (0, negative, or NaN — a malformed/absent header PAR,
-        // or a bad override) falls back to 1.0 instead of collapsing the image to a
-        // near-zero width and poisoning the screen↔image reciprocal.
-        v.prefs.anamorphic_unsqueeze = true;
-        assert_eq!(v.sanitize_unsqueeze(0.0), 1.0);
-        assert_eq!(v.sanitize_unsqueeze(-2.0), 1.0);
-        assert_eq!(v.sanitize_unsqueeze(f32::NAN), 1.0);
-        assert_eq!(v.sanitize_unsqueeze(f32::INFINITY), 1.0);
-    }
-
-    #[test]
-    fn t2ring_evict_frame_drops_one_and_ignores_absent() {
-        let mut ring: super::T2Ring<()> = super::T2Ring::new();
-        ring.set_cap(4);
-        for f in [7, 8, 9] {
-            ring.insert(f, ());
-        }
-        ring.evict_frame(8); // a re-rendered frame
-        assert_eq!(resident(&ring), vec![7, 9]);
-        ring.evict_frame(100); // absent: no-op, no panic
-        assert_eq!(ring.len(), 2);
     }
 
     /// Tiny 2×2 RGBA EXR fixture so the CPU render path has real data to draw.

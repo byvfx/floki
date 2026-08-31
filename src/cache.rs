@@ -142,8 +142,8 @@ impl FrameCache {
         Some(entry.data.clone())
     }
 
-    /// Fetch a resident frame **without** touching LRU order — used by the T2
-    /// pre-upload to read a cached frame's pixels without keeping it warm in T1.
+    /// Fetch a resident frame **without** touching LRU order — for readers that
+    /// want a cached frame's pixels without keeping it warm in T1.
     pub fn peek(&self, source: impl Into<SourceId>, frame: u32) -> Option<Arc<ExrData>> {
         self.entries
             .get(&(source.into(), frame))
