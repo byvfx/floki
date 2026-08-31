@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Removed
+- **Dead code behind the layer stack, removed.** (#301) An earlier design had the
+  first file you opened become a special "base track" pinned to the bottom of the
+  composite, distinct from the layers added after it. The unified layer model
+  replaced that — every file you open is an ordinary layer now — but the old
+  machinery was left in place and kept being maintained. It could not run: the
+  condition that created the base track depended on state nothing sets any more.
+  No behaviour changes; there is simply less code that looks like it does
+  something.
 - **The "GPU cache" setting is gone, and playback does less work without it.**
   (#299) It pre-uploaded upcoming frames to GPU textures for smoother playback —
   except the code that read those textures was deleted in an earlier refactor and
