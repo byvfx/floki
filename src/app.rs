@@ -7513,22 +7513,11 @@ impl ExrApp {
         }
     }
 
-    /// Add a source to the Layers-panel stack (#99 PR-B.2): **decode-on-demand**.
-    /// Synchronously decodes `path` (the panel is a paused, cap-6 workflow, so it
-    /// reuses [`ExrData::load`] directly rather than the A/B decode worker), then —
-    /// when a GPU is present — uploads AOV 0 into a texture keyed by a fresh
-    /// `SourceId` in [`Self::comp_sources`], so the composite ping-pong (PR-B.3)
-    /// can bind it. On a decode error nothing is added; the error surfaces in the
-    /// status bar. Headless (no `gpu_resources`) still registers the model layer +
-    /// pixels, just without a texture.
-    ///
-    /// When this is the *first* comp source and a file is open as slot A, the
-    /// opened image is pushed first as the bottom **base track** (#99 R3) so the
-    /// plate composites underneath the added layers.
     /// Flatten the live comp stack into the persistable list (#99 PR-B.5), bottom→top
-    /// so a replay rebuilds the same order. The **base plate is skipped**: it is
-    /// `A_SOURCE`, owned by the slot-A open path rather than the panel, and
-    /// `add_comp_source` re-promotes it on its own. A layer whose source is missing
+    /// so a replay rebuilds the same order. `A_SOURCE` layers are skipped — the
+    /// slot-A base track was retired in #301 and none are created, but the filter
+    /// stays so a stray one could never persist into a stack that has no way to
+    /// restore it. A layer whose source is missing
     /// (never possible today, but cheap to tolerate) is skipped rather than persisted
     /// with an empty path that would fail to restore.
     fn comp_layers_persist(&self) -> Vec<LayerPersist> {
@@ -7643,6 +7632,19 @@ impl ExrApp {
         self.error_msg = None;
     }
 
+    /// Add a source to the Layers-panel stack (#99 PR-B.2): **decode-on-demand**.
+    /// Synchronously decodes `path` (the panel is a paused, cap-6 workflow, so it
+    /// reuses [`ExrData::load`] directly rather than the A/B decode worker), then —
+    /// when a GPU is present — uploads AOV 0 into a texture keyed by a fresh
+    /// `SourceId` in [`Self::comp_sources`], so the composite ping-pong (PR-B.3)
+    /// can bind it. On a decode error nothing is added; the error surfaces in the
+    /// status bar. Headless (no `gpu_resources`) still registers the model layer +
+    /// pixels, just without a texture.
+    ///
+    /// This is where **every** opened file lands — menu, drag-drop and the CLI
+    /// argument all funnel here through `open_layer`. There is no longer a
+    /// special first-file case: the slot-A base track that used to be promoted
+    /// ahead of the first comp source was retired in #301.
     fn add_comp_source(&mut self, path: std::path::PathBuf) {
         if self.comp_stack.len() >= COMP_LAYER_CAP {
             // Report rather than silently drop — a multi-file drop past the cap
