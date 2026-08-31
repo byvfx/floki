@@ -60,8 +60,11 @@ a real GPU is where the render seams are actually verified, and macOS with
 (`metal_tests` needs macOS + an OCIO feature). Since #269 the macOS OCIO job's clippy
 step at least **compiles** those two modules on every PR, so they can no longer rot
 undetected; it does not execute them. Headless GUI tests drive `ExrViewer::handle_hotkeys` through `egui_kittest`
-(`gui_tests` in `viewer.rs`); because this is a binary crate, all tests live in
-inline `#[cfg(test)]` modules. Tone/color math lives in `render_math.rs`; the
+(`gui_tests` in `viewer.rs`). Tests live inline in `#[cfg(test)]` modules because
+nearly everything they touch is crate-private; `src/lib.rs` does expose a public
+surface that `tests/` and `benches/` reach (the `exr_load` benches use it), so
+inline is a consequence of visibility, not of this being a binary crate.
+Tone/color math lives in `render_math.rs`; the
 `channel_mode` integer encoding's single source of truth is `ChannelMode::as_u32`
 (`viewer.rs`), mirrored by `gpu/shader.wgsl`.
 

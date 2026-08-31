@@ -26,9 +26,11 @@ regresses the single-image standalone app**.
 
 ## The one fact that shapes the whole design
 
-GPU texture creation (`prebuild_t2` → `build_layer_texture`, `viewer.rs`) needs `gpu_resources` +
-`queue.write_texture` → it is **UI-thread only**. The load worker can only produce CPU-side
-`ExrData` (+ `ProxyImage`). The sampler (`sample_pixel`, `viewer.rs`, reached via
+GPU texture creation (`build_layer_texture`, `viewer.rs`) needs a `TexBuildCtx` +
+`queue.write_texture`. Since #202 that runs on the upload worker pool rather than
+the UI thread; only the *bind* is UI-side. The load worker produces CPU-side
+`ExrData` — a scrub proxy is one of those, flagged `proxy: true`. The sampler
+(`sample_pixel`, `viewer.rs`, reached via
 `self.viewer.ui(ui, data, …)` in `app.rs`, where `data` is the active slot's `&ExrData`) reads
 the **active slot's `ExrData`** directly.
 
@@ -49,9 +51,9 @@ A single frame may be resident at several tiers at once.
 
 | Tier | What | Size (4K) | Producer | Lives in | Purpose |
 |------|------|-----------|----------|----------|---------|
-| **T0 Proxy** | `ProxyImage` low-res RGBA32F (`proxy.rs`) | 5–20 MB | worker (`from_exr_fast_read`) | CPU | scrub preview / fallback paint |
+| **T0 Proxy** | a downsampled `ExrData` flagged `proxy: true`, f16 where the source is (#170) (`exr_loader.rs`) | 5–20 MB | worker (`ExrData::load_proxy` / `load_layer_proxy_into`) | RAM | scrub preview / fallback paint |
 | **T1 CPU frame** | full `ExrData`, ALL layers (`exr_loader.rs`) | 0.6–1.3 GB | worker (`ExrData::load`) | RAM | **only sampling source** + upload source for T2 |
-| **T2 GPU texture** | `Rgba16Float` for f16 sources (`Rgba32Float` for f32/u32), **active layer only** | ~66 MB (16F) / ~133 MB (32F) | UI thread (`build_layer_texture`) | VRAM | instant paint on `swap_image_data` |
+| ~~**T2 GPU texture**~~ | **Retired in #299** — the pre-upload ring had no consumer. Textures now live one-per-source in `ExrApp::comp_sources`, built on the upload worker pool (#202). | — | — | — | — |
 | **T3 active** | the `ExrData` promoted into `self.exr_data` | (== one T1) | UI thread (swap) | — | what renderer + sampler see this frame |
 
 See [memory-contract.md](memory-contract.md) for budgets, eviction, and the **INV-SAMPLE**

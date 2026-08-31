@@ -84,7 +84,11 @@ mod native {
         } else {
             panic!(
                 "could not locate a system OpenColorIO.\n\
-                 For a self-contained build that needs no installed OCIO, run `cargo ocio-run` \
+                 For a build with no native dependencies at all — no OCIO, no C++ toolchain, \
+                 no cmake — use the pure-Rust stub backend: `cargo build --release \
+                 --no-default-features` (this is what CI builds and lints; colour management \
+                 is then limited to the built-in transforms).\n\
+                 For a self-contained build with full OCIO, run `cargo ocio-run` \
                  (or `cargo build --release --no-default-features --features vendored`) — it statically builds \
                  OCIO from the vendored submodule via cmake.\n\
                  To link an installed OCIO instead, set OPENCOLORIO_ROOT to its install prefix \

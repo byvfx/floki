@@ -1,8 +1,10 @@
 # Testing
 
 Floki's test suite covers parsing/import logic, the batch converter, color/tone
-math, and headless GUI interaction. It runs on a plain CI runner with no
-committed binary fixtures.
+math, and headless GUI interaction. It runs on a plain CI runner. Fixtures are
+generated into a temp dir rather than committed — with one deliberate exception,
+the CI-gated DWA pair under `tests/fixtures/`, which cannot be produced
+synthetically (see the compression note below).
 
 > This document is the **automated** suite. For hands-on testing of a shipped
 > build — what to exercise, known caveats, what to report — see
@@ -38,7 +40,6 @@ expected there — and is worth telling apart from the failure mode in #256/#265
 *code* PR reported `CLEAN` having run nothing and looked identical.
 
 ## What is covered
-
 | Area | Location | Notes |
 |------|----------|-------|
 | EXR channel regrouping (`LogicalLayer`) | `src/exr_loader.rs` | Pure helpers **and** full `ExrData::load` integration on a generated Blender-style EXR. |
@@ -49,6 +50,14 @@ expected there — and is worth telling apart from the failure mode in #256/#265
 | Composite layer placement | `src/viewer.rs` (`gui_tests`) | `comp_layer_rect` / `comp_pane_layout` / `side_by_side_layout` — each layer at its own `tex_size × PAR` (#254). Pure, no device. |
 | Per-layer pixel aspect | `src/layer.rs` | `Draw::effective_par` — the override-vs-header precedence, and that one layer's override leaves its siblings alone (#263). |
 | Format & overscan geometry | `src/viewer.rs` (`gui_tests`), `src/app.rs` | `comp_display_rect` / `overscan_of` / `Overscan::label` — the display box placed from the data window, overscan as a percentage of the format across both sides, and crop vs overscan vs both (#251). `comp_format_of` is checked against an overscanned fixture, since a version reading the *data* window passes every square-window test and misreports exactly the renders the readout exists for. |
+| **Playback: transport** | `src/playback.rs` (30) | State machine, drift-corrected clock, loop/ping-pong wrap, trim, epoch, and the frame-time percentile ring (#236 — an idle span must not be filed as one frame). |
+| **Playback: T1 ring** | `src/cache.rs` (24) | `(SourceId, frame)` keying, directional-ring + LRU eviction, protected playheads, and the byte/count `Bound` (#232). |
+| **Playback: sequences** | `src/sequence.rs` (20) | Detection, numeric sort, holes, and path-for-frame resolution. |
+| **Playback: scheduler** | `src/scheduler.rs` (18) | Pure want-list priority (P1 playhead → P2 ahead → P3 read-behind), plus `want_first_n`'s bounded walk asserted against `want_list`'s prefix. |
+| **Playback: budgets** | `src/budget.rs` (6), `src/app.rs` | The bytes→count conversion, and — since the #288 T1/T2 split — the **cap arithmetic itself** via `tick_budgets_t1(&Sample)`, where #215 / #230 / #232 / #233 / #322 actually landed. |
+| **Playback: disk proxy cache** | `src/proxy_cache.rs` (8) | Key derivation (path + mtime + size + px + aov), filename hashing, and blob round-trip. |
+| **Playback: read-ahead warmer** | `src/prefetch.rs` (4) | Dedupe ring bounds, survival of missing files, and the gated `WarmJob` hand-off (#309). |
+| DWA decode (committed fixture) | `src/exr_loader.rs` | The one CI-gated binary fixture pair — DWA output cannot be produced synthetically. |
 | Render seams (on device) | `src/gpu/ocio_pass.rs` (`device_tests`), `src/gpu/thumbnail.rs` | Accumulate ping-pong blend vs a CPU reference, the layer-rect union (#257), blit coverage/checker, sRGB display-encode. Skips without a capable GPU — see [On-device tests](#on-device-tests). |
 | GUI interaction (headless) | `src/viewer.rs` (`gui_tests`) | Drives `ExrViewer::handle_hotkeys` through `egui_kittest` — channel keys, compare modes, contact-sheet gating, B-image gating. |
 
@@ -64,7 +73,6 @@ premultiplied-alpha blend, the α=−1 "no image" sentinel, and whether
 **They skip rather than fail** when the machine can't supply a device, so a
 GPU-less CI runner still goes green. There are **two** ways to come up short
 and both must be checked:
-
 | Condition | Where it bites |
 |---|---|
 | No adapter at all | headless runners with no Vulkan/Metal/DX |
@@ -112,9 +120,12 @@ Two consequences worth knowing:
   seam and no CPU stand-in can observe it — see below.
 - **GUI tests target a rendering-free seam.** `ExrViewer::handle_hotkeys` holds
   the keyboard-driven state changes so `egui_kittest` can exercise the real egui
-  input pipeline without building the full canvas. This is a binary crate, so
-  GUI tests live in an inline `#[cfg(test)]` module (a `tests/` integration
-  crate can't reach binary internals).
+  input pipeline without building the full canvas. GUI tests live in an inline
+  `#[cfg(test)]` module because `ExrViewer::handle_hotkeys` is crate-private —
+  that is the rule generally: **inline for crate-private items, `tests/` or
+  `benches/` for the public surface**. `src/lib.rs` exists precisely so the
+  public surface is reachable from separate crates (the `exr_load` benches use
+  it), so "a binary crate can't be tested from `tests/`" is not the reason.
 - **The `channel_mode` encoding has one source of truth:**
   `ChannelMode::as_u32` in `src/viewer.rs`. `gpu/shader.wgsl` must match it; a
   test in `gpu/mod.rs` locks the values.
@@ -134,7 +145,6 @@ git clone --depth 1 https://github.com/AcademySoftwareFoundation/openexr-images.
 committed fixtures in `tests/fixtures/` stay the CI-gated ones.
 
 What each category is worth *here*, as opposed to in general:
-
 | Category | Why it matters to floki |
 |---|---|
 | `Damaged/` | 186 fuzz crashers (ASAN heap-OOB, SIGSEGV, truncation) that broke OpenEXR. Directly on point: the `byvfx/exrs` fork exists because a decompressor **panicked**, and on a rayon worker that is an uncatchable `process::abort()`. `ExrData::load`'s `catch_unwind` has never been tried against real malformed input. Note these deliberately have **no `.exr` extension** — they are not valid files. |
@@ -147,7 +157,6 @@ What each category is worth *here*, as opposed to in general:
 
 **`Beachball/` is the #217 test case**, and better than the studio renders it was
 built against, because it is a controlled pair:
-
 | | frames | layout |
 |---|---|---|
 | `multipart.0001–0008.exr` | 8 | 10 parts, **one** logical layer each |
@@ -169,7 +178,6 @@ ARM question.
 
 Three 12 s soaks, comp layer on the named AOV, **proxy off** so the only cheap
 path is `load_beauty`/`load_layer`:
-
 | footage | AOV | build failures | `soft=` playing | settles |
 |---|---|---|---|---|
 | `multipart` | 1 — `depth_left` | 0 | **1** | `s2:8full` |

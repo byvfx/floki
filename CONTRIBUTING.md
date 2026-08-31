@@ -23,7 +23,15 @@ If you've noticed a bug or have a feature request, please make sure to open an i
 4. **Format your code** using `cargo fmt`.
 5. **Lint your code** using `cargo clippy` and fix any warnings.
 
-> CI runs `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test --all-targets`, and **blocks the build until they pass** — so run them locally first.
+> CI's `Test & Lint` job runs exactly these three, and **blocks the build until they pass** — so run them locally first:
+>
+> ```bash
+> cargo fmt --all -- --check
+> cargo clippy --all-targets --no-default-features -- -D warnings
+> cargo test --all-targets --no-default-features
+> ```
+>
+> The `--no-default-features` selects the pure-Rust OCIO stub. It matters twice over: the runner has no OpenColorIO installed, so without the flag the gate would not build there — and it means CI lints and tests *that* feature set. Running the commands without it locally checks something CI never does.
 6. **Commit your changes** with clear, descriptive commit messages.
 7. **Push to your fork** and submit a Pull Request.
 
