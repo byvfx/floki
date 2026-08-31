@@ -1428,9 +1428,8 @@ mod device_tests {
 
     // The shader's premultiplied-alpha blend switch (shader.wgsl:214-249),
     // transcribed as the *independent* CPU reference the on-device accumulate test
-    // asserts against — no such helper exists elsewhere in the tree (the
-    // shader.wgsl:213 comment names a `generate_composite_texture` that doesn't
-    // exist). `layer` is `color_a` (the incoming top layer), `accum` is `color_b`
+    // asserts against — no such helper exists elsewhere in the tree. `layer` is
+    // `color_a` (the incoming top layer), `accum` is `color_b`
     // (the running accumulation below it). Keep in lockstep with `BlendMode::as_u32`
     // (Over=0, Under=1, Add=2, Multiply=3, Screen=4).
     fn cpu_blend(layer: [f32; 4], accum: [f32; 4], blend: u32) -> [f32; 4] {

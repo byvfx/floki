@@ -27,7 +27,7 @@
 use eframe::egui_wgpu::wgpu;
 
 /// Tone / display parameters copied from the viewer for the thumbnail render.
-/// Mirrors the relevant `Uniforms` inputs of the main `draw_canvas_gpu` path so
+/// Mirrors the relevant `Uniforms` inputs of the main `draw_comp_composite` path so
 /// thumbnails match the central viewport.
 pub struct ThumbnailTone {
     pub exposure: f32,
@@ -265,7 +265,7 @@ fn decimate_source(
 }
 
 /// Build the per-thumbnail `Uniforms` from the tone/background config. Mirrors
-/// the `draw_canvas_gpu` template (viewer.rs), but with a full-target quad
+/// the `draw_comp_composite` template (viewer.rs), but with a full-target quad
 /// (`rect_min=[0,0]`, `rect_max=screen_size=[out_w,out_h]`), `skip_checker=0`
 /// (composite the background), and `opacity=1.0` (opaque output).
 fn uniforms_for(tone: &ThumbnailTone, out_w: usize, out_h: usize) -> crate::gpu::Uniforms {

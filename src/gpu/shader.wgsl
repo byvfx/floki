@@ -262,7 +262,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // and mapped through the `colormap_tex` ramp. This is a false-color
         // visualization, emitted directly in display space and NOT color-managed —
         // the viewer routes diff through this pipeline even under OCIO. Keep the
-        // metric/floor math in lockstep with `generate_diff_texture` in src/viewer.rs.
+        // metric/floor math in lockstep with `DiffMetric` in src/gradient.rs — the CPU
+        // mirror this once named was removed with the CPU render path in #59.
         let dr = abs(r - color_b.r);
         let dg = abs(g - color_b.g);
         let db = abs(b - color_b.b);
@@ -288,7 +289,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // Premultiplied-alpha compositing. Keep the `blend_mode` switch in lockstep
     // with `BlendMode::as_u32` in src/viewer.rs (Over=0, Under=1, Add=2,
-    // Multiply=3, Screen=4) and the CPU `generate_composite_texture`.
+    // Multiply=3, Screen=4). `ocio_pass.rs`'s `cpu_blend` is the independent CPU
+    // reference the on-device accumulate test asserts against.
     if uniforms.is_composite == 1u {
         let aa = color_a.a;
         let ba = color_b.a;

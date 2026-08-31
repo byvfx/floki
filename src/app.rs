@@ -4579,12 +4579,11 @@ impl ExrApp {
                 self.viewer.active_layer =
                     self.viewer.active_layer.min(layer_count.saturating_sub(1));
             }
-            // The viewport must rebuild every swap (that's how the next frame
-            // paints), but the contact-sheet thumbnails freeze while the transport
-            // is busy — otherwise a sheet open over a sequence re-bakes every layer
-            // per frame swap (#144). `settle_to_full` / the settle landing refresh
-            // them once the playhead stops.
-            self.viewer.invalidate_active_viewport();
+            // The contact-sheet thumbnails freeze while the transport is busy —
+            // otherwise a sheet open over a sequence re-bakes every layer per frame
+            // swap (#144). `settle_to_full` / the settle landing refresh them once
+            // the playhead stops. (The viewport needs no invalidation here: it
+            // rebinds through `comp_sources` + the upload pool, #302.)
             if !self.thumbs_suppressed() {
                 self.viewer.invalidate_active_thumbnails();
             }
