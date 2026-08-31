@@ -9443,10 +9443,14 @@ impl ExrApp {
     /// sheet that should follow the playhead, which is what left the sheet frozen on
     /// the open-time frame forever.
     ///
-    /// **Only a full decode substitutes.** A proxy or beauty-only frame carries a
-    /// single logical layer, and the sheet's grid is sized from
-    /// `logical_layers.len()` — so swapping one in would collapse a 40-AOV sheet to
-    /// one cell. While the clock moves, cheap frames are what is resident, so the
+    /// **Only a full decode substitutes**, and the filter rejects all three ways a
+    /// frame can be partial: `proxy` (downsampled), `beauty_only` (#56 step 3), and
+    /// `only_layer` (the per-AOV decode, #217). Each carries **fewer than all the
+    /// layers**, and the sheet's grid is sized from `logical_layers.len()` — so
+    /// swapping one in would collapse a 40-AOV sheet to one cell. `only_layer`
+    /// matters as much as the other two: it is the shape a cheap decode takes on a
+    /// multi-part render, exactly the footage a contact sheet is most useful for.
+    /// While the clock moves, partial frames are what is resident, so the
     /// sheet keeps showing the open-time decode exactly as before. On settle,
     /// `settle_to_full` re-decodes the playhead at full fidelity and
     /// `invalidate_active_thumbnails` (reachable on the comp path since #239)
