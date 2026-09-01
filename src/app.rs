@@ -5470,6 +5470,9 @@ impl ExrApp {
                     ui.label("E - Reset exposure to 0.0");
                     ui.label("Shift+G - Reset gamma to 1.0");
                     ui.label("(or right-click the EV / γ boxes to reset)");
+                    ui.label("Space - Play / pause the sequence");
+                    ui.label("Left / Right Arrow - Step one frame back / forward");
+                    ui.label("I / O - Set the in / out point of the play range");
 
                     ui.add_space(5.0);
                     ui.heading("Mouse Controls");
@@ -5480,9 +5483,9 @@ impl ExrApp {
                     ui.add_space(10.0);
                     ui.heading("Features");
                     ui.label("• Contact Sheet: View ▸ Contact Sheet shows every pass of the current layer as a grid; click one to switch the layer to it.");
-                    ui.label("• Metadata Explorer: When two images are loaded, EXR Info automatically displays metadata and layers for both Image A and Image B.");
+                    ui.label("• Metadata Explorer: With more than one layer loaded, EXR Info shows metadata and passes for each source.");
                     ui.label("• Variable Sampling: Pick 1px / 3×3 / 9×9 to average the pixel readout over an aperture.");
-                    ui.label("• Compositing: Load Image B, choose 'Comp', and pick a blend mode (Over / Under / Add / Multiply / Screen).");
+                    ui.label("• Compositing: Add a second layer, set Compare to 'Comp', pick which layer is the B side, then choose a blend mode (Over / Under / Add / Multiply / Screen).");
 
                     ui.add_space(10.0);
                     ui.heading("About");
