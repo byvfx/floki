@@ -4669,21 +4669,39 @@ impl ExrApp {
         self.viewer = ExrViewer::default();
     }
 
+    /// Resident decoded-image bytes, for the RAM readout in the debug overlay.
+    ///
+    /// Two places hold a decode and they overlap: the ring (`frame_cache`) and each
+    /// `CompSource`'s open-time `exr_data`. A source's decode is usually *also* a ring
+    /// entry — the same `Arc`, not a copy — so this sums the ring and then adds only
+    /// the source decodes the ring does not already hold, by pointer identity.
+    ///
+    /// This used to branch on `playback.is_active()` and measure `self.exr_data` when
+    /// the transport was stopped. That field belonged to the retired slot A and is
+    /// never populated, so the readout reported a flat **0** for a still image (#342)
+    /// — off by the entire decode on the 1 GB/frame renders this is built for. The
+    /// branch is gone: pointer dedup is correct whether or not the clock is running.
+    ///
+    /// Diagnostic only. The T1 budget reads `frame_cache.bytes()` directly
+    /// (`budget::t1_budget_bytes`) and never came through here.
     fn tracked_image_bytes(&self) -> u64 {
-        // For a sequence the active frame is one of the resident T1 frames (a
-        // shared `Arc`), so the cache already accounts for slot A — don't also add
-        // `exr_data`, which would double-count it.
-        if self.playback.is_active() {
-            // The ring's own measurement (#230). This used to be
-            // `len * frame_bytes`, which reported every beauty-only or proxy frame
-            // as a full one — on a 1 GB/frame render that overstated tracked RAM by
-            // an order of magnitude in exactly the mode playback runs in.
-            self.frame_cache.bytes()
-        } else {
-            self.exr_data
-                .as_ref()
-                .map_or(0, |d| d.approx_bytes() as u64)
+        // The ring's own measurement (#230). This used to be `len * frame_bytes`,
+        // which reported every beauty-only or proxy frame as a full one — on a
+        // 1 GB/frame render that overstated tracked RAM by an order of magnitude in
+        // exactly the mode playback runs in.
+        let mut total = self.frame_cache.bytes();
+        // Sources can share one decode (the same file opened as two layers), so
+        // dedupe against each other as well as against the ring.
+        let mut counted: Vec<*const ExrData> = Vec::new();
+        for cs in self.comp_sources.values() {
+            let ptr = std::sync::Arc::as_ptr(&cs.exr_data);
+            if counted.contains(&ptr) || self.frame_cache.holds(&cs.exr_data) {
+                continue;
+            }
+            counted.push(ptr);
+            total += cs.exr_data.approx_bytes() as u64;
         }
+        total
     }
 
     /// Load EXR files dragged onto the window as new layers (#99 R4). While files
@@ -11318,6 +11336,58 @@ mod tests {
         assert!(
             app.comp_sources.contains_key(&source),
             "the still source is still stored (its single texture)"
+        );
+    }
+
+    #[test]
+    fn still_image_ram_is_measured_not_reported_as_zero() {
+        // #342: the readout branched on `playback.is_active()` and measured the
+        // retired slot A when the clock was stopped. Slot A is never populated, so a
+        // still image reported a flat 0 while its decode sat resident — off by the
+        // whole image on the renders this is built for.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("still.exr");
+        write_rgba_exr(&f);
+        let mut app = ExrApp::default();
+        app.add_comp_source(f);
+
+        let source = crate::layer::SourceId(COMP_SOURCE_BASE);
+        let decode = app.comp_sources[&source].exr_data.approx_bytes() as u64;
+        assert!(decode > 0, "fixture must actually hold pixels");
+        assert!(
+            !app.playback.is_active(),
+            "a still leaves the transport stopped - the branch that returned 0"
+        );
+        assert_eq!(
+            app.tracked_image_bytes(),
+            decode,
+            "a resident still must be measured, not reported as 0"
+        );
+    }
+
+    #[test]
+    fn a_decode_in_both_the_ring_and_its_source_is_counted_once() {
+        // The reason the old code had a branch at all: a source's `exr_data` and a
+        // ring entry are frequently the *same* `Arc`, so summing both naively would
+        // double-count it. Pointer identity is what keeps that honest now, and it
+        // holds whether or not the clock is running.
+        let (_dir, paths) = write_sequence(5);
+        let mut app = ExrApp::default();
+        app.add_comp_source(paths[0].clone());
+
+        let source = crate::layer::SourceId(COMP_SOURCE_BASE);
+        let arc = app.comp_sources[&source].exr_data.clone();
+        assert!(
+            app.frame_cache.holds(&arc),
+            "opening a sequence seeds its frame into T1 under the source id"
+        );
+
+        let ring = app.frame_cache.bytes();
+        assert!(ring > 0, "the seeded frame must be resident");
+        assert_eq!(
+            app.tracked_image_bytes(),
+            ring,
+            "the shared decode is one allocation and must be counted once"
         );
     }
 
