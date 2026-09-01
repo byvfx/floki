@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **The Layers panel no longer rations layers.** The cap was 6 and the header
+  showed a "3/6" counter, which read as a quota you were spending rather than a
+  ceiling nobody reaches. The counter is gone and the cap is 100 — high enough to
+  be a runaway backstop rather than something you plan around.
+
 ### Removed
 - **The last of the old single-image slot, removed.** (#277) Before the unified
   layer model the first file you opened lived in a dedicated slot with its own
