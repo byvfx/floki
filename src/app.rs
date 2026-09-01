@@ -176,11 +176,11 @@ const MIN_PROXY_PX: usize = 256;
 /// Backstop on Layers-panel composite sources (#99 PR-B).
 ///
 /// **Not a product limit.** It was 6, chosen when playback footprint was reasoned
-/// about per layer, and it was surfaced in the panel as a "3/6" counter — which
-/// read as a quota you were spending rather than a ceiling nobody sane reaches.
-/// Both the counter and the small number are gone; this exists only so a runaway
-/// drop (or a `persisted_layers` that accumulated across sessions, #242) cannot
-/// allocate without bound.
+/// about per layer, and the panel showed it beside the heading as an `n/6` counter
+/// — which read as a quota being spent rather than a ceiling nobody is expected to
+/// reach. Both the counter and the small number are gone; this exists only so a
+/// runaway drop (or a `persisted_layers` that accumulated across sessions, #242)
+/// cannot allocate without bound.
 ///
 /// If you are raising this again, the thing to check is **not** RAM: the T1 ring
 /// is byte-budgeted and shared, so more layers divide one budget rather than
