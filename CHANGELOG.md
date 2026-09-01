@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **The sRGB toggle works again.** (#343) Turning sRGB off changed nothing on
+  screen. The composite renderer has to keep its accumulation pass in
+  scene-linear, so it hands the encode to a later display stage, and that stage
+  was encoding unconditionally without ever consulting the toggle. It now honours
+  it, so switching sRGB off shows the scene-linear image as it should. With OCIO
+  active the checkbox is greyed out instead: the OCIO display transform owns the
+  encode there, and a control that silently does nothing is what hid this.
 - **The contact sheet follows the playhead again.** (#240) Opening the sheet over
   a sequence showed the frame that was loaded when you first opened the file, and
   kept showing it however far you played — most visibly as a sheet that stayed

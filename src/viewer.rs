@@ -1258,6 +1258,28 @@ impl Default for ExrViewer {
     }
 }
 
+/// Salt distinguishing which display stage `draw_comp_composite` will run, folded
+/// into `render_sig` so a change to it re-renders instead of re-blitting the cached
+/// `display_view`.
+///
+/// The stage runs after pass 1, whose uniforms are scene-linear in every mode, so
+/// none of this reaches `ocio_sig`; and neither control bumps `ocio_render_gen`.
+/// A selector missing here is invisible until some unrelated repaint dirties the
+/// signature, and then sticks — which is exactly how #343 presented once the
+/// pipeline itself was fixed.
+///
+/// The three states must stay mutually distinct; that is what the test asserts.
+fn display_stage_salt(ocio_active: bool, srgb: bool) -> u64 {
+    if ocio_active {
+        // OCIO owns the encode; the sRGB toggle is greyed out and cannot vary.
+        0
+    } else if srgb {
+        0x9E37_79B9_7F4A_7C15
+    } else {
+        0xC2B2_AE3D_27D4_EB4F
+    }
+}
+
 impl ExrViewer {
     /// Every viewer keyboard shortcut: channel isolation (R/G/B/A/C), frame-fit
     /// (F), the tone resets (E / Shift+G), and fullscreen (F11 / Esc). Called once
@@ -3100,21 +3122,21 @@ impl ExrViewer {
             bg_checker_light: rgb3_to_vec4(self.prefs.background.checker_light),
             bg_solid: rgb3_to_vec4(self.prefs.background.solid),
         };
-        // Fold the display stage into the signature (comp path): toggling OCIO leaves
-        // pass-1's scene-linear uniforms — hence `ocio_sig` — unchanged, and the
-        // Enable-OCIO checkbox doesn't bump `ocio_render_gen`, so without this a toggle
-        // would keep the stale cached `display_view` from the prior mode (the OCIO
-        // transform vs the OCIO-off sRGB display-encode).
-        let display_stage_salt = if self.ocio_active {
-            0
-        } else {
-            0x9E37_79B9_7F4A_7C15
-        };
+        // Fold the display stage into the signature (comp path): the stage runs after
+        // pass 1, so nothing that selects it appears in `ocio_sig` (pass-1 uniforms are
+        // scene-linear either way) and neither control bumps `ocio_render_gen`. Without
+        // this, flipping one keeps the stale cached `display_view` from the prior mode.
+        //
+        // *Both* selectors have to be here, not just OCIO. The sRGB toggle (#343) picks
+        // encode vs passthrough at this same stage, and while it was missing the toggle
+        // did nothing until an unrelated repaint dirtied the signature for it, then
+        // stuck, because toggling back was equally invisible.
+        let display_salt = display_stage_salt(self.ocio_active, self.srgb);
         // Salt the arrangement in too, so switching Stacked↔Side-by-Side always
         // re-renders even if the per-draw uniforms happened to hash the same.
         let arrangement_salt = if is_sbs { 0x517C_C1B7_2722_0A95 } else { 0 };
         let render_sig =
-            (ctx.ocio_sig.get() ^ self.ocio_render_gen ^ display_stage_salt ^ arrangement_salt)
+            (ctx.ocio_sig.get() ^ self.ocio_render_gen ^ display_salt ^ arrangement_salt)
                 .wrapping_mul(0x100000001b3);
         // Side-by-Side spans the canvas with two panes, so the display transform runs
         // unscissored rather than over just the composite's rect (the A/B path does the
@@ -3138,6 +3160,8 @@ impl ExrViewer {
             accumulate: true,
             // OCIO off → the display stage is the sRGB display-encode pass (R2).
             use_display_encode: !self.ocio_active,
+            // ...and whether that stage encodes or copies is the sRGB toggle (#343).
+            display_srgb: self.srgb,
             overlay_draws,
             display_format: render_state.target_format,
             blit_uniforms,
@@ -3817,6 +3841,43 @@ fn draw_dashed_rect(
     draw_line(rect.right_top(), rect.right_bottom());
     draw_line(rect.right_bottom(), rect.left_bottom());
     draw_line(rect.left_bottom(), rect.left_top());
+}
+
+#[cfg(test)]
+mod display_stage_tests {
+    use super::display_stage_salt;
+
+    /// #343: the sRGB toggle picks encode vs passthrough at the display stage, which
+    /// runs after pass 1 and so contributes nothing to `ocio_sig`. If its state does
+    /// not change `render_sig`, `prepare` skips both passes and re-blits the cached
+    /// `display_view` — the toggle appears dead until an unrelated repaint dirties the
+    /// signature, then sticks. The salt is the only thing separating these states, so
+    /// a collision between any two is the bug returning.
+    #[test]
+    fn every_display_stage_state_has_a_distinct_salt() {
+        let ocio = display_stage_salt(true, true);
+        let ocio_srgb_off = display_stage_salt(true, false);
+        let encode = display_stage_salt(false, true);
+        let passthrough = display_stage_salt(false, false);
+
+        assert_ne!(
+            encode, passthrough,
+            "sRGB on vs off must re-render; equal salts are #343 exactly"
+        );
+        assert_ne!(encode, ocio, "OCIO transform vs sRGB encode must re-render");
+        assert_ne!(
+            passthrough, ocio,
+            "OCIO transform vs scene-linear passthrough must re-render"
+        );
+
+        // With OCIO live the toggle is greyed out and cannot vary, so both readings
+        // of it must land on the same stage — otherwise a stale `srgb` left over from
+        // the OCIO-off session would spuriously re-render on every OCIO frame.
+        assert_eq!(
+            ocio, ocio_srgb_off,
+            "under OCIO the sRGB flag must not affect the stage"
+        );
+    }
 }
 
 #[cfg(test)]

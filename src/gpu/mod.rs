@@ -183,6 +183,9 @@ pub struct GpuState {
     /// `target_format`. Slots in where OCIO pass 2 goes so the N-layer composite
     /// renders without OCIO (see [`DISPLAY_ENCODE_SHADER`]).
     pub display_encode_pipeline: wgpu::RenderPipeline,
+    /// Same pass with the encode swapped for a straight copy, used when the sRGB
+    /// toggle is off (#343). Selected in `OcioCallback::paint`.
+    pub display_passthrough_pipeline: wgpu::RenderPipeline,
 }
 
 const BLIT_SHADER: &str = r#"
@@ -340,6 +343,14 @@ fn fs_main(i: VOut) -> @location(0) vec4<f32> {
         lin_to_srgb(max(c.b, 0.0)),
     );
     return vec4<f32>(rgb, c.a);
+}
+
+// sRGB toggle off (#343): the display stage still has to run (the blit reads
+// `display_view`), so it copies scene-linear through instead of encoding it.
+// Alpha, including the <0 "no image" sentinel, carries the same way.
+@fragment
+fn fs_passthrough(i: VOut) -> @location(0) vec4<f32> {
+    return textureSample(scene_t, scene_s, i.uv);
 }
 "#;
 
@@ -876,7 +887,7 @@ impl GpuState {
 
         // OCIO-off display encode (#99 render-unify): scene-linear → sRGB, output
         // to the display target. Reuses `bind_group_layout_tex` for its scene input.
-        let display_encode_pipeline = {
+        let (display_encode_pipeline, display_passthrough_pipeline) = {
             let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("Display Encode Shader"),
                 source: wgpu::ShaderSource::Wgsl(DISPLAY_ENCODE_SHADER.into()),
@@ -886,31 +897,39 @@ impl GpuState {
                 bind_group_layouts: &[Some(&bind_group_layout_tex)],
                 immediate_size: 0,
             });
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("Display Encode Pipeline"),
-                layout: Some(&de_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_main"),
-                    buffers: &[],
-                    compilation_options: Default::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some("fs_main"),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: target_format,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: Default::default(),
-                }),
-                primitive: wgpu::PrimitiveState::default(),
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview_mask: None,
-                cache: None,
-            })
+            // Both pipelines share the module and layout; only the fragment entry
+            // differs. `fs_passthrough` is the sRGB-toggle-off path (#343).
+            let mk = |label: &str, entry: &str| {
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some(label),
+                    layout: Some(&de_layout),
+                    vertex: wgpu::VertexState {
+                        module: &shader,
+                        entry_point: Some("vs_main"),
+                        buffers: &[],
+                        compilation_options: Default::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader,
+                        entry_point: Some(entry),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: target_format,
+                            blend: None,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                        compilation_options: Default::default(),
+                    }),
+                    primitive: wgpu::PrimitiveState::default(),
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview_mask: None,
+                    cache: None,
+                })
+            };
+            (
+                mk("Display Encode Pipeline", "fs_main"),
+                mk("Display Passthrough Pipeline", "fs_passthrough"),
+            )
         };
 
         Self {
@@ -933,6 +952,7 @@ impl GpuState {
             blit_layout,
             blit_sampler,
             display_encode_pipeline,
+            display_passthrough_pipeline,
         }
     }
 
