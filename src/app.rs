@@ -173,9 +173,22 @@ impl Sizing {
 /// instant the user zooms back in.
 const MIN_PROXY_PX: usize = 256;
 
-/// Hard cap on Layers-panel composite sources (#99 PR-B). Playback footprint is
-/// bounded on 8 GB (see the roadmap); the panel disables Add at this many layers.
-const COMP_LAYER_CAP: usize = 6;
+/// Backstop on Layers-panel composite sources (#99 PR-B).
+///
+/// **Not a product limit.** It was 6, chosen when playback footprint was reasoned
+/// about per layer, and the panel showed it beside the heading as an `n/6` counter
+/// — which read as a quota being spent rather than a ceiling nobody is expected to
+/// reach. Both the counter and the small number are gone; this exists only so a
+/// runaway drop (or a `persisted_layers` that accumulated across sessions, #242)
+/// cannot allocate without bound.
+///
+/// If you are raising this again, the thing to check is **not** RAM: the T1 ring
+/// is byte-budgeted and shared, so more layers divide one budget rather than
+/// multiply it (see docs/playback/memory-contract.md). Check the decode worker
+/// instead — there is one, and every sequence layer registers a follower that
+/// competes for it, so the practical ceiling is where playback stops keeping up,
+/// not where memory runs out.
+const COMP_LAYER_CAP: usize = 100;
 
 /// First `SourceId` the Layers panel allocates for its sources (#99 Phase 2).
 /// `SourceId(0)` is the base-plate slot ([`ExrApp::A_SOURCE`]) and `SourceId(1)`
@@ -8285,7 +8298,7 @@ impl ExrApp {
                 ui.add_enabled_ui(unsqueeze && cur_has_source, |ui| {
                     let mut custom = cur_override.is_some();
                     if ui
-                        .checkbox(&mut custom, "Custom factor")
+                        .checkbox(&mut custom, "Custom factor (this layer)")
                         .on_hover_text(
                             "Override the current layer's header pixel aspect ratio. \
                              Applies to that layer only — set it per layer in the \
@@ -8350,9 +8363,8 @@ impl ExrApp {
     fn draw_layer_tracks(&mut self, ui: &mut egui::Ui, axis_w: f32, range: Option<(u32, u32)>) {
         ui.horizontal(|ui| {
             ui.heading("Layers");
-            ui.label(
-                egui::RichText::new(format!("{}/{}", self.comp_stack.len(), COMP_LAYER_CAP)).weak(),
-            );
+            // No "n/cap" counter: the cap is a runaway backstop, not a quota, and
+            // showing it made a generous ceiling look like a small allowance.
             let at_cap = self.comp_stack.len() >= COMP_LAYER_CAP;
             ui.add_enabled_ui(!at_cap, |ui| {
                 if ui
