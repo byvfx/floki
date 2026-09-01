@@ -120,6 +120,18 @@ impl FrameCache {
         self.bytes
     }
 
+    /// Whether `arc` is one of the resident entries, by **pointer identity** rather
+    /// than value.
+    ///
+    /// A decode can be reachable from two places at once — a `CompSource` holds its
+    /// open-time `Arc<ExrData>` and the same allocation may also sit in the ring — so
+    /// anything summing RAM across both has to know which is which or it counts the
+    /// bytes twice (#342). Linear over the entries, which number in the tens.
+    #[must_use]
+    pub fn holds(&self, arc: &Arc<ExrData>) -> bool {
+        self.entries.values().any(|e| Arc::ptr_eq(&e.data, arc))
+    }
+
     /// API completeness alongside [`FrameCache::len`] (and keeps
     /// `clippy::len_without_is_empty` satisfied); no runtime caller today.
     #[allow(dead_code)]

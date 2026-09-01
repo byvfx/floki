@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **The RAM readout no longer reports zero for a still image.** (#342) With a
+  single image open and the transport stopped, the debug overlay showed 0 bytes
+  held however large the file was, because it was measuring a slot the unified
+  layer model retired. It now measures what is actually resident. Diagnostic
+  only — the playback memory budget reads the cache directly and was never
+  affected.
 - **The sRGB toggle works again.** (#343) Turning sRGB off changed nothing on
   screen. The composite renderer has to keep its accumulation pass in
   scene-linear, so it hands the encode to a later display stage, and that stage
