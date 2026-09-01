@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **The Help window no longer describes a model the app dropped.** (#349) Its
+  feature list still told you to "load Image B" to composite, which has not been
+  possible since every file became an ordinary layer — you add a second layer and
+  pick it as the compare side. It also never listed the playback keys, so Space,
+  the arrow keys and I/O were discoverable only by guessing; they are in the
+  shortcut list now, under their own heading since they need a sequence loaded.
+
 ### Changed
 - **The Layers panel no longer rations layers.** The cap was 6 and the header
   showed a "3/6" counter, which read as a quota you were spending rather than a
