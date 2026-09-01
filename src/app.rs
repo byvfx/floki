@@ -8298,7 +8298,7 @@ impl ExrApp {
                 ui.add_enabled_ui(unsqueeze && cur_has_source, |ui| {
                     let mut custom = cur_override.is_some();
                     if ui
-                        .checkbox(&mut custom, "Custom factor")
+                        .checkbox(&mut custom, "Custom factor (this layer)")
                         .on_hover_text(
                             "Override the current layer's header pixel aspect ratio. \
                              Applies to that layer only — set it per layer in the \
