@@ -5470,9 +5470,16 @@ impl ExrApp {
                     ui.label("E - Reset exposure to 0.0");
                     ui.label("Shift+G - Reset gamma to 1.0");
                     ui.label("(or right-click the EV / γ boxes to reset)");
-                    ui.label("Space - Play / pause the sequence");
+
+                    ui.add_space(5.0);
+                    // Its own section, not more rows under "Keyboard Shortcuts":
+                    // `handle_playback_keys` returns early unless a sequence is
+                    // active, so with a single still open these four do nothing and
+                    // listing them unqualified would read as a bug.
+                    ui.heading("Playback (with a sequence loaded)");
+                    ui.label("Space - Play / pause");
                     ui.label("Left / Right Arrow - Step one frame back / forward");
-                    ui.label("I / O - Set the in / out point of the play range");
+                    ui.label("I / O - Set the in / out points of the play range");
 
                     ui.add_space(5.0);
                     ui.heading("Mouse Controls");
