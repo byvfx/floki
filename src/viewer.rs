@@ -1102,8 +1102,9 @@ pub struct ExrViewer {
     /// the log toggle flipped. `disc` is a source discriminator so switching which
     /// image the histogram reflects (classic A vs a comp layer's source, #99 R4)
     /// invalidates it — classic uses [`Self::HIST_DISC_CLASSIC`], comp passes its
-    /// `SourceId`. Image-B load/unload is invalidated explicitly via
-    /// [`ExrViewer::invalidate_histogram`] since B identity isn't in the key.
+    /// `SourceId`. (An explicit `invalidate_histogram` used to cover image-B
+    /// load/unload, whose identity was outside the key; B is an ordinary comp source
+    /// now, so `disc` covers it and the method went with slot A in #277.)
     histogram_key: Option<(u64, usize, bool)>,
     pub log_histogram: bool,
 
@@ -3551,13 +3552,6 @@ impl ExrViewer {
     /// working while the math lives in one tested place.
     pub fn linear_to_srgb(l: f32) -> f32 {
         crate::render_math::linear_to_srgb(l)
-    }
-
-    /// Invalidate the cached histogram so the next [`Self::calculate_histogram`] call
-    /// recomputes. Call this when image B changes (load/unload) — B identity is
-    /// not part of the cache key.
-    pub fn invalidate_histogram(&mut self) {
-        self.histogram_key = None;
     }
 
     /// Drop the cached image-A contact-sheet **thumbnails** (CPU + GPU) so the
