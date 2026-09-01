@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+- **The last of the old single-image slot, removed.** (#277) Before the unified
+  layer model the first file you opened lived in a dedicated slot with its own
+  display path. Every file is an ordinary layer now, so that path could not run:
+  the frame-swap it performed, the two fields it wrote, and a histogram
+  invalidation only it called. No behaviour changes; the code that draws your
+  image was already the other path.
+
 ### Fixed
 - **The RAM readout no longer reports zero for a still image.** (#342) With a
   single image open and the transport stopped, the debug overlay showed 0 bytes

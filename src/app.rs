@@ -51,8 +51,8 @@ struct LoadResult {
     /// B-open vs A-open (path/generation supersession); for a **seq frame**
     /// (`seq_frame`) it is the cache source (locked-step A/B, #98).
     source: crate::layer::SourceId,
-    /// True for an image-sequence frame (#7): apply via `swap_image_arc` to
-    /// preserve the viewer session, rather than starting a fresh session.
+    /// True for an image-sequence frame (#7). Always true in production:
+    /// `submit_seq` is `submit_job`'s only production caller (#277).
     seq_frame: bool,
     /// Playback frame number (meaningful only when `seq_frame`); the cache key.
     frame: u32,
@@ -591,13 +591,6 @@ enum ResetScope {
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct ExrApp {
-    #[serde(skip)]
-    loaded_file: Option<PathBuf>,
-    // `Arc` so a decoded frame can be the active image (tier T3) and stay
-    // resident in the playback ring cache (tier T1) at once, without cloning the
-    // (often 600 MB+) pixel buffers. See docs/playback/memory-contract.md.
-    #[serde(skip)]
-    exr_data: Option<std::sync::Arc<ExrData>>,
     #[serde(skip)]
     error_msg: Option<String>,
     /// A reset awaiting confirmation (#248). Runtime-only — a pending dialog must not
@@ -1166,8 +1159,6 @@ pub struct ExrApp {
 impl Default for ExrApp {
     fn default() -> Self {
         Self {
-            loaded_file: None,
-            exr_data: None,
             error_msg: None,
             pending_reset: None,
             viewer: ExrViewer::default(),
@@ -2094,13 +2085,12 @@ impl ExrApp {
             self.pump_decode();
             return;
         }
-        let Some(path) = self.playback.frame_path(frame).map(Path::to_path_buf) else {
+        if self.playback.frame_path(frame).is_none() {
             // Hole: keep showing the last real frame; prefetch may still run.
             self.playback.pending = None;
             self.pump_decode();
             return;
-        };
-        self.loaded_file = Some(path);
+        }
 
         if let Some(data) = self.frame_cache.get(Self::A_SOURCE, frame) {
             // A beauty-only ring frame (#56, step 3) is fine to *display* while
@@ -2114,7 +2104,6 @@ impl ExrApp {
                 && !self.scrub_active
                 && (data.beauty_only || data.proxy);
             self.loading_a = false;
-            self.swap_image_arc(data);
             if needs_full {
                 self.playback.pending = Some(frame);
             } else {
@@ -2135,10 +2124,9 @@ impl ExrApp {
     }
 
     /// Advance each comp-panel **sequence** layer to its `Trim`-mapped source frame
-    /// for the current global playhead and request it (#99 Phase 2) — the comp
-    /// for the current global playhead and request it (#99 Phase 2). A layer whose trim does not cover the
-    /// current global frame is blank (holds its last frame); a still (no follower)
-    /// is skipped. No-op with no comp sequence layers.
+    /// for the current global playhead and request it (#99 Phase 2). A layer whose
+    /// trim does not cover the current global frame is blank (holds its last frame);
+    /// a still (no follower) is skipped. No-op with no comp sequence layers.
     fn sync_comp_followers(&mut self) {
         let global = self.playback.current_frame;
         // Snapshot (source, source_frame) for each in-range sequence layer before
@@ -2775,14 +2763,10 @@ impl ExrApp {
     /// ever taken on a layout we have actually read.
     fn full_layer_table(&self, source: crate::layer::SourceId) -> Option<&ExrData> {
         let full = |d: &ExrData| !d.proxy && !d.beauty_only && d.only_layer.is_none();
-        if let Some(cs) = self.comp_sources.get(&source)
-            && full(&cs.exr_data)
-        {
-            return Some(&cs.exr_data);
-        }
-        self.exr_data
-            .as_deref()
-            .filter(|d| source == Self::A_SOURCE && full(d))
+        self.comp_sources
+            .get(&source)
+            .map(|cs| cs.exr_data.as_ref())
+            .filter(|d| full(d))
     }
 
     /// The shared "decode something cheaper while the playhead moves" condition for
@@ -4442,7 +4426,6 @@ impl ExrApp {
                         if res.frame == self.playback.current_frame {
                             self.loading_a = false;
                             self.playback.pending = None;
-                            self.swap_image_arc(arc);
                             self.playback
                                 .note_shown(std::time::Instant::now(), res.frame);
                         }
@@ -4464,10 +4447,11 @@ impl ExrApp {
                         // sheet can refresh (#240): its source frame is now a full
                         // decode, so let the cached thumbnails go and re-bake.
                         //
-                        // The slot-A twin of this lives in `swap_image_arc`, and both
-                        // of *its* call sites are primary-only — which the comp path
-                        // never reaches, so nothing here ever invalidated and the
-                        // sheet stayed pinned to whatever it first baked.
+                        // This is the only invalidation on the arrival path now. Its
+                        // slot-A twin was primary-only, which the comp path never
+                        // reaches, so nothing invalidated here and the sheet stayed
+                        // pinned to whatever it first baked; the twin went with the
+                        // rest of slot A in #277.
                         // `settle_to_full` covers only the case where the playhead
                         // was *already* full; after playing with proxies it takes the
                         // other branch and requests this decode instead.
@@ -4513,58 +4497,6 @@ impl ExrApp {
         // hardcodes `seq_frame: true`.
     }
 
-    /// As [`Self::swap_image_arc`], but takes an already-`Arc`'d image so a
-    /// playback cache hit (#56) can show a resident frame without cloning its
-    /// pixel buffers — the same `Arc` is held by the T1 ring and the active slot.
-    fn swap_image_arc(&mut self, data: std::sync::Arc<ExrData>) {
-        // Same Arc as already displayed (scrub-return, settle onto the shown
-        // frame): the pixels are identical, so skip the invalidations — on a
-        // texture miss they'd force a full re-pack + re-upload of the same data (#146).
-        let same = self
-            .exr_data
-            .as_ref()
-            .is_some_and(|cur| std::sync::Arc::ptr_eq(cur, &data));
-        if same {
-            self.error_msg = None;
-            return;
-        }
-        {
-            // Clamp the active layer to the new image's last valid index. A
-            // sequence normally has identical structure frame-to-frame, but guard
-            // against a frame with fewer layers so the per-layer texture index
-            // stays valid (sync_texture_caches resizes the cache but does not
-            // clamp). A true clamp (not reset-to-0) keeps the user's selection
-            // when the new image still has that index in range.
-            //
-            // **Only for a whole-image decode** (#217). A cheap decode's table is a
-            // deliberate subset — a per-AOV decode holds exactly one entry — so
-            // clamping to it would drag the user's selection to 0 on the first
-            // played frame. The gate would then agree the source is "on AOV 0",
-            // the fast path would keep working, and the viewer would show the
-            // wrong pass with every metric healthy. Nothing about a partial frame
-            // is evidence the image lost layers.
-            let partial = data.proxy || data.beauty_only || data.only_layer.is_some();
-            let layer_count = data.logical_layers.len();
-            self.exr_data = Some(data);
-            if !partial {
-                self.viewer.active_layer =
-                    self.viewer.active_layer.min(layer_count.saturating_sub(1));
-            }
-            // The contact-sheet thumbnails freeze while the transport is busy —
-            // otherwise a sheet open over a sequence re-bakes every layer per frame
-            // swap (#144). `settle_to_full` / the settle landing refresh them once
-            // the playhead stops. (The viewport needs no invalidation here: it
-            // rebinds through `comp_sources` + the upload pool, #302.)
-            if !self.thumbs_suppressed() {
-                self.viewer.invalidate_active_thumbnails();
-            }
-            self.viewer.invalidate_histogram();
-            self.viewer.last_sampled_val_a = None;
-            self.viewer.last_hover_pos_img = None;
-        }
-        self.error_msg = None;
-    }
-
     /// Reset persisted state to defaults (#248) — the escape hatch from a setting
     /// that has made the app look broken.
     ///
@@ -4579,10 +4511,11 @@ impl ExrApp {
     /// take effect immediately; neither needs a restart, because the reset runs through
     /// the same teardown a normal close does.
     ///
-    /// `Everything` also closes what is open — the comp stack *and* slot A. That is
-    /// state rather than settings, but leaving it behind would strand the app halfway:
-    /// the transport is cleared with `playback`, so the alternative is a session with
-    /// no timeline, a picture still on screen, and its frames still resident.
+    /// `Everything` also closes what is open — every comp layer, its source, and the
+    /// frames it left in the ring. That is state rather than settings, but leaving it
+    /// behind would strand the app halfway: the transport is cleared with `playback`,
+    /// so the alternative is a session with no timeline, a picture still on screen,
+    /// and its frames still resident.
     fn reset_settings(&mut self, scope: ResetScope) {
         let defaults = ExrApp::default();
 
@@ -4617,17 +4550,13 @@ impl ExrApp {
             self.remove_comp_layer(id);
         }
 
-        // Close slot A as well. `remove_comp_layer` ends by dropping the base track
-        // through `remove_base_layer`, which deliberately leaves A's own image, cache
-        // and transport alone — it exists for the case where the *panel* empties and
-        // the classic viewer takes back over. Nothing else closes slot A: the File ▸
-        // Close Image A menu went out with the #99 R4 collapse.
-        //
-        // Without this the reset half-lands: `playback` is replaced below, which
-        // clears the sequence and the playhead (those are `#[serde(skip)]` fields of
-        // `Playback`, reset along with the struct) — but the decoded image and its
-        // ring of frames stay resident, so a "reset everything" leaves the transport
-        // gone, the picture still up, and hundreds of MB still held.
+        // Dropping the layers is not enough on its own: `remove_comp_layer` releases
+        // each source, but the T1 ring and the transport are shared state that
+        // outlives any single layer. Without clearing them here the reset half-lands
+        // — `playback` is replaced below, so the sequence and the playhead go (both
+        // are `#[serde(skip)]` fields of `Playback`, reset along with the struct),
+        // while the ring of decoded frames stays resident: transport gone, hundreds
+        // of MB still held.
         //
         // The epoch is therefore the one that matters, and it needs care: replacing
         // `playback` below resets it to 0, and a job issued at epoch 0 and still in
@@ -4635,8 +4564,6 @@ impl ExrApp {
         // what was just cleared. So the counter is carried across and bumped rather
         // than restarted — supersession has to be monotonic to mean anything.
         let next_epoch = self.playback.epoch.wrapping_add(1);
-        self.exr_data = None;
-        self.loaded_file = None;
         self.loading_a = false;
         self.frame_cache.clear();
         self.frame_bytes = None;
@@ -11521,88 +11448,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn swap_image_data_a_preserves_viewer_state() {
-        // The per-frame playback path (#7): a new A frame lands but the user's
-        // view (zoom, pan, exposure, channel mode, swatches, annotations) must be
-        // preserved. Contrast the open path, which resets the viewer.
-        let dir = tempfile::tempdir().unwrap();
-        let path_a0 = dir.path().join("a0.exr");
-        let path_a1 = dir.path().join("a1.exr");
-        write_rgba_exr(&path_a0);
-        write_rgba_exr(&path_a1);
-        let a1 = ExrData::load(&path_a1).unwrap();
-
-        let mut app = ExrApp {
-            exr_data: Some(std::sync::Arc::new(ExrData::load(&path_a0).unwrap())),
-            ..Default::default()
-        };
-        // Simulate a user mid-session: non-default view + annotation + swatch.
-        app.viewer.scale = 3.5;
-        app.viewer.translation = egui::Vec2::new(12.0, -7.0);
-        app.viewer.exposure = 1.25;
-        app.viewer.channel_mode = crate::viewer::ChannelMode::R;
-        app.viewer.swatches.push([0.1, 0.2, 0.3, 1.0]);
-        app.viewer.annotations.push(crate::annotation::Annotation {
-            kind: crate::annotation::AnnotationKind::Rect {
-                a: [1.0, 1.0],
-                b: [5.0, 5.0],
-            },
-            color: egui::Color32::RED,
-            width: 2.0,
-        });
-
-        app.swap_image_arc(std::sync::Arc::new(a1));
-
-        assert!(app.exr_data.is_some(), "new A applied");
-        assert_eq!(app.viewer.scale, 3.5, "zoom preserved");
-        assert_eq!(
-            app.viewer.translation,
-            egui::Vec2::new(12.0, -7.0),
-            "pan preserved"
-        );
-        assert_eq!(app.viewer.exposure, 1.25, "exposure preserved");
-        assert_eq!(
-            app.viewer.channel_mode,
-            crate::viewer::ChannelMode::R,
-            "channel mode preserved"
-        );
-        assert_eq!(app.viewer.swatches.len(), 1, "swatches preserved");
-        assert_eq!(app.viewer.annotations.len(), 1, "annotations preserved");
-        assert!(app.error_msg.is_none());
-    }
-    #[test]
-    fn swap_image_data_clamps_active_layer_to_new_layer_count() {
-        // A sequence normally has identical layer structure frame-to-frame, but
-        // guard against a frame with fewer passes so `active_layer` stays a valid
-        // index into the per-layer texture cache (which would otherwise panic).
-        let dir = tempfile::tempdir().unwrap();
-        let path_3pass = dir.path().join("three.exr");
-        let path_1pass = dir.path().join("one.exr");
-        write_multi_pass_exr(&path_3pass, 3);
-        write_multi_pass_exr(&path_1pass, 1);
-        let one = ExrData::load(&path_1pass).unwrap();
-
-        let mut app = ExrApp {
-            exr_data: Some(std::sync::Arc::new(ExrData::load(&path_3pass).unwrap())),
-            ..Default::default()
-        };
-        assert_eq!(app.exr_data.as_ref().unwrap().logical_layers.len(), 3);
-        app.viewer.active_layer = 2; // valid for 3 passes, invalid for 1
-
-        app.swap_image_arc(std::sync::Arc::new(one));
-
-        assert_eq!(
-            app.exr_data.as_ref().unwrap().logical_layers.len(),
-            1,
-            "new (smaller) A applied"
-        );
-        assert_eq!(
-            app.viewer.active_layer, 0,
-            "active_layer clamped to a valid index for the new layer count"
-        );
-    }
-
     /// Dirty every persisted field this test knows how to reach, so the reset has
     /// something to clear on each of them.
     fn app_with_dirtied_settings() -> ExrApp {
@@ -11639,8 +11484,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("open.exr");
         write_rgba_exr(&p);
-        app.exr_data = Some(std::sync::Arc::new(ExrData::load(&p).unwrap()));
-        app.loaded_file = Some(p);
+        app.add_comp_source(p);
         app
     }
 
@@ -11688,34 +11532,31 @@ mod tests {
     }
 
     /// "Reset all settings" says *Open files are closed*, so it has to close them —
-    /// including slot A, which no other path closes since the R4 collapse removed the
-    /// File ▸ Close Image A menu.
+    /// layers, their sources, and the frames they left in the ring.
     ///
     /// Not pedantry about the dialog wording: `playback` is reset with everything
     /// else, and its sequence/playhead are `#[serde(skip)]` fields of the struct being
     /// replaced, so the transport goes regardless. Leaving the image behind would
     /// strand the app halfway — no timeline, picture still up, frames still resident.
     #[test]
-    fn resetting_everything_closes_slot_a_and_releases_its_frames() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("a.exr");
-        write_rgba_exr(&p);
-        let data = std::sync::Arc::new(ExrData::load(&p).unwrap());
+    fn resetting_everything_releases_the_open_image_and_its_frames() {
+        let (_dir, paths) = write_sequence(3);
+        let mut app = ExrApp::default();
+        app.add_comp_source(paths[0].clone());
+        app.frame_bytes = Some(1234);
+        app.loading_a = true;
 
-        let mut app = ExrApp {
-            loaded_file: Some(p.clone()),
-            exr_data: Some(data.clone()),
-            loading_a: true,
-            frame_bytes: Some(data.approx_bytes()),
-            ..Default::default()
-        };
-        app.frame_cache.insert(ExrApp::A_SOURCE, 1, data);
-        assert!(app.frame_cache.bytes() > 0, "the fixture must be resident");
+        // Everything the reset has to undo must actually be set up first, or the
+        // assertions below pass against a fixture that was already empty.
+        assert!(!app.comp_sources.is_empty(), "an image must be open");
+        assert!(!app.comp_stack.is_empty(), "with a layer for it");
+        assert!(app.frame_cache.bytes() > 0, "and a resident frame");
+        assert!(app.playback.sequence.is_some(), "and a live transport");
 
         app.reset_settings(ResetScope::Everything);
 
-        assert!(app.exr_data.is_none(), "the image is unloaded");
-        assert!(app.loaded_file.is_none());
+        assert!(app.comp_sources.is_empty(), "the image is unloaded");
+        assert!(app.comp_stack.is_empty(), "and its layer with it");
         assert!(!app.loading_a);
         assert_eq!(app.frame_cache.bytes(), 0, "its frames are released");
         assert_eq!(app.frame_bytes, None);
@@ -11770,8 +11611,8 @@ mod tests {
         assert_eq!(app.recent_files.len(), 1);
         assert_eq!(app.ocio_path, "/tmp/config.ocio");
         assert!(
-            app.exr_data.is_some(),
-            "the narrow scope must not close what is open — that is the whole reason \
+            !app.comp_sources.is_empty(),
+            "the narrow scope must not close what is open — that is the whole reason \r
              it is safe to reach for mid-session"
         );
         assert_eq!(app.lut_path, "/tmp/look.cube");
@@ -12431,10 +12272,9 @@ mod tests {
 
         app.playback_step(1);
         assert_eq!(app.playback.current_frame, 2);
-        assert_eq!(
-            app.loaded_file.as_deref(),
-            Some(dir.path().join("s.0002.exr").as_path()),
-            "the stepped-to frame is the requested load"
+        assert!(
+            app.inflight.contains(&2),
+            "the stepped-to frame is the one submitted to the worker"
         );
         assert!(app.loading_a, "a decode is in flight");
         assert_eq!(app.playback.pending, Some(2));
@@ -12524,16 +12364,13 @@ mod tests {
     }
 
     #[test]
-    fn sequence_frame_arrival_swaps_and_preserves_the_view() {
+    fn sequence_frame_arrival_preserves_the_view() {
         let dir = tempfile::tempdir().unwrap();
         let f1 = dir.path().join("f.0001.exr");
         let f2 = dir.path().join("f.0002.exr");
         write_rgba_exr(&f1);
         write_rgba_exr(&f2);
-        let mut app = ExrApp {
-            exr_data: Some(std::sync::Arc::new(ExrData::load(&f1).unwrap())),
-            ..Default::default()
-        };
+        let mut app = ExrApp::default();
         app.detect_sequence(&f1);
         // User mid-session: non-default view.
         app.viewer.scale = 3.0;
@@ -12552,7 +12389,10 @@ mod tests {
             result: Ok(data2),
         });
 
-        assert!(app.exr_data.is_some(), "frame 2 applied");
+        assert!(
+            app.frame_cache.peek(ExrApp::A_SOURCE, 2).is_some(),
+            "frame 2 landed in the ring"
+        );
         assert_eq!(app.viewer.scale, 3.0, "zoom preserved across the frame");
         assert_eq!(app.viewer.exposure, 1.5, "exposure preserved");
         assert!(!app.loading_a, "decode flag cleared");
@@ -13524,35 +13364,6 @@ mod tests {
     }
 
     #[test]
-    fn a_played_frame_never_drags_the_active_layer_back_to_zero() {
-        // `swap_image_arc` clamps `active_layer` to the incoming image's layer
-        // count, to survive a frame with fewer layers. A per-AOV decode holds
-        // exactly one entry, so clamping to it would reset the user's pass
-        // selection on the first played frame — and the gate would then agree the
-        // source is "on AOV 0" and keep the fast path running, showing the wrong
-        // pass with every metric healthy.
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("karma.exr");
-        write_one_aov_per_part_exr(&src, 64, 32, 4);
-        let mut app = ExrApp::default();
-        app.viewer.active_layer = 2;
-
-        let partial = std::sync::Arc::new(ExrData::load_layer(&src, 2, 2).unwrap());
-        app.swap_image_arc(partial);
-        assert_eq!(
-            app.viewer.active_layer, 2,
-            "a subset frame is not evidence the image lost layers"
-        );
-
-        // A genuinely smaller *full* image still clamps — that guard is why the
-        // clamp is there.
-        let small = dir.path().join("small.exr");
-        write_sized_exr(&small, 64, 32);
-        app.swap_image_arc(std::sync::Arc::new(ExrData::load(&small).unwrap()));
-        assert_eq!(app.viewer.active_layer, 0, "one real layer ⇒ clamp");
-    }
-
-    #[test]
     fn classic_sequences_still_gate_on_the_viewer_layer() {
         // The fallback matters: with no comp layer drawing a source, the viewer's
         // active layer *is* what's displayed, and that path must keep its cheap
@@ -14010,10 +13821,7 @@ mod tests {
         for n in 2..=3 {
             write_rgba_exr(&dir.path().join(format!("s.{n:04}.exr")));
         }
-        let mut app = ExrApp {
-            exr_data: Some(std::sync::Arc::new(ExrData::load(&f1).unwrap())),
-            ..Default::default()
-        };
+        let mut app = ExrApp::default();
         app.detect_sequence(&f1);
         // Seek to frame 2: bumps the epoch and re-requests 2 at the live epoch.
         app.playback_step(1);
@@ -14463,9 +14271,14 @@ mod tests {
         app.playback.state = PlayState::Paused; // settled
 
         app.request_sequence_frame(1);
-        // The beauty frame is shown instantly, but the playhead stays awaited so
-        // the readout is suppressed until the full all-AOV frame lands.
-        assert!(app.exr_data.is_some(), "beauty frame shown immediately");
+        // The resident beauty frame is what the viewport binds meanwhile, so the
+        // request must leave it in place; the playhead stays awaited so the readout
+        // is suppressed until the full all-AOV frame lands. (Slot A used to hold a
+        // second reference to it, which is what this asserted before #277.)
+        assert!(
+            app.frame_cache.peek(ExrApp::A_SOURCE, 1).is_some(),
+            "the beauty frame stays resident while its upgrade is awaited"
+        );
         assert_eq!(app.playback.pending, Some(1), "full re-decode awaited");
         // Regression: the upgrade must be *submitted*, not merely marked pending.
         // `contains` is fidelity-blind, so a beauty-resident playhead must still be
@@ -14575,7 +14388,6 @@ mod tests {
 
         let beauty = std::sync::Arc::new(ExrData::load_beauty(&f1).unwrap());
         app.frame_cache.insert(ExrApp::A_SOURCE, 1, beauty);
-        app.exr_data = app.frame_cache.peek(ExrApp::A_SOURCE, 1);
         app.playback.start_playing(std::time::Instant::now());
 
         app.playback_toggle(); // play → pause triggers the settle
@@ -14938,11 +14750,16 @@ mod tests {
             app.playback.current_frame, 5,
             "skipped straight to the wall-clock-due frame"
         );
-        assert_eq!(
-            app.loaded_file.as_deref(),
-            Some(paths[4].as_path()),
-            "only the landing frame is requested — skipped frames are never decoded"
+        assert!(
+            app.inflight.contains(&5),
+            "the landing frame is the one submitted"
         );
+        for skipped in 2..=4 {
+            assert!(
+                !app.inflight.contains(&skipped),
+                "skipped frame {skipped} must never be decoded"
+            );
+        }
     }
 
     #[test]
