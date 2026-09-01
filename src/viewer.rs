@@ -3131,12 +3131,12 @@ impl ExrViewer {
         // encode vs passthrough at this same stage, and while it was missing the toggle
         // did nothing until an unrelated repaint dirtied the signature for it, then
         // stuck, because toggling back was equally invisible.
-        let display_stage_salt = display_stage_salt(self.ocio_active, self.srgb);
+        let display_salt = display_stage_salt(self.ocio_active, self.srgb);
         // Salt the arrangement in too, so switching Stacked↔Side-by-Side always
         // re-renders even if the per-draw uniforms happened to hash the same.
         let arrangement_salt = if is_sbs { 0x517C_C1B7_2722_0A95 } else { 0 };
         let render_sig =
-            (ctx.ocio_sig.get() ^ self.ocio_render_gen ^ display_stage_salt ^ arrangement_salt)
+            (ctx.ocio_sig.get() ^ self.ocio_render_gen ^ display_salt ^ arrangement_salt)
                 .wrapping_mul(0x100000001b3);
         // Side-by-Side spans the canvas with two panes, so the display transform runs
         // unscissored rather than over just the composite's rect (the A/B path does the
