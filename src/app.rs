@@ -2752,11 +2752,11 @@ impl ExrApp {
 
     /// A **full** decode of `source`, for reading its layer table (#217).
     ///
-    /// Deliberately not "whatever is on screen": `self.exr_data` is swapped to every
-    /// frame the transport lands, including the cheap ones, and a one-layer decode's
-    /// table is a single renumbered entry — reading part layout from it would answer
-    /// "yes, one layer per part" about every file. A comp source's `exr_data` is the
-    /// open-time decode and is never replaced, so it is the reliable source.
+    /// Deliberately not "whatever is on screen": what the transport lands is whatever
+    /// fidelity was asked for, and those frames live in the T1 ring — a one-layer
+    /// decode's table is a single renumbered entry, so reading part layout from it
+    /// would answer "yes, one layer per part" about every file. `CompSource::exr_data`
+    /// is the open-time decode and is never replaced, so it is the reliable source.
     ///
     /// `None` (⇒ no fast path, full decode, i.e. exactly the pre-#217 behaviour) if
     /// nothing full is at hand. Fail-safe by construction: the fast path is only
@@ -11612,7 +11612,7 @@ mod tests {
         assert_eq!(app.ocio_path, "/tmp/config.ocio");
         assert!(
             !app.comp_sources.is_empty(),
-            "the narrow scope must not close what is open — that is the whole reason \r
+            "the narrow scope must not close what is open - that is the whole reason \
              it is safe to reach for mid-session"
         );
         assert_eq!(app.lut_path, "/tmp/look.cube");
@@ -12376,7 +12376,7 @@ mod tests {
         app.viewer.scale = 3.0;
         app.viewer.exposure = 1.5;
 
-        // Step to frame 2 (sets loaded_file + pending), then deliver it. The
+        // Step to frame 2 (submits it and marks it pending), then deliver it. The
         // result must carry the live epoch — the step bumped it.
         app.playback_step(1);
         let data2 = ExrData::load(&f2).unwrap();
