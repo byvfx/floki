@@ -142,10 +142,15 @@ mis-sizing the cap mis-schedules decoding too. Instrumentation: the 1 Hz
 `floki::playback` trace carries `t1=`, `size_bytes=`, `t1_bytes=<resident>/<budget>`,
 `evict=`, `fallback=`; the debug overlay shows the same. Frame-time percentiles are
 recorded **only while `PlayState::Playing`** (#236) — an interval measured while the
-clock is stopped is user-thinking-time, not a hitch.
+clock is stopped is user-thinking-time, not a hitch. A decode's time is reported as
+**three** figures, never one (#350): `decode_cost=` is worker-measured decompress,
+`apply_lag=` is how long the finished frame waited for the UI thread, and
+`turnaround=` is the whole submit→apply span. Only the last is the stall watchdog's;
+anything diagnosing *why* playback is slow must use the first two, because the folded
+figure reported UI contention (a screen recorder) as a slow decoder.
 
 ### State & persistence
-`ExrApp` derives serde `(default)`. Fields that should persist across sessions (recent files, LUT path, `enable_lut`, OCIO path) are plain fields; all transient/runtime state (loaded data, GPU handles, conversion progress, window-open flags) is marked `#[serde(skip)]`. Persistence is handled by `eframe` storage. Image B (reference image) is reset whenever Image A changes.
+`ExrApp` derives serde `(default)`. Fields that should persist across sessions (recent files, LUT path, `enable_lut`, OCIO path) are plain fields; all transient/runtime state (loaded data, GPU handles, conversion progress, window-open flags) is marked `#[serde(skip)]`. Persistence is handled by `eframe` storage.
 
 ### Color / LUT
 `color/cube.rs` parses Adobe `.cube` 3D LUTs into an RGBA `Vec<[f32;4]>`; `gpu/mod.rs::create_lut_bind_group` uploads it as an `Rgba32Float` 3D texture for in-shader color transforms.

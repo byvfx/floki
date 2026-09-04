@@ -471,17 +471,23 @@ impl Playback {
     }
 }
 
-/// One sample of the playback pipeline for [`DecodeBound`] (#249).
+/// One sample of the playback pipeline for [`TransportBound`] (#249/#350).
 #[derive(Clone, Copy, Debug)]
-pub struct DecodeBoundSample {
+pub struct TransportBoundSample {
     pub playing: bool,
     /// Supersession epoch. Bumped on every seek / scrub / direction change, so a
     /// change restarts the window — which is how scrubbing is excluded without a
     /// separate "am I scrubbing" flag: dragging the playhead is *expected* to be
     /// decode-bound and must never raise the hint.
     pub epoch: u64,
-    /// Turnaround of the last completed sequence decode.
-    pub last_decode: Option<std::time::Duration>,
+    /// Worker-measured decompress cost of the last completed sequence decode —
+    /// **not** its turnaround. See [`TransportBound`] for why that distinction is
+    /// the whole point of this sample.
+    pub decode_cost: Option<std::time::Duration>,
+    /// How long that decode sat finished before the UI thread applied it. Stamped
+    /// from the same completed decode as `decode_cost`, so the two are `Some`
+    /// together or not at all.
+    pub apply_lag: Option<std::time::Duration>,
     /// One frame's wall clock at the target rate.
     pub frame_period: std::time::Duration,
     /// Frames the pacer held late or dropped during this play run — the picture
@@ -490,18 +496,40 @@ pub struct DecodeBoundSample {
     pub behind: u32,
 }
 
-/// What to tell the user, with the figures that justify it.
+/// Which end of the pipeline is holding the picture up.
+///
+/// The distinction exists because the *remedies* are opposites. Beauty preview and
+/// Scrub proxy make decodes cheaper; they do nothing whatsoever for a starved UI
+/// thread. Naming the wrong one is worse than saying nothing, because it sends the
+/// user to toggle settings that cannot help while asserting a cause.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct DecodeBoundHint {
+pub enum BoundCause {
+    /// The decoder cannot produce frames fast enough. The cheap-decode settings are
+    /// the fix.
+    Decode,
+    /// The decoder is keeping up, but finished frames are waiting on the UI thread.
+    /// Something else is competing for it — a screen recorder, a screen-sharing
+    /// session, a heavy compositor.
+    Ui,
+}
+
+/// What to tell the user, with the figures that justify it. Both costs are carried
+/// whichever the cause: "the decoder is fine at 30 ms" is half of what makes a
+/// UI-bound verdict credible.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TransportBoundHint {
+    pub cause: BoundCause,
     pub decode_ms: u32,
+    pub apply_ms: u32,
     pub budget_ms: u32,
 }
 
-/// Detects a *sustained* decode-bound transport (#249): playback that presents as
-/// frozen rather than slow, because decode turnaround is many times the frame
-/// period and the displayed frame never advances.
+/// Detects a *sustained* bound transport (#249): playback that presents as frozen
+/// rather than slow, because a frame's turnaround is many times the frame period
+/// and the displayed frame never advances. Reports **which end** is responsible
+/// (#350).
 ///
-/// **Keyed on `last_decode`, deliberately not on `stale`.** #249 proposed
+/// **Keyed on the decode figures, deliberately not on `stale`.** #249 proposed
 /// `stale > 0` sustained, on the strength of that field's own comment calling it
 /// the headline "is the picture keeping up" number. Measured on a 1.03 GB/frame
 /// render it reaches **2 while playing at 25.6 fps** — comfortably keeping up — so a
@@ -510,11 +538,18 @@ pub struct DecodeBoundHint {
 /// flight that is momentarily true all the time. It reads well in a trace beside
 /// its neighbours; it is not a predicate.
 ///
-/// `last_decode` separates cleanly on the same footage: 0.03–0.05 s healthy against
+/// Decode cost separates cleanly on the same footage: 0.03–0.05 s healthy against
 /// 0.56–0.80 s bound, with nothing in between. [`BOUND_FACTOR`] sits an order of
 /// magnitude clear of both.
+///
+/// **Why two costs and not one.** That separation was originally measured against a
+/// single submit-to-apply figure, on an otherwise-idle machine where the wait for
+/// the UI thread is negligible. It is not negligible on a contended one: with a
+/// screen recorder running, the same footage tripped the hint on a decoder that was
+/// keeping up perfectly well (#350). The sample now carries the two costs
+/// separately, and the verdict names the one that is actually over budget.
 #[derive(Default, Debug)]
-pub struct DecodeBound {
+pub struct TransportBound {
     /// When the condition began holding continuously; `None` while it does not.
     since: Option<std::time::Instant>,
     /// `behind` when it began, so the hint also requires the count to be *growing*
@@ -527,22 +562,22 @@ pub struct DecodeBound {
     dismissed_at: Option<u64>,
 }
 
-/// Decode turnaround must exceed this multiple of the frame period. At 24 fps that
-/// is 83 ms, against 30–50 ms measured healthy and 560–800 ms measured bound.
+/// A cost must exceed this multiple of the frame period. At 24 fps that is 83 ms,
+/// against 30–50 ms measured healthy and 560–800 ms measured bound.
 const BOUND_FACTOR: u32 = 2;
 
 /// How long the condition must hold before the hint appears. A seek or a loop wrap
 /// costs one slow decode; this is about the state that does not recover.
 const HOLD: std::time::Duration = std::time::Duration::from_secs(2);
 
-impl DecodeBound {
+impl TransportBound {
     /// Feed one sample and get the hint to show, if any. `now` is passed in rather
     /// than read so the whole thing is testable without a clock.
     pub fn update(
         &mut self,
         now: std::time::Instant,
-        s: &DecodeBoundSample,
-    ) -> Option<DecodeBoundHint> {
+        s: &TransportBoundSample,
+    ) -> Option<TransportBoundHint> {
         // A seek restarts everything, including a dismissal: the user asked about a
         // different part of the timeline, and the old verdict no longer applies.
         if s.epoch != self.epoch {
@@ -551,18 +586,37 @@ impl DecodeBound {
             self.dismissed_at = None;
         }
         let budget = s.frame_period;
-        let bound = s.playing
-            && !budget.is_zero()
-            && s.last_decode.is_some_and(|d| d > budget * BOUND_FACTOR);
-        if !bound {
+        let over = |d: Option<std::time::Duration>| {
+            !budget.is_zero() && d.is_some_and(|d| d > budget * BOUND_FACTOR)
+        };
+        // Decode is tested first, so when *both* ends are over budget the verdict is
+        // Decode. That ordering is the useful one: between a cause with a fix in
+        // reach (two checkboxes to the right of the hint) and one whose only advice
+        // is "close the other program", name the actionable one — and a decoder that
+        // cannot keep up will back the apply side up too, so Ui alone is the more
+        // specific finding.
+        let cause = if !s.playing {
+            None
+        } else if over(s.decode_cost) {
+            Some(BoundCause::Decode)
+        } else if over(s.apply_lag) {
+            Some(BoundCause::Ui)
+        } else {
+            None
+        };
+        let Some(cause) = cause else {
             // Clears immediately rather than lingering: the condition ending is the
             // good news, and a stale warning is the thing that makes warnings
             // ignorable. Stopping also lands here, since `playing` goes false —
-            // which matters, because `last_decode` keeps its bound value after a
-            // stopped run and would otherwise pin the hint up forever.
+            // which matters, because the cost figures keep their bound values after
+            // a stopped run and would otherwise pin the hint up forever.
             self.since = None;
             return None;
-        }
+        };
+        // The window belongs to "the transport is bound", not to one cause: if the
+        // verdict flips from Decode to Ui mid-window the picture never recovered, so
+        // restarting the hold would hide a condition that is still true. The
+        // reported cause is always the current sample's.
         let started = *self.since.get_or_insert_with(|| {
             self.behind_at_start = s.behind;
             now
@@ -580,8 +634,10 @@ impl DecodeBound {
             return None;
         }
         let ms = |d: std::time::Duration| u32::try_from(d.as_millis()).unwrap_or(u32::MAX);
-        Some(DecodeBoundHint {
-            decode_ms: ms(s.last_decode?),
+        Some(TransportBoundHint {
+            cause,
+            decode_ms: ms(s.decode_cost.unwrap_or_default()),
+            apply_ms: ms(s.apply_lag.unwrap_or_default()),
             budget_ms: ms(budget),
         })
     }
@@ -593,7 +649,7 @@ impl DecodeBound {
 }
 
 #[cfg(test)]
-mod decode_bound_tests {
+mod transport_bound_tests {
     use super::*;
     use std::time::{Duration, Instant};
 
@@ -601,31 +657,44 @@ mod decode_bound_tests {
     const BUDGET: Duration = Duration::from_micros(41_667);
 
     /// Measured on redSea (4K, 1.03 GB/frame) with beauty preview and proxy off:
-    /// 560–800 ms turnaround, `run_held` climbing the whole run.
-    fn bound(behind: u32) -> DecodeBoundSample {
-        DecodeBoundSample {
+    /// 560–800 ms of decode, `run_held` climbing the whole run. The apply lag is
+    /// what an idle UI thread looks like — a decode-bound machine is not a busy one.
+    fn bound(behind: u32) -> TransportBoundSample {
+        TransportBoundSample {
             playing: true,
             epoch: 1,
-            last_decode: Some(Duration::from_millis(650)),
+            decode_cost: Some(Duration::from_millis(650)),
+            apply_lag: Some(Duration::from_millis(2)),
             frame_period: BUDGET,
             behind,
         }
     }
 
-    /// The same footage at defaults: 30–50 ms turnaround, 25.6 fps, `run_held` flat.
-    fn healthy(behind: u32) -> DecodeBoundSample {
-        DecodeBoundSample {
+    /// The same footage at defaults: 30–50 ms decodes, 25.6 fps, `run_held` flat.
+    fn healthy(behind: u32) -> TransportBoundSample {
+        TransportBoundSample {
             playing: true,
             epoch: 1,
-            last_decode: Some(Duration::from_millis(50)),
+            decode_cost: Some(Duration::from_millis(50)),
+            apply_lag: Some(Duration::from_millis(2)),
             frame_period: BUDGET,
             behind,
+        }
+    }
+
+    /// #350: a healthy decoder behind a contended UI thread. Finished frames sit in
+    /// the channel while a screen recorder has the thread, and the old submit→apply
+    /// figure folded that wait into "decode time".
+    fn ui_bound(behind: u32) -> TransportBoundSample {
+        TransportBoundSample {
+            apply_lag: Some(Duration::from_millis(400)),
+            ..healthy(behind)
         }
     }
 
     #[test]
     fn fires_only_after_the_condition_is_sustained() {
-        let mut d = DecodeBound::default();
+        let mut d = TransportBound::default();
         let t0 = Instant::now();
 
         // One slow decode is a seek or a loop wrap, not this.
@@ -647,7 +716,7 @@ mod decode_bound_tests {
     /// while keeping up at 25.6 fps, which is why it isn't the signal.
     #[test]
     fn never_fires_on_healthy_playback() {
-        let mut d = DecodeBound::default();
+        let mut d = TransportBound::default();
         let t0 = Instant::now();
         for i in 0..60 {
             let at = t0 + Duration::from_millis(i * 500);
@@ -665,7 +734,7 @@ mod decode_bound_tests {
     /// advancing, and `behind` is what says so.
     #[test]
     fn a_slow_decode_that_keeps_up_is_not_decode_bound() {
-        let mut d = DecodeBound::default();
+        let mut d = TransportBound::default();
         let t0 = Instant::now();
         for i in 0..10 {
             let at = t0 + Duration::from_millis(i * 500);
@@ -681,12 +750,12 @@ mod decode_bound_tests {
     /// gate the hint would stay up on a stopped app forever.
     #[test]
     fn clears_when_playback_stops_even_though_last_decode_is_still_slow() {
-        let mut d = DecodeBound::default();
+        let mut d = TransportBound::default();
         let t0 = Instant::now();
         d.update(t0, &bound(0));
         assert!(d.update(t0 + Duration::from_secs(3), &bound(90)).is_some());
 
-        let stopped = DecodeBoundSample {
+        let stopped = TransportBoundSample {
             playing: false,
             ..bound(90)
         };
@@ -699,17 +768,17 @@ mod decode_bound_tests {
     /// restarts the window, so dragging the playhead can never accumulate one.
     #[test]
     fn a_seek_restarts_the_window() {
-        let mut d = DecodeBound::default();
+        let mut d = TransportBound::default();
         let t0 = Instant::now();
         d.update(t0, &bound(0));
         // Two seconds in, still bound — but the user seeked, so the clock restarts.
-        let seeked = DecodeBoundSample {
+        let seeked = TransportBoundSample {
             epoch: 2,
             ..bound(60)
         };
         assert!(d.update(t0 + Duration::from_secs(2), &seeked).is_none());
         // It fires two seconds after the *seek*, not after the original start.
-        let later = DecodeBoundSample {
+        let later = TransportBoundSample {
             epoch: 2,
             ..bound(120)
         };
@@ -721,7 +790,7 @@ mod decode_bound_tests {
 
     #[test]
     fn dismissal_holds_until_the_next_seek() {
-        let mut d = DecodeBound::default();
+        let mut d = TransportBound::default();
         let t0 = Instant::now();
         d.update(t0, &bound(0));
         assert!(d.update(t0 + Duration::from_secs(3), &bound(90)).is_some());
@@ -730,12 +799,12 @@ mod decode_bound_tests {
         assert!(d.update(t0 + Duration::from_secs(4), &bound(120)).is_none());
 
         // A seek re-arms: a new part of the timeline is a new question.
-        let seeked = DecodeBoundSample {
+        let seeked = TransportBoundSample {
             epoch: 2,
             ..bound(150)
         };
         assert!(d.update(t0 + Duration::from_secs(5), &seeked).is_none());
-        let later = DecodeBoundSample {
+        let later = TransportBoundSample {
             epoch: 2,
             ..bound(200)
         };
@@ -743,15 +812,18 @@ mod decode_bound_tests {
     }
 
     /// No measurement yet, or a nonsense frame period, must not be read as trouble.
+    /// Both costs go `None` together because that is how they are stamped — one
+    /// completed decode sets both or neither.
     #[test]
     fn is_inert_without_a_usable_measurement() {
-        let mut d = DecodeBound::default();
+        let mut d = TransportBound::default();
         let t0 = Instant::now();
-        let no_decode = DecodeBoundSample {
-            last_decode: None,
+        let no_decode = TransportBoundSample {
+            decode_cost: None,
+            apply_lag: None,
             ..bound(90)
         };
-        let zero_budget = DecodeBoundSample {
+        let zero_budget = TransportBoundSample {
             frame_period: Duration::ZERO,
             ..bound(90)
         };
@@ -760,6 +832,70 @@ mod decode_bound_tests {
             assert!(d.update(at, &no_decode).is_none());
             assert!(d.update(at, &zero_budget).is_none());
         }
+    }
+
+    /// The #350 regression. A screen recorder on the UI thread makes finished frames
+    /// wait; the picture stops advancing and `behind` climbs, so the transport is
+    /// genuinely bound — but the decoder is at 50 ms against an 83 ms bar and the
+    /// cheap-decode settings have nothing to fix. The verdict must say so.
+    #[test]
+    fn ui_contention_reads_as_ui_bound_not_a_slow_decoder() {
+        let mut d = TransportBound::default();
+        let t0 = Instant::now();
+        d.update(t0, &ui_bound(0));
+        let hint = d
+            .update(t0 + Duration::from_secs(3), &ui_bound(90))
+            .expect("sustained past the hold");
+        assert_eq!(hint.cause, BoundCause::Ui);
+        assert_eq!(hint.apply_ms, 400);
+        // Carried even though it is not the cause: "the decoder is fine at 50 ms" is
+        // what makes the verdict credible rather than a second guess.
+        assert_eq!(hint.decode_ms, 50);
+    }
+
+    /// With both ends over budget, the actionable cause wins — the user has two
+    /// checkboxes for a slow decoder and nothing but "close the other program" for a
+    /// busy UI thread.
+    #[test]
+    fn a_slow_decoder_outranks_a_busy_ui_thread() {
+        let mut d = TransportBound::default();
+        let t0 = Instant::now();
+        let both = TransportBoundSample {
+            apply_lag: Some(Duration::from_millis(400)),
+            ..bound(0)
+        };
+        d.update(t0, &both);
+        let hint = d
+            .update(
+                t0 + Duration::from_secs(3),
+                &TransportBoundSample {
+                    apply_lag: Some(Duration::from_millis(400)),
+                    ..bound(90)
+                },
+            )
+            .expect("sustained past the hold");
+        assert_eq!(hint.cause, BoundCause::Decode);
+        assert_eq!(hint.decode_ms, 650);
+        assert_eq!(hint.apply_ms, 400);
+    }
+
+    /// A cause flip mid-window does not restart the hold: the picture never
+    /// recovered, and re-earning two seconds would hide a condition that is still
+    /// true. The reported cause tracks the latest sample.
+    #[test]
+    fn the_hold_window_survives_a_change_of_cause() {
+        let mut d = TransportBound::default();
+        let t0 = Instant::now();
+        d.update(t0, &bound(0));
+        assert!(
+            d.update(t0 + Duration::from_millis(1_000), &ui_bound(40))
+                .is_none(),
+            "still inside the hold"
+        );
+        let hint = d
+            .update(t0 + Duration::from_millis(2_100), &ui_bound(90))
+            .expect("the window started at t0 and was never restarted");
+        assert_eq!(hint.cause, BoundCause::Ui);
     }
 }
 

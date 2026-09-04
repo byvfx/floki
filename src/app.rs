@@ -45,6 +45,40 @@ fn fidelity_rank(proxy: bool, beauty_only: bool) -> u8 {
     }
 }
 
+/// Where a completed decode's time actually went (#350).
+///
+/// Both stamps are taken on the **worker** thread, the only place the decode can
+/// be timed in isolation. The UI used to derive one figure — submit on the UI
+/// thread to apply on the UI thread — which silently folded together three
+/// unrelated costs: queue wait behind other jobs, the decompress itself, and how
+/// long the finished result then sat in the channel waiting for the UI thread to
+/// drain it. Anything competing for that thread (a screen recorder doing window
+/// readback is how this was found) inflates the third and it was reported as the
+/// second — so the hint named the decoder for a stall the decoder had no part in,
+/// and then recommended the two settings that make decodes cheaper, which cannot
+/// help a UI-bound stall.
+#[derive(Clone, Copy, Debug)]
+struct DecodeTiming {
+    /// Worker pick-up (after the epoch skip) to the decode returning: true
+    /// decompress cost, independent of UI scheduling.
+    cost: std::time::Duration,
+    /// When the worker finished. The UI stamps `now - finished_at` as apply lag.
+    /// `Instant` is monotonic process-wide, so it crosses the channel meaningfully.
+    finished_at: std::time::Instant,
+}
+
+#[cfg(test)]
+impl DecodeTiming {
+    /// A zero-cost decode that finished *now* — what a test wants when it hands
+    /// [`ExrApp::apply_load_result`] a result directly, standing in for the worker.
+    fn immediate() -> Self {
+        Self {
+            cost: std::time::Duration::ZERO,
+            finished_at: std::time::Instant::now(),
+        }
+    }
+}
+
 struct LoadResult {
     /// Which source this decode is for (#99 unification): the A/B compare slots are
     /// `ExrApp::{A,B}_SOURCE` (`SourceId` 0/1). For an explicit open it selects
@@ -66,6 +100,8 @@ struct LoadResult {
     /// fidelity and what actually came back — so it reports rather than the UI
     /// re-deriving it from state that may have moved on since submit.
     fell_back: bool,
+    /// Where this decode's time went (#350), stamped on the worker thread.
+    timing: DecodeTiming,
     result: Result<ExrData, String>,
 }
 
@@ -742,13 +778,15 @@ pub struct ExrApp {
     run_dropped: u32,
     #[serde(skip)]
     run_held: u32,
-    /// Sustained-decode-bound detector and its current verdict (#249). When decode
-    /// can't keep up the app presents as frozen rather than slow, and every number
-    /// that says so lives in a debug trace the user has to know to enable.
+    /// Sustained-bound-transport detector and its current verdict (#249/#350). When
+    /// the picture can't keep up the app presents as frozen rather than slow, and
+    /// every number that says so lives in a debug trace the user has to know to
+    /// enable. The verdict names which end is responsible, because the remedies for
+    /// the two ends have nothing in common.
     #[serde(skip)]
-    decode_bound: crate::playback::DecodeBound,
+    transport_bound: crate::playback::TransportBound,
     #[serde(skip)]
-    decode_bound_hint: Option<crate::playback::DecodeBoundHint>,
+    transport_bound_hint: Option<crate::playback::TransportBoundHint>,
 
     /// Wall-clock instant the most recent **sequence** decode job was submitted
     /// to the worker. Anchors the decode stall watchdog ([`Self::tick_decode_watchdog`]):
@@ -756,10 +794,26 @@ pub struct ExrApp {
     /// playback is force-recovered instead of freezing until the file is reopened.
     #[serde(skip)]
     decode_submit_at: Option<std::time::Instant>,
-    /// Turnaround of the last completed sequence decode. Scales the stall
-    /// watchdog's timeout so a genuinely slow big-frame decode never trips it.
+    /// End-to-end turnaround of the last completed sequence decode: submit on the
+    /// UI thread to apply on the UI thread. Scales the stall watchdog's timeout so
+    /// a genuinely slow big-frame decode never trips it.
+    ///
+    /// This is deliberately the *whole* wait, because that is what the watchdog
+    /// compares against (`now - decode_submit_at`). It is **not** decode cost —
+    /// see [`Self::last_decode_cost`] — and nothing diagnostic should key on it
+    /// (#350).
     #[serde(skip)]
-    last_decode_dur: Option<std::time::Duration>,
+    last_turnaround: Option<std::time::Duration>,
+    /// Worker-measured decompress cost of the last completed sequence decode
+    /// ([`DecodeTiming::cost`]). The figure the decode-bound hint keys on, because
+    /// it is the only one the two cheap-decode settings can actually move.
+    #[serde(skip)]
+    last_decode_cost: Option<std::time::Duration>,
+    /// How long the last completed decode sat finished before the UI thread applied
+    /// it. Large here means the UI thread is the bottleneck, not the decoder —
+    /// a distinct condition with distinct (and different) advice (#350).
+    #[serde(skip)]
+    last_apply_lag: Option<std::time::Duration>,
     /// Throttle for the once-per-second playback state trace ([`Self::trace_playback_state`]).
     #[serde(skip)]
     dbg_last_trace: Option<std::time::Instant>,
@@ -1193,8 +1247,8 @@ impl Default for ExrApp {
             epoch_signal: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             show_playback_debug: false,
             show_playback_hud: false,
-            decode_bound: crate::playback::DecodeBound::default(),
-            decode_bound_hint: None,
+            transport_bound: crate::playback::TransportBound::default(),
+            transport_bound_hint: None,
             dbg_last_sample: None,
             dbg_evictions: 0,
             dbg_last_latch: None,
@@ -1206,7 +1260,9 @@ impl Default for ExrApp {
             run_dropped: 0,
             run_held: 0,
             decode_submit_at: None,
-            last_decode_dur: None,
+            last_turnaround: None,
+            last_decode_cost: None,
+            last_apply_lag: None,
             dbg_last_trace: None,
             pump_rotation: 0,
             dbg_was_playing: false,
@@ -1989,6 +2045,11 @@ impl ExrApp {
                     {
                         continue;
                     }
+                    // Clock starts where the *decode* does, not where the job was
+                    // submitted: everything before this point is queue wait behind
+                    // other jobs, which is not decode cost and must not be reported
+                    // as it (#350).
+                    let began = std::time::Instant::now();
                     // Decode mode while the playhead moves, cheapest first (#94/#56):
                     // - a **scrub proxy** (downsampled, tiny + fast) when requested,
                     //   falling back to beauty/full if the fast read isn't available;
@@ -2053,6 +2114,15 @@ impl ExrApp {
                         },
                         None => ExrData::load(&job.path),
                     };
+                    // Stop the clock before the bookkeeping below: `finished_at` is
+                    // what the UI subtracts from its own `now` to get apply lag, so
+                    // it has to mean "the frame was ready", not "the message was
+                    // built" (#350).
+                    let finished_at = std::time::Instant::now();
+                    let timing = DecodeTiming {
+                        cost: finished_at.duration_since(began),
+                        finished_at,
+                    };
                     // Did an `or_else` above fire? Compare what came back against
                     // what was asked for (#233). Every fallback here is deliberate
                     // — slow beats stuck — but it was also *silent*, and a job
@@ -2068,6 +2138,7 @@ impl ExrApp {
                         frame: job.frame,
                         epoch: job.epoch,
                         fell_back,
+                        timing,
                         result,
                     })));
                     wake_ui();
@@ -2672,8 +2743,8 @@ impl ExrApp {
     /// on AOV 1 with the viewer on 0 passed the gate, got a frame containing only
     /// layer 0, and then `logical_channels(1)` returned `None` in
     /// `build_layer_texture`. The build failed silently, `cur_frame` never advanced,
-    /// and the layer froze **permanently** — while `t1`, `last_decode` and every
-    /// other decode-side metric reported perfect health.
+    /// and the layer froze **permanently** — while `t1`, the decode costs and
+    /// every other decode-side metric reported perfect health.
     ///
     /// Checks *every* layer drawing this source, not just visible ones: a hidden
     /// layer on a non-zero AOV would otherwise be served cheap frames it can't
@@ -4346,11 +4417,24 @@ impl ExrApp {
             } else if let Some(st) = self.followers.get_mut(&res.source) {
                 st.inflight.remove(&res.frame);
             }
-            // The worker delivered a matching result — record turnaround so the
-            // stall watchdog can scale its timeout off real decode cost.
+            // The worker delivered a matching result — record where its time went
+            // (#350). Three figures, because they answer three different questions
+            // and one number could only ever answer them wrongly:
+            //
+            // - `last_turnaround` (submit→apply) is what the stall watchdog compares
+            //   against, so it stays the whole wait.
+            // - `last_decode_cost` is the worker's own measurement, the only figure
+            //   the cheap-decode settings can move, and so the one the hint keys on.
+            // - `last_apply_lag` is how long the finished frame waited for this
+            //   thread. Large here is a UI-contention stall wearing a decode costume.
+            let now = std::time::Instant::now();
             if let Some(t) = self.decode_submit_at {
-                self.last_decode_dur = Some(std::time::Instant::now().duration_since(t));
+                self.last_turnaround = Some(now.duration_since(t));
             }
+            self.last_decode_cost = Some(res.timing.cost);
+            // Saturating: the worker's stamp is always in the past, but a clock this
+            // thread reads later is not worth an underflow panic to assume.
+            self.last_apply_lag = Some(now.saturating_duration_since(res.timing.finished_at));
             match res.result {
                 Ok(data) => {
                     let arc = std::sync::Arc::new(data);
@@ -5020,7 +5104,7 @@ impl ExrApp {
         // …and the user-facing version of the same diagnosis (#249). Sampled here
         // rather than while drawing, so the hint doesn't depend on which panel got
         // laid out first and can't be affected by the UI it appears in.
-        self.tick_decode_bound();
+        self.tick_transport_bound();
         if self.loading_a
             || !self.inflight.is_empty()
             || self
@@ -5081,9 +5165,13 @@ impl ExrApp {
         let Some(submitted) = self.decode_submit_at.filter(|_| outstanding) else {
             return;
         };
-        // Generous and decode-scaled: only a genuine wedge waits this long.
+        // Generous and scaled off the last *turnaround*, not decode cost: `waited`
+        // below is submit→now on this thread, so the figure it is compared against
+        // has to be the same span. Scaling it by the worker's decode cost alone
+        // would tighten the watchdog exactly when the UI thread is starved — the
+        // one situation where respawning the worker fixes nothing (#350).
         const FLOOR: std::time::Duration = std::time::Duration::from_secs(10);
-        let timeout = self.last_decode_dur.map_or(FLOOR, |d| (d * 6).max(FLOOR));
+        let timeout = self.last_turnaround.map_or(FLOOR, |d| (d * 6).max(FLOOR));
         let now = std::time::Instant::now();
         let waited = now.duration_since(submitted);
         if waited < timeout {
@@ -5127,27 +5215,34 @@ impl ExrApp {
     /// the watchdog's. One line is also emitted on the play→pause/stop transition,
     /// which the `outstanding` early return would otherwise swallow: that is
     /// precisely the moment INV-SAMPLE (#7) is decided.
-    /// Sample the decode-bound detector (#249) and cache its verdict for the
+    /// Sample the bound-transport detector (#249/#350) and cache its verdict for the
     /// transport row.
     ///
     /// `run_held + run_dropped` rather than either alone: which one grows is the
     /// pacing mode's business (Stutter holds, DropFrames skips) and the hint is about
     /// the picture not keeping up either way.
-    fn tick_decode_bound(&mut self) {
+    ///
+    /// The two costs go in separately and neither is `last_turnaround`. Feeding the
+    /// end-to-end figure here is what made a screen recorder look like a slow
+    /// decoder (#350).
+    fn tick_transport_bound(&mut self) {
         let fps = self.playback.fps_target;
         let frame_period = if fps > 0.0 {
             std::time::Duration::from_secs_f32(1.0 / fps)
         } else {
             std::time::Duration::ZERO
         };
-        let sample = crate::playback::DecodeBoundSample {
+        let sample = crate::playback::TransportBoundSample {
             playing: self.playback.state == crate::playback::PlayState::Playing,
             epoch: self.playback.epoch,
-            last_decode: self.last_decode_dur,
+            decode_cost: self.last_decode_cost,
+            apply_lag: self.last_apply_lag,
             frame_period,
             behind: self.run_held.saturating_add(self.run_dropped),
         };
-        self.decode_bound_hint = self.decode_bound.update(std::time::Instant::now(), &sample);
+        self.transport_bound_hint = self
+            .transport_bound
+            .update(std::time::Instant::now(), &sample);
     }
 
     fn trace_playback_state(&mut self) {
@@ -5298,7 +5393,8 @@ impl ExrApp {
              texb_n={texb_n} texb_tot={texb_tot:.1} texb_alloc={texb_alloc:.1} \
              texb_pack={texb_pack:.1} texb_write={texb_write:.1} texb_bind={texb_bind:.1} \
              texb_max={texb_max:.1} texb_mb={texb_mb:.1} texq={texq} \
-             worker={worker} submit_age={submit_age:.2} last_decode={last_decode:.2} \
+             worker={worker} submit_age={submit_age:.2} turnaround={turnaround:.2} \
+             decode_cost={decode_cost:.3} apply_lag={apply_lag:.3} \
              precache={precache}/{precache_filled} \
              t1={t1_len}/{t1_cap} frame_bytes={frame_bytes} \
              size_bytes={size_bytes} size_src={size_src} size_prov={size_prov} \
@@ -5335,7 +5431,11 @@ impl ExrApp {
             hidden = hidden,
             worker = if self.load_rx.is_some() { "alive" } else { "dead" },
             submit_age = age(self.decode_submit_at.map(|t| now.duration_since(t))),
-            last_decode = age(self.last_decode_dur),
+            turnaround = age(self.last_turnaround),
+            // Split out (#350): a large `apply_lag` against a small `decode_cost`
+            // is a UI-thread stall, which the folded figure could not express.
+            decode_cost = age(self.last_decode_cost),
+            apply_lag = age(self.last_apply_lag),
             precache = self.precache,
             precache_filled = self.precache_filled,
             t1_len = self.frame_cache.len(),
@@ -6259,7 +6359,11 @@ impl ExrApp {
         let since_submit = self
             .decode_submit_at
             .map(|t| std::time::Instant::now().duration_since(t));
-        let last_decode = self.last_decode_dur;
+        let (turnaround, decode_cost, apply_lag) = (
+            self.last_turnaround,
+            self.last_decode_cost,
+            self.last_apply_lag,
+        );
         let thumb_bakes = self.viewer.dbg_thumb_bakes;
 
         let mut open = true;
@@ -6432,9 +6536,19 @@ impl ExrApp {
                             || "idle".to_string(),
                             |d| format!("{:.1}s ago", d.as_secs_f32()),
                         );
-                        let last = last_decode
-                            .map_or_else(|| "—".to_string(), |d| format!("{:.2}s", d.as_secs_f32()));
-                        ui.label(format!("submitted {submit}  ·  last {last}"));
+                        let secs = |d: Option<std::time::Duration>| {
+                            d.map_or_else(|| "—".to_string(), |d| format!("{:.2}s", d.as_secs_f32()))
+                        };
+                        // Three figures, not one (#350). Reading `apply` against
+                        // `cost` is how a UI-thread stall is told apart from a slow
+                        // decoder from the overlay alone — which is the whole reason
+                        // the split exists.
+                        ui.label(format!(
+                            "submitted {submit}  ·  cost {}  ·  apply {}  ·  round trip {}",
+                            secs(decode_cost),
+                            secs(apply_lag),
+                            secs(turnaround)
+                        ));
                         ui.end_row();
 
                         if let Some(s) = sample {
@@ -6685,29 +6799,55 @@ impl ExrApp {
                 self.request_sequence_frame(self.playback.current_frame);
             }
 
-            // The decode-bound hint (#249), placed here on purpose: right beside
-            // Beauty preview and Scrub proxy, which are the two things that fix it.
-            // A message that says "you are decode-bound" next to the controls that
-            // resolve it is worth more than the same words anywhere else, and the
-            // status bar would have separated the diagnosis from the remedy.
+            // The bound-transport hint (#249), placed here on purpose: right beside
+            // Beauty preview and Scrub proxy, which are the two things that fix the
+            // decode-bound case. A message that says "you are decode-bound" next to
+            // the controls that resolve it is worth more than the same words anywhere
+            // else, and the status bar would have separated the diagnosis from the
+            // remedy.
             //
             // Non-modal, never steals focus, and dismissible. Amber rather than red:
             // this is slow, not broken — the whole point is that the user currently
             // cannot tell those apart.
-            if let Some(hint) = self.decode_bound_hint {
+            //
+            // Two verdicts, because there are two causes and the remedy for one is no
+            // remedy at all for the other (#350). The UI-bound text deliberately says
+            // what the decoder is doing as well: the claim being made is "it is not
+            // the decoder", and the figure that supports it belongs in the same
+            // sentence. It also names the settings it is ruling *out*, since they sit
+            // inches away and are the obvious thing to reach for.
+            if let Some(hint) = self.transport_bound_hint {
+                use crate::playback::BoundCause;
                 ui.separator();
-                ui.label(
-                    egui::RichText::new(format!(
-                        "⚠ Decode-bound: {} ms/frame vs {} ms needed",
-                        hint.decode_ms, hint.budget_ms
-                    ))
-                    .color(egui::Color32::from_rgb(255, 200, 100)),
-                )
-                .on_hover_text(
-                    "Frames are decoding far slower than the frame rate needs, so \
-                     the picture is holding rather than playing. Beauty preview and \
-                     Scrub proxy (to the right) are the two settings that fix it.",
-                );
+                let (label, hover) = match hint.cause {
+                    BoundCause::Decode => (
+                        format!(
+                            "⚠ Decode-bound: {} ms/frame vs {} ms needed",
+                            hint.decode_ms, hint.budget_ms
+                        ),
+                        "Frames are decoding far slower than the frame rate needs, so \
+                         the picture is holding rather than playing. Beauty preview and \
+                         Scrub proxy (to the right) are the two settings that fix it."
+                            .to_string(),
+                    ),
+                    BoundCause::Ui => (
+                        format!(
+                            "⚠ UI-bound: frames waiting {} ms to be shown",
+                            hint.apply_ms
+                        ),
+                        format!(
+                            "The decoder is keeping up ({} ms/frame against a {} ms \
+                             budget) — decoded frames are waiting on floki's own UI \
+                             thread. Something else on this machine is competing for \
+                             it: a screen recorder, a screen-sharing session, or a \
+                             heavy compositor. Beauty preview and Scrub proxy only \
+                             make decodes cheaper, so they will not help here.",
+                            hint.decode_ms, hint.budget_ms
+                        ),
+                    ),
+                };
+                ui.label(egui::RichText::new(label).color(egui::Color32::from_rgb(255, 200, 100)))
+                    .on_hover_text(hover);
                 // Plain "X", matching the existing close control. `✕` (U+2715) is not
                 // in egui's default font set and rendered as an empty tofu box — a
                 // button with no legible glyph on it, in a row that is telling the
@@ -6717,7 +6857,7 @@ impl ExrApp {
                     .on_hover_text("Dismiss until the next seek")
                     .clicked()
                 {
-                    self.decode_bound.dismiss();
+                    self.transport_bound.dismiss();
                 }
             }
 
@@ -9927,6 +10067,7 @@ mod tests {
             frame,
             epoch: app.playback.epoch,
             fell_back: false,
+            timing: DecodeTiming::immediate(),
             result: Ok(data),
         });
     }
@@ -10050,6 +10191,7 @@ mod tests {
                 frame,
                 epoch: app.playback.epoch,
                 fell_back: false,
+                timing: DecodeTiming::immediate(),
                 result: Err("stub".to_string()),
             });
         }
@@ -10167,6 +10309,7 @@ mod tests {
             frame,
             epoch: app.playback.epoch,
             fell_back: false,
+            timing: DecodeTiming::immediate(),
             result: Ok(data),
         });
     }
@@ -10491,6 +10634,7 @@ mod tests {
             frame,
             epoch: app.playback.epoch,
             fell_back,
+            timing: DecodeTiming::immediate(),
             result: Ok(ExrData::load(path).unwrap()),
         });
     }
@@ -10574,6 +10718,55 @@ mod tests {
         assert!(!app.decode_fell_back, "dropped with the other sizing state");
     }
 
+    /// The #350 seam, at the point the two figures are separated. A decode that was
+    /// cheap on the worker but sat waiting for a busy UI thread must land as a cheap
+    /// decode with a large apply lag — not as one expensive number.
+    ///
+    /// The old stamp was `now - decode_submit_at` on this thread at both ends, so
+    /// this frame would have been recorded as a ~400 ms decode and the hint would
+    /// have named the decoder. `last_turnaround` still measures that whole span,
+    /// deliberately: the stall watchdog compares against it.
+    #[test]
+    fn a_frame_that_waited_for_the_ui_thread_is_not_a_slow_decode() {
+        let (_dir, paths) = write_sequence(2);
+        let mut app = ExrApp::default();
+        app.detect_sequence(&paths[0]);
+        app.playback_toggle();
+        app.decode_submit_at = Some(std::time::Instant::now());
+
+        let data = ExrData::load(&paths[1]).unwrap();
+        // Cheap on the worker, finished 400 ms ago and only now reaching the UI.
+        app.apply_load_result(LoadResult {
+            source: ExrApp::A_SOURCE,
+            seq_frame: true,
+            frame: 2,
+            epoch: app.playback.epoch,
+            fell_back: false,
+            timing: DecodeTiming {
+                cost: std::time::Duration::from_millis(12),
+                finished_at: std::time::Instant::now() - std::time::Duration::from_millis(400),
+            },
+            result: Ok(data),
+        });
+
+        assert_eq!(
+            app.last_decode_cost,
+            Some(std::time::Duration::from_millis(12)),
+            "decode cost comes from the worker, not from this thread's clock"
+        );
+        let lag = app.last_apply_lag.expect("apply lag stamped");
+        assert!(
+            lag >= std::time::Duration::from_millis(400),
+            "the wait for the UI thread is measured, not absorbed into decode cost ({lag:?})"
+        );
+        assert!(
+            app.last_turnaround.expect("turnaround stamped")
+                < std::time::Duration::from_millis(400),
+            "turnaround is submit-to-apply on this thread and knows nothing of the \
+             worker's backdated stamp; it is the watchdog's figure, not a cost"
+        );
+    }
+
     #[test]
     fn a_partial_fallback_still_sizes_off_something() {
         // A fallback is not always all the way to full. A proxy job whose fast
@@ -10597,6 +10790,7 @@ mod tests {
             frame: 2,
             epoch: app.playback.epoch,
             fell_back: true,
+            timing: DecodeTiming::immediate(),
             result: Ok(data),
         });
         assert!(app.decode_fell_back);
@@ -12371,6 +12565,7 @@ mod tests {
             frame: 3,
             epoch: app.playback.epoch,
             fell_back: false,
+            timing: DecodeTiming::immediate(),
             result: Err("truncated exr".to_string()),
         });
         assert_eq!(app.playback.pending, None);
@@ -12408,6 +12603,7 @@ mod tests {
             frame: 2,
             epoch: app.playback.epoch,
             fell_back: false,
+            timing: DecodeTiming::immediate(),
             result: Ok(data2),
         });
 
@@ -13777,7 +13973,7 @@ mod tests {
         let e0 = app.playback.epoch;
         // Backdate the submission past the floor timeout so the watchdog fires.
         app.decode_submit_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(30));
-        app.last_decode_dur = None; // no measurement → 10s floor applies
+        app.last_turnaround = None; // no measurement → 10s floor applies
 
         app.tick_decode_watchdog();
 
@@ -13807,7 +14003,7 @@ mod tests {
         let e0 = app.playback.epoch;
         // A fresh submission: a genuinely slow decode must not be force-recovered.
         app.decode_submit_at = Some(std::time::Instant::now());
-        app.last_decode_dur = None;
+        app.last_turnaround = None;
 
         app.tick_decode_watchdog();
 
@@ -13861,6 +14057,7 @@ mod tests {
             frame: 2,
             epoch: live_epoch.wrapping_sub(1),
             fell_back: false,
+            timing: DecodeTiming::immediate(),
             result: Ok(ExrData::load(&f1).unwrap()),
         });
         assert_eq!(
@@ -13886,6 +14083,7 @@ mod tests {
             frame: 2,
             epoch: live_epoch,
             fell_back: false,
+            timing: DecodeTiming::immediate(),
             result: Ok(ExrData::load(&f1).unwrap()),
         });
         assert!(
@@ -14329,6 +14527,7 @@ mod tests {
             frame: 1,
             epoch: app.playback.epoch,
             fell_back: false,
+            timing: DecodeTiming::immediate(),
             result: Ok(full),
         });
         assert_eq!(
@@ -14488,6 +14687,7 @@ mod tests {
             frame,
             epoch: app.playback.epoch,
             fell_back: false,
+            timing: DecodeTiming::immediate(),
             result: Ok(data),
         });
     }
@@ -14547,6 +14747,7 @@ mod tests {
             frame: 2,
             epoch: stale_epoch,
             fell_back: false,
+            timing: DecodeTiming::immediate(),
             result: Ok(data2),
         });
         assert!(

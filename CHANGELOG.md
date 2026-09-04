@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **The "Decode-bound" warning no longer blames the decoder for a busy computer.**
+  (#350) The figure behind it was measured from job submission to the frame being
+  applied, both on the UI thread, so it folded in how long the finished frame had
+  waited for that thread. Run a screen recorder and the same footage that played
+  fine would raise an amber "Decode-bound" hint pointing at Beauty preview and
+  Scrub proxy — two settings that make decodes cheaper and can do nothing about a
+  contended UI thread. The decode is now timed on the worker that performs it, and
+  the wait for the UI thread is measured separately, so the hint names the end
+  that is actually holding the picture up: a slow decoder still says
+  "Decode-bound", while a starved UI thread says "UI-bound", reports that the
+  decoder is keeping up, and says which settings will not help. The debug overlay
+  and the `floki::playback` trace carry all three figures (`decode_cost`,
+  `apply_lag`, `turnaround`) instead of one that meant whichever you assumed.
 - **The Help window no longer describes a model the app dropped.** (#349) Its
   feature list still told you to "load Image B" to composite, which has not been
   possible since every file became an ordinary layer — you add a second layer and
