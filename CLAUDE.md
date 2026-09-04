@@ -150,7 +150,7 @@ anything diagnosing *why* playback is slow must use the first two, because the f
 figure reported UI contention (a screen recorder) as a slow decoder.
 
 ### State & persistence
-`ExrApp` derives serde `(default)`. Fields that should persist across sessions (recent files, LUT path, `enable_lut`, OCIO path) are plain fields; all transient/runtime state (loaded data, GPU handles, conversion progress, window-open flags) is marked `#[serde(skip)]`. Persistence is handled by `eframe` storage. Image B (reference image) is reset whenever Image A changes.
+`ExrApp` derives serde `(default)`. Fields that should persist across sessions (recent files, LUT path, `enable_lut`, OCIO path) are plain fields; all transient/runtime state (loaded data, GPU handles, conversion progress, window-open flags) is marked `#[serde(skip)]`. Persistence is handled by `eframe` storage.
 
 ### Color / LUT
 `color/cube.rs` parses Adobe `.cube` 3D LUTs into an RGBA `Vec<[f32;4]>`; `gpu/mod.rs::create_lut_bind_group` uploads it as an `Rgba32Float` 3D texture for in-shader color transforms.
