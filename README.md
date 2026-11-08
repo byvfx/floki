@@ -24,7 +24,7 @@ Powered by `egui`, `wgpu`, and the pure-Rust `exr` crate, it allows you to insta
 Every EXR you open becomes a **layer** in an ordered stack — there is no special "first" image and no separate reference slot. Drop files onto the window, use `File ▸ Open EXR...`, or hit **➕ Add source…** in the panel; stack as many as the shot needs.
 * **Per-layer controls:** visibility and **solo** sit in the row gutter; the row's `⋮` menu holds blend mode (Over, Under, Add, Multiply, Screen), opacity, the **pass/AOV picker** for that layer's source, a pixel-aspect override, reorder, and remove. **Duplicate layer** gives you a second view of the same source with no extra decode — useful for comparing two AOVs of one render against each other.
 * **Timeline tracks:** each layer is a clip on a shared frame axis. Drag a clip to slide that layer against the global playhead (or type an exact offset) to line up takes that start on different frames; a fill strip under each track shows what is resident in the cache.
-* **The current layer** — click a row's name — is what the toolbar's channel and tone controls, the pixel readout, the histogram, and the contact sheet all act on. The composite keeps rendering underneath.
+* **The current layer** — click a row's name — is what the histogram and the contact sheet act on, and it is what pane A shows in a compare. Channel isolation and the tone controls are *global* view settings: they apply to the whole view, not to the selected row. The pixel readout follows whatever is actually on top — the composite's topmost drawable layer in Stacked mode, pane A's layer in a compare. The composite keeps rendering underneath.
 * Toggle the panel from **View ▸ Layer tracks**.
 
 ![Layers panel](assets/floki_layers.png)
@@ -60,7 +60,7 @@ Open one frame of a numbered sequence (e.g. `render.0101.exr`) and play the whol
 *Contact sheet — every AOV and pass of the current layer as a thumbnail grid; click one to switch the layer to it.*
 
 ### Comparison
-With more than one layer in the stack, a **Compare** picker appears in the toolbar. Side A is always the live composite; the **vs:** picker chooses which layer it is shown against, independently of which layer is current.
+With more than one layer in the stack, a **Compare** picker appears in the toolbar. Outside **Stacked**, side A is the **current layer alone** — not the composite — and the **vs:** picker chooses which layer it is shown against, so changing the current layer changes what you are comparing.
 * **Stacked:** the ordinary composite — layers blended in stack order by their own blend modes and opacities.
 * **Wipe:** split-screen slider for boundary checks, with adjustable centre, rotation angle, and divider-line opacity — drag the on-image handle, or scroll it to rotate. Wipes at any orientation.
 * **Side-by-Side:** the two panes glued into a continuous panorama sharing one camera, so panning and zooming stay synchronized. **Normalize Size** matches the compare layer's height to pane A's when the two are different formats.
@@ -70,7 +70,7 @@ With more than one layer in the stack, a **Compare** picker appears in the toolb
 The comp toolbar stays a single row: each arrangement's parameters live behind its own `Wipe ▾` / `Diff ▾` menu, next to the picker that selected it.
 
 ![Wipe compare mode](assets/floki_wipe.png)
-*Wipe — drag the divider at any angle to check the composite against any layer in the stack.*
+*Wipe — drag the divider at any angle to check the current layer against any other layer in the stack.*
 
 ![Side-by-side compare mode](assets/floki_sidebyside.png)
 *Side-by-side — both panes share one camera for synchronized panning and zooming.*
@@ -109,8 +109,8 @@ The comp toolbar stays a single row: each arrangement's parameters live behind i
 ### High-Performance UI
 * **Immediate-Mode UI:** Built on `egui` for a responsive, minimal-overhead interface.
 * **Light / Dark / System Themes:** Switch the interface theme from the **Theme** menu; the `System` option tracks your OS light/dark setting live. Your choice persists across sessions.
-* **Recent Files:** `File ▸ Open Recent` reloads a recent EXR as a new layer.
-* **Drag & Drop Loading:** Drop EXRs anywhere on the window to add them to the stack — a single overlay confirms the drop, and dropping several at once adds them all, in drop order.
+* **Recent Files:** `File ▸ Open Recent` opens a recent EXR as a new layer. If that file is already in the stack it focuses the layer it is already on instead of loading a second copy — use **Duplicate layer** when you want a second view of the same source.
+* **Drag & Drop Loading:** Drop EXRs anywhere on the window to add them to the stack — a single overlay confirms the drop, and dropping several at once adds them all, in drop order. A file already in the stack focuses its existing layer rather than adding a duplicate.
 * **Persistent State:** Remembers your UI layout, recent files list, theme, and preferences across sessions.
 * **Software Tone Mapping:** Apply Exposure, Gamma, and sRGB transforms instantly without altering the underlying raw data.
 * **Resource Monitor:** A discrete status-bar readout tracks floki's own memory footprint and system RAM, plus live GPU **VRAM** usage on macOS — handy when loading heavy EXRs or sequences. It samples about once a second and tucks into the bottom-right. (The VRAM figure is macOS/Metal only for now; Windows and Linux show RAM.)
