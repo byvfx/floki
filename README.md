@@ -43,8 +43,12 @@ Open one frame of a numbered sequence (e.g. `render.0101.exr`) and play the whol
 * **Eager precache:** Optionally cache the whole in/out range up front — a green fill bar under the scrubber shows what's resident — so the span plays and loops with the decoder idle.
 * **Live render-watch:** Watch the sequence folder and pick up frames as a render writes them (new frames extend the range; re-rendered frames refresh), optionally parking the playhead on the newest frame.
 
-![Sequence playback](assets/floki_playback.gif)
-*Real-time sequence playback — the scrubber highlights the trimmed in/out region, the green bar shows the cached range, and target/measured fps read out live.*
+<!-- TODO(#347): playback clip. Attach assets/gif_frames/floki_playback_readme.mp4 to a PR
+     comment and paste the githubusercontent URL in place of this block — a repo-relative
+     <video> is stripped by GitHub's sanitiser and raw.githubusercontent.com video is blocked,
+     so the attachment URL is the only route that renders. Caption to restore with it:
+     *Real-time sequence playback — the scrubber highlights the trimmed in/out region, the
+     green bar shows the cached range, and target/measured fps read out live.* -->
 
 ### Deep Inspection
 * **Precision Pixel Sampling:** Hover over any pixel to reveal exact floating-point values (R, G, B, A) regardless of bit-depth (F16, F32, U32).
@@ -52,7 +56,7 @@ Open one frame of a numbered sequence (e.g. `render.0101.exr`) and play the whol
 * **Metadata Explorer:** Cleanly displays embedded EXR attributes (like V-Ray/Arnold custom tags), passes, and bounding box data in collapsible panels — the current layer's source first, then the rest of the stack, so a mixed-format comp can be read top to bottom in one place.
 * **Contact Sheet:** Press `T` (or **View ▸ Contact Sheet**) to see every AOV and pass of the current layer's source as a scrollable grid of thumbnails. Click a cell to point that layer at the pass — the fastest way to go from "what is in this render" to looking at it.
 
-![Contact sheet](assets/floki_contactsheet.png)
+![Contact sheet](assets/floki_contact_sheet.png)
 *Contact sheet — every AOV and pass of the current layer as a thumbnail grid; click one to switch the layer to it.*
 
 ### Comparison
@@ -92,15 +96,11 @@ The comp toolbar stays a single row: each arrangement's parameters live behind i
 ### Customizable Viewport Background
 * **Background Modes:** Replace the default transparency checkerboard with a checkerboard (custom cell colours and size), a solid colour, or a multi-stop gradient at any angle — set from **View ▸ Viewport Background**. Save named presets that persist across sessions. The background composites consistently across the GPU and OCIO display paths.
 
-| Checkerboard | Solid | Gradient |
-|:---:|:---:|:---:|
-| ![Checkerboard background](assets/floki_bg_checker.png) | ![Solid background](assets/floki_bg_solid.png) | ![Gradient background](assets/floki_bg_grad.png) |
-
 ### Snapshot & Review
 * **Snapshot to Clipboard:** Copy exactly what's on screen to the system clipboard with `Cmd/Ctrl + Shift + S` (or **View ▸ Snapshot to Clipboard**) — background, compare mode, OCIO, and annotations all included. Optionally also save a timestamped PNG to `~/.floki/snapshots/`.
 * **Annotation Overlay:** Mark up the view with arrows, boxes, a freehand pen, and text labels (adjustable colour and stroke width) before snapshotting. Annotations anchor to image pixels so they track pan/zoom, support undo/redo and clear-all, and are flattened into the snapshot automatically.
 
-![Annotation overlay](assets/floki_annotate.png)
+![Annotation overlay](assets/floki_annotation.png)
 *Annotation overlay — arrows, boxes, freehand pen, and text labels anchor to image pixels and flatten into the snapshot.*
 
 ### Batch Tooling
