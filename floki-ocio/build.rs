@@ -183,6 +183,23 @@ mod native {
             config.env("CFLAGS", cflags);
         }
 
+        // GCC 13 stopped transitively including <cstdint> from other libstdc++ headers, and
+        // OCIO 2.4.2's bundled yaml-cpp uses uint16_t/uint32_t in emitterutils.cpp without
+        // including it. So yaml-cpp stopped compiling the moment `ubuntu-latest`'s image rolled
+        // forward to that compiler, taking the vendored build — and therefore the Linux release
+        // artifact — with it (#364). Force the header in for the whole tree. Passed via CXXFLAGS
+        // env for the same reason as the CFLAGS above: the ext deps are separate ExternalProject
+        // cmake invocations that don't inherit a top-level `-D`, but do inherit the environment.
+        // Clang/libc++ and MSVC are unaffected, so this stays scoped to Linux.
+        if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
+            let mut cxxflags = std::env::var("CXXFLAGS").unwrap_or_default();
+            if !cxxflags.is_empty() {
+                cxxflags.push(' ');
+            }
+            cxxflags.push_str("-include cstdint");
+            config.env("CXXFLAGS", cxxflags);
+        }
+
         // Keep the OCIO build hermetic from a host vcpkg install. On Windows the cmake crate
         // uses the Visual Studio (MSBuild) generator, and vcpkg's *user-wide* integration
         // (`vcpkg integrate install`, a `vcpkg.user.targets` under %LOCALAPPDATA%) silently
