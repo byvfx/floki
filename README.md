@@ -43,8 +43,8 @@ Open one frame of a numbered sequence (e.g. `render.0101.exr`) and play the whol
 * **Eager precache:** Optionally cache the whole in/out range up front — a green fill bar under the scrubber shows what's resident — so the span plays and loops with the decoder idle.
 * **Live render-watch:** Watch the sequence folder and pick up frames as a render writes them (new frames extend the range; re-rendered frames refresh), optionally parking the playhead on the newest frame.
 
-<!-- TODO(#347): playback clip. Attach assets/gif_frames/floki_playback_readme.mp4 to a PR
-     comment and paste the githubusercontent URL in place of this block — a repo-relative
+<!-- TODO(#362): playback clip. Attach assets/gif_frames/floki_playback_readme.mp4 to a PR
+     comment and paste the user-attachments URL in place of this block — a repo-relative
      <video> is stripped by GitHub's sanitiser and raw.githubusercontent.com video is blocked,
      so the attachment URL is the only route that renders. Caption to restore with it:
      *Real-time sequence playback — the scrubber highlights the trimmed in/out region, the
