@@ -15,7 +15,13 @@ dependency. `Cargo.lock` is committed so the measurements below stay reproducibl
 From this directory:
 
 ```bash
-cargo run --release --locked -- <model.gguf> <tokenizer.json> [prompt_tokens] [n_decode]
+cargo run --release --locked -- <model.gguf> <tokenizer.json> [options]
+
+  --prompt <text>   ask this, instead of running the synthetic benchmark
+  --ground <file>   prepend this file as context, instructing the model to use only it
+  --tokens <n>      synthetic prompt of about n tokens (benchmark mode, default 256)
+  --decode <n>      maximum tokens to generate (default 64)
+  --think           let Qwen3 open a <think> block (suppressed by default)
 ```
 
 `cargo run` rather than `cargo build` is deliberate: building leaves the executable in the
@@ -65,8 +71,38 @@ Three conclusions, all recorded in #358:
    vcvars and no cmake. `tokenizers` must carry `default-features = false`, otherwise
    `esaxx_fast` pulls a C++ compile.
 
+## What the grounded Q&A showed
+
+Two trials with `--ground` pointed at the README's 19-line **Comparison** section — 550 prompt
+tokens, ~1.9 s to first token:
+
+**In-context question — usable.** *"How do I compare the current layer against a different
+version?"* produced a correct answer, naming the Compare picker in the toolbar and that it
+compares the current layer against another layer in the stack. It did conflate the mode picker
+with the `vs:` layer picker, and padded with "a comprehensive comparison of their properties",
+but nothing was invented. The premise behind #358's retrieval plan holds: the grounding does
+the work, not the model.
+
+**Out-of-context question — fabricated.** *"What keyboard shortcut starts and stops
+playback?"* is absent from that section, and the system prompt instructed it to say it did not
+know when the context lacks the answer. It answered **"`Ctrl + P` ... and `Ctrl + Shift + P`"**.
+The real answer is `Space` (`src/app.rs`). That is not merely wrong, it is *plausible* — and
+`Ctrl+P` is what #357 proposes for the command palette, so a TD would try it, get nothing, and
+stop trusting the panel.
+
+The design consequence, and the main thing this spike bought: **the model cannot be trusted to
+decide whether it knows.** #358's acceptance criterion "an unanswerable question returns I
+don't know" has to be a **code path, not a prompt instruction**. If retrieval finds no registry
+entry or doc chunk above a threshold, the panel must refuse and show the registry rows without
+consulting the model at all. One trial each, so treat the magnitude as indicative — but the
+direction is not in doubt, since a model this size follows negative instructions poorly by
+nature.
+
 ## Not measured
 
 Q8_0 (estimated ~1.66 GB floor by the same arithmetic), Metal, and anything with `mkl` or
-`accelerate` enabled — all of which would move the prefill number, which is the one that
-matters.
+`accelerate` enabled — all of which would move the prefill number, the one that matters.
+
+Also untested: whether a sterner refusal instruction, few-shot examples, or a logprob
+threshold would make refusal reliable enough to lean on. The architectural fix above does not
+depend on the answer.
