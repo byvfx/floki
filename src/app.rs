@@ -13101,10 +13101,8 @@ mod tests {
 
         // With everything hidden there is nothing better — keep the claim rather
         // than inventing a source, so the transport stays coherent.
-        for l in [clock_layer] {
-            if let Some(l) = app.comp_stack.get_mut(l) {
-                l.enabled = false;
-            }
+        if let Some(l) = app.comp_stack.get_mut(clock_layer) {
+            l.enabled = false;
         }
         let other = app
             .comp_stack
