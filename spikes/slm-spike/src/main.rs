@@ -73,7 +73,11 @@ fn main() -> Result<()> {
     );
 
     let mut lp = LogitsProcessor::from_sampling(42, Sampling::ArgMax);
+    // Timed on its own so `first-token` below is prefill + this sample rather than prefill
+    // reported twice, and so the prefill println above is excluded from it.
+    let t_sample = Instant::now();
     let mut next = lp.sample(&logits)?;
+    let first_sample = t_sample.elapsed().as_secs_f64();
 
     // ---- decode ----
     let t2 = Instant::now();
@@ -91,7 +95,12 @@ fn main() -> Result<()> {
         n_decode,
         n_decode as f64 / dec
     );
-    println!("first-token : {:.3} s  (prefill + 1 sample)", prefill);
+    println!(
+        "first-token : {:.3} s  (prefill {:.3} + first sample {:.4})",
+        prefill + first_sample,
+        prefill,
+        first_sample
+    );
     println!(
         "text        : {}",
         tokenizer
