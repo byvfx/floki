@@ -38,3 +38,6 @@ Thumbs.db
 
 # GIF source frames + intermediate renders (kept locally, not versioned).
 assets/gif_frames/
+
+# Throwaway spike crates are their own workspaces; their build output is not ours.
+spikes/*/target/
