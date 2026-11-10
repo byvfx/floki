@@ -136,6 +136,14 @@ mod native {
 
     // -- vendored backend ---------------------------------------------------------------
 
+    /// Build vendored OCIO and its dependencies as static libraries with platform workarounds.
+    ///
+    /// Returns the installed headers, library search paths, and ordered link inputs for the shim.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the OCIO submodule is missing, the CMake build fails, or no OpenColorIO static
+    /// library is installed.
     #[cfg(feature = "vendored-ocio")]
     fn build_vendored_ocio() -> Backend {
         let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
