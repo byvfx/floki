@@ -136,6 +136,14 @@ mod native {
 
     // -- vendored backend ---------------------------------------------------------------
 
+    /// Build vendored OCIO and its dependencies as static libraries with platform workarounds.
+    ///
+    /// Returns the installed headers, library search paths, and ordered link inputs for the shim.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the OCIO submodule is missing, the CMake build fails, or no OpenColorIO static
+    /// library is installed.
     #[cfg(feature = "vendored-ocio")]
     fn build_vendored_ocio() -> Backend {
         let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
@@ -181,6 +189,39 @@ mod native {
             }
             cflags.push_str("-Dfdopen=fdopen");
             config.env("CFLAGS", cflags);
+        }
+
+        // GCC 13 stopped transitively including <cstdint> from other libstdc++ headers, and
+        // OCIO 2.4.2's bundled yaml-cpp uses uint16_t/uint32_t in emitterutils.cpp without
+        // including it. So yaml-cpp stopped compiling the moment `ubuntu-latest`'s image rolled
+        // forward to that compiler, taking the vendored build — and therefore the Linux release
+        // artifact — with it (#364).
+        //
+        // CXXFLAGS in the environment is NOT sufficient on its own, unlike the CFLAGS shim
+        // above. Each ext dep is an ExternalProject whose `Install<dep>.cmake` passes an
+        // explicit `-DCMAKE_CXX_FLAGS=${<dep>_CXX_FLAGS}` (see OCIO's
+        // share/cmake/modules/install/), and a command-line `-D` overrides the environment —
+        // so the sub-build discards it. OCIO *appends* to those `<dep>_CXX_FLAGS` variables,
+        // so seeding them from the top-level configure survives; and OCIO already puts
+        // space-separated flags in them itself (`/EHsc`, `-Wno-shadow`), which is what makes
+        // the space here safe through ExternalProject's CMAKE_ARGS.
+        //
+        // Seeded for every ext dep that takes the flag, not just the one that failed: they are
+        // all pinned to the same era, force-including a standard header cannot break a
+        // translation unit, and discovering them one at a time costs a ~6 minute CI round trip
+        // each. The env var stays for OCIO's own core, which has no such override. Clang/libc++
+        // and MSVC are unaffected, so this stays scoped to Linux.
+        if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
+            const FORCE_CSTDINT: &str = "-include cstdint";
+            let mut cxxflags = std::env::var("CXXFLAGS").unwrap_or_default();
+            if !cxxflags.is_empty() {
+                cxxflags.push(' ');
+            }
+            cxxflags.push_str(FORCE_CSTDINT);
+            config.env("CXXFLAGS", cxxflags);
+            for dep in ["yaml-cpp", "Imath", "OpenEXR", "pystring", "EXPAT"] {
+                config.define(format!("{dep}_CXX_FLAGS"), FORCE_CSTDINT);
+            }
         }
 
         // Keep the OCIO build hermetic from a host vcpkg install. On Windows the cmake crate
