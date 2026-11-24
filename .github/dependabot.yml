@@ -1,0 +1,54 @@
+# Grouped Dependabot version updates.
+# A dependency is included only in the first group it matches, so the UI/GPU
+# group is listed before the catch-all. Major bumps match neither group and
+# stay as individual pull requests.
+version: 2
+updates:
+  # Workspace root. Members are `.` (floki) and `floki-ocio`. The experimental
+  # `spikes/slm-spike` crate is its own workspace and is not watched.
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    groups:
+      # Crates that publish on the same train. Patterns match lockfile names:
+      # egui, egui-wgpu, egui-winit, egui_extras, egui_glow, egui_kittest,
+      # eframe, epaint, epaint_default_fonts, ecolor, emath (same 0.34 line),
+      # wgpu and wgpu-*, winit, and naga (direct floki-ocio dep, locked to wgpu).
+      ui-gpu:
+        patterns:
+          - "egui*"
+          - "eframe*"
+          - "epaint*"
+          - "ecolor*"
+          - "emath*"
+          - "wgpu*"
+          - "winit*"
+          - "naga*"
+        update-types:
+          - "minor"
+          - "patch"
+      cargo-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  # Workflows use actions/checkout, dtolnay/rust-toolchain, Swatinem/rust-cache,
+  # actions/upload-artifact, and softprops/action-gh-release.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    groups:
+      actions-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
