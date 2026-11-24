@@ -7,7 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **The Layers panel no longer rations layers.** The cap was 6 and the header
+  showed a "3/6" counter, which read as a quota you were spending rather than a
+  ceiling nobody reaches. The counter is gone and the cap is 100 — high enough to
+  be a runaway backstop rather than something you plan around.
+- **The anamorphic "Custom factor" checkbox now says which layer it affects.**
+  It is labelled "Custom factor (this layer)" — it always edited the current
+  layer only, and the short label left that to be guessed.
+
+### Removed
+- **The last of the old single-image slot, removed.** (#277) Before the unified
+  layer model the first file you opened lived in a dedicated slot with its own
+  display path. Every file is an ordinary layer now, so that path could not run:
+  the frame-swap it performed, the two fields it wrote, and a histogram
+  invalidation only it called. No behaviour changes; the code that draws your
+  image was already the other path.
+- **The slot-A open path, removed.** (#277) Before the unified layer model,
+  the first file you opened went into a dedicated "image A" slot with its own
+  open path, its own supersession counter, and its own status-bar and info-window
+  rows. Every file you open is an ordinary composite layer now, so none of that
+  could run: the branch that applied an explicit open was unreachable, and the
+  two UI rows fed from a slot that is never filled and so drew nothing. No
+  behaviour changes.
+
 ### Fixed
+- **The vendored OCIO build compiles on current Linux again.** (#365) GCC 13 no
+  longer includes `<cstdint>` transitively, and OCIO 2.4.2's bundled yaml-cpp uses
+  `uint16_t` / `uint32_t` without including it, so the static OCIO build — and the
+  Linux release binary — failed to compile (#364). The Linux vendored build now
+  force-includes `<cstdint>`.
 - **The "Decode-bound" warning no longer blames the decoder for a busy computer.**
   (#350) The figure behind it was measured from job submission to the frame being
   applied, both on the UI thread, so it folded in how long the finished frame had
@@ -27,25 +56,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pick it as the compare side. It also never listed the playback keys, so Space,
   the arrow keys and I/O were discoverable only by guessing; they are in the
   shortcut list now, under their own heading since they need a sequence loaded.
-
-### Changed
-- **The Layers panel no longer rations layers.** The cap was 6 and the header
-  showed a "3/6" counter, which read as a quota you were spending rather than a
-  ceiling nobody reaches. The counter is gone and the cap is 100 — high enough to
-  be a runaway backstop rather than something you plan around.
-- **The anamorphic "Custom factor" checkbox now says which layer it affects.**
-  It is labelled "Custom factor (this layer)" — it always edited the current
-  layer only, and the short label left that to be guessed.
-
-### Removed
-- **The last of the old single-image slot, removed.** (#277) Before the unified
-  layer model the first file you opened lived in a dedicated slot with its own
-  display path. Every file is an ordinary layer now, so that path could not run:
-  the frame-swap it performed, the two fields it wrote, and a histogram
-  invalidation only it called. No behaviour changes; the code that draws your
-  image was already the other path.
-
-### Fixed
 - **The RAM readout no longer reports zero for a still image.** (#342) With a
   single image open and the transport stopped, the debug overlay showed 0 bytes
   held however large the file was, because it was measuring a slot the unified
@@ -67,15 +77,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deliberately: the frames resident during playback carry a single pass, and a
   sheet is a grid of *every* pass, so switching to one mid-flight would collapse
   forty cells into one.
-
-### Removed
-- **The slot-A open path, removed.** (#277) Before the unified layer model,
-  the first file you opened went into a dedicated "image A" slot with its own
-  open path, its own supersession counter, and its own status-bar and info-window
-  rows. Every file you open is an ordinary composite layer now, so none of that
-  could run: the branch that applied an explicit open was unreachable, and the
-  two UI rows fed from a slot that is never filled and so drew nothing. No
-  behaviour changes.
 
 ## [1.13.3] - 2026-08-31
 

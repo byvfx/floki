@@ -13,22 +13,31 @@
 
 ## Setup
 
-1. Build the release-ish OCIO binary you actually review with (`system-ocio` or `vendored`), not the
-   stub — the budget math and T2 path only exist with a GPU.
-2. **View → Playback Debug** (the #128 overlay). Every check below reads off it. Field map:
+1. Build the release binary you actually review with (`system-ocio` or `vendored`), not the
+   stub. The app will not launch without a GPU that supports `FLOAT32_FILTERABLE`. The T2
+   VRAM ring was removed in #299; the RAM budget is the T1 ring.
+2. **View → Playback Debug** (the #128 overlay). Every check below reads off it. Field map
+   (labels as drawn in `ExrApp::draw_playback_debug`):
 
    | Overlay row | What to watch |
    |-------------|---------------|
-   | `range` | in/out trim vs full range — confirms trimmed playback honors the window |
-   | `frame · state · dir` | playhead, `Playing`/`Paused`/`Stopped`, `Forward`/`Reverse` |
+   | `range` | full range, then `(in/out …)` — confirms trimmed playback honors the window |
+   | `frame` | playhead · `Playing`/`Paused`/`Stopped` · `Forward`/`Reverse` |
    | `mode` | loop mode · pacing · **epoch** (must climb on every scrub/loop turn, never stall) |
    | `fps` | **measured / target** — the headline smoothness number |
-   | `T1 (CPU)` | `len / cap frames · ~bytes/frame` — RAM ring occupancy vs budget |
-   | `T2 (GPU)` | `len / cap frames` or `off` — VRAM ring occupancy vs budget |
-   | `worker` | `in-flight [...] · pending N` — decode-ahead depth; persistent backlog = starvation |
-   | `RAM` / `VRAM` | live `used / total` (VRAM = `n/a` off-Metal) — must stay under budget |
-   | `evictions` | cumulative; **rate** matters — a high steady rate during smooth play = thrash |
+   | `frame time` | p50 / p95 / p99 / max ms, and `n`. `—` until a frame has been shown |
+   | `T1 (CPU)` | `len / cap frames`, sizing per frame, and held bytes / budget |
+   | `proxy` | on/off, long-side px, and measured bytes/frame once a proxy has decoded |
+   | `fallbacks` | cheap decodes the worker had to satisfy with a dearer frame |
+   | `comp tex` | live comp textures (`s{id} {w}×{h}`). This is the GPU-resident set now that the T2 ring is gone |
+   | `sources` | per-follower playhead, displayed frame, pending, in-flight. The live row when the comp stack drives the clock |
+   | `worker (A)` | slot-A `in-flight`, `pending`, `loading_a`, alive/dead. Empty by construction on the comp path; read `sources` there |
+   | `decode` | `submitted`, `cost`, `apply`, `round trip` — three timings, not one (#350) |
+   | `RAM` | system `used / total` |
+   | `VRAM` | `used / budget`, or `n/a (off-Metal fixed cap)` |
+   | `evictions` | cumulative T1 evictions; **rate** matters — a high steady rate during smooth play = thrash |
    | `dropped-epoch` | superseded decodes; a few per scrub is healthy, a flood = epoch storm |
+   | `sheet bakes` | contact-sheet bakes; flat while playback is moving, steps once on settle |
 
 3. The `evictions` / `dropped-epoch` counters reset when a **new sequence is detected** (each freshly
    opened sequence starts clean); `fps` resets on stop. To zero them mid-soak, re-open the sequence.
@@ -60,20 +69,21 @@ For each sequence above, exercise:
       (eviction shouldn't dump the frames you're about to replay).
 - [ ] **In/out trim** — set a tight window mid-sequence; playback stays inside it; `range` reflects it;
       caches don't prefetch far outside the window.
-- [ ] **Scrub** — drag the scrubber fast across the whole range. Watch `pending`/`in-flight` and
-      `dropped-epoch`: a fast scrub *should* generate dropped epochs (that's supersession working),
-      but the playhead must always settle on the frame you released on, never a stale one.
-- [ ] **A-plays / B-holds** — load a B slot; A plays, B stays put; sampler/readout reflects the right slot.
+- [ ] **Scrub** — drag the scrubber fast across the whole range. Watch `pending`/`in-flight` on
+      `sources` (or `worker (A)` when slot A owns the clock) and `dropped-epoch`: a fast scrub
+      *should* generate dropped epochs (that's supersession working), but the playhead must always
+      settle on the frame you released on, never a stale one.
+- [ ] **Two layers** — add a second source. Both follow the shared playhead (their own trims
+      included); the readout names the pane under the cursor. There is no separate B slot (#277).
 
 ## The flagged risks — verify each explicitly
 
 These are the four risks called out in the hardening plan. Each gets a deliberate adversarial probe:
 
 1. [ ] **VRAM never exceeds budget.** wgpu **aborts the process** on OOM — there is no soft failure.
-       On the 4K sequence, off-Metal especially, watch `T2 len/cap` and `VRAM used`: `len` must never
-       exceed `cap`, and the cap must hold *proactively* (eviction before upload, not after). If the
-       app vanishes, that's the bug. Toggle the **T2 kill-switch** and confirm playback degrades to
-       T1-only instead of crashing.
+       On the 4K sequence, off-Metal especially, watch `VRAM` and `comp tex`. There is no T2 ring
+       and no T2 kill-switch (#299): playback does not pre-upload a ring of full-frame GPU textures.
+       If the app vanishes, that's the bug.
 2. [ ] **Epoch correctness under path recurrence.** Rapidly alternate scrub ↔ play ↔ loop-back ↔
        ping-pong on the same frames. `epoch` must climb monotonically; `dropped-epoch` rises but the
        *displayed* frame always matches the playhead. The failure signature is a frame from a previous
@@ -83,7 +93,7 @@ These are the four risks called out in the hardening plan. Each gets a deliberat
        creeps past budget. Decide here (open question #3): re-measure `approx_bytes` on deviation, or
        log-and-accept.
 4. [ ] **UI-thread starvation.** Single global rayon pool runs decode *and* texture packing. On heavy
-       T2 builds (4K, fast play), watch for `in-flight` backlog that never drains and an unresponsive
+       4K playback, watch for an `in-flight` backlog that never drains and an unresponsive
        UI (laggy scrubber, stuttery menus *while frames are still decoding*). That's decode starving
        the UI thread — the trigger to consider a dedicated decode pool (open question #4).
 
@@ -100,7 +110,7 @@ These are the four risks called out in the hardening plan. Each gets a deliberat
 
 - No process aborts (VRAM held proactively in every mode, both regimes).
 - `epoch` strictly monotonic; no stale-frame paints under any scrub/loop/ping-pong sequence.
-- `T1 len ≤ cap` and `T2 len ≤ cap` at all times; `RAM`/`VRAM used` under budget.
+- `T1` `len ≤ cap` at all times; `RAM` / `VRAM` under budget. There is no T2 cap to check (#299).
 - Eviction rate is bounded during steady play (no thrash).
 - INV-SAMPLE: suppressed during play/seek, live + correct when paused-resident, re-decode on
   paused-evicted.
@@ -109,7 +119,7 @@ These are the four risks called out in the hardening plan. Each gets a deliberat
 ## On failure
 
 File each as a **#99 blocker**, with: regime (Metal / off-Metal), sequence (res + AOV count), mode,
-the overlay readout at the moment of failure (fps / T1 / T2 / epoch / dropped / RAM / VRAM), and repro
+the overlay readout at the moment of failure (fps / frame time / T1 / comp tex / epoch / dropped-epoch / RAM / VRAM), and repro
 steps. A reproducible overlay snapshot is worth more than a description — note the exact numbers.
 
 ## Cross-references

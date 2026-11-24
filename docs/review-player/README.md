@@ -1,13 +1,13 @@
 # floki as a Review Player — Chaos Player parity roadmap
 
-> **Status:** in progress. Tracking epic: [#99](https://github.com/byvfx/floki/issues/99).
-> The compositing layer-stack unification is underway on `feat/layer-stack-play` (PR #190):
-> Phase 1 (SourceId backend) + Phase 2 (playable comp layers) + the render-foundation R-series
-> (standalone comp render, timeline tracks, base plate in the stack) have landed. **Live
-> progress + the R4 resume point live in [`unification-plan.md`](./unification-plan.md).**
+> **Status:** the layer-stack unification has shipped on `main`. Tracking epic:
+> [#99](https://github.com/byvfx/floki/issues/99). The `LayerStack` is the only model
+> floki renders and plays — open and drop add a layer, the five arrangements
+> (Stacked, Wipe, Side-by-Side, Diff, Blink) are comp-path native, and the stack
+> persists. The record of that work is [`unification-plan.md`](./unification-plan.md).
 > **Decision (2026-06-22):** build the core review features **in egui first**; the Qt
-> port ([#44](https://github.com/byvfx/floki/issues/44)) is deferred until this scope
-> ships. Porting onto a moving architecture means re-porting it.
+> port ([#44](https://github.com/byvfx/floki/issues/44)) stays deferred. Porting onto a
+> moving architecture means re-porting it.
 
 floki is already a fast, color-managed GPU EXR viewer with sequence playback. The next
 arc turns it into a **Chaos Player-class review tool**. This document is the durable
@@ -69,23 +69,24 @@ list) are unconfirmed and marked as such.
 
 | Area | floki | Notes |
 |------|-------|-------|
-| Smart cache, instant hi-res playback | ✅ | #7 Phases 0–5: T0–T3 ring, decode-ahead (#57), GPU pre-upload (#56) |
+| Smart cache, instant hi-res playback | ✅ | #7 Phases 0–5: T1 RAM ring, decode-ahead (#57), on-disk proxy cache. The T2 GPU pre-upload ring was removed in #299 |
 | OCIO 2 + LUT | ✅ | #24 / #76 (display transform baked to a 3D LUT) |
 | EXR multi-channel / multi-part / AOV / channels | ✅ | core strength |
-| Compare: **wipe / side-by-side / diff / composite** + blend modes | ✅ | `CompareMode` in `viewer.rs` |
+| Compare: **Stacked / Wipe / Side-by-Side / Diff / Blink** + per-layer blend modes | ✅ | `Arrangement` in `src/layer.rs` |
 | Color sampler, histogram, contact-sheet thumbnails | ✅ | |
 | Exposure + gamma (incl. in OCIO view) | ✅ | gamma-in-OCIO fixed in #93/#95 |
 | Transport: play/pause/stop/step, loop, ping-pong, in/out trim, stutter **+ drop-frames** pacing | ✅ | #7 Phase 5 (PR #97) |
 | **Live render-watch** | ✅ | #101 (off-thread scan #145) |
 | Color corrections: contrast / hue / saturation / white balance / **soft-clip** | ⚠️ | only exposure + gamma today → **#102** |
 | Annotations: animated **brush-sequence** + **text** layers | ⚠️ | static annotations/swatches exist → layer model (**#103**) |
-| Compare count | ⚠️ | 2-slot (A/B); Chaos does up to 4 → **#104** |
+| Compare count | ⚠️ | Any number of layers in the stack; a compare is still two panes (current vs `vs:`). N-way (up to 4) is **#104** |
 | **MP4 / ProRes export** | ❌ | **#8** |
 | **N-way compare** (up to 4) | ❌ | **#104** |
-| **Layer / composite stack** (per-layer xform, infinite canvas, layer types) | ❌ | **#103** |
+| **Layer / composite stack** | ✅ | Ordered stack on `main`: per-layer blend, opacity, solo, trim, AOV, pixel aspect, timeline tracks. Brush / text / adjustment types and infinite-canvas editing are still open (**#103** follow-ups) |
 | Stereoscopic playback | ❌ | backlog **#105** |
 | Format breadth: .VRIMG / DPX / HDR / video in | ❌ | backlog **#105** |
-| HTTP-server broadcast; CLI / macros | ❌ | backlog **#105** |
+| Opening a path from the CLI (`floki <path>`) | ✅ | Same entry as File ▸ Open and drag-and-drop |
+| HTTP-server broadcast; macros | ❌ | backlog **#105** |
 | Basic keying; export comp → Nuke/AE | ❌ | backlog **#105** |
 
 floki already covers a lot of the surface — caching, OCIO, channels, multi-mode compare,
@@ -96,9 +97,9 @@ handful of areas below.
 
 ## The structural insight: a layer model is the spine
 
-Most of the ❌ / ⚠️ rows collapse into **one abstraction — a layer stack**. floki's
-current `(Slot::A / Slot::B)` slots plus `CompareMode` / `Composite` are a hardcoded
-**two-layer special case**. Generalized to an ordered `Vec<Layer>`:
+Most of the remaining ❌ / ⚠️ rows still collapse into **one abstraction — a layer
+stack**. That stack has shipped: the old `(Slot::A / Slot::B)` slots and `CompareMode`
+are gone, and an ordered `Vec<Layer>` is the model (`src/layer.rs`). The shape:
 
 ```
 Layer = {
@@ -111,23 +112,21 @@ Layer = {
 }
 ```
 
-The existing composite / wipe / diff shaders generalize from 2 inputs to N. Once the
-layer model exists, these stop being separate features and become **arrangements**:
+The composite / wipe / diff shaders are arrangements of that stack. What is still
+ahead of the model:
 
 - **N-way compare** (up to 4) = N stacked source layers + a grid/wipe layout (**#104**).
 - **Locked-step A/B** = 2 layers with locked playheads (**#98**).
 - **Back-to-Beauty** = additive AOV layers from a multi-part EXR.
 - **Adjustment / Brush / Text** layers = non-source layer types over the stack.
 
-So we **design the layer model once** (data model, render-graph generalization, cache
-keying `(layer, frame)`, budget split across layers) and avoid building N-way compare and
-the layer stack as independent one-offs. This is the highest-leverage item, and like the
-playback phases it is pure-logic-first / headless-testable before any UI.
+The layer stack itself is no longer a one-off beside compare: it is the model. N-way
+compare and the non-image layer types are the pieces still to build on it.
 
-> **The design spike has landed** — see [`layer-model.md`](./layer-model.md). The pure model
-> (`src/layer.rs`, unit-tested) splits the two axes `CompareMode` conflates (arrangement vs
-> blend), generalizes the `(Slot, frame)` cache key to `(LayerId, source_frame)`, and maps
-> today's A/B behavior onto a `LayerStack`. Wiring follows in the build phases there.
+> **The model is what `main` runs** — see [`layer-model.md`](./layer-model.md) and
+> [`unification-plan.md`](./unification-plan.md). `src/layer.rs` splits arrangement
+> (`Arrangement`) from blend, and the app, GPU path, and timeline UI all consume that
+> stack. N-way compare and the non-image layer types are still ahead of it.
 
 ---
 
@@ -147,14 +146,15 @@ single-image or playback paths. Epic: **#99**.
 4. **Real-time color-correction suite — #102.** contrast / hue / saturation / white
    balance / soft-clip, in-shader during playback; correct placement vs the OCIO pass;
    CC params as a reusable struct (groundwork for the Adjustment Layer).
-5. **Layer-model design spike — #103**, then build on it:
+5. **Layer stack — #103.** ✅ **Shipped** on `main` (see the status note above). Still
+   to build on it:
    - **N-way compare — #104.**
-   - per-layer transform + infinite canvas, **adjustment / brush / text** layer types
-     (filed from the spike).
+   - per-layer transform + infinite canvas, **adjustment / brush / text** layer types.
    - **Locked-step A/B — #98.**
 
 **Parity backlog — #105** (parked until promoted): stereoscopic, .VRIMG / DPX / HDR /
-video input, HTTP-server broadcast, CLI + macros, keying, Nuke/AE comp export.
+video input, HTTP-server broadcast, macros, keying, Nuke/AE comp export. Opening a
+path from the CLI has shipped (`floki <path>`).
 
 ---
 

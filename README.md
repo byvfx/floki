@@ -1,6 +1,6 @@
 # Floki
 
-[![Rust](https://img.shields.io/badge/Rust-1.85+-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/Rust-1.92+-orange.svg)](https://www.rust-lang.org)
 [![egui](https://img.shields.io/badge/GUI-egui-blue)](https://github.com/emilk/egui)
 [![wgpu](https://img.shields.io/badge/wgpu-Native-green.svg)](https://wgpu.rs)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -39,7 +39,7 @@ Open one frame of a numbered sequence (e.g. `render.0101.exr`) and play the whol
 * **Loop & pacing:** Loop, Once, or Ping-Pong; choose **Stutter** (play every frame; fps drops under load) or **Drop-frames** (hold the wall-clock rate; skip frames) pacing.
 * **In/out trim:** Set in/out points to review just a section — the cache and playback respect the trim.
 * **Smart cache:** A byte-budgeted ring keeps decoded frames resident in RAM within a *live* memory budget, so scrub-backs and loops are instant and playback degrades gracefully instead of crashing under memory pressure.
-* **Beauty-only fast decode:** While playing, only the beauty/first layer is decoded for a much faster, lighter cache on heavy multi-part AOV EXRs; the paused frame re-decodes in full so the pixel readout and AOV switch stay accurate.
+* **On-screen pass while playing:** Playback and scrub decode the pass currently on screen, not always the beauty. The beauty/first pass still uses the beauty or proxy path; any other pass that lives in its own EXR part is decoded with `load_layer` (or a proxy of that pass). A full decode is used when the layers on one source want different passes, or when those passes share a single part. Pausing re-decodes the playhead in full so the pixel readout and AOV switch stay accurate.
 * **Eager precache:** Optionally cache the whole in/out range up front — a green fill bar under the scrubber shows what's resident — so the span plays and loops with the decoder idle.
 * **Live render-watch:** Watch the sequence folder and pick up frames as a render writes them (new frames extend the range; re-rendered frames refresh), optionally parking the playhead on the newest frame.
 
@@ -87,7 +87,7 @@ The comp toolbar stays a single row: each arrangement's parameters live behind i
 *EV histogram — the current layer's luminance mapped to exposure stops, so highlights over 1.0 stay visible instead of clipping off the end.*
 
 ### Color Management
-* **OpenColorIO (built in):** OCIO is compiled into every build — there is no non-OCIO build. Point Floki at a config and pick the display/view transform to see your footage in the right space; it auto-enables when a config loads and can be toggled on/off from **Color Management**. The transform runs on the GPU and can optionally be baked to a 3D LUT for smoother pan/zoom on weaker GPUs.
+* **OpenColorIO:** Point Floki at a config and pick the display/view transform to see your footage in the right space; it auto-enables when a config loads and can be toggled on/off from **Color Management**. The transform runs on the GPU and can optionally be baked to a 3D LUT for smoother pan/zoom on weaker GPUs. The default and vendored builds link a native OpenColorIO. `--no-default-features` still compiles the `floki-ocio` crate, but every OCIO call returns `NotCompiled`, so only the built-in transforms and `.cube` LUTs work. See [Installation & Building](#installation--building).
 * **3D LUT Support:** Load Adobe `.cube` 3D LUTs and apply them in real time on the GPU as a display transform, alongside the built-in Exposure/Gamma/sRGB controls.
 
 ![OpenColorIO color management](assets/floki_ocio.png)
@@ -111,7 +111,7 @@ The comp toolbar stays a single row: each arrangement's parameters live behind i
 * **Light / Dark / System Themes:** Switch the interface theme from the **Theme** menu; the `System` option tracks your OS light/dark setting live. Your choice persists across sessions.
 * **Recent Files:** `File ▸ Open Recent` opens a recent EXR as a new layer. If that file is already in the stack it focuses the layer it is already on instead of loading a second copy — use **Duplicate layer** when you want a second view of the same source.
 * **Drag & Drop Loading:** Drop EXRs anywhere on the window to add them to the stack — a single overlay confirms the drop, and dropping several at once adds them all, in drop order. A file already in the stack focuses its existing layer rather than adding a duplicate.
-* **Persistent State:** Remembers your UI layout, recent files list, theme, and preferences across sessions.
+* **Persistent State:** Remembers your UI layout, recent files list, theme, preferences, and the layer stack across sessions. Each layer is restored from its path, name, AOV, blend, opacity, visibility, solo, trim, and pixel-aspect override; a file that has moved or been deleted is skipped.
 * **Software Tone Mapping:** Apply Exposure, Gamma, and sRGB transforms instantly without altering the underlying raw data.
 * **Resource Monitor:** A discrete status-bar readout tracks floki's own memory footprint and system RAM, plus live GPU **VRAM** usage on macOS — handy when loading heavy EXRs or sequences. It samples about once a second and tucks into the bottom-right. (The VRAM figure is macOS/Metal only for now; Windows and Linux show RAM.)
 
@@ -148,9 +148,21 @@ With a sequence loaded, the transport keys are live:
 
 ---
 
+## Download
+
+Prebuilt binaries for Linux, Windows, and macOS are on the
+[GitHub Releases](https://github.com/byvfx/floki/releases) page. Those artifacts are the
+self-contained vendored-OCIO builds. To build from source, see below.
+
 ## Installation & Building
 
-Make sure you have [Rust and Cargo](https://rustup.rs/) installed on your system.
+Make sure you have [Rust and Cargo](https://rustup.rs/) installed (Rust 1.92 or newer — `egui` 0.34.3 requires it).
+
+On Linux, install the same GUI libraries CI does (`.github/workflows/build.yml`):
+
+```bash
+sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libasound2-dev libudev-dev libgtk-3-dev
+```
 
 ```bash
 # Clone the repository
@@ -163,24 +175,29 @@ cargo run --release --no-default-features
 
 > **On a clean machine, use `--no-default-features`.** The default build links an
 > *installed* OpenColorIO and fails at build time if it can't find one. The flag
-> selects the pure-Rust stub backend — no native dependencies, no C++ toolchain —
+> selects the pure-Rust stub backend — no native OCIO, no C++ toolchain —
 > which is also what CI builds and lints. Colour management is then limited to the
-> built-in transforms; see the three tiers below to get full OCIO.
+> built-in transforms; see the three tiers below to get full OCIO. Launching still
+> needs a GPU that supports `FLOAT32_FILTERABLE`.
 
 ### Color management (OpenColorIO)
 
-OCIO support is **always compiled** — it is mandatory, not an opt-in feature. What you choose
-is the *backend*, and there are three tiers. A bare `cargo run` uses the system backend, which
-is why it fails on a machine with no OCIO installed.
+`floki-ocio` is always linked. The cargo features choose its backend; they do not
+omit the crate. A bare `cargo run` enables the default `system-ocio` feature and
+fails at build time without an installed OpenColorIO. `--no-default-features`
+compiles the pure-Rust stub: the crate still builds, and every OCIO call returns
+`OcioError::NotCompiled`.
 
 | Tier | Command | Needs | Gets you |
 |---|---|---|---|
-| **Stub** | `cargo run --release --no-default-features` | nothing beyond Rust | Builds and runs anywhere. Built-in transforms only — no `.ocio` config support. **This is what CI builds, lints and tests.** |
-| **System** (default) | `cargo run --release` | an installed OCIO | Full OCIO, fast builds, no cmake |
-| **Vendored** | `cargo ocio-run` | C++ toolchain, cmake, ninja, python3 | Full OCIO, self-contained — what the release binaries ship |
+| **Stub** | `cargo run --release --no-default-features` | Rust, and a GPU with `FLOAT32_FILTERABLE` to launch | No OpenColorIO and no C++ toolchain. Built-in transforms and `.cube` LUTs only. **This is what CI builds, lints, and tests.** |
+| **System** (default) | `cargo run --release` | An installed OpenColorIO (`OPENCOLORIO_ROOT`, or Homebrew on macOS), a C++ toolchain for the cxx shim and shaderc, `python3`, `make` or `ninja`, and `cmake` (shaderc's build script uses it; `floki-ocio` does not cmake-build OCIO on this tier). Imath headers from `IMATH_ROOT` or Homebrew `imath` when present. | Full OCIO. OCIO is linked, not built from source. |
+| **Vendored** | `cargo ocio-run` | A C++ toolchain, `cmake` ≥ 3.14, `make` or `ninja`, `python3`, and the OCIO submodule | Full OCIO, self-contained — what the [release binaries](https://github.com/byvfx/floki/releases) ship. `cmake` builds OCIO here, as well as shaderc. |
 
 **Fast dev — link an installed OCIO (system, the default):** a plain `cargo run --release`
-links an OCIO found via `OPENCOLORIO_ROOT` (any OS) or Homebrew (macOS). Fast, no cmake.
+links an OCIO found via `OPENCOLORIO_ROOT` (any OS) or Homebrew (macOS). Imath headers
+come from `IMATH_ROOT` if it is set, otherwise from `brew --prefix imath`. This tier does not
+cmake-build OCIO; shaderc still needs `cmake`, `python3`, and `make` or `ninja`.
 
 ```bash
 cargo run --release
@@ -199,7 +216,7 @@ just ocio
 ```
 
 Prerequisites: a C++ toolchain (MSVC "Desktop development with C++" on Windows; clang/gcc
-elsewhere), **cmake ≥ 3.14**, **ninja**, **python3**, and the OCIO submodule checked out
+elsewhere), **cmake ≥ 3.14**, **make or ninja**, **python3**, and the OCIO submodule checked out
 (`git submodule update --init --recursive` — done automatically by `just ocio`).
 
 Once running, enable it in **Color Management…** (check *Enable OCIO*). With the config-path
@@ -223,7 +240,38 @@ scripts\run-windows.ps1 run -- "D:\shots\comp.exr"
 ```
 
 Paths default to a common layout and are overridable via `FLOKI_VCPKG`, `FLOKI_ANACONDA`,
-and `FLOKI_VSPATH`. It's a **local dev convenience only** — CI does not use it.
+and `FLOKI_VSPATH`. It's a **local dev convenience only** — CI does not use it. Its
+`test` task runs `cargo fmt`, `cargo clippy`, and `cargo test` against the default
+`system-ocio` backend. CI's Test & Lint job passes `--no-default-features` instead.
+
+## Launching
+
+```bash
+floki path/to/frame.exr
+```
+
+The first argument is opened through the same path as **File ▸ Open EXR…** and a
+drag-and-drop (`open_cli_path` → `open_layer`), after any saved layer stack has been
+restored. The file is added as a layer, or the existing layer is focused if that path
+is already in the stack. A path that does not exist is shown as `No such file: …` in
+the EXR Info panel and logged; nothing is opened. Further arguments are ignored.
+
+### `WGPU_BACKEND`
+
+wgpu reads `WGPU_BACKEND` when it lists adapters, and Floki's startup check uses that
+same list. The app needs an adapter with `FLOAT32_FILTERABLE`. If none qualifies it
+prints the reason, shows an error dialog, and exits — it does not open a window.
+
+The message depends on what the probe found:
+
+* **No adapter at all.** Unset `WGPU_BACKEND` and try again. A value naming a backend
+  this machine does not have leaves the list empty.
+* **Adapters, but none with `FLOAT32_FILTERABLE`.** Unset `WGPU_BACKEND` if it is set —
+  it may be hiding a capable adapter. If it is not set, try forcing one with
+  `vulkan`, `dx12`, or `metal`, or launch Floki on the discrete GPU.
+
+If the probe found a capable adapter but the one eframe then picks lacks the feature,
+the log says to set `WGPU_BACKEND` or select the discrete GPU.
 
 ## Debugging & Logging
 
@@ -270,8 +318,8 @@ standalone `floki-ocio` crate that wraps OpenColorIO.
 - **`exr_loader.rs`** — threaded OpenEXR decode and logical-layer grouping via the `exr` crate (the load hot path the benches exercise).
 
 **Viewer & rendering**
-- **`viewer.rs`** — the heavy lifter: canvas pan/zoom, the six compare modes, pixel sampling, histograms, contact sheets, and the GPU render path (plus a CPU path used for contact-sheet thumbnails and headless tests, not as a missing-GPU fallback).
-- **`gpu/`** — the `wgpu` backend: `mod.rs` (pipelines, uniforms, bind groups), `shader.wgsl` (the display / compare / diff / background fragment shader), and `ocio_pass.rs` (the two-pass OCIO display transform and blit).
+- **`viewer.rs`** — the heavy lifter: canvas pan/zoom, the five compare modes, pixel sampling, histograms, contact sheets, and the GPU render path (plus a CPU path used for contact-sheet thumbnails and headless tests, not as a missing-GPU fallback).
+- **`gpu/`** — the `wgpu` backend: `mod.rs` (pipelines, uniforms, bind groups), `shader.wgsl` (the display / compare / diff / background fragment shader), `ocio_pass.rs` (the two-pass OCIO display transform and blit), `thumbnail.rs` (GPU contact-sheet thumbnails), and `resources.rs` (app-owned `GpuState` and the OCIO pass publisher).
 - **`render_math.rs`** — shared tone-mapping math (exposure / gamma / sRGB), unit-tested in one place.
 
 **Visualization & overlays**
@@ -294,7 +342,7 @@ standalone `floki-ocio` crate that wraps OpenColorIO.
 - **`prefetch.rs`** — read-ahead file warmer; overlaps the next frame's file read with the current decode via the OS page cache.
 - **`proxy_cache.rs`** — persistent on-disk proxy cache (`~/.floki/proxy-cache`), so a scrub proxy's first-touch decode is paid once ever.
 - **`tex_upload.rs`** — off-thread comp-texture upload; the paint thread submits a frame and collects a finished GPU texture instead of interleaving and uploading inline.
-- **`layer.rs`** — the pure comp layer-stack model backing A/B compare (the spine for N-way / locked-step).
+- **`layer.rs`** — the comp layer stack: ordered layers (blend, opacity, solo, trim, per-layer AOV) and the viewport `Arrangement` (Stacked, Wipe, Side-by-Side, Diff, Blink).
 
 **Tooling & CLI**
 - **`tools.rs`** — the multi-threaded EXR Header Converter (batch channel renaming via `rayon`) with progress reporting and `RUST_LOG` logging.

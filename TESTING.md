@@ -8,10 +8,11 @@ synthetically (see the compression note below).
 
 > This document is the **automated** suite. For hands-on testing of a shipped
 > build — what to exercise, known caveats, what to report — see
-> [`docs/release-testing/`](docs/release-testing/), which carries one field-test
-> guide per release. The two are complements: the suite is structurally blind to
-> anything whose trigger is human timing, which is most of what field testing
-> finds.
+> [`docs/release-testing/`](docs/release-testing/), which holds the hands-on guide
+> for a shipped build (currently [`v1.13.3.md`](docs/release-testing/v1.13.3.md)).
+> It is not a guide for every past tag. The two are complements: the suite is
+> structurally blind to anything whose trigger is human timing, which is most of
+> what field testing finds.
 
 Almost all of it is **GPU-free** — that is the default and the rule for new
 tests. The exception is a small set of **on-device** tests that validate the
@@ -51,7 +52,7 @@ expected there — and is worth telling apart from the failure mode in #256/#265
 | EXR channel regrouping (`LogicalLayer`) | `src/exr_loader.rs` | Pure helpers **and** full `ExrData::load` integration on a generated Blender-style EXR. |
 | Batch channel-rename converter | `src/tools.rs` | `canonical_rgba` aliases, sort-safety skip, and `run_conversion_task` over a temp dir (progress monotonicity + cancellation). |
 | `.cube` 3D LUT parser | `src/color/cube.rs` | Valid parse, domain handling, comment skipping, and every error path. |
-| Tone / color math | `src/render_math.rs` | Exposure, gamma, sRGB transfer (round-trips). Shared by the CPU fallback and mirrored by `gpu/shader.wgsl`. |
+| Tone / color math | `src/render_math.rs` | Exposure, gamma, sRGB transfer (round-trips). CPU reference for the contact-sheet thumbnail bake (`ExrViewer::generate_texture`) and mirrored by `gpu/shader.wgsl`. The viewport itself is GPU-only. |
 | GPU uniform layout | `src/gpu/mod.rs` | `Uniforms` size/alignment + `Pod` round-trip, and the `ChannelMode` → `u32` encoding contract. |
 | Composite layer placement | `src/viewer.rs` (`gui_tests`) | `comp_layer_rect` / `comp_pane_layout` / `side_by_side_layout` — each layer at its own `tex_size × PAR` (#254). Pure, no device. |
 | Per-layer pixel aspect | `src/layer.rs` | `Draw::effective_par` — the override-vs-header precedence, and that one layer's override leaves its siblings alone (#263). |
@@ -60,12 +61,12 @@ expected there — and is worth telling apart from the failure mode in #256/#265
 | **Playback: T1 ring** | `src/cache.rs` (24) | `(SourceId, frame)` keying, directional-ring + LRU eviction, protected playheads, and the byte/count `Bound` (#232). |
 | **Playback: sequences** | `src/sequence.rs` (20) | Detection, numeric sort, holes, and path-for-frame resolution. |
 | **Playback: scheduler** | `src/scheduler.rs` (18) | Pure want-list priority (P1 playhead → P2 ahead → P3 read-behind), plus `want_first_n`'s bounded walk asserted against `want_list`'s prefix. |
-| **Playback: budgets** | `src/budget.rs` (6), `src/app.rs` | The bytes→count conversion, and — since the #288 T1/T2 split — the **cap arithmetic itself** via `tick_budgets_t1(&Sample)`, where #215 / #230 / #232 / #233 / #322 actually landed. |
+| **Playback: budgets** | `src/budget.rs` (6), `src/app.rs` | The bytes→count conversion, and the **T1 cap arithmetic itself** via `tick_budgets_t1(&Sample)` (#288), where #215 / #230 / #232 / #233 / #322 actually landed. The T2 VRAM ring that split used to size alongside was removed in #299. |
 | **Playback: disk proxy cache** | `src/proxy_cache.rs` (8) | Key derivation (path + mtime + size + px + aov), filename hashing, and blob round-trip. |
 | **Playback: read-ahead warmer** | `src/prefetch.rs` (4) | Dedupe ring bounds, survival of missing files, and the gated `WarmJob` hand-off (#309). |
 | DWA decode (committed fixture) | `src/exr_loader.rs` | The one CI-gated binary fixture pair — DWA output cannot be produced synthetically. |
 | Render seams (on device) | `src/gpu/ocio_pass.rs` (`device_tests`), `src/gpu/thumbnail.rs` | Accumulate ping-pong blend vs a CPU reference, the layer-rect union (#257), blit coverage/checker, sRGB display-encode. Skips without a capable GPU — see [On-device tests](#on-device-tests). |
-| GUI interaction (headless) | `src/viewer.rs` (`gui_tests`) | Drives `ExrViewer::handle_hotkeys` through `egui_kittest` — channel keys, compare modes, contact-sheet gating, B-image gating. |
+| GUI interaction (headless) | `src/viewer.rs` (`gui_tests`) | Drives `ExrViewer::handle_channel_hotkeys` through `egui_kittest` — channel keys, tone resets, fullscreen, and contact-sheet gating — plus pure compare-layout helpers (wipe, side-by-side, blink). The old B-image slot is gone (#277). |
 
 ## On-device tests
 
@@ -96,7 +97,7 @@ guard is the shape that let the `FLOAT32_FILTERABLE` condition go missing from a
 them at once, so #266/#268 hoisted it somewhere every module can reach. Don't write a
 fourth copy.
 
-Two consequences worth knowing:
+Three consequences worth knowing:
 
 - **A skip reads as a pass.** `Test & Lint` reports these green having run
   none of them. Treat CI as covering the GPU-free suite only, and a real GPU
@@ -104,8 +105,9 @@ Two consequences worth knowing:
   actually verified.
 - **macOS with an OCIO feature runs the most.** `metal_tests` additionally
   needs `target_os = "macos"` and `system-ocio` or `vendored`, so
-  `cargo test --features vendored` on a Mac is the only configuration that
-  runs every test in the repo.
+  `cargo test --no-default-features --features vendored` on a Mac is the only configuration that
+  runs every test in the repo. `--no-default-features` is required so the default
+  `system-ocio` feature is not enabled beside `vendored` (`Cargo.toml`).
 - **Compiled ≠ run.** Those two macOS+OCIO modules (`ocio_pass::metal_tests`,
   `thumbnail::ocio_tests`) were once built by *no* CI job at all — every job was
   either the wrong `target_os`, feature-less, or a `cargo build` that skips test
@@ -120,14 +122,15 @@ Two consequences worth knowing:
   `tools.rs` tests do — do not commit `.exr` binaries (`*.exr` is gitignored;
   the few files under `assets/` are small, deliberately force-added smoke
   fixtures).
-- **No live GPU in tests, by default.** `viewer::ui` accepts
-  `render_state: Option<&RenderState>`; tests pass `None` and assert on state.
-  Reach for an on-device test only when the thing under test *is* the render
-  seam and no CPU stand-in can observe it — see below.
-- **GUI tests target a rendering-free seam.** `ExrViewer::handle_hotkeys` holds
-  the keyboard-driven state changes so `egui_kittest` can exercise the real egui
-  input pipeline without building the full canvas. GUI tests live in an inline
-  `#[cfg(test)]` module because `ExrViewer::handle_hotkeys` is crate-private —
+- **No live GPU in tests, by default.** Ordinary tests do not construct a wgpu
+  device. (`ExrViewer::ui` and its `render_state: Option<&RenderState>` argument
+  were deleted with the A/B viewport.) Reach for an on-device test only when the
+  thing under test *is* the render seam and no CPU stand-in can observe it — see
+  [On-device tests](#on-device-tests).
+- **GUI tests target a rendering-free seam.** `ExrViewer::handle_channel_hotkeys`
+  holds the keyboard-driven state changes so `egui_kittest` can exercise the real
+  egui input pipeline without building the full canvas. GUI tests live in an inline
+  `#[cfg(test)]` module because the viewer state they assert is crate-private —
   that is the rule generally: **inline for crate-private items, `tests/` or
   `benches/` for the public surface**. `src/lib.rs` exists precisely so the
   public surface is reachable from separate crates (the `exr_load` benches use

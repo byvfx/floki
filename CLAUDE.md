@@ -9,12 +9,16 @@ Floki is a native GPU-accelerated GUI for inspecting and A/B-comparing multi-lay
 ## Commands
 
 ```bash
-cargo run --release        # Run the app — ALWAYS use --release; debug EXR parsing is painfully slow
-cargo build                # Debug build (compile check)
-cargo fmt                  # Required before committing (see CONTRIBUTING.md)
-cargo clippy               # Required; fix all warnings before committing
-cargo test                 # Run tests
+cargo run --release --no-default-features   # Stub build — ALWAYS use --release; debug EXR parsing is painfully slow
+cargo build --no-default-features           # Debug build of the stub (compile check)
+cargo fmt                                   # Required before committing (see CONTRIBUTING.md)
+cargo clippy --all-targets --no-default-features -- -D warnings
+cargo test --all-targets --no-default-features
 ```
+
+A plain `cargo build` / `cargo test` / `cargo clippy` enables the default `system-ocio`
+feature and fails without an installed OpenColorIO. `--no-default-features` is the
+pure-Rust stub, which is what CI's Test & Lint job builds, lints, and tests.
 
 **On Windows, go through `scripts\run-windows.ps1` instead.** The `shaderc`/OCIO build
 scripts need cmake + ninja + python, which on a typical dev box are bundled inside
@@ -23,11 +27,29 @@ Visual Studio and Anaconda rather than on `PATH` — so a bare `cargo build` die
 on `PATH`, points at the vcpkg OCIO, then shells out to cargo:
 
 ```powershell
-scripts\run-windows.ps1 run          # cargo run --release
-scripts\run-windows.ps1 test         # fmt --check + clippy -D warnings + test --all-targets (the CI gate)
+scripts\run-windows.ps1 run          # cargo run --release (default system-ocio)
+scripts\run-windows.ps1 test         # fmt --check + clippy -D warnings + test --all-targets, against system-ocio
 scripts\run-windows.ps1 build        # cargo build --release
 scripts\run-windows.ps1 soak -- <file.exr>   # #100 playback capture; see docs/playback/soak-checklist.md
 ```
+
+`test` is the local Windows check, not CI's. The script sets `OPENCOLORIO_ROOT` and
+runs those three cargo commands **without** `--no-default-features`, so they exercise
+the default `system-ocio` backend. CI's Test & Lint job
+(`.github/workflows/build.yml`) runs the same three with `--no-default-features`
+(the stub; the runner has no OpenColorIO).
+
+`soak` sets `RUST_LOG=floki::playback=debug`, tees stderr to `soak-logs/`, and
+launches the release build with the given path. It does **not** set
+`FLOKI_SOAK_SECS`, so it does not press Play. Auto-play lives in
+`ExrApp::tick_soak_harness` and runs only when that variable is set:
+
+* `FLOKI_SOAK_SECS=<n>` — after the warm-up, press Play, run for n seconds, pause,
+  hold 4 seconds so the playhead settles to full resolution, then close the window.
+* `FLOKI_SOAK_WARMUP=<n>` — seconds to wait before Play (default 3), so restored
+  layers finish their first decode. The harness does not measure the open.
+
+Without `FLOKI_SOAK_SECS` the harness returns immediately and the session is manual.
 
 The app must be **closed** before building — a running instance holds `floki.exe` and
 the link step fails with `Access is denied. (os error 5)`.
@@ -40,11 +62,12 @@ $env:RUST_LOG = "floki=debug"; cargo run --release   # PowerShell
 
 ### Testing (see TESTING.md)
 The suite is **GPU-free by default** and gated in CI (`Test & Lint` job → blocks
-`build`). Run `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`,
-and `cargo test --all-targets` before committing. Conventions: generate EXR/`.cube`
+`build`). Run `cargo fmt --all -- --check`, `cargo clippy --all-targets --no-default-features -- -D warnings`,
+and `cargo test --all-targets --no-default-features` before committing. Conventions: generate EXR/`.cube`
 fixtures in a temp dir via `tempfile` (no committed binaries); don't create a wgpu
-device in tests (`viewer::ui` takes `render_state: Option<&RenderState>` — pass
-`None`).
+device in ordinary tests. (`ExrViewer::ui` and its `Option<&RenderState>` argument
+were deleted with the A/B viewport; on-device tests go through `crate::gpu::test_device`
+and skip.)
 
 The exception is `gpu::ocio_pass::device_tests` + `gpu::thumbnail`, which validate
 render seams no CPU stand-in can observe. They **skip** without a capable GPU, and the
@@ -56,10 +79,11 @@ conditions and is the one shared guard (#266/#268); four hand-rolled copies is t
 that let the `FLOAT32_FILTERABLE` condition go missing from all of them at once, so don't
 write a fifth. Consequence: **those tests report green on CI having run none of them** —
 a real GPU is where the render seams are actually verified, and macOS with
-`--features vendored` is the only config that *runs* every test in the repo
-(`metal_tests` needs macOS + an OCIO feature). Since #269 the macOS OCIO job's clippy
+`--no-default-features --features vendored` is the only config that *runs* every test in the repo
+(`metal_tests` needs macOS + an OCIO feature; `--no-default-features` keeps the default
+`system-ocio` feature from being enabled alongside `vendored`). Since #269 the macOS OCIO job's clippy
 step at least **compiles** those two modules on every PR, so they can no longer rot
-undetected; it does not execute them. Headless GUI tests drive `ExrViewer::handle_hotkeys` through `egui_kittest`
+undetected; it does not execute them. Headless GUI tests drive `ExrViewer::handle_channel_hotkeys` through `egui_kittest`
 (`gui_tests` in `viewer.rs`). Tests live inline in `#[cfg(test)]` modules because
 nearly everything they touch is crate-private; `src/lib.rs` does expose a public
 surface that `tests/` and `benches/` reach (the `exr_load` benches use it), so
@@ -73,8 +97,9 @@ Tone/color math lives in `render_math.rs`; the
 `budget.rs` precisely so it can be built by hand), so drive that directly rather than
 only the pure helpers beneath it (#288). The T2 VRAM ring it used to size alongside
 was retired in #299 — it had produced a full-frame GPU texture every playback frame,
-on the UI thread, into a map with no getter. And the
-soak harness (`run-windows.ps1 soak`) auto-plays and never idles, so anything whose
+on the UI thread, into a map with no getter. And a soak with `FLOKI_SOAK_SECS` set
+auto-plays for that many seconds and then pauses — it does not sit idle, and
+`run-windows.ps1 soak` alone does not set the variable — so anything whose
 trigger is *human timing* is invisible to both: #236 (a pause filed the whole idle
 span as one frame time) survived 360 passing tests and a dozen clean soak runs. For
 playback changes, a real interactive session is a merge gate, not a formality.
@@ -88,10 +113,10 @@ playback changes, a real interactive session is a merge gate, not a formality.
 
 Entry: `main.rs` builds the `eframe` app and — critically — enables the wgpu `FLOAT32_FILTERABLE` device feature (needed to linearly sample the f32 3D LUT texture). `app.rs::ExrApp::new` constructs `GpuState` once and stashes it in `render_state.renderer.callback_resources`.
 
-Data flow: `app.rs` (state + menus + persistence) → `exr_loader.rs` (parse file → `ExrData`) → `viewer.rs` (canvas, interaction, sampling, builds per-frame GPU uniforms or CPU fallback) → `gpu/mod.rs` + `gpu/shader.wgsl` (render).
+Data flow: `app.rs` (state + menus + persistence) → `exr_loader.rs` (parse file → `ExrData`) → `viewer.rs` (canvas, interaction, sampling, builds per-frame GPU uniforms) → `gpu/mod.rs` + `gpu/shader.wgsl` (render).
 
 ### GPU rendering (the core mechanism)
-Rendering is a single WGSL shader (`gpu/shader.wgsl`) invoked through an `egui_wgpu::CallbackTrait` impl (`ExrCallback` in `gpu/mod.rs`). It binds **4 bind groups in fixed order**: `tex_a`, `tex_b`, `uniforms`, `lut`. The shader does all exposure / gamma / sRGB / channel-isolation / `|A-B|` diff / LUT work on the GPU. `viewer.rs` has a parallel CPU fallback path for when no GPU is available.
+Rendering is a single WGSL shader (`gpu/shader.wgsl`) invoked through an `egui_wgpu::CallbackTrait` impl (`ExrCallback` in `gpu/mod.rs`). It binds **4 bind groups in fixed order**: `tex_a`, `tex_b`, `uniforms`, `lut`. The shader does all exposure / gamma / sRGB / channel-isolation / `|A-B|` diff / LUT work on the GPU. The viewport has no CPU fallback: `main.rs` probes adapters at startup and exits (dialog + stderr) when none offers `FLOAT32_FILTERABLE`. The only CPU bake left is contact-sheet thumbnails (`ExrViewer::generate_texture`), used by headless tests when no device is wired.
 
 Five things must stay in lockstep when touching rendering:
 1. The `Uniforms` struct (`gpu/mod.rs`) and the matching WGSL uniform struct in `shader.wgsl` — including the explicit `pad*` fields for alignment. The size is asserted in `uniforms_size_is_16_byte_aligned`; bump it there when the struct grows.
@@ -150,7 +175,9 @@ anything diagnosing *why* playback is slow must use the first two, because the f
 figure reported UI contention (a screen recorder) as a slow decoder.
 
 ### State & persistence
-`ExrApp` derives serde `(default)`. Fields that should persist across sessions (recent files, LUT path, `enable_lut`, OCIO path) are plain fields; all transient/runtime state (loaded data, GPU handles, conversion progress, window-open flags) is marked `#[serde(skip)]`. Persistence is handled by `eframe` storage.
+`ExrApp` derives serde `(default)`. Fields that should persist across sessions (recent files, theme, LUT path, `enable_lut`, OCIO path / display / view, playback and proxy preferences) are plain fields; all transient/runtime state (loaded data, GPU handles, conversion progress, window-open flags) is marked `#[serde(skip)]`. Persistence is handled by `eframe` storage.
+
+The layer stack is saved too, but not as `LayerStack`. That model is `#[serde(skip)]` — `LayerId` and `SourceId` are session-scoped and would be a lie after reload. `save()` flattens the live stack into `persisted_layers: Vec<LayerPersist>` (path, name, AOV, blend, opacity, enabled, solo, trim in/out/offset, pixel-aspect override). `restore_comp_layers` replays that list on the next launch through `add_comp_source`, the same path as a normal open, then writes the per-layer fields back on top. A missing or moved file is skipped; adjustment layers (no file) and any stray `A_SOURCE` layer are not written. Two saved layers on one path share one source.
 
 ### Color / LUT
 `color/cube.rs` parses Adobe `.cube` 3D LUTs into an RGBA `Vec<[f32;4]>`; `gpu/mod.rs::create_lut_bind_group` uploads it as an `Rgba32Float` 3D texture for in-shader color transforms.

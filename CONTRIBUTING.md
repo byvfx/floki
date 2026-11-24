@@ -10,18 +10,20 @@ If you've noticed a bug or have a feature request, please make sure to open an i
 
 1. Ensure you have Rust and Cargo installed via [rustup](https://rustup.rs/).
 2. Fork the repository and clone it locally.
-3. Run `cargo build` to ensure everything compiles correctly on your system.
+3. Run `cargo build --no-default-features` to ensure the stub build compiles. A plain
+   `cargo build` enables the default `system-ocio` feature and fails without an
+   installed OpenColorIO (and the C++ toolchain that feature's shim and shaderc need).
 4. To work on OCIO (color management), build with it enabled: `cargo ocio-run` for the
-   self-contained vendored build (needs cmake/ninja/python + a C++ toolchain; see the
+   self-contained vendored build (needs cmake, make or ninja, python, and a C++ toolchain; see the
    [README](README.md#color-management-opencolorio)).
 
 ## Submitting a Pull Request (PR)
 
 1. **Create a new branch** for your feature or bugfix (`git checkout -b feature/my-awesome-feature`).
 2. **Make your changes**. Ensure your code is well-commented and clean.
-3. **Run the tests** (`cargo test`) to ensure no existing functionality is broken. See [TESTING.md](TESTING.md) for what the suite covers and how to add tests (generate fixtures in a temp dir; keep tests GPU-free).
+3. **Run the tests** (`cargo test --all-targets --no-default-features`) to ensure no existing functionality is broken. See [TESTING.md](TESTING.md) for what the suite covers and how to add tests (generate fixtures in a temp dir; keep tests GPU-free).
 4. **Format your code** using `cargo fmt`.
-5. **Lint your code** using `cargo clippy` and fix any warnings.
+5. **Lint your code** using `cargo clippy --all-targets --no-default-features` and fix any warnings. A plain `cargo test` or `cargo clippy` enables the default `system-ocio` feature and fails without an installed OpenColorIO.
 
 > CI's `Test & Lint` job runs exactly these three, and **blocks the build until they pass** — so run them locally first:
 >

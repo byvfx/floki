@@ -20,10 +20,16 @@ C++ toolchain on unrelated builds).
 
 | Feature         | What it does                                                                      |
 |-----------------|-----------------------------------------------------------------------------------|
-| `system-ocio`   | Links an externally-provided OCIO (Homebrew / `OPENCOLORIO_ROOT`). **Dev default** — fast, no cmake. |
+| `system-ocio`   | Links an externally-provided OCIO (Homebrew / `OPENCOLORIO_ROOT`) and Imath headers (Homebrew / `IMATH_ROOT`). **Dev default** — OCIO is linked, not cmake-built. |
 | `vendored-ocio` | Statically builds OCIO 2.4.2 from the vendored submodule via cmake. **Distributable** — the binary needs no installed OCIO. |
 
 If both are enabled, `vendored-ocio` wins (a self-contained build never falls back to a system OCIO).
+
+`OPENCOLORIO_ROOT` is an install prefix containing `include/` and `lib/`. On macOS,
+`brew --prefix opencolorio` is the fallback when that variable is unset. Imath headers
+are located separately: `IMATH_ROOT` (the build adds `$IMATH_ROOT/include`) or
+`brew --prefix imath`. If neither is set, the extra include is omitted. `build.rs`
+reruns when `OPENCOLORIO_ROOT` or `IMATH_ROOT` changes.
 
 ## Build prerequisites (for the native backends)
 
