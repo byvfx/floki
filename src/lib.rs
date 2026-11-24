@@ -12,6 +12,9 @@
 pub mod app;
 pub mod exr_loader;
 
+mod icon;
+pub use icon::window_icon;
+
 // The startup GPU preflight (#247). Re-exported rather than making `gpu` public:
 // `main.rs` enumerates the adapters (that needs a live wgpu instance) and this
 // crate decides what to say about them, so only what that split needs crosses the
@@ -55,5 +58,6 @@ mod snapshot;
 // Off-thread comp-texture upload (#202) — the paint thread submits a frame and
 // collects a finished GPU texture instead of interleaving and uploading inline.
 mod tex_upload;
+mod theme;
 pub mod tools;
 mod viewer;

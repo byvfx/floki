@@ -6,6 +6,26 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Ko-fi](https://img.shields.io/badge/Ko--fi-Support%20Floki-ff5e5b?logo=ko-fi&logoColor=white)](https://ko-fi.com/byvfx)
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme-lockup-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="docs/images/readme-lockup-light.png">
+  <img alt="Floki · BYVFX" src="docs/images/readme-lockup-dark.png" width="595">
+</picture>
+
+**Inspect, compare, and play multi-layer image sequences with color-accurate OCIO viewing.**
+
+## Download
+
+Prebuilt binaries are on [GitHub Releases](https://github.com/byvfx/floki/releases/latest). Those artifacts are the self-contained vendored-OCIO builds.
+
+| Platform | Binary |
+| --- | --- |
+| Linux x86_64 | [`floki-linux-x86_64`](https://github.com/byvfx/floki/releases/latest/download/floki-linux-x86_64) |
+| macOS Apple Silicon | [`floki-macos-arm64`](https://github.com/byvfx/floki/releases/latest/download/floki-macos-arm64) |
+| Windows x86_64 | [`floki-windows-x86_64.exe`](https://github.com/byvfx/floki/releases/latest/download/floki-windows-x86_64.exe) |
+
+Documentation: <https://byvfx.github.io/floki/>. Brand kit: [`brand/BRAND.md`](brand/BRAND.md).
+
 **Floki** is a fast, hardware-accelerated Rust GUI application tailored for Technical Directors, Compositors, and LookDev Artists who need to deeply inspect and compare multi-layered OpenEXR files. 
 
 Powered by `egui`, `wgpu`, and the pure-Rust `exr` crate, it allows you to instantly view dense pixel data, isolate color channels, explore unbounded floating-point histograms, and stack renders as layers to composite and pixel-perfect diff them against each other — all rendered natively on your GPU — as well as **play image sequences in real time**.
@@ -108,7 +128,7 @@ The comp toolbar stays a single row: each arrangement's parameters live behind i
 
 ### High-Performance UI
 * **Immediate-Mode UI:** Built on `egui` for a responsive, minimal-overhead interface.
-* **Light / Dark / System Themes:** Switch the interface theme from the **Theme** menu; the `System` option tracks your OS light/dark setting live. Your choice persists across sessions.
+* **Light / Dark / System Themes:** The interface defaults to a neutral obsidian studio chrome — silver focus, no brand color in the viewing room. Switch Light, Dark, or System from the **Theme** menu; `System` tracks the OS setting live. The choice persists across sessions. **Help ▸ About Floki** shows the version, license, and links to the repository, releases, and docs.
 * **Recent Files:** `File ▸ Open Recent` opens a recent EXR as a new layer. If that file is already in the stack it focuses the layer it is already on instead of loading a second copy — use **Duplicate layer** when you want a second view of the same source.
 * **Drag & Drop Loading:** Drop EXRs anywhere on the window to add them to the stack — a single overlay confirms the drop, and dropping several at once adds them all, in drop order. A file already in the stack focuses its existing layer rather than adding a duplicate.
 * **Persistent State:** Remembers your UI layout, recent files list, theme, preferences, and the layer stack across sessions. Each layer is restored from its path, name, AOV, blend, opacity, visibility, solo, trim, and pixel-aspect override; a file that has moved or been deleted is skipped.
@@ -147,12 +167,6 @@ With a sequence loaded, the transport keys are live:
 | `I` / `O` | Set the in / out points of the play range |
 
 ---
-
-## Download
-
-Prebuilt binaries for Linux, Windows, and macOS are on the
-[GitHub Releases](https://github.com/byvfx/floki/releases) page. Those artifacts are the
-self-contained vendored-OCIO builds. To build from source, see below.
 
 ## Installation & Building
 

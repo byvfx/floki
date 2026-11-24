@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Brand kit, window icon, and neutral studio chrome.** The Parallax mark
+  (NEO-3 Acid Arcade) ships under `brand/`, as the obsidian dock and window
+  icon, and in **Help ▸ About Floki**. The interface defaults to Chrome C:
+  obsidian panels and a silver focus. The viewport checker, timeline cache
+  greens, missing-frame marks, decode-warning amber, and channel readouts are
+  unchanged. The GitHub social card is `docs/images/social-preview.png`.
+
 ### Changed
 - **The Layers panel no longer rations layers.** The cap was 6 and the header
   showed a "3/6" counter, which read as a quota you were spending rather than a

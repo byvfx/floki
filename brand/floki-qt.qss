@@ -1,0 +1,108 @@
+/* Floki Chrome C — starter stylesheet for the Qt port (issue #44).
+ *
+ * Hex values are the literals in brand/tokens.json. Qt Style Sheets have no
+ * custom properties, so the values are repeated here on purpose. When a token
+ * changes, change it in both places.
+ *
+ * Chrome C is achromatic on purpose. Do not point a selector at the mark
+ * oranges, greens, or blues. The optional Chrome A accent (#00AAFF) is
+ * documented in tokens.json and is not used below.
+ *
+ * Viewport contract: the image surface paints its own backdrop (linear 0.10 /
+ * 0.20 checker, or the user's solid / gradient). Do not give that widget a
+ * brand fill, a tinted stylesheet background, or a hue-shifted border.
+ */
+
+QMainWindow, QWidget#studioCanvas {
+    background-color: #141518;
+    color: #D8DCE4;
+    font-family: "IBM Plex Sans";
+    font-size: 13px;
+}
+
+QWidget#studioPanel, QMenuBar, QMenu, QStatusBar, QDockWidget {
+    background-color: #1C1D22;
+    color: #D8DCE4;
+    border: 1px solid #2E313B;
+}
+
+QDockWidget::title {
+    background-color: #1C1D22;
+    color: #D8DCE4;
+    padding: 6px 8px;
+}
+
+QMenuBar::item:selected, QMenu::item:selected {
+    background-color: #2E313B;
+    color: #D8DCE4;
+}
+
+QToolBar {
+    background-color: #1C1D22;
+    border: 0;
+    spacing: 4px;
+}
+
+QPushButton, QToolButton, QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox {
+    background-color: #262830;
+    color: #D8DCE4;
+    border: 1px solid #2E313B;
+    border-radius: 4px;
+    padding: 4px 8px;
+    selection-background-color: #2E313B;
+    selection-color: #D8DCE4;
+}
+
+QPushButton:hover, QToolButton:hover, QComboBox:hover, QLineEdit:hover {
+    border-color: #D8DCE4;
+}
+
+QPushButton:focus, QToolButton:focus, QComboBox:focus,
+QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus,
+QSlider:focus {
+    border: 1px solid #D8DCE4;
+    outline: none;
+}
+
+QPushButton:pressed, QToolButton:pressed {
+    background-color: #2E313B;
+}
+
+QLabel#muted, QStatusBar QLabel {
+    color: #8C919E;
+}
+
+/* Paper theme. Apply by swapping this sheet, or gate it with a dynamic
+   property, when the user picks the light theme. Body text stays neutral. */
+QWidget#paperCanvas {
+    background-color: #F4F5F7;
+    color: #141518;
+}
+
+QWidget#paperPanel {
+    background-color: #FFFFFF;
+    color: #141518;
+    border: 1px solid #D8DCE4;
+}
+
+QWidget#paperCanvas QLabel#muted {
+    color: #4A4E59;
+}
+
+QWidget#paperCanvas QLabel#link, QWidget#paperCanvas QLabel a {
+    color: #0070B8;
+}
+
+/* The viewing surface. Leave the background to the renderer. */
+QWidget#viewport {
+    background: transparent;
+    border: none;
+}
+
+/* Functional colors — do not restyle the widgets that paint these.
+ *   cache proxy   #346848
+ *   cache full    #40A860
+ *   missing frame #CE5C3C
+ *   decode warn   #FFC864
+ *   readout R/G/B #FF5050 / #50FF50 / #6496FF
+ */

@@ -34,6 +34,7 @@
 use crate::annotation::{Annotation, AnnotationKind, AnnotationTool};
 use crate::exr_loader::ExrData;
 use crate::gradient::{Colormap, DiffMetric, Gradient};
+use crate::theme::{DECODE_WARN_AMBER, READOUT_B, READOUT_G, READOUT_R};
 use eframe::egui;
 use exr::prelude::f16;
 use rayon::prelude::*;
@@ -3011,12 +3012,17 @@ impl ExrViewer {
                 egui::FontId::proportional(12.0),
                 egui::Color32::GRAY,
             );
-            // Data window: dashed orange, the current layer's actual pixel coverage.
-            let orange = egui::Color32::from_rgb(255, 200, 100);
+            // Data window: dashed functional amber, the current layer's pixel coverage.
+            let orange = DECODE_WARN_AMBER;
             draw_dashed_rect(
                 &painter,
                 bbox_rect,
-                egui::Color32::from_rgba_unmultiplied(255, 200, 100, 180),
+                egui::Color32::from_rgba_unmultiplied(
+                    DECODE_WARN_AMBER.r(),
+                    DECODE_WARN_AMBER.g(),
+                    DECODE_WARN_AMBER.b(),
+                    180,
+                ),
                 4.0,
                 4.0,
             );
@@ -3782,18 +3788,9 @@ fn colored_rgba_label(ui: &mut egui::Ui, prefix: &str, val: [f32; 4]) {
         if !prefix.is_empty() {
             ui.label(prefix);
         }
-        ui.label(
-            egui::RichText::new(format!("{:.5}", val[0]))
-                .color(egui::Color32::from_rgb(255, 80, 80)),
-        );
-        ui.label(
-            egui::RichText::new(format!("{:.5}", val[1]))
-                .color(egui::Color32::from_rgb(80, 255, 80)),
-        );
-        ui.label(
-            egui::RichText::new(format!("{:.5}", val[2]))
-                .color(egui::Color32::from_rgb(100, 150, 255)),
-        );
+        ui.label(egui::RichText::new(format!("{:.5}", val[0])).color(READOUT_R));
+        ui.label(egui::RichText::new(format!("{:.5}", val[1])).color(READOUT_G));
+        ui.label(egui::RichText::new(format!("{:.5}", val[2])).color(READOUT_B));
         ui.label(egui::RichText::new(format!("{:.5}", val[3])).color(egui::Color32::LIGHT_GRAY));
     });
 }
