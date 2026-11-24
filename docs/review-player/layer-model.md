@@ -1,16 +1,17 @@
 # Layer model — the review-player spine (#103)
 
-> **Status:** design spike landed. The pure model lives in [`src/layer.rs`](../../src/layer.rs)
-> with unit tests; no app/GPU/UI wiring yet. Consumers land in the build phases below.
+> **Status:** shipped on `main`. The model in [`src/layer.rs`](../../src/layer.rs) is
+> what the app, the GPU composite, and the timeline UI render and play. Viewport
+> presentation is [`Arrangement`](../../src/layer.rs) (Stacked, Wipe, Side-by-Side,
+> Diff, Blink). `src/render_program.rs` and `CompareMode` are gone — see
+> [`unification-plan.md`](./unification-plan.md).
 > Parent epic: [#99](https://github.com/byvfx/floki/issues/99).
 
 This is the one structural decision the review-player roadmap calls highest-leverage
-(see [`README.md`](./README.md#the-structural-insight-a-layer-model-is-the-spine)). Most of
-the ❌/⚠️ gaps — N-way compare, locked-step A/B, per-layer transform, adjustment/brush/text
-layers, Back-to-Beauty — collapse into **one abstraction: an ordered stack of placed
-sources**. We design and unit-test that model once, headless, before building any of the
-features on top of it, so each feature becomes an *arrangement* of the model rather than a
-one-off.
+(see [`README.md`](./README.md#the-structural-insight-a-layer-model-is-the-spine)). The
+ordered stack of placed sources is what `main` renders and plays. The remaining gaps —
+N-way compare, locked-step A/B, per-layer transform, adjustment/brush/text layers,
+Back-to-Beauty — are arrangements of that model rather than separate one-offs.
 
 ---
 
@@ -27,10 +28,11 @@ of its AOVs*. In code and docs: unqualified "layer" = comp layer; the EXR AOV is
 
 ---
 
-## The core idea: separate the two axes `CompareMode` conflates
+## The core idea: separate the two axes `CompareMode` conflated
 
-Today, `Slot::{A,B}` + [`CompareMode`](../../src/viewer.rs) hardcode a two-input pipeline, and
-`CompareMode` mixes two unrelated concerns into one enum:
+The old `Slot::{A,B}` slots and `CompareMode` hardcoded a two-input pipeline, and
+`CompareMode` mixed two unrelated concerns into one enum. Both are deleted. The split
+that replaced them:
 
 - **Arrangement** — *where* the visible inputs are placed (one viewport, a wipe split, a grid).
 - **Blend** — *how* stacked inputs combine (Over/Add/Multiply…).
@@ -85,9 +87,13 @@ to the existing decode/upload pipeline.
 
 ---
 
-## How today's behavior maps onto the model
+## How the old A/B modes map onto the model
 
-| Today                          | Layer-model expression                              |
+`CompareMode` is deleted. The live viewport axis is `Arrangement` in `src/layer.rs`
+(Stacked, Wipe, Side-by-Side, Diff, Blink), not `Layout` (kept, unused). The table is
+the mapping the model was designed against:
+
+| Old A/B mode                   | Layer-model expression                              |
 |--------------------------------|-----------------------------------------------------|
 | `Slot::A` / `Slot::B`          | stack layers 0 / 1                                  |
 | `active_layer`                 | the active layer's `LayerSource::Image.aov`         |
@@ -107,8 +113,8 @@ layers the arrangement exposes.
 
 ## Cache keying generalization
 
-The T1 ring (`src/cache.rs`) and T2 GPU ring (`src/viewer.rs`) key on `(Slot, frame)`. With the
-model they key on **`(LayerId, source_frame)`**:
+The T1 ring (`src/cache.rs`) keys on `(SourceId, frame)`. (The T2 GPU ring was removed
+in #299.) The model's cache key is **`(LayerId, source_frame)`**:
 
 - `Slot::A`/`B` → `LayerId` (now N inputs, not 2).
 - `frame` → the layer's *resolved source frame* (post-trim/offset), so two layers pointing at
@@ -128,8 +134,8 @@ visible source.
 
 ## Render-graph generalization
 
-The current diff/composite/wipe paths (GPU shader + CPU fallbacks in `viewer.rs`) take exactly
-two inputs. The model turns rendering into: **walk `composite_at(frame)` bottom-to-top, fetch
+The viewport is GPU-only (`viewer.rs` / `gpu/shader.wgsl`; `main.rs` exits when no
+adapter offers `FLOAT32_FILTERABLE`). The model turns rendering into: **walk `composite_at(frame)` bottom-to-top, fetch
 each `Draw`'s `(source, aov, source_frame)` texture, place it by `transform`, blend it by
 `blend`/`opacity`; apply each `Adjust` to the accumulated result; finally lay the visible
 groups out per `Layout`.** Two visible layers + `Layout::Wipe`/`Grid` reproduce the existing
@@ -139,18 +145,15 @@ wipe/side-by-side exactly, so the generalization is additive, not a rewrite.
 
 ## Build phases (filed from this spike)
 
-The spike is the model only. Wiring is sequenced so each step ships without regressing the
-single-image or A/B paths:
+The spike started as the model only. Phase 1 has since been replaced by the unification
+on `main` (see the status note). Later phases are still ahead:
 
-1. **Adopt the model behind today's UI** — represent the current A/B + `CompareMode` as a
-   2-layer `LayerStack` internally, keeping the existing controls. Pure refactor, no new UX.
-   **Landed ([#114](https://github.com/byvfx/floki/issues/114)).** `src/render_program.rs`
-   reconfigures the viewer's held 2-layer stack from `compare_mode` / `blend_mode` /
-   `active_layer` each frame and resolves it via `LayerStack::composite_at` into a
-   `RenderProgram`; both the GPU and CPU draw paths now dispatch on that program instead of
-   matching `CompareMode` inline. The two layers carry stable `LayerId`s (the `Slot ⇄ LayerId`
-   cache-key seam). Arrangement geometry (wipe/side-by-side) and the diff-matte inspection stay
-   viewer-side this phase; the N-input render lands with #104.
+1. **Adopt the model behind the UI.** **Landed, and since superseded by the unification
+   on `main`** ([#114](https://github.com/byvfx/floki/issues/114), then the #99 render
+   retire). The intermediate `src/render_program.rs` module is deleted. What remains is
+   [`Arrangement`](../../src/layer.rs) next to [`LayerStack::composite_at`](../../src/layer.rs):
+   the comp path walks that program, and wipe / side-by-side / diff / blink geometry stays
+   in `viewer.rs`. The N-input render is still #104.
 2. **N-way compare — [#104](https://github.com/byvfx/floki/issues/104).** N source layers +
    `Layout::Grid`; generalize the cache key and the scheduler look-ahead across visible layers.
 3. **Per-layer transform + infinite canvas**, then the **adjustment / brush / text** layer
