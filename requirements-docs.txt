@@ -1,0 +1,3 @@
+# The docs site only. The app lockfile does not include these.
+mkdocs==1.6.1
+mkdocs-material==9.8.2

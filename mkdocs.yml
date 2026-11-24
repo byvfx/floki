@@ -1,0 +1,119 @@
+site_name: Floki
+site_description: Inspect, compare, and play multi-layer image sequences with color-accurate OCIO viewing.
+site_url: https://byvfx.github.io/floki/
+repo_url: https://github.com/byvfx/floki
+repo_name: byvfx/floki
+edit_uri: ""
+copyright: Inspect, compare, and play multi-layer image sequences with color-accurate OCIO viewing.
+docs_dir: docs-site
+site_dir: site
+
+watch:
+  - docs/wiki
+  - docs_site
+  - overrides
+
+theme:
+  name: material
+  custom_dir: overrides
+  logo: assets/floki-mark.svg
+  favicon: assets/favicon.svg
+  font: false
+  palette:
+    - scheme: slate
+      toggle:
+        icon: material/white-balance-sunny
+        name: Switch to light
+    - scheme: default
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark
+  features:
+    - navigation.sections
+    - navigation.tracking
+    - navigation.top
+    - navigation.footer
+    - toc.follow
+    - search.highlight
+    - content.code.copy
+    - content.tabs.link
+
+nav:
+  - Home: index.md
+  - Start here:
+      - Install: install.md
+      - Windows: install-windows.md
+      - macOS: install-macos.md
+      - Linux: install-linux.md
+      - Color management: color-management.md
+      - Troubleshooting: troubleshooting.md
+  - Using Floki:
+      - Layers and compositing: layers-and-compositing.md
+      - Playback: playback.md
+      - Comparison: comparison.md
+      - Inspection: inspection.md
+      - Batch tools: batch-tools.md
+      - Keyboard shortcuts: keyboard-shortcuts.md
+  - Working on Floki:
+      - Developing: developing.md
+      - Testing: testing.md
+      - Architecture: architecture.md
+      - Releasing: releasing.md
+      - Patched exr fork: patched-exr-fork.md
+  - Design notes:
+      - Memory contract: memory-contract.md
+      - Concurrency contract: concurrency-contract.md
+      - Sequence playback: sequence-playback.md
+      - Layer model: layer-model.md
+      - Review player roadmap: review-player-roadmap.md
+      - Perf roadmap: perf-roadmap.md
+      - Cross-player benchmark: cross-player-benchmark.md
+
+plugins:
+  - search
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+      toc_depth: 2-6
+      # slugify is docs_site.convert.github_slugify, set from docs_site/hooks.py
+      # so the build does not depend on the repo being on PYTHONPATH.
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.keys
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+
+extra_css:
+  - stylesheets/extra.css
+
+extra_javascript:
+  - javascripts/extra.js
+
+extra:
+  generator: false
+
+validation:
+  nav:
+    omitted_files: warn
+    not_found: warn
+    absolute_links: warn
+  links:
+    not_found: warn
+    anchors: warn
+    absolute_links: warn
+    unrecognized_links: warn
+
+hooks:
+  - docs_site/hooks.py

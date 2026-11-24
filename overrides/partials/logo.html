@@ -1,0 +1,7 @@
+{% if config.theme.logo %}
+  <img class="floki-logo floki-logo-dark" src="{{ config.theme.logo | url }}" alt="">
+  <img class="floki-logo floki-logo-light" src="{{ 'assets/floki-mark-light.svg' | url }}" alt="">
+{% else %}
+  {% set icon = config.theme.icon.logo or "material/library" %}
+  {% include ".icons/" ~ icon ~ ".svg" %}
+{% endif %}
