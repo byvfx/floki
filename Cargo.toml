@@ -61,7 +61,7 @@ memmap2 = "0.9"
 # wgpu 29 made `enumerate_adapters` a future for WebGPU's sake; this is a native
 # binary, so it just needs a minimal block_on. Was already a dev-dependency for the
 # on-device tests — same crate, now also linked into the app.
-pollster = "0.4"
+pollster = "1.0"
 
 [build-dependencies]
 # Windows executable icon. build.rs returns immediately unless
