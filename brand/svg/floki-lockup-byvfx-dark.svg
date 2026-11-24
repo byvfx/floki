@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 592.9 204.0" width="593" height="204" fill="none">
+  <title>Floki · BYVFX</title>
+  <g transform="translate(-25.405 -50.216) scale(0.297297)">
+    <path d="M 224.9 384.9 Q 220.0 398.0 234.0 398.0 L 766.0 398.0 Q 780.0 398.0 784.9 384.9 L 815.1 303.1 Q 820.0 290.0 806.0 290.0 L 274.0 290.0 Q 260.0 290.0 255.1 303.1 Z" fill="#FF5500"/>
+    <path d="M 234.9 552.9 Q 230.0 566.0 244.0 566.0 L 616.0 566.0 Q 630.0 566.0 634.9 552.9 L 665.1 471.1 Q 670.0 458.0 656.0 458.0 L 284.0 458.0 Q 270.0 458.0 265.1 471.1 Z" fill="#38FF4F"/>
+    <path d="M 244.9 720.9 Q 240.0 734.0 254.0 734.0 L 436.0 734.0 Q 450.0 734.0 454.9 720.9 L 485.1 639.1 Q 490.0 626.0 476.0 626.0 L 294.0 626.0 Q 280.0 626.0 275.1 639.1 Z" fill="#00AAFF"/>
+  </g>
+  <text x="246.4" y="126.0" font-family="'IBM Plex Sans', sans-serif" font-weight="600" font-size="64" fill="#F4F5F7">FLOKI</text>
+  <text x="430.3" y="126.0" font-family="'IBM Plex Sans', sans-serif" font-weight="500" font-size="28" fill="#8C919E">  ·  BYVFX</text>
+</svg>

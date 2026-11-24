@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Brand kit, window icon, and neutral studio chrome.** The Parallax mark
+  (NEO-3 Acid Arcade) ships under `brand/`, as the obsidian dock and window
+  icon, and in **Help ▸ About Floki**. The interface defaults to Chrome C:
+  obsidian panels and a silver focus. The viewport checker, timeline cache
+  greens, missing-frame marks, decode-warning amber, and channel readouts are
+  unchanged. The GitHub social card is `docs/images/social-preview.png`.
+
 ### Fixed
 - **The "Decode-bound" warning no longer blames the decoder for a busy computer.**
   (#350) The figure behind it was measured from job submission to the frame being
