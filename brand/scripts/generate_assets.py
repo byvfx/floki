@@ -264,7 +264,23 @@ def render_cropped_mark(paths: list[tuple[list[tuple], str]], height: int) -> Im
 
 
 def font(path: Path, size: int) -> ImageFont.FreeTypeFont:
-    return ImageFont.truetype(str(path), size)
+    """Open a vendored IBM Plex file.
+
+    ``Layout.BASIC`` draws only that file. Raqm (Pillow's default when it is
+    installed) will ask fontconfig for a missing glyph and can substitute a
+    system serif for the whole run.
+    """
+    if not path.is_file():
+        raise SystemExit(f"vendored font missing: {path}")
+    face = ImageFont.truetype(str(path), size, layout_engine=ImageFont.Layout.BASIC)
+    family, style = face.getname()
+    if not str(family).startswith("IBM Plex"):
+        raise SystemExit(
+            f"{path.name} opened as {family} {style}. Refusing a system fallback."
+        )
+    if face.getlength("Ag") < 1:
+        raise SystemExit(f"{path.name} has no Latin glyphs")
+    return face
 
 
 def line_box(face: ImageFont.FreeTypeFont) -> tuple[int, int]:
@@ -298,9 +314,14 @@ def draw_tracked(
     fill: tuple[int, int, int],
     tracking: float,
 ) -> float:
+    """Draw ``text`` on one baseline.
+
+    ``origin`` is the left baseline (``anchor='ls'``). Per-glyph ``lt`` alignment
+    pins a middle dot to the cap line, which reads as a superscript tick.
+    """
     x, y = origin
     for index, ch in enumerate(text):
-        draw.text((x, y), ch, font=face, fill=fill, anchor="lt")
+        draw.text((x, y), ch, font=face, fill=(*fill, 255), anchor="ls")
         x += face.getlength(ch)
         if index != len(text) - 1:
             x += tracking
@@ -320,85 +341,144 @@ def save_png(image: Image.Image, path: Path) -> None:
 
 
 def write_social(paths: list[tuple[list[tuple], str]], colors: dict[str, tuple[int, int, int]]) -> None:
+    """1280×640 card: large FLOKI, tight kicker and tagline, URL near one segmented rule.
+
+    Colors stay NEO-3 Acid Arcade. The rule is a single 7 px bar split into three
+    equal side-by-side segments, not three stacked stripes.
+    """
     width, height = 1280, 640
-    band = 8
+    rule_h = 7
     canvas = (0x14, 0x15, 0x18, 255)
     image = Image.new("RGBA", (width, height), canvas)
     draw = ImageDraw.Draw(image)
 
-    mark = render_cropped_mark(paths, 280)
-    mark_x, margin_right = 72, 64
-    text_gap = 56
+    mark = render_cropped_mark(paths, 188)
+    mark_x = 104
+    text_gap = 72
+    margin_right = 80
     text_x = mark_x + mark.width + text_gap
     text_w = width - margin_right - text_x
-    if text_w < 520:
-        raise SystemExit(f"social text column is only {text_w}px — mark is too wide")
+    if text_w < 560:
+        raise SystemExit(f"social text column is only {text_w:.0f}px")
 
-    logo_px = 96
-    while logo_px > 64:
-        logo_font = font(FONTS / "IBMPlexSans-SemiBold.ttf", logo_px)
-        if logo_font.getlength("FLOKI") <= text_w:
-            break
-        logo_px -= 2
-    else:
-        raise SystemExit("FLOKI does not fit the social card")
+    logo_font = font(FONTS / "IBMPlexSans-SemiBold.ttf", 112)
+    kicker_font = font(FONTS / "IBMPlexSans-Medium.ttf", 18)
+    body_font = font(FONTS / "IBMPlexSans-Regular.ttf", 23)
+    url_font = font(FONTS / "IBMPlexMono-Regular.ttf", 18)
 
-    sub_font = font(FONTS / "IBMPlexSans-Medium.ttf", 21)
-    body_font = font(FONTS / "IBMPlexSans-Regular.ttf", 26)
-    url_font = font(FONTS / "IBMPlexMono-Regular.ttf", 20)
-    sub = "IMAGE SEQUENCE VIEWER  ·  BYVFX"
-    sub_track = 0.8
-    if tracked_width(sub, sub_font, sub_track) > text_w:
-        raise SystemExit("social subtitle overflows")
-    body_lines = wrap_text(TAGLINE, body_font, text_w)
-    if len(body_lines) > 3:
-        raise SystemExit(f"tagline wrapped to {len(body_lines)} lines")
+    logo = "FLOKI"
+    kicker = "IMAGE SEQUENCE VIEWER  ·  BYVFX"
     url = "github.com/byvfx/floki"
+    kicker_track = 0.5
+    if logo_font.getlength(logo) > text_w:
+        raise SystemExit("FLOKI does not fit at 112 px")
+    if tracked_width(kicker, kicker_font, kicker_track) > text_w:
+        raise SystemExit("social kicker overflows")
+    # Break where the reference card breaks: the second line starts at "with".
+    first_line = "Inspect, compare, and play multi-layer image sequences"
+    body_lines = wrap_text(TAGLINE, body_font, body_font.getlength(first_line) + 2)
+    if body_lines != [first_line, "with color-accurate OCIO viewing."]:
+        raise SystemExit(f"tagline wrapped unexpectedly: {body_lines}")
+    if body_font.getlength(first_line) > text_w:
+        raise SystemExit("tagline does not fit the text column")
     if url_font.getlength(url) > text_w:
         raise SystemExit("social url overflows")
 
-    logo_a, logo_d = line_box(logo_font)
-    sub_a, sub_d = line_box(sub_font)
-    body_a, body_d = line_box(body_font)
-    url_a, url_d = line_box(url_font)
-    gap_sub, gap_body, gap_url, body_lead = 14, 26, 22, 6
-    block_h = (
-        logo_a
-        + logo_d
-        + gap_sub
-        + sub_a
-        + sub_d
-        + gap_body
-        + len(body_lines) * (body_a + body_d)
-        + (len(body_lines) - 1) * body_lead
-        + gap_url
-        + url_a
-        + url_d
-    )
-    band_top = height - band * 3
-    content_h = band_top
-    block_y = (content_h - block_h) / 2
-    mark_y = (content_h - mark.height) / 2
-    if block_y < 28 or mark_y < 28:
-        raise SystemExit("social content collides with the top edge")
-    if block_y + block_h > band_top - 20 or mark_y + mark.height > band_top - 16:
-        raise SystemExit("social content collides with the spectral rule")
+    # Baseline-anchored: the dot's center belongs in the x-height, not on the cap line.
+    dot = kicker_font.getbbox("·", anchor="ls")
+    cap = kicker_font.getbbox("H", anchor="ls")
+    dot_mid = (dot[1] + dot[3]) / 2.0
+    span = cap[3] - cap[1]
+    if span <= 0 or not (0.25 < (dot_mid - cap[1]) / span < 0.85):
+        raise SystemExit(f"middle dot is not in the x-height (dot {dot}, cap {cap})")
+
+    def ink(face: ImageFont.FreeTypeFont, sample: str) -> tuple[int, int]:
+        _left, top, _right, bottom = face.getbbox(sample, anchor="ls")
+        return top, bottom
+
+    logo_top, logo_bot = ink(logo_font, "FLOKI")
+    kick_top, kick_bot = ink(kicker_font, "IMAGE")
+    body_top, body_bot = ink(body_font, "Inspect")
+    url_top_off, _url_bot = ink(url_font, url)
+    # Ink gaps, not em-box gaps. The em box pads all-caps FLOKI with an empty
+    # descent and pushes the kicker away from the wordmark.
+    gap_kick, gap_body, body_lead = 10, 14, 6
+    logo_baseline_off = -logo_top
+    kick_baseline_off = logo_baseline_off + logo_bot + gap_kick - kick_top
+    body_baseline_off = kick_baseline_off + kick_bot + gap_body - body_top
+    body_step = (body_bot - body_top) + body_lead
+    stack_h = body_baseline_off + body_step + body_bot
+
+    rule_top = height - rule_h
+    url_baseline = rule_top - 36
+    url_top = url_baseline + url_top_off
+    region_top = 44
+    region_bottom = url_top - 40
+    if stack_h > region_bottom - region_top:
+        raise SystemExit(f"headline stack {stack_h:.0f}px does not fit above the URL")
+    stack_top = region_top + (region_bottom - region_top - stack_h) / 2
+
+    mark_y = stack_top + (stack_h - mark.height) / 2
+    if mark_x < 80 or mark_y < 36:
+        raise SystemExit("mark crowds the card edge")
+    if mark_y + mark.height > url_top - 12:
+        raise SystemExit("mark crowds the URL")
 
     image.alpha_composite(mark, (mark_x, int(round(mark_y))))
-    y = block_y
-    draw.text((text_x, y), "FLOKI", font=logo_font, fill=(0xF4, 0xF5, 0xF7, 255), anchor="lt")
-    y += logo_a + logo_d + gap_sub
-    draw_tracked(draw, (text_x, y), sub, sub_font, colors["top"], sub_track)
-    y += sub_a + sub_d + gap_body
-    for line in body_lines:
-        draw.text((text_x, y), line, font=body_font, fill=(0xD8, 0xDC, 0xE4, 255), anchor="lt")
-        y += body_a + body_d + body_lead
-    y += gap_url - body_lead
-    draw.text((text_x, y), url, font=url_font, fill=(0x8C, 0x91, 0x9E, 255), anchor="lt")
 
+    baseline = stack_top + logo_baseline_off
+    draw.text(
+        (text_x, baseline),
+        logo,
+        font=logo_font,
+        fill=(0xF4, 0xF5, 0xF7, 255),
+        anchor="ls",
+    )
+    draw_tracked(
+        draw,
+        (text_x, stack_top + kick_baseline_off),
+        kicker,
+        kicker_font,
+        colors["top"],
+        kicker_track,
+    )
+    for index, line in enumerate(body_lines):
+        draw.text(
+            (text_x, stack_top + body_baseline_off + index * body_step),
+            line,
+            font=body_font,
+            fill=(0xD8, 0xDC, 0xE4, 255),
+            anchor="ls",
+        )
+    draw.text(
+        (text_x, url_baseline),
+        url,
+        font=url_font,
+        fill=(0x8C, 0x91, 0x9E, 255),
+        anchor="ls",
+    )
+
+    cuts = [round(i * width / 3) for i in range(4)]
     for index, plane in enumerate(("top", "middle", "bottom")):
-        y0 = band_top + index * band
-        draw.rectangle((0, y0, width, y0 + band), fill=(*colors[plane], 255))
+        draw.rectangle(
+            (cuts[index], rule_top, cuts[index + 1], height),
+            fill=(*colors[plane], 255),
+        )
+
+    pixels = image.load()
+    planes = {colors["top"], colors["middle"], colors["bottom"]}
+    rule_row = [pixels[x, rule_top][:3] for x in range(width)]
+    if set(rule_row) != planes:
+        raise SystemExit(f"segmented rule colors drifted: {set(rule_row)}")
+    if (
+        rule_row[0] != colors["top"]
+        or rule_row[width // 2] != colors["middle"]
+        or rule_row[-1] != colors["bottom"]
+    ):
+        raise SystemExit("rule segments are not orange | green | blue")
+    above = {pixels[x, rule_top - 1][:3] for x in range(0, width, 4)}
+    if planes & above:
+        raise SystemExit("the rule is thicker than one bar, or a plane leaked above it")
 
     save_png(image, DOCS_IMG / "social-preview.png")
 
