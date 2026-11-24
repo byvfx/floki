@@ -41,3 +41,6 @@ assets/gif_frames/
 
 # Throwaway spike crates are their own workspaces; their build output is not ours.
 spikes/*/target/
+
+# MkDocs build output. Generated pages live in docs-site/*.md (gitignored there).
+/site/

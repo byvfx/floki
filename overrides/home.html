@@ -1,0 +1,24 @@
+{% extends "main.html" %}
+{% block extrahead %}
+  {{ super() }}
+  <script>document.documentElement.classList.add("nw-home");</script>
+{% endblock %}
+{% block hero %}
+  <section class="nw-hero" aria-label="Floki">
+    <div class="nw-hero-inner md-grid">
+      <div class="nw-hero-brand">
+        <span class="nw-hero-mark">
+          <img class="floki-logo floki-logo-dark" src="{{ 'assets/floki-mark.svg' | url }}" alt="" width="48" height="48">
+          <img class="floki-logo floki-logo-light" src="{{ 'assets/floki-mark-light.svg' | url }}" alt="" width="48" height="48">
+        </span>
+        <span class="nw-wordmark">Floki</span>
+      </div>
+      <h1 class="nw-hero-tagline">Inspect, compare, and play multi-layer image sequences with color-accurate OCIO viewing.</h1>
+      <p class="nw-hero-actions">
+        <a class="nw-btn nw-btn-primary" href="{{ 'install/' | url }}">Install</a>
+        <a class="nw-btn nw-btn-secondary" href="{{ 'layers-and-compositing/' | url }}">Using Floki</a>
+        <a class="nw-btn nw-btn-secondary" href="https://github.com/byvfx/floki">GitHub</a>
+      </p>
+    </div>
+  </section>
+{% endblock %}
