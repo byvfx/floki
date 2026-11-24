@@ -34,7 +34,7 @@ egui_extras = { version = "0.34.3", features = ["image", "all_loaders"] }
 env_logger = "0.11.10"
 exr = "1.74.1"
 log = "0.4.30"
-rfd = "0.17.2"
+rfd = "0.18.0"
 smallvec = "1.15.1"
 bytemuck = { version = "1.16", features = ["derive"] }
 rayon = "1.12.0"
