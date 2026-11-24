@@ -91,7 +91,8 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 800.0])
-            .with_title("Floki"),
+            .with_title("Floki")
+            .with_icon(floki::window_icon()),
         wgpu_options,
         ..Default::default()
     };

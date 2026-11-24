@@ -2,6 +2,12 @@
 name = "floki"
 version = "1.13.3"
 edition = "2024"
+description = "Inspect, compare, and play multi-layer image sequences with color-accurate OCIO viewing."
+homepage = "https://byvfx.github.io/floki/"
+repository = "https://github.com/byvfx/floki"
+license = "MIT"
+keywords = ["exr", "vfx", "ocio", "viewer", "image-sequence"]
+categories = ["graphics", "multimedia::images", "visualization"]
 # The app binary. Without this, `cargo run` is ambiguous because src/bin/ also has
 # the convert_dir/inspect_exr/check_types helper bins (so `cargo run`, `cargo ocio-run`,
 # etc. would error asking for --bin).
@@ -56,6 +62,11 @@ memmap2 = "0.9"
 # binary, so it just needs a minimal block_on. Was already a dev-dependency for the
 # on-device tests — same crate, now also linked into the app.
 pollster = "0.4"
+
+[build-dependencies]
+# Windows executable icon. build.rs returns immediately unless
+# CARGO_CFG_TARGET_OS is windows, so Linux and macOS never look for rc.exe.
+winresource = "0.1"
 
 [dev-dependencies]
 tempfile = "3"          # scoped temp dirs/files for test fixtures (auto-cleanup)

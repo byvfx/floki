@@ -1,4 +1,8 @@
 use crate::exr_loader::ExrData;
+use crate::theme::{
+    CACHE_FULL_FILL, CACHE_PROXY_FILL, DECODE_WARN_AMBER, MISSING_FRAME, READOUT_B, READOUT_G,
+    READOUT_R,
+};
 use crate::viewer::ExrViewer;
 use eframe::egui;
 use rfd::FileDialog;
@@ -242,12 +246,8 @@ const TIMELINE_GUTTER_W: f32 = 220.0;
 /// Height of one row in the timeline panel (#99) — the ruler and each layer track.
 const TIMELINE_ROW_H: f32 = 22.0;
 
-/// Cache-fill strip colors (#172), shared by the ruler's bar and the per-track
-/// strips (#99): proxy/beauty-resident frames in a dim green, full-res on top in a
-/// brighter green — so a range that's only proxy-cached (it sharpens to full on
-/// pause) reads differently from a fully-cached one.
-const CACHE_PROXY_FILL: egui::Color32 = egui::Color32::from_rgb(52, 104, 72);
-const CACHE_FULL_FILL: egui::Color32 = egui::Color32::from_rgb(64, 168, 96);
+// Cache-fill colors (#172) live in `theme` — the functional greens stay a
+// tested constant instead of a literal next to the brand palette.
 
 /// Frame ↔ x mapping for the timeline panel (#99). Built per row from that row's
 /// axis rect (every row allocates identically, so they all agree) and shared by
@@ -1021,6 +1021,9 @@ pub struct ExrApp {
 
     #[serde(skip)]
     show_help: bool,
+    /// About Floki. Transient; the dialog is not part of the persisted session.
+    #[serde(skip)]
+    show_about: bool,
     #[serde(skip)]
     show_settings: bool,
     /// Whether the **Layers** panel is shown (#99). On by default now that the
@@ -1296,6 +1299,7 @@ impl Default for ExrApp {
             snapshot_rx: None,
             resource_monitor: crate::resource_monitor::ResourceMonitor::default(),
             show_help: false,
+            show_about: false,
             show_settings: false,
             show_layers_panel: true,
             show_side_panel: true,
@@ -5010,7 +5014,10 @@ impl eframe::App for ExrApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // Apply the persisted theme preference. Idempotent per frame; `System`
         // tracks the OS light/dark setting via egui's input each frame.
+        // Chrome C is installed on both themes so Light stays paper-neutral
+        // and Dark stays obsidian — the viewport colors are not part of this.
         ui.ctx().set_theme(self.theme);
+        crate::theme::install_studio_chrome(ui.ctx());
 
         self.tick_soak_harness(ui.ctx());
 
@@ -5053,6 +5060,7 @@ impl eframe::App for ExrApp {
         // hotkey and consume the reply when it arrives.
         self.process_snapshot(ui.ctx());
 
+        self.draw_about_window(ui.ctx());
         self.draw_help_window(ui.ctx());
         self.draw_tools_window(ui.ctx());
         self.draw_color_management_window(ui.ctx());
@@ -5484,6 +5492,46 @@ impl ExrApp {
         );
     }
 
+    fn draw_about_window(&mut self, ctx: &egui::Context) {
+        if !self.show_about {
+            return;
+        }
+        egui::Window::new("About Floki")
+            .open(&mut self.show_about)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_max_width(440.0);
+                ui.vertical_centered(|ui| {
+                    let mark = 112.0;
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(mark, mark), egui::Sense::hover());
+                    crate::theme::paint_parallax_mark(ui.painter(), rect, ui.visuals().dark_mode);
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new("FLOKI · BYVFX").strong().size(20.0));
+                    let secondary = crate::theme::secondary_ink(ui.visuals().dark_mode);
+                    ui.label(egui::RichText::new(crate::theme::about_version()).color(secondary));
+                    ui.add_space(8.0);
+                    ui.label(crate::theme::TAGLINE);
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new(format!("{} License", crate::theme::LICENSE_NAME))
+                            .color(secondary),
+                    );
+                    ui.add_space(6.0);
+                    ui.horizontal_centered(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        ui.hyperlink_to("GitHub", crate::theme::URL_REPOSITORY);
+                        ui.label("·");
+                        ui.hyperlink_to("Releases", crate::theme::URL_RELEASES);
+                        ui.label("·");
+                        ui.hyperlink_to("Docs", crate::theme::URL_DOCS);
+                    });
+                });
+            });
+    }
+
     fn draw_help_window(&mut self, ctx: &egui::Context) {
         // Confirm before resetting (#248). A modal rather than an immediate action:
         // the full scope clears the layer stack, which is not something to do on a
@@ -5593,13 +5641,6 @@ impl ExrApp {
                     ui.label("• Metadata Explorer: With more than one layer loaded, EXR Info shows metadata and passes for each source.");
                     ui.label("• Variable Sampling: Pick 1px / 3×3 / 9×9 to average the pixel readout over an aperture.");
                     ui.label("• Compositing: Add a second layer, set Compare to 'Comp', pick which layer is the B side, then choose a blend mode (Over / Under / Add / Multiply / Screen).");
-
-                    ui.add_space(10.0);
-                    ui.heading("About");
-                    ui.label(format!("Floki v{}", env!("CARGO_PKG_VERSION")));
-                    ui.label("A professional tool for inspecting OpenEXR files.");
-                    ui.add_space(5.0);
-                    ui.hyperlink("https://github.com/byvfx/floki");
                 });
         }
     }
@@ -5997,6 +6038,10 @@ impl ExrApp {
                     });
 
                     ui.menu_button("Help", |ui| {
+                        if ui.button("About Floki").clicked() {
+                            self.show_about = true;
+                            ui.close();
+                        }
                         if ui.button("Keyboard Shortcuts").clicked() {
                             self.show_help = true;
                             ui.close();
@@ -6138,15 +6183,15 @@ impl ExrApp {
                                         ui.spacing_mut().item_spacing.x = 4.0;
                                         ui.label(
                                             egui::RichText::new(format!("{:.5}", v[0]))
-                                                .color(egui::Color32::from_rgb(255, 80, 80)),
+                                                .color(READOUT_R),
                                         );
                                         ui.label(
                                             egui::RichText::new(format!("{:.5}", v[1]))
-                                                .color(egui::Color32::from_rgb(80, 255, 80)),
+                                                .color(READOUT_G),
                                         );
                                         ui.label(
                                             egui::RichText::new(format!("{:.5}", v[2]))
-                                                .color(egui::Color32::from_rgb(100, 150, 255)),
+                                                .color(READOUT_B),
                                         );
                                         ui.label(
                                             egui::RichText::new(format!("{:.5}", v[3]))
@@ -6846,7 +6891,7 @@ impl ExrApp {
                         ),
                     ),
                 };
-                ui.label(egui::RichText::new(label).color(egui::Color32::from_rgb(255, 200, 100)))
+                ui.label(egui::RichText::new(label).color(DECODE_WARN_AMBER))
                     .on_hover_text(hover);
                 // Plain "X", matching the existing close control. `✕` (U+2715) is not
                 // in egui's default font set and rendered as an empty tofu box — a
@@ -7081,7 +7126,7 @@ impl ExrApp {
             paint_runs(&mut full, CACHE_FULL_FILL);
             // Holes: distinct vertical marks across the full span.
             if let Some(seq) = self.playback.sequence.as_ref() {
-                let hole_color = egui::Color32::from_rgb(206, 92, 60);
+                let hole_color = MISSING_FRAME;
                 for &h in &seq.holes {
                     let x = x_of(h);
                     painter.line_segment(

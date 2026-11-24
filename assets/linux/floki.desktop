@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Floki
+GenericName=Image Sequence Viewer
+Comment=Inspect, compare, and play multi-layer image sequences with color-accurate OCIO viewing.
+Exec=floki %F
+# Packagers install assets/icons/floki-<size>.png as
+# hicolor/<size>x<size>/apps/floki.png. The icon is the obsidian badge.
+Icon=floki
+Terminal=false
+Categories=Graphics;2DGraphics;
+Keywords=EXR;OCIO;VFX;sequence;viewer;
+StartupWMClass=floki
+MimeType=image/x-exr;
