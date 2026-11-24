@@ -204,18 +204,17 @@
   margin: 0;
 }
 .md-header__button.md-logo img,
-.md-header__button.md-logo svg {
-  width: 1.6rem;
-  height: 1.6rem;
+.md-header__button.md-logo svg,
+.md-nav__button.md-logo img,
+.md-nav__button.md-logo svg {
+  height: 1.35rem;
+  width: auto;
 }
-.md-header__button.md-logo img.floki-logo-light,
-.nw-hero-mark img.floki-logo-light { display: none; }
-.md-header__button.md-logo img.floki-logo-dark,
-.nw-hero-mark img.floki-logo-dark { display: block; }
-[data-md-color-scheme="default"] .md-header__button.md-logo img.floki-logo-dark,
-[data-md-color-scheme="default"] .nw-hero-mark img.floki-logo-dark { display: none; }
-[data-md-color-scheme="default"] .md-header__button.md-logo img.floki-logo-light,
-[data-md-color-scheme="default"] .nw-hero-mark img.floki-logo-light { display: block; }
+/* Header, hero, and the mobile drawer all include both marks. Scheme picks one. */
+.floki-logo-light { display: none; }
+.floki-logo-dark { display: block; }
+[data-md-color-scheme="default"] .floki-logo-dark { display: none; }
+[data-md-color-scheme="default"] .floki-logo-light { display: block; }
 .md-search__form {
   background-color: #1C1D22;
   border: 1px solid #2E313B;
@@ -547,6 +546,38 @@
   background-color: var(--nw-approve);
 }
 
+/* Light titles sit on white. An 8% tint keeps #0070B8 and #0E7A22 at 4.5:1. */
+[data-md-color-scheme="default"] .md-typeset .admonition,
+[data-md-color-scheme="default"] .md-typeset details {
+  background: #FFFFFF;
+}
+[data-md-color-scheme="default"] .md-typeset .note > .admonition-title,
+[data-md-color-scheme="default"] .md-typeset .note > summary {
+  background-color: color-mix(in srgb, var(--nw-pending) 8%, transparent);
+}
+[data-md-color-scheme="default"] .md-typeset .tip > .admonition-title,
+[data-md-color-scheme="default"] .md-typeset .tip > summary,
+[data-md-color-scheme="default"] .md-typeset .hint > .admonition-title,
+[data-md-color-scheme="default"] .md-typeset .hint > summary {
+  background-color: color-mix(in srgb, var(--nw-accent) 8%, transparent);
+}
+[data-md-color-scheme="default"] .md-typeset .warning > .admonition-title,
+[data-md-color-scheme="default"] .md-typeset .warning > summary,
+[data-md-color-scheme="default"] .md-typeset .important > .admonition-title,
+[data-md-color-scheme="default"] .md-typeset .important > summary {
+  background-color: color-mix(in srgb, var(--nw-hold) 8%, transparent);
+}
+[data-md-color-scheme="default"] .md-typeset .caution > .admonition-title,
+[data-md-color-scheme="default"] .md-typeset .caution > summary,
+[data-md-color-scheme="default"] .md-typeset .danger > .admonition-title,
+[data-md-color-scheme="default"] .md-typeset .danger > summary {
+  background-color: color-mix(in srgb, var(--nw-finding) 8%, transparent);
+}
+[data-md-color-scheme="default"] .md-typeset .success > .admonition-title,
+[data-md-color-scheme="default"] .md-typeset .success > summary {
+  background-color: color-mix(in srgb, var(--nw-approve) 8%, transparent);
+}
+
 /* Hero follows the scheme. The mark swaps with the header. */
 .nw-hero {
   background: var(--nw-bg);
@@ -566,13 +597,13 @@
 }
 .nw-hero-mark {
   display: block;
-  width: 3rem;
-  height: 3rem;
+  height: 2.25rem;
+  width: auto;
 }
 .nw-hero-mark img,
 .nw-hero-brand img {
-  width: 3rem;
-  height: 3rem;
+  height: 2.25rem;
+  width: auto;
 }
 .nw-wordmark {
   font-family: var(--nw-font-sans);
@@ -743,6 +774,21 @@
   }
   .nw-hero-tagline {
     max-width: none;
+  }
+  /* Home's card table is a direct child of article.md-typeset (browsers insert tbody).
+     Block layout on the table, tbody, and row is what lets the cells stack. */
+  .md-typeset > table,
+  .md-typeset > table tbody,
+  .md-typeset > table tr {
+    display: block;
+    width: 100%;
+  }
+  .md-typeset > table { border-spacing: 0; }
+  .md-typeset table td[valign] {
+    display: block;
+    box-sizing: border-box;
+    width: 100%;
+    margin-bottom: 0.75rem;
   }
 }
 
