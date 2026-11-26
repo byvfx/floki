@@ -90,9 +90,25 @@ The dock, taskbar, window, and `.ico` / `.icns` icon is always the dark obsidian
 
 The in-app UI is an obsidian chassis (`#141518` canvas, `#1C1D22` panels) with silver/bone `#D8DCE4` focus rings and active highlights. Light mode is `#FFFFFF` / `#F4F5F7` paper, `#141518` text, `#0070B8` links. The Theme menu still offers Dark, Light, and System. Both themes are this chrome. Neither one introduces a brand hue into the widgets.
 
-Chrome A (`#00AAFF` as a focus accent) is reserved in `brand/tokens.json` for a later toggle. It is not the shipping theme.
+Chrome A (`#00AAFF` as a focus accent) is reserved in `brand/tokens.json` for a later toggle. It is not the shipping egui theme.
 
-`brand/floki-qt.qss` is the same token set in a Qt Style Sheet, for the v2 port (issue #44).
+## Qt port — Direction C Final
+
+The Qt stylesheets are a separate, locked port of this chrome (issue #44). They do not replace the egui theme above. Load exactly one sheet with `QApplication::setStyleSheet`. Do not cascade them. Tokens for all three live under `qt` in `brand/tokens.json`; the hexes in the sheets are those literals, repeated because Qt Style Sheets have no custom properties.
+
+| Sheet | Theme menu | What it is |
+| --- | --- | --- |
+| `brand/floki-qt.qss` | Dark (primary default) | Direction C Final. Canvas `#141518`, panels `#1C1D22`, ink `#E6E9EF`, bone focus `#D8DCE4`. Dead-flat surround `#101114`. Studio-metal vertical gradients on the title, look bar, transport, and status. Recessed wells run `#0C0D10` → `#121318`. Play is `#FF6A1A` → `#E64800`. A 1px NEO-3 hairline sits under the FLOKI mark. Timeline lanes use the muted studio colors in `qt.themes.dark.timelineTracks`. |
+| `brand/floki-qt-light.qss` | Light (default) | Acid Arcade Neon. Paper `#FFFFFF` / `#F4F6FB`, ink `#11131A`, surround `#22242B`. A 2px full-width spectral bar (`#FF5500` → `#38FF4F` → `#00AAFF` → `#FF2D87`) caps the window. Look-bar pills, the OCIO chip, and the fps/cache chips carry neon tints. Play runs `#FF6A1A` → `#FF2D87`. Lanes are `#00B8FF` / `#00E65A` / `#FF6B00` / `#D92BFF`. |
+| `brand/floki-qt-light-studio.qss` | Studio Light (optional) | The quieter paper preset. `#FFFFFF` / `#F3F4F6`, ink `#141518`, surround `#2B2D33`. Same play disc as Dark. Lanes are desaturated studio tints. No full-width spectral bar. |
+
+`QWidget#viewport` stays transparent in every sheet. The surround color belongs on `QWidget#viewportSurround`. HUD, A/B badges, the wipe handle, annotation notes, and the contact sheet stay on the dark plate, including in both light themes, because they sit on the picture.
+
+Timeline lanes are 22px, `border-radius: 0`, edge to edge, with no label inside the bar. Pass names live in `QLabel#trackGutter`. The top lip is `border-top`; that is the QSS stand-in for the inset highlight.
+
+QSS cannot paint a drop shadow, an outer glow, or a hatch. Each sheet says which of those are a `paintEvent` (or a `QGraphicsDropShadowEffect`): the play halo, the cache-proxy hatch (`-45°`, 3px on / 3px off), the missing-frame dash, and the playhead triangle. Load `brand/fonts/*.ttf` through `QFontDatabase` before the sheet. There is no `@font-face` in QSS.
+
+The old `#paperCanvas` / `#paperPanel` object names still resolve. On the neon sheet they take the neon paper; on the studio sheet they take Studio Light. Dark no longer carries a second theme inside the same file.
 
 ### Viewport contract
 
@@ -100,10 +116,10 @@ The viewing room stays neutral so OCIO output is the only color on screen.
 
 * The viewport backdrop stays the linear 0.10 / 0.20 checker, or the user's own solid or gradient. Do not tint it, and do not replace it with canvas `#141518`.
 * Do not grade, overlay, or recolor rendered image pixels.
-* Timeline cache greens stay `#346848` (proxy / beauty) and `#40A860` (full).
+* Timeline cache greens stay `#346848` (proxy / beauty) and `#40A860` (full) in the egui theme, the dark Qt sheet, and Studio Light. Acid Arcade Neon uses the arcade pair on `qt.themes.lightNeon.cache`.
 * Missing-frame holes stay `#CE5C3C`.
 * Decode-warning amber stays `#FFC864`.
-* Channel readouts stay `#FF5050` / `#50FF50` / `#6496FF`.
+* Channel readouts stay `#FF5050` / `#50FF50` / `#6496FF` on dark surfaces. Both light Qt sheets use the paper-safe set on `qt.themes.*.readout` so the status line stays legible.
 
 Brand color lives in the icon, the About mark, and the docs. It does not live in the viewport.
 
@@ -119,5 +135,5 @@ Brand color lives in the icon, the About mark, and the docs. It does not live in
 * Don't draw a box, circle, or wordmark container around the F.
 * Don't recolor a plane, swap their order, or substitute yellow, amber, or Nuke gold.
 * Don't set small body text in the neon inks.
-* Don't paint brand orange, green, or blue onto panels, focus rings, or the viewport.
+* Don't paint brand orange, green, or blue onto the egui panels, focus rings, or the viewport image. The Qt sheets under "Qt port" are the locked exception, and they still leave the rendered pixels alone.
 * Don't retint the functional timeline, warning, or readout colors to "match the brand."
