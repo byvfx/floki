@@ -354,4 +354,107 @@ mod tests {
             assert_eq!(g, b);
         }
     }
+
+    fn qss_code(sheet: &str) -> String {
+        let mut code = String::new();
+        let mut chars = sheet.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '/' && chars.peek() == Some(&'*') {
+                chars.next();
+                while let Some(d) = chars.next() {
+                    if d == '*' && chars.peek() == Some(&'/') {
+                        chars.next();
+                        break;
+                    }
+                }
+            } else {
+                code.push(c);
+            }
+        }
+        code
+    }
+
+    #[test]
+    fn qt_direction_c_sheets_match_the_token_block() {
+        let tokens = include_str!("../brand/tokens.json");
+        for needle in [
+            "\"qt\"",
+            "floki-qt.qss",
+            "floki-qt-light.qss",
+            "floki-qt-light-studio.qss",
+            "lightNeon",
+            "lightStudio",
+            "timelineTracks",
+            "surfaces",
+            "#101114",
+            "#22242B",
+            "#2B2D33",
+            "#FF6A1A",
+            "#E64800",
+            "#FF2D87",
+            "#00B8FF",
+            "#00E65A",
+            "#FF6B00",
+            "#D92BFF",
+        ] {
+            assert!(tokens.contains(needle), "{needle} missing from tokens.json");
+        }
+
+        let dark = include_str!("../brand/floki-qt.qss");
+        let neon = include_str!("../brand/floki-qt-light.qss");
+        let studio = include_str!("../brand/floki-qt-light-studio.qss");
+        for (name, sheet) in [("dark", dark), ("neon", neon), ("studio", studio)] {
+            let code = qss_code(sheet);
+            assert_eq!(
+                code.matches('{').count(),
+                code.matches('}').count(),
+                "{name} braces do not balance"
+            );
+            for banned in [
+                "box-shadow",
+                "backdrop-filter",
+                "var(",
+                "calc(",
+                "@font-face",
+                "outline:",
+            ] {
+                assert!(!code.contains(banned), "{name} still has {banned}");
+            }
+            for selector in [
+                "QPushButton#playButton",
+                "QPushButton[role=\"play\"]",
+                "QWidget#viewportSurround",
+                "QWidget#viewport",
+                "QWidget#trackLane[pass=\"beauty\"]",
+                "QWidget#trackLane[pass=\"diffuse\"]",
+                "QWidget#trackLane[pass=\"spec\"]",
+                "QWidget#trackLane[pass=\"volume\"]",
+                "QWidget[surface=\"well\"]",
+                "QFrame#annotateToolbar",
+                "QFrame#sheetTile",
+                "QDialog#settingsDialog",
+                "QDialog#aboutDialog",
+                "QWidget#layerRow[selected=\"true\"]",
+                "QFrame#spectralTopBar",
+                "QListView#layerList",
+                "QTreeView#layerList",
+                "QSlider#strokeWidth",
+                "QProgressBar#opacityBar",
+                "QTabBar#dockTabs",
+                "QScrollBar:vertical",
+            ] {
+                assert!(sheet.contains(selector), "{name} missing {selector}");
+            }
+        }
+        assert!(dark.contains("#101114"));
+        assert!(dark.contains("#FF6A1A"));
+        assert!(dark.contains("#2D5270"));
+        assert!(dark.contains("background: transparent"));
+        assert!(neon.contains("#22242B"));
+        assert!(neon.contains("#FF2D87"));
+        assert!(neon.contains("#00B8FF"));
+        assert!(studio.contains("#2B2D33"));
+        assert!(studio.contains("#4E7A98"));
+        assert!(studio.contains("#F3F4F6"));
+    }
 }

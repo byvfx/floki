@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Direction C Final Qt stylesheets.** `brand/floki-qt.qss` is the locked dark chrome for the Qt port. Light defaults to Acid Arcade Neon (`brand/floki-qt-light.qss`); Studio Light is the quieter optional preset (`brand/floki-qt-light-studio.qss`). The three themes, timeline lanes, and secondary surfaces are tokenised under `qt` in `brand/tokens.json`. The shipping egui theme is unchanged.
 - **Brand kit, window icon, and neutral studio chrome.** The Parallax mark
   (NEO-3 Acid Arcade) ships under `brand/`, as the obsidian dock and window
   icon, and in **Help ▸ About Floki**. The interface defaults to Chrome C:

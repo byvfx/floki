@@ -1,108 +1,1396 @@
-/* Floki Chrome C — starter stylesheet for the Qt port (issue #44).
+/* Floki — Direction C Final, locked Dark stylesheet.
  *
- * Hex values are the literals in brand/tokens.json. Qt Style Sheets have no
- * custom properties, so the values are repeated here on purpose. When a token
+ * Primary default for the Qt port (issue #44). Hex values are the literals in
+ * brand/tokens.json under "qt.themes.dark". Qt Style Sheets have no custom
+ * properties, so the values are repeated here on purpose. When a token
  * changes, change it in both places.
  *
- * Chrome C is achromatic on purpose. Do not point a selector at the mark
- * oranges, greens, or blues. The optional Chrome A accent (#00AAFF) is
- * documented in tokens.json and is not used below.
+ * Load brand/fonts/*.ttf with QFontDatabase::addApplicationFont before applying
+ * this sheet. QSS has no @font-face. Tabular figures (frame numbers, readouts,
+ * paths) are QFont::setFeature("tnum", 1) or a monospace face — QSS cannot set
+ * font-variant-numeric. Uppercase dock tabs and info headings are the widget
+ * strings; QSS cannot set text-transform. Wordmark tracking is
+ * QFont::letterSpacing: FLOKI 0.14em, the BYVFX secondary 0.04em, About
+ * product 0.16em.
  *
- * Viewport contract: the image surface paints its own backdrop (linear 0.10 /
- * 0.20 checker, or the user's solid / gradient). Do not give that widget a
- * brand fill, a tinted stylesheet background, or a hue-shifted border.
+ * Companion sheets, swapped whole (do not cascade them):
+ *   brand/floki-qt-light.qss         Acid Arcade Neon — default Light
+ *   brand/floki-qt-light-studio.qss  Studio Light — optional quieter preset
+ *
+ * Viewport contract: QWidget#viewport stays transparent. The renderer owns
+ * image pixels (checker, solid, or gradient). The dead-flat surround is
+ * QWidget#viewportSurround (#101114). Do not give the image widget a brand
+ * fill, and do not retint functional cache / missing / readout colors.
+ *
+ * Object names and dynamic properties this sheet expects:
+ *   #titleBar #spectralTopBar #brandSpectralRule #wordmark #wordmarkSecondary
+ *   #shotPath #trafficLight[role=close|min|zoom] #commandSearch #searchShortcut
+ *   #lookBar #currentLayerName #currentLayerMeta #vDivider
+ *   #exposureWell #gammaWell #wellField [surface=well|raised]
+ *   #displayCombo #ocioCombo #ocioTag #segment #segmentButton[active=true]
+ *   #pill[role=ab|lut][active=true] #utilButton[role=sheet|annotate|display]
+ *   #iconButton #layersDock #dockTabs #layerList #layerRow[selected=true][dim=true]
+ *   #layerRow[pass=beauty|diffuse|spec|volume|crypto] #activeRail
+ *   #layerName #layerSub #layerMode #opacityBar #addLayer #layerHit #layerSolo
+ *   #viewportSurround #viewport #imageFrame #guides #wipeLine #wipeHandle
+ *   #abBadge[side=a|b] #playbackHud #hudKey #hudValue #hudSub
+ *   #transport #transportWell #transportGutter #frameNumber #frameRange
+ *   #playButton [role=play] #transportButton #markButton #fpsChip #liveDot
+ *   #cacheChip #cachePercent
+ *   #timeline #timelineRuler #cacheStrip #rulerAxis #trackAxis
+ *   #trackLane[pass=…][active=true] #trackGutter[active=true]
+ *   #playhead #playheadCap #cacheProxyRun #cacheFullRun #missingTick
+ *   #cacheSwatch[kind=proxy|full|missing] #pip[pass=…]
+ *   #infoBody #infoHeading #infoFile #infoDir #infoKey #infoValue #infoNote
+ *   #infoChip #pixelProbe #probeLabel #probeValue #histogram #attributes
+ *   #annotateToolbar #annotateToolGroup #annotateTool[active=true] #strokeWidth
+ *   #annotateDivider #annotatePalette #paletteSwatch[active=true]
+ *   #annotateAction #annotationNote #annoMarker[current=true]
+ *   #contactSheet #sheetTile[selected=true] #sheetTag #sheetHint
+ *   #sheetGrid #sheetFilter #modalScrim
+ *   #settingsDialog #aboutDialog #dialogHeader #dialogTitle #dialogClose
+ *   #settingsSidebar #settingsCategory[active=true] #fieldLabel #settingsField
+ *   #settingsCombo #browseButton #fieldHint #dialogFooter #dialogButton
+ *   #dialogPrimary #aboutProduct #aboutVersion #aboutTagline #aboutCredit
+ *   #aboutBuild #aboutLicense #aboutLink #aboutSpectralBar #aboutTile
+ *
+ * Paint-event notes (QSS cannot express these):
+ *   Play halo — QRadialGradient behind #playButton, 14px, rgba(255, 85, 0, 0.28),
+ *   plus a 2px 6px black drop under the disc. This sheet paints the disc and a
+ *   1px top sheen only.
+ *   Raised controls — the 1px top lip is border-top. The real inset highlight
+ *   and the 1px 2px drop are a paintEvent on the same rounded rect.
+ *   Recessed wells — the gradient's dark top stands in for the inset shadow
+ *   (0 1px 3px rgba(0,0,0,0.65)) and the 1px white lip under the well.
+ *   Cache proxy — base fill only. Hatch is a tiled QBrush, -45 degrees,
+ *   3px #346848 / 3px #2A543A, then a vertical white-to-black sheen.
+ *   Cache full — solid #40A860. Sheen is a vertical QLinearGradient in paintEvent.
+ *   Missing tick — 2px on / 1px off vertical repeat of #CE5C3C.
+ *   Playhead cap — QPolygonF triangle, not a stylesheet shape. Stem is #playhead.
+ *   Dialog, HUD, and plate drop shadows — QGraphicsDropShadowEffect or the
+ *   parent paintEvent. This sheet paints the 1px hairline only.
+ *   Modal dim — QWidget#modalScrim, fill #9E08090C, behind the dialogs.
+ *   Checked indicator — fill is #D8DCE4. Draw the tick in a styled indicator
+ *   or a 8×5 dark polyline; QSS has no content property.
+ *   Palette swatches — background is palette(button). Set QPalette::Button to
+ *   the ink before polish. The selection ring is the 2px bone border.
+ *   Dimmed layer rows — name/sub colors below are the 0.48 mix over #1C1D22.
+ *   A QGraphicsOpacityEffect on the row is the other legal equivalent.
+ *   Track lanes — 22px tall, border-radius 0, edge to edge, no in-bar text.
+ *   Pass names live in #trackGutter. Do not add a child label inside the lane.
  */
 
-QMainWindow, QWidget#studioCanvas {
+QMainWindow, QWidget#studioCanvas, QWidget#studioWindow {
     background-color: #141518;
-    color: #D8DCE4;
+    color: #E6E9EF;
     font-family: "IBM Plex Sans";
     font-size: 13px;
 }
 
-QWidget#studioPanel, QMenuBar, QMenu, QStatusBar, QDockWidget {
-    background-color: #1C1D22;
-    color: #D8DCE4;
-    border: 1px solid #2E313B;
+/* ---------- title bar ---------- */
+
+QWidget#titleBar {
+    min-height: 32px;
+    max-height: 32px;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #191A20, stop:1 #16171C);
+    color: #E6E9EF;
+    border: none;
+    border-top: 1px solid #0DFFFFFF;
 }
 
-QDockWidget::title {
-    background-color: #1C1D22;
-    color: #D8DCE4;
-    padding: 6px 8px;
+/* Full-width spectral bar belongs to Acid Arcade Neon. Keep the widget so the
+   chrome can host it, but do not paint it on Dark. */
+QFrame#spectralTopBar {
+    min-height: 0px;
+    max-height: 0px;
+    border: none;
+    background: none;
 }
 
-QMenuBar::item:selected, QMenu::item:selected {
-    background-color: #2E313B;
-    color: #D8DCE4;
+QFrame#brandSpectralRule {
+    min-height: 1px;
+    max-height: 1px;
+    border: none;
+    border-radius: 1px;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 #59FF5500, stop:0.5 #5938FF4F, stop:1 #5900AAFF);
 }
 
-QToolBar {
-    background-color: #1C1D22;
-    border: 0;
-    spacing: 4px;
+QLabel#wordmark {
+    color: #E6E9EF;
+    font-size: 12px;
+    font-weight: 600;
+    background: transparent;
 }
 
-QPushButton, QToolButton, QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox {
-    background-color: #262830;
-    color: #D8DCE4;
-    border: 1px solid #2E313B;
+QLabel#wordmarkSecondary {
+    color: #9AA1AE;
+    font-size: 12px;
+    font-weight: 400;
+    background: transparent;
+}
+
+QLabel#shotPath, QLabel#mono {
+    color: #9AA1AE;
+    font-family: "IBM Plex Mono";
+    font-size: 12px;
+    background: transparent;
+}
+
+QWidget#trafficLight {
+    min-width: 9px;
+    max-width: 9px;
+    min-height: 9px;
+    max-height: 9px;
     border-radius: 4px;
-    padding: 4px 8px;
-    selection-background-color: #2E313B;
-    selection-color: #D8DCE4;
+    background: #2A2C34;
+    border: none;
 }
 
-QPushButton:hover, QToolButton:hover, QComboBox:hover, QLineEdit:hover {
+/* ---------- menu ---------- */
+
+QMenuBar {
+    min-height: 28px;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #16171C, stop:1 #141518);
+    color: #E6E9EF;
+    border: none;
+    border-bottom: 1px solid #59000000;
+    font-size: 13px;
+    spacing: 0px;
+}
+
+QMenuBar::item {
+    padding: 4px 10px;
+    background: transparent;
+    color: #E6E9EF;
+    border-radius: 4px;
+}
+
+QMenuBar::item:selected, QMenuBar::item:pressed {
+    background: #2E313B;
+    color: #E6E9EF;
+}
+
+QMenu {
+    background-color: #1C1D22;
+    color: #E6E9EF;
+    border: 1px solid #14FFFFFF;
+    padding: 4px;
+}
+
+QMenu::item {
+    padding: 6px 28px 6px 12px;
+    border-radius: 4px;
+    background: transparent;
+}
+
+QMenu::item:selected {
+    background: #2E313B;
+    color: #E6E9EF;
+}
+
+QMenu::separator {
+    height: 1px;
+    background: #14FFFFFF;
+    margin: 4px 8px;
+}
+
+QLineEdit#commandSearch, QLineEdit#settingsField, QLineEdit {
+    min-height: 24px;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #0C0D10, stop:1 #121318);
+    color: #E6E9EF;
+    border: 1px solid #707684;
+    border-radius: 5px;
+    padding: 0 8px;
+    selection-background-color: #2E313B;
+    selection-color: #E6E9EF;
+    font-size: 12px;
+}
+
+QLineEdit#commandSearch {
+    font-size: 12px;
+    color: #9AA1AE;
+}
+
+QLabel#searchShortcut {
+    color: #E6E9EF;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #2B2E37, stop:1 #21232A);
+    border-radius: 3px;
+    border-top: 1px solid #3C3F47;
+    padding: 1px 5px;
+    font-family: "IBM Plex Mono";
+    font-size: 11px;
+}
+
+/* ---------- look bar ---------- */
+
+QWidget#lookBar, QToolBar#lookBar {
+    min-height: 42px;
+    max-height: 42px;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #1E2026, stop:1 #17181D);
+    color: #E6E9EF;
+    border: none;
+    border-top: 1px solid #0DFFFFFF;
+    border-bottom: 1px solid #66000000;
+    spacing: 12px;
+    padding: 0 14px;
+}
+
+QLabel#currentLayerName {
+    color: #E6E9EF;
+    font-size: 13px;
+    font-weight: 500;
+    background: transparent;
+}
+
+QLabel#currentLayerMeta, QLabel#muted, QLabel#lbl {
+    color: #9AA1AE;
+    font-size: 12px;
+    background: transparent;
+}
+
+QFrame#vDivider, QFrame#statusDivider, QFrame#annotateDivider {
+    min-width: 1px;
+    max-width: 1px;
+    background: #14FFFFFF;
+    border: none;
+}
+
+QWidget#exposureWell, QWidget#gammaWell, QWidget[surface="well"],
+QWidget#segment, QWidget#annotateToolGroup, QLabel#frameRange, QWidget#transportWell {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #0C0D10, stop:1 #121318);
+    border: none;
+    border-radius: 5px;
+    color: #E6E9EF;
+}
+
+QWidget#exposureWell, QWidget#gammaWell, QLineEdit#wellField {
+    min-height: 28px;
+    font-family: "IBM Plex Mono";
+    font-size: 12px;
+}
+
+QWidget#exposureWell[focused="true"], QWidget#gammaWell[focused="true"],
+QLineEdit#wellField:focus {
+    border: 2px solid #D8DCE4;
+}
+
+QLineEdit#wellField {
+    background: transparent;
+    border: none;
+    padding: 0;
+    color: #E6E9EF;
+    selection-background-color: #2E313B;
+    selection-color: #E6E9EF;
+}
+
+QLabel#wellKey {
+    color: #9AA1AE;
+    font-family: "IBM Plex Sans";
+    font-size: 11px;
+    font-weight: 500;
+    background: transparent;
+}
+
+QComboBox, QComboBox#displayCombo, QComboBox#ocioCombo, QComboBox#settingsCombo,
+QComboBox#sheetGrid, QComboBox#sheetFilter {
+    min-height: 28px;
+    padding: 0 8px 0 10px;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #2B2E37, stop:1 #21232A);
+    color: #E6E9EF;
+    border: 1px solid #707684;
+    border-top-color: #3C3F47;
+    border-radius: 5px;
+    font-size: 12px;
+}
+
+QComboBox:hover, QComboBox#displayCombo:hover, QComboBox#ocioCombo:hover {
     border-color: #D8DCE4;
 }
 
-QPushButton:focus, QToolButton:focus, QComboBox:focus,
-QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus,
-QSlider:focus {
+QComboBox:focus, QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus {
     border: 1px solid #D8DCE4;
-    outline: none;
+}
+
+QComboBox::drop-down {
+    width: 18px;
+    border: none;
+    background: transparent;
+}
+
+QComboBox::down-arrow {
+    width: 0px;
+    height: 0px;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 5px solid #9AA1AE;
+}
+
+QComboBox QAbstractItemView {
+    background: #1C1D22;
+    color: #E6E9EF;
+    border: 1px solid #14FFFFFF;
+    selection-background-color: #2E313B;
+    selection-color: #E6E9EF;
+}
+
+/* #ocioTag is the Acid Arcade chip. On Dark it stays quiet secondary type. */
+QLabel#ocioTag {
+    color: #9AA1AE;
+    background: transparent;
+    border: none;
+    font-size: 10px;
+    font-weight: 600;
+    padding: 0;
+}
+
+QWidget#segment, QWidget#annotateToolGroup {
+    border-radius: 6px;
+    min-height: 28px;
+    padding: 2px;
+}
+
+QPushButton#segmentButton, QToolButton#annotateTool, QPushButton#pill {
+    min-height: 24px;
+    padding: 0 8px;
+    background: transparent;
+    color: #9AA1AE;
+    border: none;
+    border-radius: 4px;
+    font-size: 12px;
+    font-weight: 500;
+}
+
+QPushButton#segmentButton[active="true"], QToolButton#annotateTool[active="true"],
+QPushButton#pill[active="true"], QPushButton#utilButton[active="true"] {
+    color: #E6E9EF;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #2B2E37, stop:1 #21232A);
+    border-top: 1px solid #3C3F47;
+}
+
+QPushButton#utilButton, QToolButton#iconButton, QPushButton#markButton,
+QPushButton#annotateAction, QToolButton#dialogClose, QPushButton#dialogButton {
+    background: transparent;
+    color: #9AA1AE;
+    border: none;
+    border-radius: 5px;
+    padding: 0 8px;
+    font-size: 12px;
+    font-weight: 500;
+}
+
+QToolButton#iconButton {
+    min-width: 28px;
+    max-width: 28px;
+    min-height: 28px;
+    max-height: 28px;
+    padding: 0;
+    color: #E6E9EF;
+}
+
+QPushButton#utilButton:hover, QToolButton#iconButton:hover,
+QPushButton#markButton:hover, QPushButton#annotateAction:hover,
+QToolButton#dialogClose:hover, QPushButton#dialogButton:hover,
+QToolButton#layerHit:hover, QToolButton#layerSolo:hover {
+    background: #0AFFFFFF;
+    color: #E6E9EF;
 }
 
 QPushButton:pressed, QToolButton:pressed {
-    background-color: #2E313B;
+    background: #14FFFFFF;
 }
 
-QLabel#muted, QStatusBar QLabel {
-    color: #8C919E;
+QPushButton:disabled, QToolButton:disabled, QComboBox:disabled, QLineEdit:disabled {
+    color: #9AA1AE;
 }
 
-/* Paper theme. Apply by swapping this sheet, or gate it with a dynamic
-   property, when the user picks the light theme. Body text stays neutral. */
-QWidget#paperCanvas {
-    background-color: #F4F5F7;
-    color: #141518;
+/* ---------- layers dock ---------- */
+
+QWidget#studioPanel, QDockWidget, QDockWidget#layersDock {
+    background-color: #1C1D22;
+    color: #E6E9EF;
+    border: none;
+    border-right: 1px solid #14FFFFFF;
 }
 
-QWidget#paperPanel {
-    background-color: #FFFFFF;
-    color: #141518;
-    border: 1px solid #D8DCE4;
+QDockWidget#layersDock {
+    min-width: 220px;
 }
 
-QWidget#paperCanvas QLabel#muted {
-    color: #4A4E59;
+QDockWidget::title {
+    background: #1C1D22;
+    color: #E6E9EF;
+    padding: 6px 8px;
+    border: none;
 }
 
-QWidget#paperCanvas QLabel#link, QWidget#paperCanvas QLabel a {
-    color: #0070B8;
+QTabBar#dockTabs {
+    background: transparent;
+    border: none;
+    border-bottom: 1px solid #14FFFFFF;
 }
 
-/* The viewing surface. Leave the background to the renderer. */
+QTabBar#dockTabs::tab {
+    min-height: 32px;
+    padding: 0 10px;
+    background: transparent;
+    color: #9AA1AE;
+    font-size: 11px;
+    font-weight: 600;
+    border: none;
+    border-bottom: 2px solid transparent;
+}
+
+QTabBar#dockTabs::tab:selected {
+    color: #E6E9EF;
+    border-bottom: 2px solid #D8DCE4;
+}
+
+QTabBar#dockTabs::tab:hover {
+    color: #E6E9EF;
+}
+
+QListView#layerList, QTreeView#layerList {
+    background: #1C1D22;
+    color: #E6E9EF;
+    border: none;
+    selection-background-color: #33231F;
+    selection-color: #E6E9EF;
+    font-size: 13px;
+}
+
+QListView#layerList::item, QTreeView#layerList::item {
+    min-height: 40px;
+    padding: 4px 8px;
+    border-radius: 5px;
+}
+
+QListView#layerList::item:selected, QTreeView#layerList::item:selected {
+    background: #33231F;
+    color: #E6E9EF;
+    border-left: 2px solid #FF5500;
+}
+
+QWidget#layerRow {
+    background: transparent;
+    border: none;
+    border-radius: 5px;
+    min-height: 40px;
+}
+
+QWidget#layerRow[selected="true"] {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 #33231F, stop:0.14 #22242A, stop:1 #1F2126);
+    border-left: 2px solid #FF5500;
+    border-radius: 5px;
+}
+
+QFrame#activeRail {
+    min-width: 2px;
+    max-width: 2px;
+    border: none;
+    border-radius: 1px;
+    background: transparent;
+}
+
+QWidget#layerRow[selected="true"] QFrame#activeRail {
+    background: #FF5500;
+}
+
+QPushButton#settingsCategory[active="true"] QFrame#activeRail {
+    background: #D8DCE4;
+}
+
+QLabel#layerName {
+    color: #E6E9EF;
+    font-size: 13px;
+    font-weight: 500;
+    background: transparent;
+}
+
+QLabel#layerSub, QLabel#layerMode {
+    color: #9AA1AE;
+    font-size: 12px;
+    background: transparent;
+}
+
+QLabel#layerMode {
+    font-size: 11px;
+}
+
+QWidget#layerRow[dim="true"] QLabel#layerName {
+    color: #7D7F84;
+}
+
+QWidget#layerRow[dim="true"] QLabel#layerSub,
+QWidget#layerRow[dim="true"] QLabel#layerMode {
+    color: #585C65;
+}
+
+QToolButton#layerHit, QToolButton#layerSolo {
+    min-width: 24px;
+    max-width: 24px;
+    min-height: 24px;
+    max-height: 24px;
+    padding: 0;
+    background: transparent;
+    color: #9AA1AE;
+    border: none;
+    border-radius: 4px;
+}
+
+QToolButton#layerHit[active="true"], QToolButton#layerSolo[active="true"] {
+    color: #E6E9EF;
+}
+
+QProgressBar#opacityBar {
+    min-width: 36px;
+    max-width: 36px;
+    min-height: 3px;
+    max-height: 3px;
+    border: none;
+    border-radius: 2px;
+    background: #14FFFFFF;
+    color: transparent;
+}
+
+QProgressBar#opacityBar::chunk {
+    background: #E6E9EF;
+    border-radius: 2px;
+}
+
+QFrame#pip {
+    min-width: 8px;
+    max-width: 8px;
+    min-height: 8px;
+    max-height: 8px;
+    border-radius: 2px;
+    border: none;
+    border-top: 1px solid #38FFFFFF;
+}
+
+QFrame#pip[pass="beauty"] { background: #447AA6; }
+QFrame#pip[pass="diffuse"] { background: #3B826E; }
+QFrame#pip[pass="spec"] { background: #966838; }
+QFrame#pip[pass="volume"] { background: #725694; }
+
+QPushButton#addLayer, QPushButton#dialogPrimary, QPushButton#fpsChip, QPushButton#cacheChip {
+    min-height: 28px;
+    padding: 0 10px;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #2B2E37, stop:1 #21232A);
+    color: #E6E9EF;
+    border: 1px solid #707684;
+    border-top-color: #3C3F47;
+    border-radius: 5px;
+    font-size: 12px;
+    font-weight: 500;
+}
+
+QPushButton#addLayer {
+    min-height: 32px;
+    border-radius: 6px;
+    color: #9AA1AE;
+}
+
+QPushButton#addLayer:hover, QPushButton#dialogPrimary:hover,
+QPushButton#fpsChip:hover, QPushButton#cacheChip:hover {
+    border-color: #D8DCE4;
+    color: #E6E9EF;
+}
+
+/* ---------- viewport ---------- */
+
+QWidget#viewportSurround, QWidget#contactSheet {
+    background: #101114;
+    border: none;
+}
+
 QWidget#viewport {
     background: transparent;
     border: none;
 }
 
-/* Functional colors — do not restyle the widgets that paint these.
- *   cache proxy   #346848
+QFrame#imageFrame {
+    background: #0A0B0D;
+    border: 1px solid #0AFFFFFF;
+    border-radius: 0px;
+}
+
+QFrame#guides {
+    background: transparent;
+    border: 1px solid #1AFFFFFF;
+}
+
+QFrame#wipeLine, QFrame#playhead {
+    min-width: 2px;
+    max-width: 2px;
+    background: #FF5500;
+    border: none;
+}
+
+QFrame#wipeLine {
+    min-width: 1px;
+    max-width: 1px;
+    background: #EBE6E9EF;
+}
+
+QWidget#wipeHandle {
+    min-width: 11px;
+    max-width: 11px;
+    min-height: 11px;
+    max-height: 11px;
+    border-radius: 5px;
+    background: #1C1D22;
+    border: 2px solid #E6E9EF;
+}
+
+QLabel#abBadge {
+    min-height: 22px;
+    padding: 0 7px;
+    background: #EB0F1013;
+    color: #E6E9EF;
+    border: 1px solid #1FFFFFFF;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+}
+
+QFrame#playbackHud {
+    background: #1C1D22;
+    border: 1px solid #14FFFFFF;
+    border-radius: 6px;
+    color: #E6E9EF;
+}
+
+QLabel#hudKey {
+    color: #9AA1AE;
+    font-size: 10px;
+    font-weight: 600;
+    background: transparent;
+}
+
+QLabel#hudValue {
+    color: #E6E9EF;
+    font-family: "IBM Plex Mono";
+    font-size: 12px;
+    background: transparent;
+}
+
+QLabel#hudSub {
+    color: #9AA1AE;
+    font-size: 12px;
+    background: transparent;
+}
+
+/* ---------- transport ---------- */
+
+QWidget#transport {
+    min-height: 56px;
+    max-height: 56px;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #1E2026, stop:1 #17181D);
+    border: none;
+    border-top: 1px solid #0DFFFFFF;
+    border-bottom: 1px solid #66000000;
+    color: #E6E9EF;
+}
+
+QWidget#transportGutter {
+    border: none;
+    border-right: 1px solid #14FFFFFF;
+    background: transparent;
+}
+
+QWidget#transportWell {
+    min-height: 40px;
+    border-radius: 20px;
+    padding: 0 6px;
+}
+
+QLabel#frameNumber {
+    color: #E6E9EF;
+    background: transparent;
+    border: none;
+    font-family: "IBM Plex Mono";
+    font-size: 22px;
+    padding: 0;
+}
+
+QLabel#frameRange {
+    min-height: 22px;
+    padding: 0 8px;
+    border-radius: 11px;
+    color: #9AA1AE;
+    font-family: "IBM Plex Mono";
+    font-size: 12px;
+}
+
+QToolButton#transportButton {
+    min-width: 32px;
+    max-width: 32px;
+    min-height: 32px;
+    max-height: 32px;
+    padding: 0;
+    background: transparent;
+    color: #E6E9EF;
+    border: none;
+    border-radius: 16px;
+}
+
+QToolButton#transportButton:hover {
+    background: #0AFFFFFF;
+}
+
+QPushButton#playButton, QPushButton[role="play"] {
+    min-width: 40px;
+    max-width: 40px;
+    min-height: 40px;
+    max-height: 40px;
+    padding: 0;
+    margin: 0 4px;
+    color: #0F1013;
+    border: none;
+    border-top: 1px solid #FF945A;
+    border-radius: 20px;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #FF6A1A, stop:1 #E64800);
+}
+
+QPushButton#playButton:hover, QPushButton[role="play"]:hover {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #FF7A30, stop:1 #F05000);
+}
+
+QPushButton#playButton:pressed, QPushButton[role="play"]:pressed {
+    background: #E64800;
+    border-top-color: #E64800;
+}
+
+QPushButton#markButton {
+    min-width: 32px;
+    min-height: 28px;
+    color: #E6E9EF;
+    font-weight: 600;
+}
+
+QLabel#liveDot {
+    min-width: 6px;
+    max-width: 6px;
+    min-height: 6px;
+    max-height: 6px;
+    border-radius: 3px;
+    background: #40A860;
+    border: none;
+}
+
+QLabel#cachePercent {
+    color: #9AA1AE;
+    font-family: "IBM Plex Mono";
+    font-size: 12px;
+    background: transparent;
+}
+
+QPushButton#fpsChip {
+    font-family: "IBM Plex Mono";
+    font-size: 12px;
+}
+
+/* ---------- timeline ---------- */
+
+QWidget#timeline {
+    background: #141518;
+    border: none;
+    border-top: 1px solid #14FFFFFF;
+    color: #9AA1AE;
+}
+
+QWidget#timelineRuler {
+    min-height: 22px;
+    max-height: 22px;
+    background: transparent;
+}
+
+QWidget#rulerAxis {
+    background: #1C1D22;
+    border: none;
+}
+
+QWidget#cacheStrip {
+    min-height: 16px;
+    max-height: 16px;
+    background: transparent;
+}
+
+QWidget#trackAxis {
+    background: #101114;
+    border: none;
+}
+
+QLabel#trackGutter {
+    color: #9AA1AE;
+    background: #1C1D22;
+    border: none;
+    border-right: 1px solid #14FFFFFF;
+    font-family: "IBM Plex Mono";
+    font-size: 12px;
+    padding: 0 12px;
+    min-width: 220px;
+}
+
+QLabel#trackGutter[active="true"] {
+    color: #E6E9EF;
+}
+
+QLabel#cacheGutter {
+    color: #9AA1AE;
+    background: #1C1D22;
+    font-family: "IBM Plex Sans";
+    font-size: 11px;
+    font-weight: 600;
+    border: none;
+    border-right: 1px solid #14FFFFFF;
+    padding: 0 12px;
+}
+
+/* 22px, square ends, no horizontal inset, no label inside the bar. */
+QWidget#trackLane {
+    min-height: 22px;
+    max-height: 22px;
+    margin: 0;
+    padding: 0;
+    border: none;
+    border-radius: 0px;
+    color: transparent;
+}
+
+QWidget#trackLane QLabel {
+    color: transparent;
+    background: transparent;
+    min-width: 0px;
+    max-width: 0px;
+    min-height: 0px;
+    max-height: 0px;
+    padding: 0;
+    margin: 0;
+    border: none;
+}
+
+QWidget#trackLane[pass="beauty"] {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #2D5270, stop:1 #223E56);
+    border-top: 1px solid #447AA6;
+}
+
+QWidget#trackLane[pass="beauty"][active="true"] {
+    border-top: 1px solid #5A9BC9;
+}
+
+QWidget#trackLane[pass="diffuse"] {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #27584A, stop:1 #1D4338);
+    border-top: 1px solid #3B826E;
+}
+
+QWidget#trackLane[pass="spec"] {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #6B4A27, stop:1 #52381C);
+    border-top: 1px solid #966838;
+}
+
+QWidget#trackLane[pass="volume"] {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #4E3A66, stop:1 #3B2B4F);
+    border-top: 1px solid #725694;
+}
+
+QFrame#playhead {
+    background: #FF5500;
+}
+
+QFrame#playheadCap {
+    min-width: 10px;
+    max-width: 10px;
+    min-height: 8px;
+    max-height: 8px;
+    background: #FF5500;
+    border: none;
+}
+
+QFrame#cacheProxyRun {
+    min-height: 8px;
+    background: #346848;
+    border: none;
+    border-radius: 2px;
+}
+
+QFrame#cacheFullRun {
+    min-height: 8px;
+    background: #40A860;
+    border: none;
+    border-top: 1px solid #7DCA94;
+    border-radius: 2px;
+}
+
+QFrame#missingTick {
+    min-width: 5px;
+    max-width: 5px;
+    background: #CE5C3C;
+    border: none;
+    border-radius: 1px;
+}
+
+QFrame#cacheSwatch {
+    min-width: 10px;
+    max-width: 10px;
+    min-height: 6px;
+    max-height: 6px;
+    border: none;
+    border-radius: 1px;
+}
+
+QFrame#cacheSwatch[kind="proxy"] { background: #346848; }
+QFrame#cacheSwatch[kind="full"] { background: #40A860; }
+QFrame#cacheSwatch[kind="missing"] { background: #CE5C3C; }
+
+QFrame#annoMarker {
+    min-width: 6px;
+    max-width: 6px;
+    min-height: 6px;
+    max-height: 6px;
+    border-radius: 3px;
+    background: #E8A020;
+    border: 1px solid #73000000;
+}
+
+QFrame#annoMarker[current="true"] {
+    background: #FF5500;
+}
+
+/* ---------- status ---------- */
+
+QStatusBar {
+    min-height: 28px;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #1A1B21, stop:1 #15161B);
+    color: #9AA1AE;
+    border: none;
+    border-top: 1px solid #0AFFFFFF;
+    font-size: 12px;
+}
+
+QStatusBar QLabel {
+    color: #9AA1AE;
+    background: transparent;
+    font-size: 12px;
+}
+
+QStatusBar QLabel#mono, QLabel#readoutR, QLabel#readoutG, QLabel#readoutB, QLabel#readoutA {
+    font-family: "IBM Plex Mono";
+    font-size: 12px;
+    background: transparent;
+}
+
+QLabel#readoutR { color: #FF5050; }
+QLabel#readoutG { color: #50FF50; }
+QLabel#readoutB { color: #6496FF; }
+QLabel#readoutA { color: #9AA1AE; }
+
+/* ---------- info ---------- */
+
+QWidget#infoBody {
+    background: #1C1D22;
+    color: #E6E9EF;
+    border: none;
+}
+
+QLabel#infoHeading {
+    color: #9AA1AE;
+    font-size: 10px;
+    font-weight: 600;
+    background: transparent;
+}
+
+QLabel#infoFile, QLabel#infoValue, QLabel#probeValue, QLabel#probeMeta {
+    color: #E6E9EF;
+    font-family: "IBM Plex Mono";
+    font-size: 12px;
+    background: transparent;
+}
+
+QLabel#infoDir, QLabel#infoKey, QLabel#infoNote, QLabel#probeLabel {
+    color: #9AA1AE;
+    font-size: 12px;
+    background: transparent;
+}
+
+QLabel#probeLabel {
+    font-size: 10px;
+    font-weight: 600;
+}
+
+QFrame#infoChip {
+    min-height: 18px;
+    padding: 0 6px;
+    background: #0F1013;
+    color: #E6E9EF;
+    border: none;
+    border-radius: 3px;
+    font-family: "IBM Plex Mono";
+    font-size: 10px;
+}
+
+QFrame#pixelProbe {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #0C0D10, stop:1 #121318);
+    border: none;
+    border-radius: 6px;
+    color: #E6E9EF;
+}
+
+QFrame#histogram {
+    min-height: 24px;
+    background: #0F1013;
+    border: none;
+    border-radius: 4px;
+}
+
+QTableView#attributes {
+    background: transparent;
+    color: #E6E9EF;
+    border: none;
+    gridline-color: transparent;
+    font-family: "IBM Plex Mono";
+    font-size: 12px;
+    selection-background-color: transparent;
+    selection-color: #E6E9EF;
+}
+
+QHeaderView::section {
+    background: transparent;
+    color: #9AA1AE;
+    border: none;
+    font-family: "IBM Plex Mono";
+    font-size: 11px;
+    font-weight: 500;
+    padding: 2px 6px 2px 0;
+}
+
+/* ---------- annotate ---------- */
+
+QFrame#annotateToolbar {
+    min-height: 40px;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #1E2026, stop:1 #17181D);
+    border: 1px solid #14FFFFFF;
+    border-radius: 8px;
+    color: #E6E9EF;
+}
+
+QSlider#strokeWidth::groove:horizontal {
+    height: 4px;
+    background: #1AFFFFFF;
+    border: none;
+    border-radius: 2px;
+}
+
+QSlider#strokeWidth::sub-page:horizontal {
+    background: #E6E9EF;
+    border-radius: 2px;
+}
+
+QSlider#strokeWidth::handle:horizontal {
+    width: 10px;
+    height: 10px;
+    margin: -4px 0;
+    border-radius: 5px;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #2B2E37, stop:1 #21232A);
+    border: 1px solid #707684;
+}
+
+QToolButton#paletteSwatch {
+    min-width: 16px;
+    max-width: 16px;
+    min-height: 16px;
+    max-height: 16px;
+    padding: 0;
+    border-radius: 8px;
+    background: palette(button);
+    border: 1px solid #66000000;
+}
+
+QToolButton#paletteSwatch[active="true"] {
+    border: 2px solid #D8DCE4;
+}
+
+QFrame#annotationNote {
+    background: #F00F1013;
+    color: #E6E9EF;
+    border: 1px solid #1FFFFFFF;
+    border-radius: 5px;
+    padding: 6px 9px;
+    font-size: 12px;
+    font-weight: 500;
+}
+
+/* ---------- contact sheet ---------- */
+
+QFrame#sheetTile {
+    background: #0A0B0D;
+    border: 1px solid #0DFFFFFF;
+    border-radius: 4px;
+}
+
+QFrame#sheetTile[selected="true"] {
+    border: 2px solid #D8DCE4;
+}
+
+QLabel#sheetTag {
+    min-height: 18px;
+    padding: 0 6px;
+    background: #EB0F1013;
+    color: #E6E9EF;
+    border: 1px solid #1AFFFFFF;
+    border-radius: 3px;
+    font-family: "IBM Plex Mono";
+    font-size: 11px;
+}
+
+QLabel#sheetHint {
+    color: #9AA1AE;
+    font-size: 12px;
+    background: transparent;
+}
+
+/* ---------- dialogs ---------- */
+
+QWidget#modalScrim {
+    background: #9E08090C;
+    border: none;
+}
+
+QDialog, QDialog#settingsDialog, QDialog#aboutDialog {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #1E2026, stop:1 #191A20);
+    color: #E6E9EF;
+    border: 1px solid #14FFFFFF;
+    border-radius: 8px;
+    font-family: "IBM Plex Sans";
+    font-size: 13px;
+}
+
+QWidget#dialogHeader {
+    min-height: 40px;
+    max-height: 40px;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #22242B, stop:1 #1C1D22);
+    border: none;
+    border-bottom: 1px solid #14FFFFFF;
+    border-top: 1px solid #0DFFFFFF;
+}
+
+QLabel#dialogTitle {
+    color: #E6E9EF;
+    font-size: 13px;
+    font-weight: 600;
+    background: transparent;
+}
+
+QWidget#settingsSidebar {
+    background: #18191E;
+    border: none;
+    border-right: 1px solid #14FFFFFF;
+    min-width: 148px;
+}
+
+QPushButton#settingsCategory {
+    min-height: 32px;
+    padding: 0 10px;
+    background: transparent;
+    color: #9AA1AE;
+    border: none;
+    border-radius: 5px;
+    font-size: 12px;
+    font-weight: 500;
+    text-align: left;
+}
+
+QPushButton#settingsCategory[active="true"] {
+    color: #E6E9EF;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #2B2E37, stop:1 #21232A);
+    border-left: 2px solid #D8DCE4;
+    border-top: 1px solid #14FFFFFF;
+}
+
+QLabel#fieldLabel {
+    color: #9AA1AE;
+    font-size: 12px;
+    font-weight: 500;
+    background: transparent;
+}
+
+QLabel#fieldHint {
+    color: #9AA1AE;
+    font-size: 12px;
+    background: transparent;
+}
+
+QPushButton#browseButton {
+    min-height: 22px;
+    padding: 0 8px;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #2B2E37, stop:1 #21232A);
+    color: #E6E9EF;
+    border: none;
+    border-top: 1px solid #3C3F47;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 500;
+}
+
+QCheckBox {
+    spacing: 8px;
+    color: #E6E9EF;
+    font-size: 12px;
+    background: transparent;
+}
+
+QCheckBox::indicator {
+    width: 14px;
+    height: 14px;
+    border-radius: 3px;
+    border: 1px solid #707684;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #2B2E37, stop:1 #21232A);
+}
+
+QCheckBox::indicator:checked {
+    background: #D8DCE4;
+    border-color: #D8DCE4;
+}
+
+QWidget#dialogFooter {
+    min-height: 52px;
+    background: transparent;
+    border: none;
+    border-top: 1px solid #14FFFFFF;
+}
+
+QPushButton#dialogPrimary {
+    min-height: 32px;
+    padding: 0 14px;
+    color: #E6E9EF;
+}
+
+QFrame#aboutTile {
+    min-width: 96px;
+    max-width: 96px;
+    min-height: 96px;
+    max-height: 96px;
+    border-radius: 14px;
+    background: #141518;
+    border: 1px solid #0FFFFFFF;
+}
+
+QLabel#aboutProduct {
+    color: #E6E9EF;
+    font-size: 20px;
+    font-weight: 600;
+    background: transparent;
+}
+
+QLabel#aboutVersion, QLabel#aboutCredit, QLabel#aboutBuild, QLabel#aboutLicense {
+    color: #9AA1AE;
+    font-size: 12px;
+    background: transparent;
+}
+
+QLabel#aboutBuild {
+    font-family: "IBM Plex Mono";
+    font-size: 11px;
+}
+
+QLabel#aboutTagline {
+    color: #E6E9EF;
+    font-size: 13px;
+    background: transparent;
+}
+
+QLabel#aboutLink {
+    color: #E6E9EF;
+    font-size: 12px;
+    font-weight: 500;
+    background: transparent;
+}
+
+QLabel#link {
+    color: #D8DCE4;
+    background: transparent;
+}
+
+QFrame#aboutSpectralBar {
+    min-height: 3px;
+    max-height: 3px;
+    border: none;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 #FF5500, stop:0.333 #FF5500,
+        stop:0.334 #38FF4F, stop:0.666 #38FF4F,
+        stop:0.667 #00AAFF, stop:1 #00AAFF);
+}
+
+/* ---------- scrollbars ---------- */
+
+QScrollBar:vertical {
+    background: #141518;
+    width: 10px;
+    margin: 0;
+    border: none;
+}
+
+QScrollBar:horizontal {
+    background: #141518;
+    height: 10px;
+    margin: 0;
+    border: none;
+}
+
+QScrollBar::handle:vertical, QScrollBar::handle:horizontal {
+    background: #2B2E37;
+    border-radius: 4px;
+    min-height: 24px;
+    min-width: 24px;
+}
+
+QScrollBar::handle:vertical:hover, QScrollBar::handle:horizontal:hover {
+    background: #3C3F47;
+}
+
+QScrollBar::add-line, QScrollBar::sub-line {
+    height: 0px;
+    width: 0px;
+    background: none;
+    border: none;
+}
+
+QScrollBar::add-page, QScrollBar::sub-page {
+    background: none;
+}
+
+QSplitter::handle {
+    background: #14FFFFFF;
+}
+
+QToolTip {
+    background: #1C1D22;
+    color: #E6E9EF;
+    border: 1px solid #14FFFFFF;
+    padding: 4px 8px;
+    font-size: 12px;
+}
+
+QSpinBox, QDoubleSpinBox {
+    min-height: 28px;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #0C0D10, stop:1 #121318);
+    color: #E6E9EF;
+    border: 1px solid #707684;
+    border-radius: 5px;
+    padding: 0 8px;
+    font-family: "IBM Plex Mono";
+    font-size: 12px;
+    selection-background-color: #2E313B;
+    selection-color: #E6E9EF;
+}
+
+/* Functional instrument colors. Do not retint the widgets that paint these.
+ *   cache proxy   #346848   hatch partner #2A543A
  *   cache full    #40A860
  *   missing frame #CE5C3C
  *   decode warn   #FFC864
  *   readout R/G/B #FF5050 / #50FF50 / #6496FF
+ *   anno marker   #E8A020   (current marker uses the playhead accent #FF5500)
  */
